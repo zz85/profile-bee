@@ -17,6 +17,15 @@ use profile_bee_common::StackInfo;
 pub const STACK_ENTRIES: u32 = 1024;
 pub const STACK_SIZE: u32 = 127;
 
+/* Global configuration */
+#[no_mangle]
+static SKIP_IDLE: u8 = 0;
+
+unsafe fn skip_idle() -> bool {
+    let skip = core::ptr::read_volatile(&SKIP_IDLE);
+    skip > 0
+}
+
 
 #[map(name = "counts")]
 pub static mut COUNTS: HashMap<StackInfo, u64> =
@@ -39,13 +48,16 @@ pub fn profile_cpu(ctx: PerfEventContext) -> u32 {
     0
 }
 
+
+
 #[inline(always)]
 unsafe fn try_profile_cpu(ctx: PerfEventContext) {
     let pid = ctx.pid();
     
-    // if pid == 0 {
-    //     return; // not profiling idle
-    // }
+    if skip_idle() && pid == 0 {
+        // not profiling idle
+        return;
+    }
 
     let cmd = ctx.command().unwrap();
     let tgid = ctx.tgid(); // thread group id

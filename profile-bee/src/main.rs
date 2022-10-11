@@ -5,14 +5,15 @@ use aya::programs::{
     KProbe, PerfEvent,
 };
 
-use aya::Pod;
 use aya::{include_bytes_aligned, util::online_cpus, Bpf};
+use aya::{BpfLoader, Btf, Pod};
 use aya_log::BpfLogger;
 use clap::Parser;
 use log::info;
 use profile_bee_common::StackInfo;
 use tokio::signal;
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 mod symbols;
@@ -21,7 +22,26 @@ use symbols::ProcessMapper;
 use crate::symbols::{StackFrameInfo, StackMeta, SymbolLookup};
 
 #[derive(Debug, Parser)]
-struct Opt {}
+#[command(author, version, about, long_about = None)]
+struct Opt {
+    /// Filename to write in stackcollapse format
+    #[arg(short, long)]
+    collapse: Option<PathBuf>,
+
+    #[arg(short, long)]
+    svg: Option<PathBuf>,
+
+    #[arg(long)]
+    skip_idle: bool,
+
+    /// time for profiling CPU in milliseconds,
+    #[arg(short, long, default_value_t = 10000)]
+    time: usize,
+
+    /// frequency for sampling,
+    #[arg(short, long, default_value_t = 99)]
+    frequency: u64,
+}
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
@@ -33,19 +53,23 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // like to specify the eBPF program at runtime rather than at compile-time, you can
     // reach for `Bpf::load_file` instead.
     #[cfg(debug_assertions)]
-    let mut bpf = Bpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/debug/profile-bee"
-    ))?;
+    let data = include_bytes_aligned!("../../target/bpfel-unknown-none/debug/profile-bee");
     #[cfg(not(debug_assertions))]
-    let mut bpf = Bpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/release/profile-bee"
-    ))?;
+    let data = include_bytes_aligned!("../../target/bpfel-unknown-none/release/profile-bee");
+
+    let skip_idle = if opt.skip_idle { 1u8 } else { 0u8 };
+
+    let mut bpf = BpfLoader::new()
+        .set_global("SKIP_IDLE", &skip_idle)
+        .btf(Btf::from_sys_fs().ok().as_ref())
+        .load(data)?;
+
     BpfLogger::init(&mut bpf)?;
     let program: &mut PerfEvent = bpf.program_mut("profile_cpu").unwrap().try_into()?;
 
     program.load()?;
 
-    info!("started");
+    println!("starting {:?}", opt);
 
     // https://elixir.bootlin.com/linux/v4.2/source/include/uapi/linux/perf_event.h#L103
     const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
@@ -74,7 +98,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let started = Instant::now();
 
     loop {
-        if started.elapsed().as_secs() > 10 {
+        if started.elapsed().as_millis() > opt.time as _ {
             break;
         }
         match stacks.pop(0) {
@@ -133,7 +157,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     println!("Total: {}", samples);
     println!("***************************");
-    println!("{}", out.join("\n"));
+    let out = out.join("\n");
+
+    if let Some(name) = opt.collapse {
+        println!("writing to file: {}", name.display());
+        std::fs::write(name, out).expect("Unable to write file");
+    } else {
+        println!("{}", out);
+    }
 
     // info!("Waiting for Ctrl-C...");
     // signal::ctrl_c().await?;
