@@ -1,12 +1,12 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
 use addr2line::{
     demangle, gimli,
     object::{Object, ObjectSymbol},
-    Context,
+    Context, ObjectContext,
 };
 use aya::{maps::stack_trace::StackTrace, util::kernel_symbols};
 use proc_maps::{get_process_maps, MapRange};
@@ -41,17 +41,35 @@ pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> core::result::Result<&str, std::
     ::std::str::from_utf8(&utf8_src[0..nul_range_end])
 }
 
-pub struct SymbolLookup {
+#[derive(Default)]
+pub struct SymbolFinder {
     // kernel symbols
     ksyms: BTreeMap<u64, String>,
     // TODO when we get down to caching processes, store inode, exe and starttime as a way to check staleness
+    proc_map_cache: HashMap<i32, ProcessMapper>,
+    obj_cache: HashMap<PathBuf, ObjItem>,
+    addr_cache: HashMap<(i32, u64), StackFrameInfo>,
 }
 
-impl SymbolLookup {
+struct ObjItem {
+    ctx: ObjectContext,
+    symbols: Vec<Symbol>,
+}
+
+struct Symbol {
+    address: u64,
+    size: u64,
+    name: Option<String>,
+}
+
+impl SymbolFinder {
     pub fn new() -> Self {
         // load kernel symbols from /proc/kallsyms
         let ksyms = kernel_symbols().unwrap();
-        Self { ksyms }
+        Self {
+            ksyms,
+            ..Default::default()
+        }
     }
 
     /// takes an Aya StackTrace contain StackFrames into our StackFrameInfo struct
@@ -77,12 +95,24 @@ impl SymbolLookup {
         kernel_stack
     }
 
-    ///
+    /// Attempts to get from cache, otherwise load from procfs
+    pub fn cache_get_process_mapper(&mut self, pid: i32) -> Option<&ProcessMapper> {
+        let found = self.proc_map_cache.contains_key(&pid);
+
+        if !found {
+            let mapper = ProcessMapper::new(pid).ok()?;
+            self.proc_map_cache.insert(pid, mapper);
+        } else {
+        }
+
+        self.proc_map_cache.get(&pid)
+    }
+
+    /// Resolves user space stack trace
     pub fn resolve_user_trace(
-        &self,
+        &mut self,
         trace: &StackTrace,
         meta: &StackMeta,
-        mapper: &ProcessMapper,
     ) -> Vec<StackFrameInfo> {
         let user_stack = trace
             .frames()
@@ -91,8 +121,27 @@ impl SymbolLookup {
                 let address = frame.ip;
                 let mut info = StackFrameInfo::prepare(&meta);
 
-                mapper.lookup(address as _, &mut info);
-                info.resolve(address);
+                let mapper = self.cache_get_process_mapper(meta.tgid as _);
+                if mapper.is_none() {
+                    return info;
+                }
+                mapper.unwrap().lookup(address as _, &mut info);
+
+                let key = (meta.tgid as _, address);
+                let found = self.addr_cache.contains_key(&key);
+
+                if found {
+                    let g = self
+                        .addr_cache
+                        .get(&key)
+                        .map(|v| v.clone())
+                        .unwrap_or_default();
+                    return g;
+                } else {
+                }
+
+                info.resolve(address, self);
+                self.addr_cache.insert(key, info.clone());
 
                 // println!("User Frame: {}", info.fmt());
 
@@ -139,7 +188,7 @@ impl ProcessMapper {
 }
 
 /// Struct to contain information about a userspace/kernel stack frame
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StackFrameInfo {
     pub pid: usize,
     pub cmd: String,
@@ -196,7 +245,7 @@ impl StackFrameInfo {
     }
 
     /// Based on virtual address calculated from proc maps, resolve symbols
-    pub fn resolve(&mut self, virtual_address: u64) {
+    pub fn resolve(&mut self, virtual_address: u64, finder: &mut SymbolFinder) {
         if self.object_path().is_none() {
             println!(
                 "[frame] [unknown] {:#x} {} ({})",
@@ -207,39 +256,71 @@ impl StackFrameInfo {
 
         // println!("{:#x} -> obj physical address {:#x}", f.ip, info.address());
         let object_path = self.object_path().unwrap();
-        let data = std::fs::read(object_path);
 
-        if data.is_err() {
-            println!("Can't read {:?} {:?}", object_path, data.err());
-            return;
-        }
+        let obj = {
+            let find = finder.obj_cache.get(object_path);
 
-        let data = data.unwrap();
+            match find {
+                Some(item) => item,
+                None => {
+                    let data = std::fs::read(object_path);
+                    if data.is_err() {
+                        println!("Can't read {:?} {:?}", object_path, data.err());
+                        return;
+                    }
 
-        let object: addr2line::object::File<_> = addr2line::object::File::parse(&data[..]).unwrap();
+                    let data = data.unwrap();
 
-        let ctx = Context::new(&object).unwrap();
-        let mut frames = ctx.find_frames(self.address()).expect("find frames");
+                    let object: addr2line::object::File<_> =
+                        addr2line::object::File::parse(&data[..]).unwrap();
+
+                    // TODO binary search tree
+                    let symbols = object
+                        .symbols()
+                        .chain(object.dynamic_symbols())
+                        .map(|s| Symbol {
+                            address: s.address(),
+                            size: s.size(),
+                            name: s.name().map(|v| v.to_owned()).ok(),
+                        })
+                        .collect();
+
+                    let ctx = ObjectContext::new(&object).unwrap();
+
+                    let item = ObjItem { ctx, symbols };
+
+                    finder.obj_cache.insert(PathBuf::from(object_path), item);
+
+                    finder.obj_cache.get(object_path).unwrap()
+                }
+            }
+        };
+
+        let dwarf = true;
 
         let mut found_frames = 0;
 
-        while let Ok(Some(frame)) = frames.next() {
-            found_frames += 1;
-            self.symbol = frame.function.and_then(|function_name| {
-                function_name
-                    .demangle()
-                    .map(|demangled_name| demangled_name.to_string())
-                    .ok()
-            });
+        if dwarf {
+            let mut frames = obj.ctx.find_frames(self.address()).expect("find frames");
 
-            self.source = frame.location.map(|loc| {
-                format!(
-                    "{}:{}:{}",
-                    loc.file.unwrap_or("-"),
-                    loc.line.unwrap_or(0),
-                    loc.column.unwrap_or(0)
-                )
-            });
+            while let Ok(Some(frame)) = frames.next() {
+                found_frames += 1;
+                self.symbol = frame.function.and_then(|function_name| {
+                    function_name
+                        .demangle()
+                        .map(|demangled_name| demangled_name.to_string())
+                        .ok()
+                });
+
+                self.source = frame.location.map(|loc| {
+                    format!(
+                        "{}:{}:{}",
+                        loc.file.unwrap_or("-"),
+                        loc.line.unwrap_or(0),
+                        loc.column.unwrap_or(0)
+                    )
+                });
+            }
         }
 
         if found_frames > 1 {
@@ -254,18 +335,17 @@ impl StackFrameInfo {
             // TODO get stats on % of lookups via dwarf vs symbols
 
             // TODO use binary search
-            for s in object.symbols().chain(object.dynamic_symbols()) {
-                if addr2 >= s.address() && addr2 < (s.address() + s.size()) {
-                    self.symbol = s
-                        .name()
-                        .map(|v| {
-                            if v.starts_with("_Z") || v.starts_with("__Z") {
-                                demangle(v, gimli::DW_LANG_C_plus_plus).unwrap_or(v.to_string())
-                            } else {
-                                v.to_owned()
-                            }
-                        })
-                        .ok();
+            for s in &obj.symbols {
+                if addr2 >= s.address && addr2 < (s.address + s.size) {
+                    self.symbol = s.name.as_ref().map(|v| {
+                        if v.starts_with("_Z") || v.starts_with("__Z") {
+                            demangle(v, gimli::DW_LANG_Rust)
+                                .or_else(|| demangle(v, gimli::DW_LANG_C_plus_plus))
+                                .unwrap_or(v.to_string())
+                        } else {
+                            v.to_owned()
+                        }
+                    });
 
                     // TODO we could attempt to get dwarf info again
                     // let offset = addr2 - s.address();

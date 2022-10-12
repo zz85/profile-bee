@@ -26,7 +26,6 @@ unsafe fn skip_idle() -> bool {
     skip > 0
 }
 
-
 #[map(name = "counts")]
 pub static mut COUNTS: HashMap<StackInfo, u64> =
     HashMap::with_max_entries(STACK_ENTRIES, 0);

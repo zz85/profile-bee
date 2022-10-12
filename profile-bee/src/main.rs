@@ -17,9 +17,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 mod symbols;
-use symbols::ProcessMapper;
 
-use crate::symbols::{StackFrameInfo, StackMeta, SymbolLookup};
+use crate::symbols::{StackFrameInfo, StackMeta, SymbolFinder};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -62,7 +61,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let mut bpf = BpfLoader::new()
         .set_global("SKIP_IDLE", &skip_idle)
         .btf(Btf::from_sys_fs().ok().as_ref())
-        .load(data)?;
+        .load(data)
+        .map_err(|e| {
+            println!("{:?}", e);
+            e
+        })?;
 
     BpfLogger::init(&mut bpf)?;
     let program: &mut PerfEvent = bpf.program_mut("profile_cpu").unwrap().try_into()?;
@@ -83,14 +86,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             // CallingProcessAnyCpu
             PerfEventScope::AllProcessesOneCpu { cpu },
             // SamplePolicy::Period(1000000),
-            SamplePolicy::Frequency(999),
+            SamplePolicy::Frequency(opt.frequency),
         )?;
     }
 
     let mut stacks = Queue::<_, [u8; 28]>::try_from(bpf.map_mut("STACKS")?)?;
     let stack_traces = StackTraceMap::try_from(bpf.map("stack_traces")?)?;
 
-    let symbols = SymbolLookup::new();
+    let mut symbols = SymbolFinder::new();
 
     let mut trace_count = std::collections::HashMap::<String, usize>::new();
     let mut samples = 0;
@@ -119,13 +122,20 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                     let key = format!("idle;{} ({})", stack_meta.cmd, tgid);
                     let trace = trace_count.entry(key).or_insert(0);
                     *trace += 1;
+
+                    samples += 1;
                     continue;
                 }
 
                 samples += 1;
 
-                let combined =
-                    format_stack_trace(ktrace_id, utrace_id, &stack_meta, &stack_traces, &symbols);
+                let combined = format_stack_trace(
+                    ktrace_id,
+                    utrace_id,
+                    &stack_meta,
+                    &stack_traces,
+                    &mut symbols,
+                );
 
                 let key = combined
                     .iter()
@@ -142,7 +152,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             }
             _ => {
                 // println!("--------------");
-                // tokio::time::sleep(Duration::from_millis(5000)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }
@@ -160,7 +170,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let out = out.join("\n");
 
     if let Some(name) = opt.collapse {
-        println!("writing to file: {}", name.display());
+        println!("Writing to file: {}", name.display());
         std::fs::write(name, out).expect("Unable to write file");
     } else {
         println!("{}", out);
@@ -179,7 +189,7 @@ fn format_stack_trace(
     utrace_id: i32,
     stack_meta: &StackMeta,
     stack_traces: &StackTraceMap<MapRef>,
-    symbols: &SymbolLookup,
+    symbols: &mut SymbolFinder,
 ) -> Vec<StackFrameInfo> {
     let kernel_stacks = if ktrace_id > -1 {
         stack_traces
@@ -190,17 +200,10 @@ fn format_stack_trace(
         None
     };
 
-    let mapper = ProcessMapper::new(stack_meta.tgid as _);
-    if mapper.is_err() {
-        println!("Couldn't read pid {}", stack_meta.tgid);
-        return vec![StackFrameInfo::process_only(&stack_meta)];
-    }
-    let mapper = mapper.unwrap();
-
     let user_stacks = if utrace_id > -1 {
         stack_traces
             .get(&(utrace_id as u32), 0)
-            .map(|trace| symbols.resolve_user_trace(&trace, &stack_meta, &mapper))
+            .map(|trace| symbols.resolve_user_trace(&trace, &stack_meta))
             .ok()
     } else {
         None

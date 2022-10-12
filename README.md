@@ -11,21 +11,35 @@ Stacktraces are retrieved in the user space program and symbols resolution is ha
 Stacks are counted and sorted, the resulting output is [Branden Gregg's](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html) Stack Collapsed [format](https://github.com/BrendanGregg/flamegraph#2-fold-stacks).
 This format can be turned into a flamegraph visualization using [speedscope](https://www.speedscope.app/) or inferno-flamegraph.
 
+### Usage
+
+```
+# Profile at 999hz for 10s, writing output to profile.txt
+cargo xtask run --release -- --collapse profile.txt --frequency 999 --time 10000
+
+
+# Profile at 99hz for 5s, writing output to screen, idle CPU cycles not counted
+cargo xtask run --release -- --collapse profile.txt --frequency 99 --time 5000 --skip-idle
+```
+
 ### Supported
 - Rust and C++ symbols demangling supported (via gimli)
 - Some source mapping supported (via addr2line)
+- Simple symbol lookup cache
 
 ### Limitations
 - Linux only
-- No caching in symbol lookup
 - Interpreted / JIT stacktraces not yet supported
 
 ### TODOs
+- Optimize CPU usage
+- Option to enable/disable dwarf
 - switch over to Perf buffers
 - implement k/uprobing
 - Integrate inferno-flamegraph for svg generation
 - Add CPU id information
 - Off CPU profiling
+- Stack aggregation in kernel
 
 ### Alternatives
 - Perf
