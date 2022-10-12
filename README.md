@@ -40,12 +40,13 @@ cargo xtask run --release -- --collapse profile.txt --frequency 99 --time 5000 -
 - Add CPU id information
 - Off CPU profiling
 - Stack aggregation in kernel
+- Optimize symbol lookup via binary search
 
 ### Alternatives
 - Perf
 - Bcc's [profile tool](https://github.com/iovisor/bcc/blob/b57dbb397cb110433c743685a7d1eb1fb9c3b1f9/tools/profile.py)
 - [Cargo flamegraph](https://github.com/flamegraph-rs/flamegraph), utilizing perf without the hassle
-- [Parca-agent](https://github.com/parca-dev/parca-agent), always on profiling with BPF, except for golang for userspace tools
+- [Parca-agent](https://github.com/parca-dev/parca-agent), always on profiling with BPF, except using [golang](https://github.com/parca-dev/parca-agent/pull/869).
 
 # Development
 

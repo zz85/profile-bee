@@ -1,5 +1,5 @@
 use aya::maps::stack_trace::StackTrace;
-use aya::maps::{MapRef, Queue, StackTraceMap};
+use aya::maps::{HashMap, MapRef, Queue, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
@@ -92,6 +92,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let mut stacks = Queue::<_, [u8; 28]>::try_from(bpf.map_mut("STACKS")?)?;
     let stack_traces = StackTraceMap::try_from(bpf.map("stack_traces")?)?;
+    let counts: HashMap<_, [u8; 28], u64> =
+        HashMap::<_, [u8; 28], u64>::try_from(bpf.map("counts")?)?;
 
     let mut symbols = SymbolFinder::new();
 
@@ -100,6 +102,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let started = Instant::now();
 
+    /*
+     */
     loop {
         if started.elapsed().as_millis() > opt.time as _ {
             break;
@@ -107,41 +111,18 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         match stacks.pop(0) {
             Ok(v) => {
                 let stack: StackInfo = unsafe { *v.as_ptr().cast() };
-                let tgid = stack.tgid;
-                let ktrace_id = stack.kernel_stack_id;
-                let utrace_id = stack.user_stack_id;
                 let stack_meta = StackMeta::from(stack);
 
-                let key = if tgid == 0 {
-                    "idle".to_string()
-                } else {
-                    format!("{} ({})", stack_meta.cmd, stack_meta.tgid)
-                };
-
-                if tgid == 0 {
-                    let key = format!("idle;{} ({})", stack_meta.cmd, tgid);
-                    let trace = trace_count.entry(key).or_insert(0);
-                    *trace += 1;
-
-                    samples += 1;
-                    continue;
-                }
-
-                samples += 1;
-
-                let combined = format_stack_trace(
-                    ktrace_id,
-                    utrace_id,
-                    &stack_meta,
-                    &stack_traces,
-                    &mut symbols,
-                );
+                // samples += 1;
+                let combined = format_stack_trace(&stack, &stack_meta, &stack_traces, &mut symbols);
 
                 let key = combined
                     .iter()
                     .map(|s| s.fmt_symbol())
                     .collect::<Vec<_>>()
                     .join(";");
+
+                // user space counting
                 let trace = trace_count.entry(key).or_insert(0);
                 *trace += 1;
 
@@ -152,15 +133,47 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             }
             _ => {
                 // println!("--------------");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
     }
 
+    // let mut out = Vec::new();
+    // for (k, v) in trace_count {
+    //     out.push(format!("{} {}", k, v));
+    //     samples += v;
+    // }
+
+    // out.sort();
+
+    // println!("Sleep for {}", opt.time);
+    // tokio::time::sleep(Duration::from_millis(opt.time as _)).await;
+    println!("Process stacks");
+
     let mut out = Vec::new();
-    for (k, v) in trace_count {
-        out.push(format!("{} {}", k, v));
-        samples += v;
+    for i in counts.iter() {
+        match i {
+            Ok((key, value)) => {
+                let stack: StackInfo = unsafe { *key.as_ptr().cast() };
+
+                let stack_meta = StackMeta::from(stack);
+
+                samples += 1;
+
+                let combined = format_stack_trace(&stack, &stack_meta, &stack_traces, &mut symbols);
+
+                let key = combined
+                    .iter()
+                    .map(|s| s.fmt_symbol())
+                    .collect::<Vec<_>>()
+                    .join(";");
+
+                out.push(format!("{} {}", &key, &value));
+
+                // println!("YO {} {}", key, value);
+            }
+            _ => {}
+        }
     }
 
     out.sort();
@@ -185,12 +198,22 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
 /// converts pointers from bpf to usable, symbol resolved stack information
 fn format_stack_trace(
-    ktrace_id: i32,
-    utrace_id: i32,
+    stack_info: &StackInfo,
     stack_meta: &StackMeta,
     stack_traces: &StackTraceMap<MapRef>,
     symbols: &mut SymbolFinder,
 ) -> Vec<StackFrameInfo> {
+    let ktrace_id = stack_info.kernel_stack_id;
+    let utrace_id = stack_info.user_stack_id;
+
+    if stack_meta.tgid == 0 {
+        let mut idle = StackFrameInfo::prepare(stack_meta);
+        idle.symbol = Some("idle".into());
+        let idle_cpu = StackFrameInfo::process_only(stack_meta);
+
+        return vec![idle, idle_cpu];
+    }
+
     let kernel_stacks = if ktrace_id > -1 {
         stack_traces
             .get(&(ktrace_id as u32), 0)

@@ -45,7 +45,7 @@ pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> core::result::Result<&str, std::
 pub struct SymbolFinder {
     // kernel symbols
     ksyms: BTreeMap<u64, String>,
-    // TODO when we get down to caching processes, store inode, exe and starttime as a way to check staleness
+    // TODO we should store inode, exe and starttime as a way to check staleness
     proc_map_cache: HashMap<i32, ProcessMapper>,
     obj_cache: HashMap<PathBuf, ObjItem>,
     addr_cache: HashMap<(i32, u64), StackFrameInfo>,
@@ -372,7 +372,10 @@ impl StackFrameInfo {
     pub fn fmt_symbol(&self) -> String {
         format!(
             "{}{}",
-            self.symbol.as_deref().unwrap_or("[unknown]"),
+            self.symbol.as_deref().unwrap_or(
+                //"[unknown]"
+                format!("{}+{:#x}", self.fmt_object(), self.address).as_str()
+            ),
             self.fmt_source()
         )
     }
