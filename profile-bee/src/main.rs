@@ -1,4 +1,3 @@
-use aya::maps::stack_trace::StackTrace;
 use aya::maps::{HashMap, MapRef, Queue, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
@@ -9,6 +8,7 @@ use aya::{include_bytes_aligned, util::online_cpus, Bpf};
 use aya::{BpfLoader, Btf, Pod};
 use aya_log::BpfLogger;
 use clap::Parser;
+use inferno::flamegraph::{self, Options};
 use log::info;
 use profile_bee_common::StackInfo;
 use tokio::signal;
@@ -92,13 +92,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let mut stacks = Queue::<_, [u8; 28]>::try_from(bpf.map_mut("STACKS")?)?;
     let stack_traces = StackTraceMap::try_from(bpf.map("stack_traces")?)?;
-    let counts: HashMap<_, [u8; 28], u64> =
-        HashMap::<_, [u8; 28], u64>::try_from(bpf.map("counts")?)?;
+    let counts = HashMap::<_, [u8; 28], u64>::try_from(bpf.map("counts")?)?;
 
     let mut symbols = SymbolFinder::new();
 
     let mut trace_count = std::collections::HashMap::<String, usize>::new();
     let mut samples = 0;
+    let mut queue_processed = 0;
 
     let started = Instant::now();
 
@@ -113,7 +113,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 let stack: StackInfo = unsafe { *v.as_ptr().cast() };
                 let stack_meta = StackMeta::from(stack);
 
-                // samples += 1;
+                queue_processed += 1;
+
                 let combined = format_stack_trace(&stack, &stack_meta, &stack_traces, &mut symbols);
 
                 let key = combined
@@ -138,6 +139,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         }
     }
 
+    println!("Processed {} queue events", queue_processed);
     // let mut out = Vec::new();
     // for (k, v) in trace_count {
     //     out.push(format!("{} {}", k, v));
@@ -148,50 +150,71 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     // println!("Sleep for {}", opt.time);
     // tokio::time::sleep(Duration::from_millis(opt.time as _)).await;
-    println!("Process stacks");
+    println!("Processing stacks...");
 
     let mut out = Vec::new();
     for i in counts.iter() {
-        match i {
-            Ok((key, value)) => {
-                let stack: StackInfo = unsafe { *key.as_ptr().cast() };
+        if let Ok((key, value)) = i {
+            let stack: StackInfo = unsafe { *key.as_ptr().cast() };
 
-                let stack_meta = StackMeta::from(stack);
+            let stack_meta = StackMeta::from(stack);
 
-                samples += 1;
+            samples += value;
 
-                let combined = format_stack_trace(&stack, &stack_meta, &stack_traces, &mut symbols);
+            let combined = format_stack_trace(&stack, &stack_meta, &stack_traces, &mut symbols);
 
-                let key = combined
-                    .iter()
-                    .map(|s| s.fmt_symbol())
-                    .collect::<Vec<_>>()
-                    .join(";");
+            let key = combined
+                .iter()
+                .map(|s| s.fmt_symbol())
+                .collect::<Vec<_>>()
+                .join(";");
 
-                out.push(format!("{} {}", &key, &value));
-
-                // println!("YO {} {}", key, value);
-            }
-            _ => {}
+            out.push(format!("{} {}", &key, &value));
         }
     }
 
     out.sort();
 
-    println!("Total: {}", samples);
-    println!("***************************");
+    println!("Total samples: {}", samples);
+
+    if let Some(svg) = opt.svg {
+        let _ = output_svg(
+            &svg,
+            &out,
+            format!(
+                "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
+                opt.time, opt.frequency
+            ),
+        )
+        .map_err(|e| {
+            println!("Failed to write svg file {:?}", svg);
+            e
+        });
+    }
+
     let out = out.join("\n");
 
     if let Some(name) = opt.collapse {
         println!("Writing to file: {}", name.display());
-        std::fs::write(name, out).expect("Unable to write file");
+        std::fs::write(name, &out).expect("Unable to write stack collapsed file");
     } else {
+        println!("***************************");
         println!("{}", out);
     }
 
     // info!("Waiting for Ctrl-C...");
     // signal::ctrl_c().await?;
     // info!("Exiting...");
+
+    Ok(())
+}
+
+/// Creates a flamegraph svg file using the inferno-flamegraph lib
+fn output_svg(path: &PathBuf, str: &[String], title: String) -> anyhow::Result<()> {
+    let mut svg_opts = Options::default();
+    svg_opts.title = title;
+    let mut svg_file = std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(path)?);
+    flamegraph::from_lines(&mut svg_opts, str.iter().map(|v| v.as_str()), &mut svg_file)?;
 
     Ok(())
 }
@@ -226,7 +249,7 @@ fn format_stack_trace(
     let user_stacks = if utrace_id > -1 {
         stack_traces
             .get(&(utrace_id as u32), 0)
-            .map(|trace| symbols.resolve_user_trace(&trace, &stack_meta))
+            .map(|trace| symbols.resolve_user_trace(&trace, stack_meta))
             .ok()
     } else {
         None
@@ -242,7 +265,7 @@ fn format_stack_trace(
         _ => Default::default(),
     };
 
-    let pid_info = StackFrameInfo::process_only(&stack_meta);
+    let pid_info = StackFrameInfo::process_only(stack_meta);
     combined.push(pid_info);
     combined.reverse();
 

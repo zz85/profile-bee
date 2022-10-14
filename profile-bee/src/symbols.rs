@@ -119,7 +119,7 @@ impl SymbolFinder {
             .iter()
             .map(|frame| {
                 let address = frame.ip;
-                let mut info = StackFrameInfo::prepare(&meta);
+                let mut info = StackFrameInfo::prepare(meta);
 
                 let mapper = self.cache_get_process_mapper(meta.tgid as _);
                 if mapper.is_none() {
@@ -131,11 +131,7 @@ impl SymbolFinder {
                 let found = self.addr_cache.contains_key(&key);
 
                 if found {
-                    let g = self
-                        .addr_cache
-                        .get(&key)
-                        .map(|v| v.clone())
-                        .unwrap_or_default();
+                    let g = self.addr_cache.get(&key).cloned().unwrap_or_default();
                     return g;
                 } else {
                 }
@@ -180,7 +176,7 @@ impl ProcessMapper {
                 };
 
                 info.address = translated as _;
-                info.object_path = m.filename().map(|v| PathBuf::from(v));
+                info.object_path = m.filename().map(PathBuf::from);
             }
         }
         // we can't translate address, so keep things as they are
@@ -341,7 +337,7 @@ impl StackFrameInfo {
                         if v.starts_with("_Z") || v.starts_with("__Z") {
                             demangle(v, gimli::DW_LANG_Rust)
                                 .or_else(|| demangle(v, gimli::DW_LANG_C_plus_plus))
-                                .unwrap_or(v.to_string())
+                                .unwrap_or_else(|| v.to_string())
                         } else {
                             v.to_owned()
                         }
@@ -382,10 +378,8 @@ impl StackFrameInfo {
 
     pub fn fmt_object(&self) -> &str {
         self.object_path()
-            .map(|v| v.file_name())
-            .flatten()
-            .map(|v| v.to_str())
-            .flatten()
+            .and_then(|v| v.file_name())
+            .and_then(|v| v.to_str())
             .unwrap_or(&self.cmd)
     }
 

@@ -1,6 +1,6 @@
  # profile-bee
 
-🐝🦀 Profile Bee is an eBPF based CPU profiler written in Rust for performance and efficiency.
+🐝🦀🔥 Profile Bee is an eBPF based CPU profiler written in Rust for performance and efficiency.
 
 Aya is used for building the BPF programs that is attached to perf events for sampling.
 The beauty of this tool is that it runs from a single binary without the need to install
@@ -14,18 +14,24 @@ This format can be turned into a flamegraph visualization using [speedscope](htt
 ### Usage
 
 ```
+# Profile at 9999hz for 2s, writing output to profile.svg
+profile-bee --svg profile.svg --frequency 999 --time 2000
+
+
 # Profile at 999hz for 10s, writing output to profile.txt
-cargo xtask run --release -- --collapse profile.txt --frequency 999 --time 10000
+profile-bee --collapse profile.txt --frequency 999 --time 10000
 
 
 # Profile at 99hz for 5s, writing output to screen, idle CPU cycles not counted
 cargo xtask run --release -- --collapse profile.txt --frequency 99 --time 5000 --skip-idle
 ```
 
-### Supported
+### Features
 - Rust and C++ symbols demangling supported (via gimli)
 - Some source mapping supported (via addr2line)
 - Simple symbol lookup cache
+- SVG Flamegraph generation (via inferno)
+- BPF based stacktrace aggregation for reducing kernel <-> userspace transfers
 
 ### Limitations
 - Linux only
@@ -36,11 +42,12 @@ cargo xtask run --release -- --collapse profile.txt --frequency 99 --time 5000 -
 - Option to enable/disable dwarf
 - switch over to Perf buffers
 - implement k/uprobing
-- Integrate inferno-flamegraph for svg generation
 - Add CPU id information
 - Off CPU profiling
-- Stack aggregation in kernel
 - Optimize symbol lookup via binary search
+- Profile target pids/cpu
+- Publish to crates.io
+- Measure cache hit ratio
 
 ### Alternatives
 - Perf
