@@ -136,7 +136,7 @@ impl SymbolFinder {
                 } else {
                 }
 
-                info.resolve(address, self);
+                info.resolve(address, self, meta.tgid);
                 self.addr_cache.insert(key, info.clone());
 
                 // println!("User Frame: {}", info.fmt());
@@ -241,13 +241,19 @@ impl StackFrameInfo {
     }
 
     /// Based on virtual address calculated from proc maps, resolve symbols
-    pub fn resolve(&mut self, virtual_address: u64, finder: &mut SymbolFinder) {
+    pub fn resolve(&mut self, virtual_address: u64, finder: &mut SymbolFinder, id: usize) {
         if self.object_path().is_none() {
             println!(
                 "[frame] [unknown] {:#x} {} ({})",
                 self.address, self.cmd, virtual_address
             );
-            return;
+
+            let r = std::fs::read_link(format!("/proc/{}/exe", id));
+            if r.is_err() {
+                return;
+            }
+
+            self.object_path = r.ok();
         }
 
         // println!("{:#x} -> obj physical address {:#x}", f.ip, info.address());

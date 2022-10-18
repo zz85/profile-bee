@@ -3,6 +3,7 @@ use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
 };
+use aya::programs::{TracePoint, UProbe};
 
 use aya::{include_bytes_aligned, util::online_cpus, Bpf};
 use aya::{BpfLoader, Btf, Pod};
@@ -27,19 +28,33 @@ struct Opt {
     #[arg(short, long)]
     collapse: Option<PathBuf>,
 
+    /// Filename to generate flamegraph svg
     #[arg(short, long)]
     svg: Option<PathBuf>,
 
+    /// Avoid profiling idle cpu cycles
     #[arg(long)]
     skip_idle: bool,
 
-    /// time for profiling CPU in milliseconds,
+    /// Time to run CPU profiling in milliseconds,
     #[arg(short, long, default_value_t = 10000)]
     time: usize,
 
-    /// frequency for sampling,
+    /// Frequency for sampling,
     #[arg(short, long, default_value_t = 99)]
     frequency: u64,
+
+    /// function name to attached kprobe
+    #[arg(long)]
+    kprobe: Option<String>,
+
+    /// function name to attached uprobe
+    #[arg(long)]
+    uprobe: Option<String>,
+
+    /// function name to attached tracepoint eg.
+    #[arg(long)]
+    tracepoint: Option<String>,
 }
 
 #[tokio::main]
@@ -68,26 +83,46 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         })?;
 
     BpfLogger::init(&mut bpf)?;
-    let program: &mut PerfEvent = bpf.program_mut("profile_cpu").unwrap().try_into()?;
-
-    program.load()?;
 
     println!("starting {:?}", opt);
 
-    // https://elixir.bootlin.com/linux/v4.2/source/include/uapi/linux/perf_event.h#L103
-    const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
+    if let Some(kprobe) = &opt.kprobe {
+        let program: &mut KProbe = bpf.program_mut("kprobe_profile").unwrap().try_into()?;
+        program.load()?;
+        program.attach(kprobe, 0)?;
+    } else if let Some(uprobe) = &opt.uprobe {
+        let program: &mut UProbe = bpf.program_mut("uprobe_profile").unwrap().try_into()?;
+        program.load()?;
+        program.attach(Some(uprobe), 0, "libc", None)?;
+    } else if let Some(tracepoint) = &opt.tracepoint {
+        let program: &mut TracePoint = bpf.program_mut("tracepoint_profile").unwrap().try_into()?;
+        program.load()?;
 
-    let cpus = online_cpus()?;
-    let nprocs = cpus.len();
-    for cpu in cpus {
-        program.attach(
-            PerfTypeId::Software,
-            PERF_COUNT_SW_CPU_CLOCK as u64,
-            // CallingProcessAnyCpu
-            PerfEventScope::AllProcessesOneCpu { cpu },
-            // SamplePolicy::Period(1000000),
-            SamplePolicy::Frequency(opt.frequency),
-        )?;
+        let mut split = tracepoint.split(":");
+        let category = split.next().expect("category");
+        let name = split.next().expect("name");
+
+        program.attach(category, name)?;
+    } else {
+        let program: &mut PerfEvent = bpf.program_mut("profile_cpu").unwrap().try_into()?;
+
+        program.load()?;
+
+        // https://elixir.bootlin.com/linux/v4.2/source/include/uapi/linux/perf_event.h#L103
+        const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
+
+        let cpus = online_cpus()?;
+        let nprocs = cpus.len();
+        for cpu in cpus {
+            program.attach(
+                PerfTypeId::Software,
+                PERF_COUNT_SW_CPU_CLOCK as u64,
+                // CallingProcessAnyCpu
+                PerfEventScope::AllProcessesOneCpu { cpu },
+                // SamplePolicy::Period(1000000),
+                SamplePolicy::Frequency(opt.frequency),
+            )?;
+        }
     }
 
     let mut stacks = Queue::<_, [u8; 28]>::try_from(bpf.map_mut("STACKS")?)?;

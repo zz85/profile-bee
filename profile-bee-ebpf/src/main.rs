@@ -3,10 +3,10 @@
 
 use aya_bpf::{
     bindings::{BPF_F_USER_STACK, BPF_NOEXIST},
-    macros::kprobe,
-    macros::{map, perf_event},
+    macros::{kprobe, uprobe},
+    macros::{map, perf_event, tracepoint},
     maps::{HashMap, Queue, StackTrace},
-    programs::PerfEventContext,
+    programs::{PerfEventContext, TracePointContext},
     programs::ProbeContext,
     BpfContext,
 };
@@ -15,7 +15,7 @@ use aya_log_ebpf::info;
 use profile_bee_common::StackInfo;
 
 pub const STACK_ENTRIES: u32 = 16392;
-pub const STACK_SIZE: u32 = 127;
+pub const STACK_SIZE: u32 = 16384;
 
 /* Global configuration */
 #[no_mangle]
@@ -38,14 +38,14 @@ pub static mut STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZ
 #[perf_event]
 pub fn profile_cpu(ctx: PerfEventContext) -> u32 {
     unsafe {
-        try_profile_cpu(ctx);
+        collect_trace(ctx);
     }
 
     0
 }
 
 #[inline(always)]
-unsafe fn try_profile_cpu(ctx: PerfEventContext) {
+unsafe fn collect_trace<C: BpfContext>(ctx: C) {
     let pid = ctx.pid();
 
     if skip_idle() && pid == 0 {
@@ -87,18 +87,23 @@ unsafe fn try_profile_cpu(ctx: PerfEventContext) {
     // info!(&ctx, "try_profile_cpu {} {} user: {}, kernel: {}", pid, tgid, key.user_stack_id, key.kernel_stack_id);
 }
 
-// #[kprobe(name="kprobe_profile")]
-// pub fn kprobe_profile(ctx: ProbeContext) -> u32 {
-//     match unsafe { try_kprobe_profile(ctx) } {
-//         Ok(ret) => ret,
-//         Err(ret) => ret,
-//     }
-// }
+#[kprobe(name="kprobe_profile")]
+pub fn kprobe_profile(ctx: ProbeContext) -> u32 {
+    unsafe { collect_trace(ctx) }
+    0
+}
 
-// unsafe fn try_kprobe_profile(ctx: ProbeContext) -> Result<u32, u32> {
-//     info!(&ctx, "function try_profsample called");
-//     Ok(0)
-// }
+#[uprobe(name="uprobe_profile")]
+pub fn uprobe_profile(ctx: ProbeContext) -> u32 {
+    unsafe { collect_trace(ctx) }
+    0
+}
+
+#[tracepoint(name="tracepoint_profile")]
+pub fn tracepoint_profile(ctx: TracePointContext) -> u32 {
+    unsafe { collect_trace(ctx) }
+    0
+}
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
