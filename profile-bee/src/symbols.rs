@@ -6,7 +6,7 @@ use std::{
 use addr2line::{
     demangle, gimli,
     object::{Object, ObjectSymbol},
-    Context, ObjectContext,
+    ObjectContext,
 };
 use aya::{maps::stack_trace::StackTrace, util::kernel_symbols};
 use proc_maps::{get_process_maps, MapRange};
