@@ -19,6 +19,9 @@ b) [Branden Gregg's](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.htm
 # Profile at 9999hz for 2s, writing output to profile.svg
 profile-bee --svg profile.svg --frequency 9999 --time 2000
 
+# Same as above, grouped by CPU ids
+profile-bee --svg profile.svg --frequency 9999 --time 2000 --group-by-cpu
+
 # Profile at 999hz for 10s, writing output to profile.txt
 profile-bee --collapse profile.txt --frequency 999 --time 10000
 
@@ -40,6 +43,7 @@ profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 - SVG Flamegraph generation (via inferno)
 - BPF based stacktrace aggregation for reducing kernel <-> userspace transfers
 - Basic Kernel and tracepoint probing
+- Group by CPUs
 
 ### Limitations
 - Linux only
@@ -51,7 +55,6 @@ profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 - Option to enable/disable dwarf
 - switch over to Perf buffers
 - implement uprobing/USDT
-- Add CPU id information
 - pid filtering
 - Off CPU profiling
 - Optimize symbol lookup via binary search

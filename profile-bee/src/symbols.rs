@@ -18,18 +18,22 @@ pub enum SymbolError {
     #[error("Failed to open proc maps")]
     MapReadError { err: std::io::Error },
 }
-
-pub struct StackMeta {
-    pub tgid: usize,
-    pub cmd: String,
+pub trait StackInfoExt {
+    fn get_cmd(&self) -> String;
+    fn get_cpu_id(&self) -> Option<u32>;
 }
 
-impl From<StackInfo> for StackMeta {
-    fn from(stack: StackInfo) -> Self {
-        let tgid = stack.tgid as _;
-        let cmd = str_from_u8_nul_utf8(&stack.cmd).unwrap().to_owned();
+impl StackInfoExt for StackInfo {
+    fn get_cmd(&self) -> String {
+        str_from_u8_nul_utf8(&self.cmd).unwrap().to_owned()
+    }
 
-        StackMeta { tgid, cmd }
+    fn get_cpu_id(&self) -> Option<u32> {
+        if self.cpu == u32::MAX {
+            return None;
+        }
+
+        Some(self.cpu)
     }
 }
 
@@ -39,6 +43,11 @@ pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> core::result::Result<&str, std::
         .position(|&c| c == b'\0')
         .unwrap_or(utf8_src.len()); // default to length if no `\0` present
     ::std::str::from_utf8(&utf8_src[0..nul_range_end])
+}
+
+pub struct FrameCount {
+    pub frames: Vec<StackFrameInfo>,
+    pub count: u64,
 }
 
 #[derive(Default)]
@@ -76,7 +85,7 @@ impl SymbolFinder {
     pub fn resolve_kernel_trace(
         &self,
         trace: &mut StackTrace,
-        meta: &StackMeta,
+        meta: &StackInfo,
     ) -> Vec<StackFrameInfo> {
         let kernel_stack = trace
             .resolve(&self.ksyms)
@@ -112,7 +121,7 @@ impl SymbolFinder {
     pub fn resolve_user_trace(
         &mut self,
         trace: &StackTrace,
-        meta: &StackMeta,
+        meta: &StackInfo,
     ) -> Vec<StackFrameInfo> {
         let user_stack = trace
             .frames()
@@ -136,7 +145,7 @@ impl SymbolFinder {
                 } else {
                 }
 
-                info.resolve(address, self, meta.tgid);
+                info.resolve(address, self, meta.tgid as usize);
                 self.addr_cache.insert(key, info.clone());
 
                 // println!("User Frame: {}", info.fmt());
@@ -199,24 +208,29 @@ pub struct StackFrameInfo {
 
     /// Source file and location
     pub source: Option<String>,
+
+    pub cpu_id: Option<u32>,
 }
 
 impl StackFrameInfo {
     /// Creates an empty/default StackFrameInfo
-    pub fn prepare(meta: &StackMeta) -> Self {
+    pub fn prepare(meta: &StackInfo) -> Self {
         Self {
-            pid: meta.tgid,
-            cmd: meta.cmd.to_owned(),
+            pid: meta.tgid as usize,
+            cmd: meta.get_cmd(),
+            // "".to_string(), // don't really need meta.get_cmd(),
             ..Default::default()
         }
     }
 
     /// Creates an StackFrameInfo placeholder for process name
-    pub fn process_only(meta: &StackMeta) -> Self {
-        let sym = format!("{} ({})", meta.cmd, meta.tgid);
+    pub fn process_only(meta: &StackInfo) -> Self {
+        let cmd = meta.get_cmd();
+        let sym = format!("{} ({})", cmd, meta.tgid);
+
         Self {
-            pid: meta.tgid,
-            cmd: meta.cmd.to_owned(),
+            pid: meta.tgid as usize,
+            cmd,
             symbol: Some(sym),
             ..Default::default()
         }
@@ -244,7 +258,7 @@ impl StackFrameInfo {
     pub fn resolve(&mut self, virtual_address: u64, finder: &mut SymbolFinder, id: usize) {
         if self.object_path().is_none() {
             println!(
-                "[frame] [unknown] {:#x} {} ({})",
+                "[frame] [unknown] {:#16x} {} ({:#16x})",
                 self.address, self.cmd, virtual_address
             );
 

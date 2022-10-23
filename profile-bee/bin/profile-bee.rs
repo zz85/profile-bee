@@ -1,4 +1,4 @@
-use aya::maps::{HashMap, MapRef, Queue, StackTraceMap};
+use aya::maps::{HashMap, Queue, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
@@ -11,13 +11,14 @@ use aya_log::BpfLogger;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use log::info;
+use profile_bee::format_stack_trace;
 use profile_bee_common::StackInfo;
 use tokio::signal;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use profile_bee::symbols::{StackFrameInfo, StackMeta, SymbolFinder};
+use profile_bee::symbols::{FrameCount, SymbolFinder};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -53,6 +54,9 @@ struct Opt {
     /// function name to attached tracepoint eg.
     #[arg(long)]
     tracepoint: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    group_by_cpu: bool,
 }
 
 #[tokio::main]
@@ -96,7 +100,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         let program: &mut TracePoint = bpf.program_mut("tracepoint_profile").unwrap().try_into()?;
         program.load()?;
 
-        let mut split = tracepoint.split(":");
+        let mut split = tracepoint.split(':');
         let category = split.next().expect("category");
         let name = split.next().expect("name");
 
@@ -123,9 +127,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         }
     }
 
-    let mut stacks = Queue::<_, [u8; 28]>::try_from(bpf.map_mut("STACKS")?)?;
+    const STACK_INFO_SIZE: usize = std::mem::size_of::<StackInfo>();
+    let mut stacks = Queue::<_, [u8; STACK_INFO_SIZE]>::try_from(bpf.map_mut("STACKS")?)?;
     let stack_traces = StackTraceMap::try_from(bpf.map("stack_traces")?)?;
-    let counts = HashMap::<_, [u8; 28], u64>::try_from(bpf.map("counts")?)?;
+    let counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(bpf.map("counts")?)?;
 
     let mut symbols = SymbolFinder::new();
 
@@ -144,11 +149,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         match stacks.pop(0) {
             Ok(v) => {
                 let stack: StackInfo = unsafe { *v.as_ptr().cast() };
-                let stack_meta = StackMeta::from(stack);
-
                 queue_processed += 1;
 
-                let combined = format_stack_trace(&stack, &stack_meta, &stack_traces, &mut symbols);
+                let combined =
+                    format_stack_trace(&stack, &stack_traces, &mut symbols, opt.group_by_cpu);
 
                 let key = combined
                     .iter()
@@ -173,42 +177,39 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     println!("Processed {} queue events", queue_processed);
-    // let mut out = Vec::new();
-    // for (k, v) in trace_count {
-    //     out.push(format!("{} {}", k, v));
-    //     samples += v;
-    // }
 
-    // out.sort();
-
-    // println!("Sleep for {}", opt.time);
-    // tokio::time::sleep(Duration::from_millis(opt.time as _)).await;
     println!("Processing stacks...");
 
-    let mut out = Vec::new();
-    for i in counts.iter() {
-        if let Ok((key, value)) = i {
-            let stack: StackInfo = unsafe { *key.as_ptr().cast() };
+    let mut stacks = Vec::new();
+    for (key, value) in counts.iter().flatten() {
+        let stack: StackInfo = unsafe { *key.as_ptr().cast() };
 
-            let stack_meta = StackMeta::from(stack);
+        samples += value;
 
-            samples += value;
+        let combined = format_stack_trace(&stack, &stack_traces, &mut symbols, opt.group_by_cpu);
 
-            let combined = format_stack_trace(&stack, &stack_meta, &stack_traces, &mut symbols);
+        stacks.push(FrameCount {
+            frames: combined,
+            count: value,
+        });
+    }
 
-            let key = combined
+    println!("Total samples: {}", samples);
+
+    let mut out = stacks
+        .into_iter()
+        .map(|frames| {
+            let key = frames
+                .frames
                 .iter()
                 .map(|s| s.fmt_symbol())
                 .collect::<Vec<_>>()
                 .join(";");
-
-            out.push(format!("{} {}", &key, &value));
-        }
-    }
-
+            let count = frames.count;
+            format!("{} {}", &key, count)
+        })
+        .collect::<Vec<_>>();
     out.sort();
-
-    println!("Total samples: {}", samples);
 
     if let Some(svg) = opt.svg {
         let _ = output_svg(
@@ -250,57 +251,4 @@ fn output_svg(path: &PathBuf, str: &[String], title: String) -> anyhow::Result<(
     flamegraph::from_lines(&mut svg_opts, str.iter().map(|v| v.as_str()), &mut svg_file)?;
 
     Ok(())
-}
-
-/// converts pointers from bpf to usable, symbol resolved stack information
-fn format_stack_trace(
-    stack_info: &StackInfo,
-    stack_meta: &StackMeta,
-    stack_traces: &StackTraceMap<MapRef>,
-    symbols: &mut SymbolFinder,
-) -> Vec<StackFrameInfo> {
-    let ktrace_id = stack_info.kernel_stack_id;
-    let utrace_id = stack_info.user_stack_id;
-
-    if stack_meta.tgid == 0 {
-        let mut idle = StackFrameInfo::prepare(stack_meta);
-        idle.symbol = Some("idle".into());
-        let idle_cpu = StackFrameInfo::process_only(stack_meta);
-
-        return vec![idle, idle_cpu];
-    }
-
-    let kernel_stacks = if ktrace_id > -1 {
-        stack_traces
-            .get(&(ktrace_id as u32), 0)
-            .map(|mut trace| symbols.resolve_kernel_trace(&mut trace, stack_meta))
-            .ok()
-    } else {
-        None
-    };
-
-    let user_stacks = if utrace_id > -1 {
-        stack_traces
-            .get(&(utrace_id as u32), 0)
-            .map(|trace| symbols.resolve_user_trace(&trace, stack_meta))
-            .ok()
-    } else {
-        None
-    };
-
-    let mut combined = match (kernel_stacks, user_stacks) {
-        (Some(kernel_stacks), None) => kernel_stacks,
-        (None, Some(user_stacks)) => user_stacks,
-        (Some(kernel_stacks), Some(user_stacks)) => kernel_stacks
-            .into_iter()
-            .chain(user_stacks.into_iter())
-            .collect::<Vec<_>>(),
-        _ => Default::default(),
-    };
-
-    let pid_info = StackFrameInfo::process_only(stack_meta);
-    combined.push(pid_info);
-    combined.reverse();
-
-    combined
 }

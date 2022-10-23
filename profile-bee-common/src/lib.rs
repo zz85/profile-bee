@@ -7,4 +7,5 @@ pub struct StackInfo {
     pub user_stack_id: i32,
     pub kernel_stack_id: i32,
     pub cmd: [u8; 16],
+    pub cpu: u32,
 }

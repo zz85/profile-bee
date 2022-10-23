@@ -8,14 +8,14 @@ use aya_bpf::{
     bindings::BPF_F_USER_STACK,
     macros::map,
     maps::{HashMap, Queue, StackTrace},
-    BpfContext,
+    BpfContext, helpers::bpf_get_smp_processor_id,
 };
 
 // use aya_log_ebpf::info;
 use profile_bee_common::StackInfo;
 
 pub const STACK_ENTRIES: u32 = 16392;
-pub const STACK_SIZE: u32 = 16384;
+pub const STACK_SIZE: u32 = 2048;
 
 /* Global configuration */
 #[no_mangle]
@@ -54,7 +54,10 @@ pub unsafe fn collect_trace<C: BpfContext>(ctx: C) {
         user_stack_id: -1,
         kernel_stack_id: -1,
         cmd,
+        cpu: u32::MAX,
     };
+
+    key.cpu = bpf_get_smp_processor_id();
 
     if let Ok(stack_id) = STACK_TRACES.get_stackid(&ctx, BPF_F_USER_STACK.into()) {
         key.user_stack_id = stack_id as i32;
