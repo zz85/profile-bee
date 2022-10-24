@@ -25,6 +25,7 @@ thiserror = "*"
 addr2line = "*"
 proc-maps = "*"
 inferno = "0.11.10"
+procfs = "*"
 
 [[bin]]
 name = "profile-bee"

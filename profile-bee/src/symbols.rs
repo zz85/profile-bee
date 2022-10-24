@@ -1,7 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    fs,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -12,9 +10,10 @@ use addr2line::{
 };
 
 use aya::{maps::stack_trace::StackTrace, util::kernel_symbols};
-use proc_maps::{get_process_maps, MapRange};
 use profile_bee_common::StackInfo;
 use thiserror::Error;
+
+use crate::process::{ProcessCache, ProcessMapper};
 
 #[derive(Debug, Error)]
 pub enum SymbolError {
@@ -58,12 +57,12 @@ pub struct SymbolFinder {
     // kernel symbols
     ksyms: BTreeMap<u64, String>,
     // TODO we should store inode, exe and starttime as a way to check staleness
-    proc_map_cache: HashMap<i32, ProcessMapper>,
-    obj_cache: HashMap<String, ObjItem>,
+    obj_cache: HashMap<String, Option<ObjItem>>,
     addr_cache: HashMap<(i32, u64), StackFrameInfo>,
+    process_cache: ProcessCache,
 }
 
-struct ObjItem {
+pub struct ObjItem {
     ctx: ObjectContext,
     symbols: Vec<Symbol>,
 }
@@ -107,19 +106,6 @@ impl SymbolFinder {
         kernel_stack
     }
 
-    /// Attempts to get from cache, otherwise load from procfs
-    pub fn cache_get_process_mapper(&mut self, pid: i32) -> Option<&ProcessMapper> {
-        let found = self.proc_map_cache.contains_key(&pid);
-
-        if !found {
-            let mapper = ProcessMapper::new(pid).ok()?;
-            self.proc_map_cache.insert(pid, mapper);
-        } else {
-        }
-
-        self.proc_map_cache.get(&pid)
-    }
-
     /// Resolves user space stack trace
     pub fn resolve_user_trace(
         &mut self,
@@ -133,11 +119,17 @@ impl SymbolFinder {
                 let address = frame.ip;
                 let mut info = StackFrameInfo::prepare(meta);
 
-                let mapper = self.cache_get_process_mapper(meta.tgid as _);
+                let process = self.process_cache.get(meta.tgid as usize);
+                if process.is_none() {
+                    println!("Empty process cache entry shouldn't happen");
+                    return info;
+                }
+
+                let mapper = &process.unwrap().mapper;
                 if mapper.is_none() {
                     return info;
                 }
-                mapper.unwrap().lookup(address as _, &mut info);
+                mapper.as_ref().unwrap().lookup(address as _, &mut info);
 
                 let key = (meta.tgid as _, address);
                 let found = self.addr_cache.contains_key(&key);
@@ -160,41 +152,6 @@ impl SymbolFinder {
     }
 }
 
-pub struct ProcessMapper {
-    maps: Vec<MapRange>,
-}
-
-impl ProcessMapper {
-    pub fn new(pid: i32) -> Result<Self, SymbolError> {
-        let maps = get_process_maps(pid as _).map_err(|err| SymbolError::MapReadError { err })?;
-
-        let maps = maps
-            .into_iter()
-            .filter(|r| r.is_exec() && !r.is_write() && r.is_read())
-            .collect::<Vec<_>>();
-
-        Ok(ProcessMapper { maps })
-    }
-
-    pub fn lookup(&self, address: usize, info: &mut StackFrameInfo) {
-        for m in &self.maps {
-            let start = m.start();
-
-            if address >= start && address < (start + m.size()) {
-                let translated = if m.filename().map(|f| f.ends_with(".so")).unwrap_or(false) {
-                    address
-                } else {
-                    address - start
-                };
-
-                info.address = translated as _;
-                info.object_path = m.filename().map(PathBuf::from);
-            }
-        }
-        // we can't translate address, so keep things as they are
-    }
-}
-
 /// Struct to contain information about a userspace/kernel stack frame
 #[derive(Debug, Default, Clone)]
 pub struct StackFrameInfo {
@@ -202,9 +159,9 @@ pub struct StackFrameInfo {
     pub cmd: String,
 
     /// Physical memory address
-    address: u64,
+    pub address: u64,
     /// Shared Object / Module
-    object_path: Option<PathBuf>,
+    pub object_path: Option<PathBuf>,
 
     /// Source file and location
     pub symbol: Option<String>,
@@ -232,7 +189,14 @@ impl StackFrameInfo {
     /// Creates an StackFrameInfo placeholder for process name
     pub fn process_only(meta: &StackInfo) -> Self {
         let cmd = meta.get_cmd();
-        let sym = format!("{} ({})", cmd, meta.tgid);
+
+        let with_pid = false;
+
+        let sym = if with_pid {
+            format!("{} ({})", cmd, meta.tgid)
+        } else {
+            cmd.to_owned()
+        };
 
         Self {
             pid: meta.tgid as usize,
@@ -276,24 +240,21 @@ impl StackFrameInfo {
                 // uhoh, this means link isn't there, but there might be a way to
                 // read the process in memory
                 // self.object_path = Some(exe_path);
-                println!("read_link err on {:?}", exe_path);
+                println!(
+                    "read_link err on {:?}. Cmd: {}, pid: {}",
+                    exe_path, self.cmd, self.pid
+                );
                 return;
             } else {
                 // cool, we were able to read link, now read it from the target namespace
                 self.object_path = r.ok();
-
-                let p = &format!("/proc/{}/ns/mnt", self.pid);
-                if let Ok(meta) = fs::metadata(p) {
-                    let namespace = meta.ino();
-                    self.ns = Some(namespace);
-                }
             }
         }
 
         // println!("{:#x} -> obj physical address {:#x}", f.ip, info.address());
         let object_path = self.object_path().unwrap();
 
-        // optimize cache hit based on same namespace
+        // optimized cache hit based on same namespace
         // TODO, should also mmap
         let object_key = format!(
             "{}-{}",
@@ -301,57 +262,56 @@ impl StackFrameInfo {
             object_path.to_str().unwrap_or_default()
         );
 
-        let obj = {
-            let find = finder.obj_cache.get(&object_key);
+        let obj_cache = finder.obj_cache.entry(object_key).or_insert_with(|| {
+            // TODO don't open if "[vdso]"
+            let target = PathBuf::from(format!(
+                "/proc/{}/root{}",
+                id,
+                object_path.to_str().unwrap_or_default()
+            ));
+            let data = std::fs::read(&target);
 
-            match find {
-                Some(item) => item,
-                None => {
-                    // TODO don't open if "[vdso]"
-                    let target = PathBuf::from(format!(
-                        "/proc/{}/root{}",
-                        id,
-                        object_path.to_str().unwrap_or_default()
-                    ));
-                    let data = std::fs::read(&target);
+            if data.is_err() {
+                println!(
+                    "Can't read {:?} {:?} {} {:#8x} {:#8x} - pid {}",
+                    target,
+                    data.err(),
+                    self.cmd,
+                    self.address,
+                    virtual_address,
+                    self.pid
+                );
+                return None;
+            }
 
-                    if data.is_err() {
-                        println!(
-                            "Can't read {:?} {:?} {} {:#8x} {:#8x} - pid {}",
-                            target,
-                            data.err(),
-                            self.cmd,
-                            self.address,
-                            virtual_address,
-                            self.pid
-                        );
-                        return;
-                    }
+            let data = data.unwrap();
 
-                    let data = data.unwrap();
+            let object: addr2line::object::File<_> =
+                addr2line::object::File::parse(&data[..]).unwrap();
 
-                    let object: addr2line::object::File<_> =
-                        addr2line::object::File::parse(&data[..]).unwrap();
+            // TODO binary search tree
+            let symbols = object
+                .symbols()
+                .chain(object.dynamic_symbols())
+                .map(|s| Symbol {
+                    address: s.address(),
+                    size: s.size(),
+                    name: s.name().map(|v| v.to_owned()).ok(),
+                })
+                .collect();
 
-                    // TODO binary search tree
-                    let symbols = object
-                        .symbols()
-                        .chain(object.dynamic_symbols())
-                        .map(|s| Symbol {
-                            address: s.address(),
-                            size: s.size(),
-                            name: s.name().map(|v| v.to_owned()).ok(),
-                        })
-                        .collect();
+            let ctx = ObjectContext::new(&object).unwrap();
 
-                    let ctx = ObjectContext::new(&object).unwrap();
+            let item = ObjItem { ctx, symbols };
 
-                    let item = ObjItem { ctx, symbols };
+            Some(item)
+        });
 
-                    finder.obj_cache.insert(object_key.clone(), item);
-
-                    finder.obj_cache.get(&object_key).unwrap()
-                }
+        let obj = match obj_cache {
+            Some(obj) => obj,
+            None => {
+                // because this failed to load before, it's been negatively cached
+                return;
             }
         };
 

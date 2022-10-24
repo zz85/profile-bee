@@ -2,6 +2,7 @@ use aya::maps::{MapRef, StackTraceMap};
 use profile_bee_common::StackInfo;
 use symbols::{StackFrameInfo, StackInfoExt, SymbolFinder};
 
+pub mod process;
 pub mod symbols;
 
 /// converts pointers from bpf to usable, symbol resolved stack information
