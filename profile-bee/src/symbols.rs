@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -8,6 +10,7 @@ use addr2line::{
     object::{Object, ObjectSymbol},
     ObjectContext,
 };
+
 use aya::{maps::stack_trace::StackTrace, util::kernel_symbols};
 use proc_maps::{get_process_maps, MapRange};
 use profile_bee_common::StackInfo;
@@ -56,7 +59,7 @@ pub struct SymbolFinder {
     ksyms: BTreeMap<u64, String>,
     // TODO we should store inode, exe and starttime as a way to check staleness
     proc_map_cache: HashMap<i32, ProcessMapper>,
-    obj_cache: HashMap<PathBuf, ObjItem>,
+    obj_cache: HashMap<String, ObjItem>,
     addr_cache: HashMap<(i32, u64), StackFrameInfo>,
 }
 
@@ -96,7 +99,7 @@ impl SymbolFinder {
                 info.symbol = frame
                     .symbol_name
                     .as_deref()
-                    .map(|name| format!("{}_k", name));
+                    .map(|name| format!("{}_[k]", name));
 
                 info
             })
@@ -210,6 +213,9 @@ pub struct StackFrameInfo {
     pub source: Option<String>,
 
     pub cpu_id: Option<u32>,
+
+    /// namespace
+    pub ns: Option<u64>,
 }
 
 impl StackFrameInfo {
@@ -257,31 +263,68 @@ impl StackFrameInfo {
     /// Based on virtual address calculated from proc maps, resolve symbols
     pub fn resolve(&mut self, virtual_address: u64, finder: &mut SymbolFinder, id: usize) {
         if self.object_path().is_none() {
-            println!(
-                "[frame] [unknown] {:#16x} {} ({:#16x})",
-                self.address, self.cmd, virtual_address
-            );
+            // println!(
+            //     "[frame] [unknown] {:#16x} {} ({:#16x})",
+            //     self.address, self.cmd, virtual_address
+            // );
 
-            let r = std::fs::read_link(format!("/proc/{}/exe", id));
+            //patch
+            let path = format!("/proc/{}/exe", id);
+            let exe_path = PathBuf::from(path);
+            let r = std::fs::read_link(&exe_path);
             if r.is_err() {
+                // uhoh, this means link isn't there, but there might be a way to
+                // read the process in memory
+                // self.object_path = Some(exe_path);
+                println!("read_link err on {:?}", exe_path);
                 return;
-            }
+            } else {
+                // cool, we were able to read link, now read it from the target namespace
+                self.object_path = r.ok();
 
-            self.object_path = r.ok();
+                let p = &format!("/proc/{}/ns/mnt", self.pid);
+                if let Ok(meta) = fs::metadata(p) {
+                    let namespace = meta.ino();
+                    self.ns = Some(namespace);
+                }
+            }
         }
 
         // println!("{:#x} -> obj physical address {:#x}", f.ip, info.address());
         let object_path = self.object_path().unwrap();
 
+        // optimize cache hit based on same namespace
+        // TODO, should also mmap
+        let object_key = format!(
+            "{}-{}",
+            self.ns.unwrap_or(self.pid as u64),
+            object_path.to_str().unwrap_or_default()
+        );
+
         let obj = {
-            let find = finder.obj_cache.get(object_path);
+            let find = finder.obj_cache.get(&object_key);
 
             match find {
                 Some(item) => item,
                 None => {
-                    let data = std::fs::read(object_path);
+                    // TODO don't open if "[vdso]"
+                    let target = PathBuf::from(format!(
+                        "/proc/{}/root{}",
+                        id,
+                        object_path.to_str().unwrap_or_default()
+                    ));
+                    let data = std::fs::read(&target);
+
                     if data.is_err() {
-                        println!("Can't read {:?} {:?}", object_path, data.err());
+                        println!(
+                            "Can't read {:?} {:?} {} {:#8x} {:#8x} - pid {}",
+                            target,
+                            data.err(),
+                            self.cmd,
+                            self.address,
+                            virtual_address,
+                            self.pid
+                        );
                         return;
                     }
 
@@ -305,9 +348,9 @@ impl StackFrameInfo {
 
                     let item = ObjItem { ctx, symbols };
 
-                    finder.obj_cache.insert(PathBuf::from(object_path), item);
+                    finder.obj_cache.insert(object_key.clone(), item);
 
-                    finder.obj_cache.get(object_path).unwrap()
+                    finder.obj_cache.get(&object_key).unwrap()
                 }
             }
         };
