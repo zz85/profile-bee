@@ -59,7 +59,7 @@ pub struct SymbolFinder {
     // TODO we should store inode, exe and starttime as a way to check staleness
     obj_cache: HashMap<String, Option<ObjItem>>,
     addr_cache: HashMap<(i32, u64), StackFrameInfo>,
-    process_cache: ProcessCache,
+    pub process_cache: ProcessCache,
 }
 
 pub struct ObjItem {
@@ -189,7 +189,6 @@ impl StackFrameInfo {
     /// Creates an StackFrameInfo placeholder for process name
     pub fn process_only(meta: &StackInfo) -> Self {
         let cmd = meta.get_cmd();
-
         let with_pid = false;
 
         let sym = if with_pid {
@@ -232,29 +231,24 @@ impl StackFrameInfo {
             //     self.address, self.cmd, virtual_address
             // );
 
-            //patch
-            let path = format!("/proc/{}/exe", id);
-            let exe_path = PathBuf::from(path);
-            let r = std::fs::read_link(&exe_path);
-            if r.is_err() {
+            let path = finder
+                .process_cache
+                .get(id)
+                .and_then(|p| p.exe_link.as_ref());
+
+            if path.is_none() {
                 // uhoh, this means link isn't there, but there might be a way to
                 // read the process in memory
-                // self.object_path = Some(exe_path);
-                println!(
-                    "read_link err on {:?}. Cmd: {}, pid: {}",
-                    exe_path, self.cmd, self.pid
-                );
                 return;
-            } else {
-                // cool, we were able to read link, now read it from the target namespace
-                self.object_path = r.ok();
             }
+
+            self.object_path = path.map(ToOwned::to_owned);
         }
 
         // println!("{:#x} -> obj physical address {:#x}", f.ip, info.address());
         let object_path = self.object_path().unwrap();
 
-        // optimized cache hit based on same namespace
+        // optimize cache hit based on same namespace
         // TODO, should also mmap
         let object_key = format!(
             "{}-{}",

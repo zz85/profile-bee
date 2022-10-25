@@ -13,6 +13,7 @@ pub struct ProcessInfo {
     pub cwd: Option<PathBuf>,
     pub ns: Option<u64>,
     pub mapper: Option<ProcessMapper>,
+    pub exe_link: Option<PathBuf>,
     // pub obj: Option<ObjItem>,
 }
 
@@ -36,6 +37,17 @@ impl ProcessInfo {
         let ns = fs::metadata(ns_mnt).ok().map(|meta| meta.ino());
         let mapper = ProcessMapper::new(pid as i32).ok();
 
+        let path = format!("/proc/{}/exe", pid);
+        let exe_path = PathBuf::from(path);
+        let exe_link = std::fs::read_link(&exe_path)
+            .map_err(|_err| {
+                println!(
+                    "read_link err on {:?}. Cmd: {:?}, pid: {:?}",
+                    exe_path, cmdline, pid
+                );
+            })
+            .ok();
+
         Self {
             process,
             environ,
@@ -44,23 +56,24 @@ impl ProcessInfo {
             cwd,
             ns,
             mapper,
+            exe_link,
         }
     }
 
-    fn environ(&self, key: &str) -> Option<&str> {
+    pub fn environ(&self, key: &str) -> Option<&str> {
         let e = self.environ.as_ref()?;
         e.get(&OsString::from(key)).and_then(|s| s.to_str())
     }
 
-    fn info(&self) -> bool {
+    pub fn info(&self) -> bool {
         self.process.is_some()
     }
 
-    fn process(&self) -> Option<&Process> {
+    pub fn process(&self) -> Option<&Process> {
         self.process.as_ref()
     }
 
-    fn cmdline(&self) -> Option<&Vec<String>> {
+    pub fn cmdline(&self) -> Option<&Vec<String>> {
         self.cmdline.as_ref()
     }
 }
@@ -71,12 +84,6 @@ pub struct ProcessCache {
 }
 
 impl ProcessCache {
-    fn new() -> Self {
-        Self {
-            map: HashMap::default(),
-        }
-    }
-
     pub fn get(&mut self, pid: usize) -> Option<&ProcessInfo> {
         self.map.entry(pid).or_insert_with(|| ProcessInfo::new(pid));
 

@@ -19,7 +19,12 @@ pub fn format_stack_trace(
         let mut idle = StackFrameInfo::prepare(stack_info);
         idle.symbol = Some("idle".into());
         let mut idle_cpu = StackFrameInfo::process_only(stack_info);
-        idle_cpu.symbol = idle_cpu.symbol.map(|s| s.replace("swapper/", "cpu_"));
+
+        if let Some(cpu_id) = stack_info.get_cpu_id() {
+            idle_cpu.symbol = Some(format!("cpu_{:02}", cpu_id));
+        } else {
+            idle_cpu.symbol = idle_cpu.symbol.map(|s| s.replace("swapper/", "cpu_"));
+        }
 
         if group_by_cpu {
             if let Some(cpu_id) = stack_info.get_cpu_id() {
