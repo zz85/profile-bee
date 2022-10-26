@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    path::{Path, PathBuf}, fs::File,
 };
 
 use addr2line::{
@@ -10,10 +10,11 @@ use addr2line::{
 };
 
 use aya::{maps::stack_trace::StackTrace, util::kernel_symbols};
+use memmap::Mmap;
 use profile_bee_common::StackInfo;
 use thiserror::Error;
 
-use crate::process::{ProcessCache, ProcessMapper};
+use crate::process::ProcessCache;
 
 #[derive(Debug, Error)]
 pub enum SymbolError {
@@ -57,7 +58,7 @@ pub struct SymbolFinder {
     // kernel symbols
     ksyms: BTreeMap<u64, String>,
     // TODO we should store inode, exe and starttime as a way to check staleness
-    obj_cache: HashMap<String, Option<ObjItem>>,
+    obj_cache: HashMap<(u64, PathBuf), Option<ObjItem>>,
     addr_cache: HashMap<(i32, u64), StackFrameInfo>,
     pub process_cache: ProcessCache,
 }
@@ -249,27 +250,30 @@ impl StackFrameInfo {
         let object_path = self.object_path().unwrap();
 
         // optimize cache hit based on same namespace
-        // TODO, should also mmap
-        let object_key = format!(
-            "{}-{}",
+        let object_key = (
             self.ns.unwrap_or(self.pid as u64),
-            object_path.to_str().unwrap_or_default()
+            object_path.clone().into()
         );
 
         let obj_cache = finder.obj_cache.entry(object_key).or_insert_with(|| {
-            // TODO don't open if "[vdso]"
+            let path = object_path.to_str().unwrap_or_default();
+            if path == "[vdso]" || path.starts_with("[") {
+                // since this is a cache entry, should prevent much reloading
+                return None;
+            }
             let target = PathBuf::from(format!(
                 "/proc/{}/root{}",
                 id,
-                object_path.to_str().unwrap_or_default()
+                &path
             ));
-            let data = std::fs::read(&target);
 
-            if data.is_err() {
+            let file = File::open(&target);
+
+            if file.is_err() {
                 println!(
                     "Can't read {:?} {:?} {} {:#8x} {:#8x} - pid {}",
                     target,
-                    data.err(),
+                    file.err(),
                     self.cmd,
                     self.address,
                     virtual_address,
@@ -278,7 +282,24 @@ impl StackFrameInfo {
                 return None;
             }
 
-            let data = data.unwrap();
+            let data = {
+                let file = file.unwrap();
+                let mmapped_file = unsafe { Mmap::map(&file) };
+                if mmapped_file.is_err() {
+                    println!(
+                        "Couldn't mmap {:?} {:?} {} {:#8x} {:#8x} - pid {}",
+                        target,
+                        mmapped_file.err(),
+                        self.cmd,
+                        self.address,
+                        virtual_address,
+                        self.pid
+                    );
+                    return None;
+                }
+
+                &mmapped_file.unwrap()[..]
+            };
 
             let object: addr2line::object::File<_> =
                 addr2line::object::File::parse(&data[..]).unwrap();
