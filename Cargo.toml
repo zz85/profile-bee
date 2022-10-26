@@ -1,2 +1,5 @@
 [workspace]
 members = ["profile-bee", "profile-bee-common", "xtask"]
+
+[profile.release]
+debug = true
