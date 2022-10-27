@@ -69,8 +69,11 @@ pub fn format_stack_trace(
 
     if group_by_cpu {
         if let Some(cpu_id) = stack_info.get_cpu_id() {
-            let mut frame = StackFrameInfo::default();
-            frame.symbol = Some(format!("cpu_{:02}", cpu_id));
+            let frame = StackFrameInfo {
+                symbol: Some(format!("cpu_{:02}", cpu_id)),
+                ..Default::default()
+            };
+
             combined.push(frame);
         }
     }

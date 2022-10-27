@@ -57,6 +57,9 @@ struct Opt {
 
     #[arg(long, default_value_t = false)]
     group_by_cpu: bool,
+
+    #[arg(long, default_value_t = false)]
+    no_dwarf: bool,
 }
 
 #[tokio::main]
@@ -132,7 +135,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let stack_traces = StackTraceMap::try_from(bpf.map("stack_traces")?)?;
     let counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(bpf.map("counts")?)?;
 
-    let mut symbols = SymbolFinder::new();
+    let mut symbols = SymbolFinder::new(!opt.no_dwarf);
 
     let mut trace_count = std::collections::HashMap::<String, usize>::new();
     let mut samples = 0;

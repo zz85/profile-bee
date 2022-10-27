@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf}, fs::File,
+    fs::File,
+    path::{Path, PathBuf},
 };
 
 use addr2line::{
@@ -61,6 +62,7 @@ pub struct SymbolFinder {
     obj_cache: HashMap<(u64, PathBuf), Option<ObjItem>>,
     addr_cache: HashMap<(i32, u64), StackFrameInfo>,
     pub process_cache: ProcessCache,
+    use_dwarf: bool,
 }
 
 pub struct ObjItem {
@@ -75,11 +77,12 @@ struct Symbol {
 }
 
 impl SymbolFinder {
-    pub fn new() -> Self {
+    pub fn new(use_dwarf: bool) -> Self {
         // load kernel symbols from /proc/kallsyms
         let ksyms = kernel_symbols().unwrap();
         Self {
             ksyms,
+            use_dwarf,
             ..Default::default()
         }
     }
@@ -249,23 +252,16 @@ impl StackFrameInfo {
         // println!("{:#x} -> obj physical address {:#x}", f.ip, info.address());
         let object_path = self.object_path().unwrap();
 
-        // optimize cache hit based on same namespace
-        let object_key = (
-            self.ns.unwrap_or(self.pid as u64),
-            object_path.clone().into()
-        );
+        // optimized cache hit based on same namespace
+        let object_key = (self.ns.unwrap_or(self.pid as u64), object_path.into());
 
         let obj_cache = finder.obj_cache.entry(object_key).or_insert_with(|| {
             let path = object_path.to_str().unwrap_or_default();
-            if path == "[vdso]" || path.starts_with("[") {
+            if path == "[vdso]" || path.starts_with('[') {
                 // since this is a cache entry, should prevent much reloading
                 return None;
             }
-            let target = PathBuf::from(format!(
-                "/proc/{}/root{}",
-                id,
-                &path
-            ));
+            let target = PathBuf::from(format!("/proc/{}/root{}", id, &path));
 
             let file = File::open(&target);
 
@@ -301,8 +297,7 @@ impl StackFrameInfo {
                 &mmapped_file.unwrap()[..]
             };
 
-            let object: addr2line::object::File<_> =
-                addr2line::object::File::parse(&data[..]).unwrap();
+            let object: addr2line::object::File<_> = addr2line::object::File::parse(data).unwrap();
 
             // TODO binary search tree
             let symbols = object
@@ -330,11 +325,9 @@ impl StackFrameInfo {
             }
         };
 
-        let dwarf = true;
-
         let mut found_frames = 0;
 
-        if dwarf {
+        if finder.use_dwarf {
             let mut frames = obj.ctx.find_frames(self.address()).expect("find frames");
 
             while let Ok(Some(frame)) = frames.next() {
