@@ -60,6 +60,10 @@ struct Opt {
 
     #[arg(long, default_value_t = false)]
     no_dwarf: bool,
+
+    /// PID to process
+    #[arg(short, long)]
+    pid: Option<u32>,
 }
 
 #[tokio::main]
@@ -116,17 +120,36 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         // https://elixir.bootlin.com/linux/v4.2/source/include/uapi/linux/perf_event.h#L103
         const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
 
-        let cpus = online_cpus()?;
-        let nprocs = cpus.len();
-        for cpu in cpus {
+        let self_profile = false;
+
+        if self_profile {
             program.attach(
                 PerfTypeId::Software,
                 PERF_COUNT_SW_CPU_CLOCK as u64,
-                // CallingProcessAnyCpu
-                PerfEventScope::AllProcessesOneCpu { cpu },
-                // SamplePolicy::Period(1000000),
+                PerfEventScope::CallingProcessAnyCpu,
                 SamplePolicy::Frequency(opt.frequency),
             )?;
+        } else if let Some(pid) = opt.pid {
+            program.attach(
+                PerfTypeId::Software,
+                PERF_COUNT_SW_CPU_CLOCK as u64,
+                PerfEventScope::OneProcessAnyCpu { pid },
+                SamplePolicy::Frequency(opt.frequency),
+            )?;
+        } else {
+            let cpus = online_cpus()?;
+            let nprocs = cpus.len();
+            eprintln!("CPUs: {}", nprocs);
+
+            for cpu in cpus {
+                program.attach(
+                    PerfTypeId::Software,
+                    PERF_COUNT_SW_CPU_CLOCK as u64,
+                    PerfEventScope::AllProcessesOneCpu { cpu },
+                    // SamplePolicy::Period(1000000),
+                    SamplePolicy::Frequency(opt.frequency),
+                )?;
+            }
         }
     }
 
@@ -238,6 +261,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         println!("***************************");
         println!("{}", out);
     }
+
+    println!("{}", symbols.process_cache.stats());
 
     // info!("Waiting for Ctrl-C...");
     // signal::ctrl_c().await?;

@@ -8,10 +8,11 @@ additional libraries such as bcctools or libbpf on target hosts.
 
 Stacktraces are retrieved in the user space program and symbols resolution is handled.
 
-Stacks are counted and sorted, the resulting output is
+Stacks are counted and sorted and can be output with the follow choices
 
-a) A SVG flamegraph (generated with inferno) you can load in your browser
-b) [Branden Gregg's](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html) Stack Collapsed [format](https://github.com/BrendanGregg/flamegraph#2-fold-stacks) that can be loaded up using [speedscope visualizer](https://www.speedscope.app/)
+- A SVG flamegraph (generated with inferno) you can load in your browser
+- [Branden Gregg's](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html) Stack Collapsed [format](https://github.com/BrendanGregg/flamegraph#2-fold-stacks) that can be loaded up using [speedscope visualizer](https://www.speedscope.app/)
+- Your own custom format
 
 ### Usage
 
@@ -44,6 +45,7 @@ profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 - BPF based stacktrace aggregation for reducing kernel <-> userspace transfers
 - Basic Kernel and tracepoint probing
 - Group by CPUs
+- Profile specific PIDs
 
 ### Limitations
 - Linux only
@@ -52,10 +54,9 @@ profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 
 ### TODOs
 - Optimize CPU usage
-- Option to enable/disable dwarf
 - switch over to Perf buffers
 - implement uprobing/USDT
-- pid filtering
+- pid nesting
 - Off CPU profiling
 - Optimize symbol lookup via binary search
 - Profile target pids/cpu
