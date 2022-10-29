@@ -35,6 +35,9 @@ profile-bee --kprobe vfs_write --time 200 --svg kprobe.svg
 # Profile using a tracepoint over a interval of 200ms
 profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 
+# Profile specific pid (or cpu)
+profile-bee --pid <pid> ...
+
 ```
 
 ### Features
@@ -45,7 +48,7 @@ profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 - BPF based stacktrace aggregation for reducing kernel <-> userspace transfers
 - Basic Kernel and tracepoint probing
 - Group by CPUs
-- Profile specific PIDs
+- Profile target PIDs, CPU id, or itself
 
 ### Limitations
 - Linux only
@@ -54,14 +57,17 @@ profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 
 ### TODOs
 - Optimize CPU usage
+- Check stack correctness (compare with perf, pprof etc)
 - switch over to Perf buffers
 - implement uprobing/USDT
 - pid nesting
 - Off CPU profiling
 - Optimize symbol lookup via binary search
-- Profile target pids/cpu
 - Publish to crates.io
 - Measure cache hit ratio
+- JSON output
+- Stacktrace and Hashmap clearing
+- Missing symbols
 
 ### Alternatives
 - Perf

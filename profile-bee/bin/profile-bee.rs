@@ -6,8 +6,7 @@ use aya::programs::{
 use aya::programs::{TracePoint, UProbe};
 
 use aya::{include_bytes_aligned, util::online_cpus, Bpf};
-use aya::{BpfLoader, Btf, Pod};
-use aya_log::BpfLogger;
+use aya::{BpfLoader, Btf};
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use log::info;
@@ -61,9 +60,17 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     no_dwarf: bool,
 
-    /// PID to process
+    /// PID to profile
     #[arg(short, long)]
     pid: Option<u32>,
+
+    /// target CPU to profile
+    #[arg(long)]
+    cpu: Option<u32>,
+
+    /// Profile this process
+    #[arg(long, default_value_t = false)]
+    self_profile: bool,
 }
 
 #[tokio::main]
@@ -91,7 +98,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             e
         })?;
 
-    // BpfLogger::init(&mut bpf)?;
+    // this might be useful for debugging, but definitely disable bpf logging for performance purposes
+    // aya_log::BpfLogger::init(&mut bpf)?;
 
     println!("starting {:?}", opt);
 
@@ -120,9 +128,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         // https://elixir.bootlin.com/linux/v4.2/source/include/uapi/linux/perf_event.h#L103
         const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
 
-        let self_profile = false;
-
-        if self_profile {
+        if opt.self_profile {
             program.attach(
                 PerfTypeId::Software,
                 PERF_COUNT_SW_CPU_CLOCK as u64,
@@ -134,6 +140,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 PerfTypeId::Software,
                 PERF_COUNT_SW_CPU_CLOCK as u64,
                 PerfEventScope::OneProcessAnyCpu { pid },
+                SamplePolicy::Frequency(opt.frequency),
+            )?;
+        } else if let Some(cpu) = opt.cpu {
+            program.attach(
+                PerfTypeId::Software,
+                PERF_COUNT_SW_CPU_CLOCK as u64,
+                PerfEventScope::AllProcessesOneCpu { cpu },
                 SamplePolicy::Frequency(opt.frequency),
             )?;
         } else {
