@@ -332,14 +332,8 @@ impl StackFrameInfo {
 
             while let Ok(Some(frame)) = frames.next() {
                 found_frames += 1;
-                self.symbol = frame.function.and_then(|function_name| {
-                    function_name
-                        .demangle()
-                        .map(|demangled_name| demangled_name.to_string())
-                        .ok()
-                });
 
-                self.source = frame.location.map(|loc| {
+                let loc = frame.location.map(|loc| {
                     format!(
                         "{}:{}:{}",
                         loc.file.unwrap_or("-"),
@@ -347,12 +341,33 @@ impl StackFrameInfo {
                         loc.column.unwrap_or(0)
                     )
                 });
+
+                if let Some(source) = &mut self.source {
+                    source.insert(0, ';');
+                    source.insert_str(0, &loc.unwrap_or_default())
+                } else {
+                    self.source = loc;
+                }
+
+                let sym = frame.function.and_then(|function_name| {
+                    function_name
+                        .demangle()
+                        .map(|demangled_name| demangled_name.to_string())
+                        .map(remove_generics)
+                        .ok()
+                });
+
+                if let Some(symbol) = &mut self.symbol {
+                    symbol.insert(0, ';');
+                    symbol.insert_str(0, &sym.unwrap_or_default())
+                } else {
+                    self.symbol = sym;
+                }
             }
         }
 
         if found_frames > 1 {
-            // TODO
-            // this is due to inlining, decide how to collapse these frames
+            // Inlined frames were found
         }
 
         if found_frames == 0 {
@@ -414,16 +429,107 @@ impl StackFrameInfo {
             .unwrap_or(&self.cmd)
     }
 
+    fn fmt_shorter_source(&self, count: usize) -> Option<String> {
+        StackFrameInfo::fmt_shorter(self.source.as_deref(), count)
+    }
+
+    /// instead of bla/meh/mah/test.c
+    /// returns mah/test.c for example
+    fn fmt_shorter(op: Option<&str>, count: usize) -> Option<String> {
+        op.map(|v| {
+            v.split('/')
+                .rev()
+                .take(count)
+                .map(|v| v.to_string())
+                .collect::<Vec<String>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<String>>()
+                .join("/")
+        })
+    }
+
     pub fn fmt_source(&self) -> String {
-        let short = self.source.as_deref().and_then(|v| {
-            let s = v.split('/');
-            s.last()
-        });
+        // let short = self.source.as_deref();
+        // .and_then(|v| {
+        //     let s = v.split('/');
+        //     s.last()
+        // });
+
+        let short = self.fmt_shorter_source(4);
 
         if short.is_some() {
             format!(" ({})", short.unwrap())
         } else {
             "".to_string()
         }
+    }
+}
+
+fn remove_generics(mut func: String) -> String {
+    func = func.replace(';', ":");
+    let mut bracket_depth = 0;
+
+    let mut new_str = String::with_capacity(func.len());
+    let mut continous_seperator = 0;
+    let mut running = false;
+
+    for (_idx, c) in func.char_indices() {
+        match c {
+            '<' => {
+                bracket_depth += 1;
+            }
+            '>' => {
+                bracket_depth -= 1;
+            }
+            ':' => {
+                if bracket_depth > 0 {
+                    continue;
+                }
+
+                continous_seperator += 1;
+
+                if continous_seperator <= 2 && running {
+                    new_str.push(c);
+                }
+            }
+            _ => {
+                if bracket_depth > 0 {
+                    continue;
+                }
+                continous_seperator = 0;
+                new_str.push(c);
+                running = true;
+            }
+        };
+    }
+
+    new_str
+}
+
+#[test]
+fn test_clean() {
+    let tests = [
+        "<<lock_api::rwlock::RwLock<R,T> as core::fmt::Debug>::fmt::LockedPlaceholder as core::fmt::Debug>::fmt",
+        "core::array::<impl core::ops::index::IndexMut<I> for [T: N]>::index_mut",
+        "alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree",
+        "alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::Edge>::descend",
+        "alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Immut,K,V,Type>::keys",
+        "core::ptr::drop_in_place<gimli::read::line::LineInstruction<gimli::read::endian_reader::EndianReader<gimli::endianity::RunTimeEndian,alloc::rc::Rc<[u8]>>,usize>>",
+        "<core::iter::adapters::enumerate::Enumerate<I> as core::iter::traits::iterator::Iterator>::next",
+    ];
+
+    let expected = [
+        "fmt",
+        "core::array::index_mut",
+        "alloc::collections::btree::search::search_tree",
+        "alloc::collections::btree::node::Handle::descend",
+        "alloc::collections::btree::node::NodeRef::keys",
+        "core::ptr::drop_in_place",
+        "next",
+    ];
+
+    for no in 0..tests.len() {
+        assert_eq!(remove_generics(tests[no].to_string()), expected[no]);
     }
 }
