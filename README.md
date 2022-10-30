@@ -18,6 +18,9 @@ Stacks are counted and sorted and can be output with the follow choices
 ### Usage
 
 ```
+# Profile system wide for 5s, generating a html flamegraph
+profile-bee --time 5000 --html flamegraphs.html
+
 # Profile at 9999hz for 2s, writing output to profile.svg
 profile-bee --svg profile.svg --frequency 9999 --time 2000
 
@@ -26,6 +29,9 @@ profile-bee --svg profile.svg --frequency 9999 --time 2000 --group-by-cpu
 
 # Profile at 999hz for 10s, writing output to profile.txt
 profile-bee --collapse profile.txt --frequency 999 --time 10000
+
+# Kitchen sink of all output formats
+profile-bee --time 5000 --html flamegraphs.html --json profile.json --collapse profile.txt --svg profile.svg
 
 # Profile at 99hz for 5s, writing output to screen, idle CPU cycles not counted
 cargo xtask run --release -- --collapse profile.txt --frequency 99 --time 5000 --skip-idle

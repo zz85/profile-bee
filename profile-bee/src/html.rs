@@ -29,7 +29,7 @@ pub fn collapse_to_json(stacks: &[&str]) -> String {
 
     for stack in stacks {
         let mut parts = stack.split(' ');
-        let mut names = parts.next().map(|v| v.split(";")).expect("stack");
+        let names = parts.next().map(|v| v.split(';')).expect("stack");
         let count = parts
             .next()
             .and_then(|v| v.parse::<usize>().ok())
@@ -37,7 +37,7 @@ pub fn collapse_to_json(stacks: &[&str]) -> String {
 
         let mut depth = 0;
 
-        while let Some(name) = names.next() {
+        for name in names {
             depth += 1;
 
             if depth >= crumbs.len() || name != crumbs[depth].borrow().name {
@@ -112,8 +112,7 @@ fn test_serialization() {
     );
 }
 
-pub fn generate_html_file(filename: &Path, stacks: &[&str]) {
-    let data = collapse_to_json(stacks);
+pub fn generate_html_file(filename: &Path, data: &str) {
     let html = flamegraph_html(&data);
     std::fs::write(&filename, &html).expect("Unable to write stack html file");
 }

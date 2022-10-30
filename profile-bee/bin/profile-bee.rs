@@ -35,6 +35,10 @@ struct Opt {
     #[arg(long)]
     html: Option<PathBuf>,
 
+    /// Generate json data format in d3 flamegraph format
+    #[arg(long)]
+    json: Option<PathBuf>,
+
     /// Avoid profiling idle cpu cycles
     #[arg(long)]
     skip_idle: bool,
@@ -270,12 +274,16 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         });
     }
 
-    if let Some(html_path) = &opt.html {
-        // collapse_to_json(&out);
-        generate_html_file(
-            html_path,
-            &out.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
-        );
+    if opt.html.is_some() || opt.json.is_some() {
+        let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
+
+        if let Some(json_path) = &opt.json {
+            std::fs::write(&json_path, &json).expect("Unable to write stack html file");
+        }
+
+        if let Some(html_path) = &opt.html {
+            generate_html_file(html_path, &json);
+        }
     }
 
     let out = out.join("\n");
