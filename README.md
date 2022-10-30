@@ -12,6 +12,7 @@ Stacks are counted and sorted and can be output with the follow choices
 
 - A SVG flamegraph (generated with inferno) you can load in your browser
 - [Branden Gregg's](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html) Stack Collapsed [format](https://github.com/BrendanGregg/flamegraph#2-fold-stacks) that can be loaded up using [speedscope visualizer](https://www.speedscope.app/)
+- D3 flamegraph JSON and HTML output
 - Your own custom format
 
 ### Usage

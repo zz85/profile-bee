@@ -91,7 +91,7 @@ impl ProcessCache {
     }
 
     pub fn stats(&self) -> String {
-        format!("Process cache entries: {}", self.map.len())
+        format!("Processes cache entries: {}", self.map.len())
     }
 }
 

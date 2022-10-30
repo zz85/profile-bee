@@ -2,6 +2,7 @@ use aya::maps::{MapRef, StackTraceMap};
 use profile_bee_common::StackInfo;
 use symbols::{StackFrameInfo, StackInfoExt, SymbolFinder};
 
+pub mod html;
 pub mod process;
 pub mod symbols;
 

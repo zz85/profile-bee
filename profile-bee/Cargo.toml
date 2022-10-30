@@ -27,6 +27,8 @@ proc-maps = "*"
 inferno = "0.11.10"
 procfs = "*"
 memmap = "*"
+serde_json = "*"
+serde = { version = "1", features = ["derive", "rc"] }
 
 [[bin]]
 name = "profile-bee"

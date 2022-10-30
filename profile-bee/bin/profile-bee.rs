@@ -11,6 +11,7 @@ use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use log::info;
 use profile_bee::format_stack_trace;
+use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee_common::StackInfo;
 use tokio::signal;
 
@@ -29,6 +30,10 @@ struct Opt {
     /// Filename to generate flamegraph svg
     #[arg(short, long)]
     svg: Option<PathBuf>,
+
+    /// Filename for generate html version of flamegraph
+    #[arg(long)]
+    html: Option<PathBuf>,
 
     /// Avoid profiling idle cpu cycles
     #[arg(long)]
@@ -263,6 +268,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             println!("Failed to write svg file {:?}", svg);
             e
         });
+    }
+
+    if let Some(html_path) = &opt.html {
+        // collapse_to_json(&out);
+        generate_html_file(
+            html_path,
+            &out.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
+        );
     }
 
     let out = out.join("\n");
