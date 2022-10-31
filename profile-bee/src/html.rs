@@ -26,7 +26,15 @@ impl<'a> Stack<'a> {
 pub async fn start_server(data: &str) {
     use warp::Filter;
 
+    let json_copy = data.to_owned();
     let copy = data.to_owned();
+
+    let json = warp::path("json").and(warp::get()).map(move || {
+        warp::http::Response::builder()
+            .header("content-type", "application/json")
+            .body(json_copy.clone())
+    });
+
     // GET / -> index html
     let index = warp::path::end().map(move || {
         warp::http::Response::builder()
@@ -35,7 +43,9 @@ pub async fn start_server(data: &str) {
     });
 
     eprintln!("Listening on port 8000. Goto http://localhost:8000/");
-    warp::serve(index).run(([127, 0, 0, 1], 8000)).await;
+    warp::serve(index.or(json))
+        .run(([127, 0, 0, 1], 8000))
+        .await;
 }
 
 /// turns a sorted stackcollapsed format into d3-flamegraph json format
