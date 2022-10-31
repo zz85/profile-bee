@@ -2,13 +2,13 @@
 
 /// Shared reusable profiling ebpf components that can be included in
 /// different ebpf applications.
-/// 
-
+///
 use aya_bpf::{
     bindings::BPF_F_USER_STACK,
+    helpers::bpf_get_smp_processor_id,
     macros::map,
     maps::{HashMap, Queue, StackTrace},
-    BpfContext, helpers::bpf_get_smp_processor_id,
+    BpfContext,
 };
 
 // use aya_log_ebpf::info;

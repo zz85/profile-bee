@@ -1,11 +1,11 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
 
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
     /* Space out content a bit */
     body {
       padding-top: 20px;
@@ -31,44 +31,47 @@
     .container {
       max-width: 990px;
     }
-    </style>
-    {styles}
-    <title>{title}</title>
-  </head>
-  <body>
-    <div class="container">
-      <div class="header clearfix">
-        <nav>
-          <div class="pull-right">
-            <form class="form-inline" id="form">
-              <a class="btn" href="javascript: resetZoom();">Reset zoom</a>
-              <a class="btn" href="javascript: clear();">Clear</a>
-              <div class="form-group">
-                <input type="text" class="form-control" id="term">
-              </div>
-              <a class="btn btn-primary" href="javascript: search();">Search</a>
-            </form>
-          </div>
-        </nav>
-        <h3 class="text-muted">{title}</h3>
-      </div>
-      <div id="chart">
-      </div>
-      <hr>
-      <div id="details">
-      </div>
+  </style>
+  {styles}
+  <title>{title}</title>
+</head>
+
+<body>
+  <div class="container">
+    <div class="header clearfix">
+      <nav>
+        <div class="pull-right">
+          <form class="form-inline" id="form">
+            <a class="btn" href="javascript: refresh();">Refresh data</a>
+            <a class="btn" href="javascript: resetZoom();">Reset zoom</a>
+            <a class="btn" href="javascript: clear();">Clear</a>
+            <div class="form-group">
+              <input type="text" class="form-control" id="term">
+            </div>
+            <a class="btn btn-primary" href="javascript: search();">Search</a>
+          </form>
+        </div>
+      </nav>
+      <h3 class="text-muted">{title}</h3>
     </div>
+    <div id="chart">
+    </div>
+    <hr>
+    <div id="details">
+    </div>
+  </div>
 
-    {scripts}
+  {scripts}
 
-    <script type="text/javascript">
-      var data = {stack};
-    </script>
+  <script type="text/javascript">
+    var data = { stack };
+  </script>
 
-    <script type="text/javascript">
+  <script type="text/javascript">
     var flameGraph = d3.flamegraph()
       .width(960)
       .cellHeight(18)
+      .height(540)
       .transitionDuration(750)
       .minFrameSize(5)
       .transitionEase(d3.easeCubic)
@@ -78,7 +81,7 @@
       .title("")
       .onClick(onClick)
       .differential(false)
-      .selfValue(!false);
+      .selfValue(false);
 
 
     // Example on how to use custom tooltips using d3-tip.
@@ -97,36 +100,28 @@
     var details = document.getElementById("details");
     flameGraph.setDetailsElement(details);
 
-    /*
-        d3.json("live.json", function(error, data) {
-      if (error) return console.warn(error);
-      var i = 1;
-      for (var value in data) {
-        setTimeout(function(timestamp) {
-          flameGraph.merge(data[timestamp]);
-        }, 1000 * i, value);
-        i++;
-      }
-    });
-    */
-
     // Example on how to use custom labels
     // var label = function(d) {
     //  return "name: " + d.name + ", value: " + d.value;
     // }
     // flameGraph.label(label);
 
-    // Example of how to set fixed chart height
-    // flameGraph.height(540);
 
-    d3.json("stacks.json", function(error, data) {
+    const refresh = () => d3.json("/json", function (error, data) {
+      console.log('refreshing', data);
       if (error) return console.warn(error);
       d3.select("#chart")
-          .datum(data)
-          .call(flameGraph);
+        .datum(data)
+        .call(flameGraph);
     });
 
-    document.getElementById("form").addEventListener("submit", function(event){
+    const merge = () => d3.json("/json", function (error, data) {
+      if (error) return console.warn(error);
+      console.log('got json', data);
+      flameGraph.merge(data);
+    });
+
+    document.getElementById("form").addEventListener("submit", function (event) {
       event.preventDefault();
       search();
     });
@@ -148,6 +143,7 @@
     function onClick(d) {
       console.info("Clicked on " + d.data.name);
     }
-    </script>
-  </body>
+  </script>
+</body>
+
 </html>

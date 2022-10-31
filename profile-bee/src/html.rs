@@ -2,7 +2,13 @@
 /// profile stacktraces in an interactive flamegraph format
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::{cell::RefCell, path::Path, rc::Rc};
+use std::{
+    cell::RefCell,
+    path::Path,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
+use tokio::sync::broadcast::Receiver;
 
 /// hierarchical data structure
 /// in the form of { name, value, children }
@@ -23,23 +29,37 @@ impl<'a> Stack<'a> {
 }
 
 /// starts a local server that serves ht flmaegraph html file
-pub async fn start_server(data: &str) {
+pub async fn start_server(mut rx: Receiver<String>) {
     use warp::Filter;
 
-    let json_copy = data.to_owned();
-    let copy = data.to_owned();
+    let latest_data = Arc::new(Mutex::new("{}".to_string()));
 
+    let write = latest_data.clone();
+    tokio::spawn(async move {
+        while let Ok(data) = rx.recv().await {
+            println!("Received....");
+            let mut moo = write.lock().expect("poisoned");
+            *moo = data;
+        }
+    });
+
+    let json_copy = latest_data.clone();
+    // GET /json -> stack trace json
     let json = warp::path("json").and(warp::get()).map(move || {
+        let json = json_copy.lock().expect("poisoned").clone();
+
         warp::http::Response::builder()
             .header("content-type", "application/json")
-            .body(json_copy.clone())
+            .body(json)
     });
 
     // GET / -> index html
     let index = warp::path::end().map(move || {
+        let json_copy = latest_data.lock().expect("poisoned");
+
         warp::http::Response::builder()
             .header("content-type", "text/html; charset=utf-8")
-            .body(flamegraph_html(&copy))
+            .body(flamegraph_html(&json_copy))
     });
 
     eprintln!("Listening on port 8000. Goto http://localhost:8000/");
@@ -81,7 +101,7 @@ pub fn collapse_to_json(stacks: &[&str]) -> String {
             crumbs.truncate(depth);
         }
 
-        let self_value = true;
+        let self_value = false;
         if self_value {
             // if we were to use selfValue(true), this inserts values only
             // at leave nodes

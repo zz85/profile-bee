@@ -157,7 +157,7 @@ impl SymbolFinder {
 }
 
 /// Struct to contain information about a userspace/kernel stack frame
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct StackFrameInfo {
     pub pid: usize,
     pub cmd: String,

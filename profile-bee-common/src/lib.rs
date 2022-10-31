@@ -1,6 +1,6 @@
 #![no_std]
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(C)]
 pub struct StackInfo {
     pub tgid: u32,

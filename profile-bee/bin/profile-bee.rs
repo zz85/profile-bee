@@ -114,6 +114,15 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // this might be useful for debugging, but definitely disable bpf logging for performance purposes
     // aya_log::BpfLogger::init(&mut bpf)?;
 
+    use tokio::sync::broadcast;
+    let (tx, rx) = broadcast::channel(16);
+
+    if opt.serve {
+        tokio::spawn(async {
+            profile_bee::html::start_server(rx).await;
+        });
+    }
+
     println!("starting {:?}", opt);
 
     if let Some(kprobe) = &opt.kprobe {
@@ -186,133 +195,164 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let mut symbols = SymbolFinder::new(!opt.no_dwarf);
 
-    let mut trace_count = std::collections::HashMap::<String, usize>::new();
-    let mut samples = 0;
+    // Local counting
+    let mut trace_count = std::collections::HashMap::<StackInfo, usize>::new();
+    let mut samples;
     let mut queue_processed = 0;
 
-    let started = Instant::now();
-
-    /*
-     */
     loop {
-        if started.elapsed().as_millis() > opt.time as _ {
-            break;
+        let started = Instant::now();
+
+        // Clear counters
+        trace_count.clear();
+        samples = 0;
+
+        // TODO clear for bpf maps
+        // for (key, value) in counts.iter().flatten() {
+        //     counts.remove(&fail);
+        // }
+
+        /*
+         */
+        loop {
+            if started.elapsed().as_millis() > opt.time as _ {
+                break;
+            }
+            match stacks.pop(0) {
+                Ok(v) => {
+                    let stack: StackInfo = unsafe { *v.as_ptr().cast() };
+                    queue_processed += 1;
+
+                    // user space counting
+                    let trace = trace_count.entry(stack).or_insert(0);
+                    *trace += 1;
+
+                    if *trace == 1 {
+                        let _combined = format_stack_trace(
+                            &stack,
+                            &stack_traces,
+                            &mut symbols,
+                            opt.group_by_cpu,
+                        );
+                    }
+                }
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                }
+            }
         }
-        match stacks.pop(0) {
-            Ok(v) => {
-                let stack: StackInfo = unsafe { *v.as_ptr().cast() };
-                queue_processed += 1;
+
+        println!("Processed {} queue events", queue_processed);
+
+        println!("Processing stacks...");
+
+        let mut stacks = Vec::new();
+        let local_counting = true;
+
+        if local_counting {
+            for (stack, value) in trace_count.iter() {
+                let combined =
+                    format_stack_trace(&stack, &stack_traces, &mut symbols, opt.group_by_cpu);
+
+                samples += *value as u64;
+                stacks.push(FrameCount {
+                    frames: combined,
+                    count: *value as u64,
+                });
+            }
+        } else {
+            // kernel counting
+            for (key, value) in counts.iter().flatten() {
+                let stack: StackInfo = unsafe { *key.as_ptr().cast() };
+
+                samples += value;
 
                 let combined =
                     format_stack_trace(&stack, &stack_traces, &mut symbols, opt.group_by_cpu);
 
-                let key = combined
+                stacks.push(FrameCount {
+                    frames: combined,
+                    count: value,
+                });
+            }
+        }
+
+        // TODO stack processing can be expensive, so consider moving into a separate task
+        // to avoid blocking the collection loop
+
+        println!("Total samples: {}", samples);
+
+        let mut out = stacks
+            .into_iter()
+            .map(|frames| {
+                let key = frames
+                    .frames
                     .iter()
                     .map(|s| s.fmt_symbol())
                     .collect::<Vec<_>>()
                     .join(";");
+                let count = frames.count;
+                format!("{} {}", &key, count)
+            })
+            .collect::<Vec<_>>();
+        out.sort();
 
-                // user space counting
-                let trace = trace_count.entry(key).or_insert(0);
-                *trace += 1;
-
-                // for x in combined {
-                //     println!("{}", x.fmt_symbol())
-                // }
-                // println!("---------------");
-            }
-            _ => {
-                // println!("--------------");
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-            }
-        }
-    }
-
-    println!("Processed {} queue events", queue_processed);
-
-    println!("Processing stacks...");
-
-    let mut stacks = Vec::new();
-    for (key, value) in counts.iter().flatten() {
-        let stack: StackInfo = unsafe { *key.as_ptr().cast() };
-
-        samples += value;
-
-        let combined = format_stack_trace(&stack, &stack_traces, &mut symbols, opt.group_by_cpu);
-
-        stacks.push(FrameCount {
-            frames: combined,
-            count: value,
-        });
-    }
-
-    println!("Total samples: {}", samples);
-
-    let mut out = stacks
-        .into_iter()
-        .map(|frames| {
-            let key = frames
-                .frames
-                .iter()
-                .map(|s| s.fmt_symbol())
-                .collect::<Vec<_>>()
-                .join(";");
-            let count = frames.count;
-            format!("{} {}", &key, count)
-        })
-        .collect::<Vec<_>>();
-    out.sort();
-
-    if let Some(svg) = opt.svg {
-        let _ = output_svg(
-            &svg,
-            &out,
-            format!(
-                "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
-                opt.time, opt.frequency
-            ),
-        )
-        .map_err(|e| {
-            println!("Failed to write svg file {:?}", svg);
-            e
-        });
-    }
-
-    if opt.html.is_some() || opt.json.is_some() || opt.serve {
-        let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
-
-        if let Some(json_path) = &opt.json {
-            std::fs::write(&json_path, &json).expect("Unable to write stack html file");
-        }
-
-        if let Some(html_path) = &opt.html {
-            generate_html_file(html_path, &json);
-        }
-
-        if opt.serve {
-            tokio::spawn(async move {
-                profile_bee::html::start_server(&json).await;
+        if let Some(svg) = &opt.svg {
+            let _ = output_svg(
+                &svg,
+                &out,
+                format!(
+                    "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
+                    opt.time, opt.frequency
+                ),
+            )
+            .map_err(|e| {
+                println!("Failed to write svg file {:?}", svg);
+                e
             });
         }
+
+        if opt.html.is_some() || opt.json.is_some() || opt.serve {
+            let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
+
+            if let Some(json_path) = &opt.json {
+                std::fs::write(&json_path, &json).expect("Unable to write stack html file");
+            }
+
+            if let Some(html_path) = &opt.html {
+                generate_html_file(html_path, &json);
+            }
+
+            let r = tx.send(json);
+            println!("Sending {:?}", r);
+        }
+
+        let out = out.join("\n");
+
+        if let Some(name) = &opt.collapse {
+            println!("Writing to file: {}", name.display());
+            std::fs::write(name, &out).expect("Unable to write stack collapsed file");
+        } else {
+            // println!("***************************");
+            // println!("{}", out);
+        }
+
+        if !opt.serve {
+            // only loop with serve mode
+            break;
+        }
     }
 
-    let out = out.join("\n");
+    println!("{}", symbols.process_cache.stats());
 
-    if let Some(name) = opt.collapse {
-        println!("Writing to file: {}", name.display());
-        std::fs::write(name, &out).expect("Unable to write stack collapsed file");
-    } else {
-        println!("***************************");
-        println!("{}", out);
-    }
-
+    // TODO fix this
+    /*
     if opt.serve {
         info!("Waiting for Ctrl-C...");
         signal::ctrl_c().await?;
         info!("Exiting...");
     }
-
-    println!("{}", symbols.process_cache.stats());
+    */
 
     Ok(())
 }
