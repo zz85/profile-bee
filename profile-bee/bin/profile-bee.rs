@@ -1,3 +1,4 @@
+use aya::maps::perf::AsyncPerfEventArray;
 use aya::maps::{HashMap, Queue, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
@@ -7,15 +8,17 @@ use aya::programs::{TracePoint, UProbe};
 
 use aya::{include_bytes_aligned, util::online_cpus, Bpf};
 use aya::{BpfLoader, Btf};
+use bytes::BytesMut;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use log::info;
 use profile_bee::format_stack_trace;
 use profile_bee::html::{collapse_to_json, generate_html_file};
-use profile_bee_common::StackInfo;
-use tokio::signal;
+use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
+use tokio::{signal, task};
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use profile_bee::symbols::{FrameCount, SymbolFinder};
@@ -84,6 +87,13 @@ struct Opt {
     /// Profile this process
     #[arg(long, default_value_t = false)]
     self_profile: bool,
+
+    /// method of passes events/traces to
+    /// user space.
+    /// 1 - always, 2 - new stacktraces
+    /// 3 - none
+    #[arg(long, default_value_t = 2)]
+    stream_mode: u8,
 }
 
 #[tokio::main]
@@ -104,6 +114,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let mut bpf = BpfLoader::new()
         .set_global("SKIP_IDLE", &skip_idle)
+        .set_global("NOTIFY_TYPE", &opt.stream_mode)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {
@@ -191,7 +202,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     const STACK_INFO_SIZE: usize = std::mem::size_of::<StackInfo>();
     let mut stacks = Queue::<_, [u8; STACK_INFO_SIZE]>::try_from(bpf.map_mut("STACKS")?)?;
     let stack_traces = StackTraceMap::try_from(bpf.map("stack_traces")?)?;
+
     let counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(bpf.map("counts")?)?;
+    let mut perf_stacks = AsyncPerfEventArray::try_from(bpf.map_mut("PERF_STACKS")?)?;
 
     let mut symbols = SymbolFinder::new(!opt.no_dwarf);
 
@@ -199,6 +212,33 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let mut trace_count = std::collections::HashMap::<StackInfo, usize>::new();
     let mut samples;
     let mut queue_processed = 0;
+
+    let (perf_tx, perf_rx) = mpsc::channel();
+    // let (tx2, rx2) = tokio::sync::mpsc::channel(10000);
+
+    for cpu_id in online_cpus()? {
+        let mut buf = perf_stacks.open(cpu_id, None)?;
+        let perf_tx = perf_tx.clone();
+
+        task::spawn(async move {
+            let mut buffers = (0..1000)
+                .map(|_| BytesMut::with_capacity(1024))
+                .collect::<Vec<_>>();
+
+            loop {
+                let events = buf.read_events(&mut buffers).await.unwrap();
+                for i in 0..events.read {
+                    let buf = &mut buffers[i];
+                    let ptr = buf.as_ptr() as *const StackInfo;
+                    let payload = unsafe { ptr.read_unaligned() };
+
+                    perf_tx.send(payload).unwrap();
+                }
+
+                // tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        });
+    }
 
     loop {
         let started = Instant::now();
@@ -213,11 +253,29 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         // }
 
         /*
-         */
+        while let Ok(stack) = perf_rx.recv() {
+            queue_processed += 1;
+
+            // user space counting
+            let trace = trace_count.entry(stack).or_insert(0);
+            *trace += 1;
+
+            if *trace == 1 {
+                let _combined =
+                    format_stack_trace(&stack, &stack_traces, &mut symbols, opt.group_by_cpu);
+            }
+
+            if started.elapsed().as_millis() > opt.time as _ {
+                break;
+            }
+        }*/
+
+        /**/
         loop {
             if started.elapsed().as_millis() > opt.time as _ {
                 break;
             }
+
             match stacks.pop(0) {
                 Ok(v) => {
                     let stack: StackInfo = unsafe { *v.as_ptr().cast() };
@@ -247,7 +305,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         println!("Processing stacks...");
 
         let mut stacks = Vec::new();
-        let local_counting = true;
+        let local_counting = opt.stream_mode == EVENT_TRACE_ALWAYS;
 
         if local_counting {
             for (stack, value) in trace_count.iter() {

@@ -30,7 +30,7 @@ memmap = "*"
 serde_json = "*"
 serde = { version = "1", features = ["derive", "rc"] }
 warp = "0.3"
-
+bytes = "1"
 
 [[bin]]
 name = "profile-bee"

@@ -9,3 +9,7 @@ pub struct StackInfo {
     pub cmd: [u8; 16],
     pub cpu: u32,
 }
+
+pub static EVENT_TRACE_ALWAYS: u8 = 1;
+pub static EVENT_TRACE_NEW: u8 = 2;
+pub static EVENT_TRACE_NONE: u8 = 3;

@@ -7,12 +7,12 @@ use aya_bpf::{
     bindings::BPF_F_USER_STACK,
     helpers::bpf_get_smp_processor_id,
     macros::map,
-    maps::{HashMap, Queue, StackTrace},
+    maps::{HashMap, Queue, StackTrace, PerfEventArray},
     BpfContext,
 };
 
 // use aya_log_ebpf::info;
-use profile_bee_common::StackInfo;
+use profile_bee_common::{StackInfo, EVENT_TRACE_NEW, EVENT_TRACE_ALWAYS};
 
 pub const STACK_ENTRIES: u32 = 16392;
 pub const STACK_SIZE: u32 = 2048;
@@ -21,15 +21,25 @@ pub const STACK_SIZE: u32 = 2048;
 #[no_mangle]
 static SKIP_IDLE: u8 = 0;
 
+#[no_mangle]
+static NOTIFY_TYPE: u8 = EVENT_TRACE_ALWAYS;
+
 unsafe fn skip_idle() -> bool {
     let skip = core::ptr::read_volatile(&SKIP_IDLE);
     skip > 0
+}
+
+unsafe fn notify_type() -> u8 {
+    core::ptr::read_volatile(&NOTIFY_TYPE)
 }
 
 /* Setup maps */
 
 #[map(name = "counts")]
 pub static mut COUNTS: HashMap<StackInfo, u64> = HashMap::with_max_entries(STACK_ENTRIES, 0);
+
+#[map]
+static mut PERF_STACKS: PerfEventArray<StackInfo> = PerfEventArray::new(0);
 
 #[map]
 static STACKS: Queue<StackInfo> = Queue::with_max_entries(STACK_ENTRIES, 0);
@@ -67,15 +77,29 @@ pub unsafe fn collect_trace<C: BpfContext>(ctx: C) {
         key.kernel_stack_id = stack_id as i32;
     }
 
+    let notify_code = notify_type();
+    // only assume true for "always mode"
+    let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+
     if let Some(count) = COUNTS.get_ptr_mut(&key) {
         *count += 1;
     } else {
         // update hashmap with count and and only push new keys to queue for symbol resolution
         let _ = COUNTS.insert(&key, &1, 0); // BPF_F_NO_PREALLOC
 
+        if notify_code == EVENT_TRACE_NEW {
+            notify = true;
+        }
+    }
+
+    if notify {
         // notify
         if let Err(_e) = STACKS.push(&key, 0) {
             // info!(&ctx, "Error pushing stack: {}", e);
         }
+
+        // send perf event
+        // PERF_STACKS.output(&ctx, &key, 0);
+
     }
 }
