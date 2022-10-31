@@ -4,8 +4,6 @@
     <meta charset="utf-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-
-    
     <style>
 
     /* Space out content a bit */
@@ -98,6 +96,19 @@
 
     var details = document.getElementById("details");
     flameGraph.setDetailsElement(details);
+
+    /*
+        d3.json("live.json", function(error, data) {
+      if (error) return console.warn(error);
+      var i = 1;
+      for (var value in data) {
+        setTimeout(function(timestamp) {
+          flameGraph.merge(data[timestamp]);
+        }, 1000 * i, value);
+        i++;
+      }
+    });
+    */
 
     // Example on how to use custom labels
     // var label = function(d) {

@@ -29,6 +29,8 @@ procfs = "*"
 memmap = "*"
 serde_json = "*"
 serde = { version = "1", features = ["derive", "rc"] }
+warp = "0.3"
+
 
 [[bin]]
 name = "profile-bee"

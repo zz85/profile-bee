@@ -56,6 +56,8 @@ profile-bee --pid <pid> ...
 - Basic Kernel and tracepoint probing
 - Group by CPUs
 - Profile target PIDs, CPU id, or itself
+- d3 flamegraph JSON and/or HTML output
+- Integrated web server (using warp)
 
 ### Limitations
 - Linux only
@@ -72,7 +74,6 @@ profile-bee --pid <pid> ...
 - Optimize symbol lookup via binary search
 - Publish to crates.io
 - Measure cache hit ratio
-- JSON output
 - Stacktrace and Hashmap clearing
 - Missing symbols
 

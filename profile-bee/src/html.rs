@@ -22,6 +22,22 @@ impl<'a> Stack<'a> {
     }
 }
 
+/// starts a local server that serves ht flmaegraph html file
+pub async fn start_server(data: &str) {
+    use warp::Filter;
+
+    let copy = data.to_owned();
+    // GET / -> index html
+    let index = warp::path::end().map(move || {
+        warp::http::Response::builder()
+            .header("content-type", "text/html; charset=utf-8")
+            .body(flamegraph_html(&copy))
+    });
+
+    eprintln!("Listening on port 8000. Goto http://localhost:8000/");
+    warp::serve(index).run(([127, 0, 0, 1], 8000)).await;
+}
+
 /// turns a sorted stackcollapsed format into d3-flamegraph json format
 pub fn collapse_to_json(stacks: &[&str]) -> String {
     let root = Stack::new("");
@@ -75,6 +91,42 @@ pub fn collapse_to_json(stacks: &[&str]) -> String {
     serde_json::to_string(&root).expect("serialization to json")
 }
 
+pub fn generate_html_file(filename: &Path, data: &str) {
+    let html = flamegraph_html(&data);
+    std::fs::write(&filename, &html).expect("Unable to write stack html file");
+}
+
+// Uses https://github.com/spiermar/d3-flame-graph
+const HTML_TEMPLATE: &str = include_str!("../assets/d3-flamegraph.html");
+const SCRIPTS: &str = include_str!("../assets/scripts.js");
+const STYLES: &str = include_str!("../assets/styles.css");
+
+const EXTERNAL_SCRIPTS: &str = r#"<script src="https://d3js.org/d3.v4.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3-tip/0.9.1/d3-tip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/spiermar/d3-flame-graph@2.0.3/dist/d3-flamegraph.min.js"></script>"#;
+
+const EXTERNAL_STYLES: &str = r#"
+<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/spiermar/d3-flame-graph@2.0.3/dist/d3-flamegraph.css" />"#;
+
+fn flamegraph_html(stacks: &str) -> String {
+    let embedded = true;
+
+    let template = HTML_TEMPLATE
+        .replace("{stack}", stacks)
+        .replace("{title}", "profile-bee");
+
+    if embedded {
+        template
+            .replace("{scripts}", &format!("<script>{}</script>", SCRIPTS))
+            .replace("{styles}", &format!("<style>{}</style>", STYLES))
+    } else {
+        template
+            .replace("{scripts}", EXTERNAL_SCRIPTS)
+            .replace("{styles}", EXTERNAL_STYLES)
+    }
+}
+
 #[test]
 fn test_serialization() {
     let x = [
@@ -110,40 +162,4 @@ fn test_serialization() {
         test_json,
         r##"{"name":"hi","value":10,"children":[{"name":"test 1","value":3,"children":[]},{"name":"test 2","value":4,"children":[]}]}"##
     );
-}
-
-pub fn generate_html_file(filename: &Path, data: &str) {
-    let html = flamegraph_html(&data);
-    std::fs::write(&filename, &html).expect("Unable to write stack html file");
-}
-
-// Uses https://github.com/spiermar/d3-flame-graph
-const HTML_TEMPLATE: &str = include_str!("../assets/d3-flamegraph.html");
-const SCRIPTS: &str = include_str!("../assets/scripts.js");
-const STYLES: &str = include_str!("../assets/styles.css");
-
-const EXTERNAL_SCRIPTS: &str = r#"<script src="https://d3js.org/d3.v4.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/d3-tip/0.9.1/d3-tip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/spiermar/d3-flame-graph@2.0.3/dist/d3-flamegraph.min.js"></script>"#;
-
-const EXTERNAL_STYLES: &str = r#"
-<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css" />
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/spiermar/d3-flame-graph@2.0.3/dist/d3-flamegraph.css" />"#;
-
-fn flamegraph_html(stacks: &str) -> String {
-    let embedded = true;
-
-    let template = HTML_TEMPLATE
-        .replace("{stack}", stacks)
-        .replace("{title}", "profile-bee");
-
-    if embedded {
-        template
-            .replace("{scripts}", &format!("<script>{}</script>", SCRIPTS))
-            .replace("{styles}", &format!("<style>{}</style>", STYLES))
-    } else {
-        template
-            .replace("{scripts}", EXTERNAL_SCRIPTS)
-            .replace("{styles}", EXTERNAL_STYLES)
-    }
 }

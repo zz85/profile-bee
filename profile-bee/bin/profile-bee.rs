@@ -39,6 +39,10 @@ struct Opt {
     #[arg(long)]
     json: Option<PathBuf>,
 
+    /// Starts a http server to serve the html flamegraph result
+    #[arg(long)]
+    serve: bool,
+
     /// Avoid profiling idle cpu cycles
     #[arg(long)]
     skip_idle: bool,
@@ -274,7 +278,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         });
     }
 
-    if opt.html.is_some() || opt.json.is_some() {
+    if opt.html.is_some() || opt.json.is_some() || opt.serve {
         let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
 
         if let Some(json_path) = &opt.json {
@@ -283,6 +287,12 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
         if let Some(html_path) = &opt.html {
             generate_html_file(html_path, &json);
+        }
+
+        if opt.serve {
+            tokio::spawn(async move {
+                profile_bee::html::start_server(&json).await;
+            });
         }
     }
 
@@ -296,11 +306,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         println!("{}", out);
     }
 
-    println!("{}", symbols.process_cache.stats());
+    if opt.serve {
+        info!("Waiting for Ctrl-C...");
+        signal::ctrl_c().await?;
+        info!("Exiting...");
+    }
 
-    // info!("Waiting for Ctrl-C...");
-    // signal::ctrl_c().await?;
-    // info!("Exiting...");
+    println!("{}", symbols.process_cache.stats());
 
     Ok(())
 }
