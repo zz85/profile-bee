@@ -98,6 +98,13 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
+    // console_subscriber::init();
+    // let guard = pprof::ProfilerGuardBuilder::default()
+    //     .frequency(1000)
+    //     // .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+    //     .build()
+    //     .unwrap();
+
     let opt = Opt::parse();
     env_logger::init();
 
@@ -411,6 +418,12 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         info!("Exiting...");
     }
     */
+
+    // if let Ok(report) = guard.report().build() {
+    //     // println!("report: {:?}", &report);
+    //     let file = std::fs::File::create("pprof.svg").unwrap();
+    //     report.flamegraph(file).unwrap();
+    // };
 
     Ok(())
 }

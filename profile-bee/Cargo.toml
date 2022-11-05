@@ -20,7 +20,8 @@ anyhow = "1.0.42"
 clap = { version = "4.0", features = ["derive"] }
 env_logger = "0.9"
 log = "0.4"
-tokio = { version = "1.18", features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time"] }
+tokio = { version = "1.18", features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time", "tracing"] }
+console-subscriber = "*"
 thiserror = "*"
 addr2line = "*"
 proc-maps = "*"
@@ -31,6 +32,7 @@ serde_json = "*"
 serde = { version = "1", features = ["derive", "rc"] }
 warp = "0.3"
 bytes = "1"
+pprof = { version = "0.10", features = ["flamegraph", "frame-pointer"] }
 
 [[bin]]
 name = "profile-bee"
