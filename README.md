@@ -15,6 +15,11 @@ Stacks are counted and sorted and can be output with the follow choices
 - D3 flamegraph JSON and HTML output
 - Your own custom format
 
+Note: if symbols for your C/Rust programs doesn't appear correct, you may want to build your software with frame pointers.
+
+For rust programs, you can emit frame pointer by setting `RUSTFLAGS="-Cforce-frame-pointers=yes"` with building (or modifying ./cargo/config)
+and `-fno-omit-frame-pointer` for gcc.
+
 ### Usage
 
 ```

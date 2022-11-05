@@ -66,7 +66,7 @@ pub struct SymbolFinder {
 }
 
 pub struct ObjItem {
-    ctx: ObjectContext,
+    ctx: Option<ObjectContext>,
     symbols: Vec<Symbol>,
 }
 
@@ -310,7 +310,11 @@ impl StackFrameInfo {
                 })
                 .collect();
 
-            let ctx = ObjectContext::new(&object).unwrap();
+            let ctx = if finder.use_dwarf {
+                None
+            } else {
+                ObjectContext::new(&object).ok()
+            };
 
             let item = ObjItem { ctx, symbols };
 
@@ -327,8 +331,13 @@ impl StackFrameInfo {
 
         let mut found_frames = 0;
 
-        if finder.use_dwarf {
-            let mut frames = obj.ctx.find_frames(self.address()).expect("find frames");
+        if obj.ctx.is_some() {
+            let mut frames = obj
+                .ctx
+                .as_ref()
+                .unwrap()
+                .find_frames(self.address())
+                .expect("find frames");
 
             while let Ok(Some(frame)) = frames.next() {
                 found_frames += 1;
