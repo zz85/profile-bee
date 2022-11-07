@@ -42,7 +42,12 @@
       <nav>
         <div class="pull-right">
           <form class="form-inline" id="form">
-            <a class="btn" href="javascript: refresh();">Refresh data</a>
+            <a class="btn" href="javascript: update();">Update data</a>
+            <select id="update_mode">
+              <option value="refresh">Refresh</option>
+              <option value="merge">Merge</option>
+            </select>
+
             <a class="btn" href="javascript: resetZoom();">Reset zoom</a>
             <a class="btn" href="javascript: clear();">Clear</a>
             <div class="form-group">
@@ -68,7 +73,7 @@
   </script>
 
   <script type="text/javascript">
-    var flameGraph = d3.flamegraph()
+    var flameGraph = flamegraph()
       .width(960)
       .cellHeight(18)
       .height(540)
@@ -80,7 +85,7 @@
       //.sort(function(a,b){ return d3.descending(a.name, b.name);})
       .title("")
       .onClick(onClick)
-      .differential(false)
+      // .differential(false)
       .selfValue(false);
 
 
@@ -107,19 +112,25 @@
     // flameGraph.label(label);
 
 
-    const refresh = () => d3.json("/json", function (error, data) {
-      console.log('refreshing', data);
-      if (error) return console.warn(error);
-      d3.select("#chart")
-        .datum(data)
-        .call(flameGraph);
-    });
+    const refresh = () => d3.json("/json").then(data => {
+      flameGraph.update(data);
+    }).catch(error => {
+      console.warn(error);
+    })
 
-    const merge = () => d3.json("/json", function (error, data) {
-      if (error) return console.warn(error);
-      console.log('got json', data);
+    const merge = () =>  d3.json("/json").then(data => {
       flameGraph.merge(data);
-    });
+    }).catch(error => {
+      console.warn(error);
+    })
+
+    function update() {
+      if (document.getElementById('update_mode').value != 'merge') {
+        refresh();
+      } else {
+        merge();
+      }
+    }
 
     document.getElementById("form").addEventListener("submit", function (event) {
       event.preventDefault();

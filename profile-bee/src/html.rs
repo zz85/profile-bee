@@ -131,13 +131,13 @@ const HTML_TEMPLATE: &str = include_str!("../assets/d3-flamegraph.html");
 const SCRIPTS: &str = include_str!("../assets/scripts.js");
 const STYLES: &str = include_str!("../assets/styles.css");
 
-const EXTERNAL_SCRIPTS: &str = r#"<script src="https://d3js.org/d3.v4.min.js"></script>
+const EXTERNAL_SCRIPTS: &str = r#"<script src="https://d3js.org/d3.v7.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3-tip/0.9.1/d3-tip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/spiermar/d3-flame-graph@2.0.3/dist/d3-flamegraph.min.js"></script>"#;
+<script src="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.min.js"></script>"#;
 
 const EXTERNAL_STYLES: &str = r#"
 <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css" />
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/spiermar/d3-flame-graph@2.0.3/dist/d3-flamegraph.css" />"#;
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.css" />"#;
 
 fn flamegraph_html(stacks: &str) -> String {
     let embedded = true;

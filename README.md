@@ -15,10 +15,10 @@ Stacks are counted and sorted and can be output with the follow choices
 - D3 flamegraph JSON and HTML output
 - Your own custom format
 
-Note: if symbols for your C/Rust programs doesn't appear correct, you may want to build your software with frame pointers.
+Note: if symbols for your C/Rust programs doesn't appear correct, you may want to build your software with debug information.
 
-For rust programs, you can emit frame pointer by setting `RUSTFLAGS="-Cforce-frame-pointers=yes"` with building (or modifying ./cargo/config)
-and `-fno-omit-frame-pointer` for gcc.
+With rustc that's adding a `-g` flag when you compile. Another thing to consider doing is emitting frame pointer by setting `RUSTFLAGS="-Cforce-frame-pointers=yes"` with building (or modifying ./cargo/config)
+and `-fno-omit-frame-pointer` for gcc. With framepointers, you could get symbols while saving on the cost of dwarf parsing (using --no-dwarf)
 
 ### Usage
 
@@ -61,8 +61,8 @@ profile-bee --pid <pid> ...
 - Basic Kernel and tracepoint probing
 - Group by CPUs
 - Profile target PIDs, CPU id, or itself
-- d3 flamegraph JSON and/or HTML output
-- Integrated web server (using warp)
+- Static d3 flamegraph JSON and/or HTML output
+- Real time flamegraphs served over integrated web server (using warp)
 
 ### Limitations
 - Linux only
