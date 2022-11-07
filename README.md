@@ -29,6 +29,9 @@ profile-bee --time 5000 --html flamegraphs.html
 # Profile at 9999hz for 2s, writing output to profile.svg
 profile-bee --svg profile.svg --frequency 9999 --time 2000
 
+# Realtime flamegraphs
+profile-bee --time 5000 --serve --skip-idle --stream-mode 1 # Goto http://localhost:8000/ and click "realtime-updates"
+
 # Same as above, grouped by CPU ids
 profile-bee --svg profile.svg --frequency 9999 --time 2000 --group-by-cpu
 

@@ -1,3 +1,4 @@
+use futures_util::{Stream, StreamExt};
 /// this modules generates a d3 html page that views
 /// profile stacktraces in an interactive flamegraph format
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,9 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
-use tokio::sync::broadcast::Receiver;
+use tokio::sync::{broadcast::Receiver, mpsc};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use warp::sse::Event;
 
 /// hierarchical data structure
 /// in the form of { name, value, children }
@@ -33,13 +36,21 @@ pub async fn start_server(mut rx: Receiver<String>) {
     use warp::Filter;
 
     let latest_data = Arc::new(Mutex::new("{}".to_string()));
+    let subscribers = Arc::new(Mutex::new(Vec::<mpsc::UnboundedSender<String>>::new()));
+    let access_subscribers = subscribers.clone();
+    let subscriptions = warp::any().map(move || subscribers.clone());
 
-    let write = latest_data.clone();
+    let writer = latest_data.clone();
     tokio::spawn(async move {
         while let Ok(data) = rx.recv().await {
             println!("Received....");
-            let mut moo = write.lock().expect("poisoned");
-            *moo = data;
+            let mut write = writer.lock().expect("poisoned");
+            *write = data.clone();
+            drop(write);
+
+            let mut write = access_subscribers.lock().expect("poisoned");
+            write.retain(|tx| tx.send(data.clone()).is_ok());
+            println!("{} realtime subscribers", write.len());
         }
     });
 
@@ -53,6 +64,17 @@ pub async fn start_server(mut rx: Receiver<String>) {
             .body(json)
     });
 
+    // GET /stream -> subscribe to profiling data updates
+    let stream = warp::path("stream")
+        .and(warp::get())
+        .and(subscriptions)
+        .map(|subscriptions| {
+            let stream = connected(subscriptions);
+
+            // returns a stream when replies is sent via server-sent events
+            warp::sse::reply(warp::sse::keep_alive().stream(stream))
+        });
+
     // GET / -> index html
     let index = warp::path::end().map(move || {
         let json_copy = latest_data.lock().expect("poisoned");
@@ -63,9 +85,25 @@ pub async fn start_server(mut rx: Receiver<String>) {
     });
 
     eprintln!("Listening on port 8000. Goto http://localhost:8000/");
-    warp::serve(index.or(json))
+    warp::serve(index.or(json).or(stream))
         .run(([127, 0, 0, 1], 8000))
         .await;
+}
+
+fn connected(
+    subscriptions: Arc<Mutex<Vec<mpsc::UnboundedSender<String>>>>,
+) -> impl Stream<Item = Result<Event, warp::Error>> + Send + 'static {
+    println!("new subscription");
+
+    // Use an unbounded channel to handle buffering and flushing of messages
+    // to the event source...
+    let (tx, rx) = mpsc::unbounded_channel();
+    let rx = UnboundedReceiverStream::new(rx);
+
+    // Push a tx channel so we have a way to reach out to all connected users.
+    subscriptions.lock().unwrap().push(tx);
+
+    rx.map(|msg| Ok(Event::default().data(msg)))
 }
 
 /// turns a sorted stackcollapsed format into d3-flamegraph json format

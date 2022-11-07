@@ -42,6 +42,8 @@
       <nav>
         <div class="pull-right">
           <form class="form-inline" id="form">
+            <a class="btn" href="javascript: stream();">Realtime updates</a>
+            <span id="status"></span>
             <a class="btn" href="javascript: update();">Update data</a>
             <select id="update_mode">
               <option value="refresh">Refresh</option>
@@ -112,23 +114,23 @@
     // flameGraph.label(label);
 
 
-    const refresh = () => d3.json("/json").then(data => {
+    const refresh = (data) => Promise.resolve(data || d3.json("/json")).then(data => {
       flameGraph.update(data);
     }).catch(error => {
       console.warn(error);
     })
 
-    const merge = () =>  d3.json("/json").then(data => {
+    const merge = (data) => Promise.resolve(data || d3.json("/json")).then(data => {
       flameGraph.merge(data);
     }).catch(error => {
       console.warn(error);
     })
 
-    function update() {
+    function update(data) {
       if (document.getElementById('update_mode').value != 'merge') {
-        refresh();
+        refresh(data);
       } else {
-        merge();
+        merge(data);
       }
     }
 
@@ -153,6 +155,25 @@
 
     function onClick(d) {
       console.info("Clicked on " + d.data.name);
+    }
+
+    function stream() {
+      var uri = location.origin + '/stream'
+      var sse = new EventSource(uri);
+      sse.onopen = function () {
+        status.innerHTML = 'Connected for flamegraph updates';
+      }
+
+      sse.onmessage = function (msg) {
+        var data = JSON.parse(msg.data)
+        console.log(data);
+        update(data)
+      };
+
+      sse.onerror = function (err) {
+        status.innerHTML = 'Disconnected'
+        console.error(err);
+      }
     }
   </script>
 </body>
