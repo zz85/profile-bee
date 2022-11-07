@@ -311,9 +311,9 @@ impl StackFrameInfo {
                 .collect();
 
             let ctx = if finder.use_dwarf {
-                None
-            } else {
                 ObjectContext::new(&object).ok()
+            } else {
+                None
             };
 
             let item = ObjItem { ctx, symbols };
