@@ -161,7 +161,7 @@
       var uri = location.origin + '/stream'
       var sse = new EventSource(uri);
       sse.onopen = function () {
-        status.innerHTML = 'Connected for flamegraph updates';
+        document.getElementById('status').innerHTML = 'Connected for flamegraph updates';
       }
 
       sse.onmessage = function (msg) {
@@ -171,7 +171,7 @@
       };
 
       sse.onerror = function (err) {
-        status.innerHTML = 'Disconnected'
+        document.getElementById('status').innerHTML = 'Disconnected'
         console.error(err);
       }
     }

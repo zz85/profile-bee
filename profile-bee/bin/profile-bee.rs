@@ -1,5 +1,5 @@
 use aya::maps::perf::AsyncPerfEventArray;
-use aya::maps::{HashMap, Queue, StackTraceMap};
+use aya::maps::{HashMap, MapRefMut, Queue, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
@@ -203,7 +203,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let mut stacks = Queue::<_, [u8; STACK_INFO_SIZE]>::try_from(bpf.map_mut("STACKS")?)?;
     let stack_traces = StackTraceMap::try_from(bpf.map("stack_traces")?)?;
 
-    let counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(bpf.map("counts")?)?;
+    let mut counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(bpf.map_mut("counts")?)?;
     let mut perf_stacks = AsyncPerfEventArray::try_from(bpf.map_mut("PERF_STACKS")?)?;
 
     let mut symbols = SymbolFinder::new(!opt.no_dwarf);
@@ -247,10 +247,12 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         trace_count.clear();
         samples = 0;
 
-        // TODO clear for bpf maps
-        // for (key, value) in counts.iter().flatten() {
-        //     counts.remove(&fail);
-        // }
+        // clear "counts" hashmap
+        let keys = counts.keys().flatten().collect::<Vec<_>>();
+        for k in keys {
+            let _ = counts.remove(&k);
+            // let _ = counts.insert(k, 0, 0);
+        }
 
         /*
         while let Ok(stack) = perf_rx.recv() {
