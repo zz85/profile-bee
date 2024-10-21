@@ -1,4 +1,4 @@
-use aya::maps::{MapRef, StackTraceMap};
+use aya::maps::{MapData, StackTraceMap};
 use profile_bee_common::StackInfo;
 use symbols::{StackFrameInfo, StackInfoExt, SymbolFinder};
 
@@ -9,7 +9,7 @@ pub mod symbols;
 /// converts pointers from bpf to usable, symbol resolved stack information
 pub fn format_stack_trace(
     stack_info: &StackInfo,
-    stack_traces: &StackTraceMap<MapRef>,
+    stack_traces: &StackTraceMap<MapData>,
     symbols: &mut SymbolFinder,
     group_by_cpu: bool,
 ) -> Vec<StackFrameInfo> {

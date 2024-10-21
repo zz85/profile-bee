@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use aya_bpf::{
+use aya_ebpf::{
     macros::{kprobe, uprobe},
     macros::{perf_event, tracepoint},
     programs::ProbeContext,
@@ -18,19 +18,19 @@ pub fn profile_cpu(ctx: PerfEventContext) -> u32 {
     0
 }
 
-#[kprobe(name = "kprobe_profile")]
+#[kprobe]
 pub fn kprobe_profile(ctx: ProbeContext) -> u32 {
     unsafe { collect_trace(ctx) }
     0
 }
 
-#[uprobe(name = "uprobe_profile")]
+#[uprobe]
 pub fn uprobe_profile(ctx: ProbeContext) -> u32 {
     unsafe { collect_trace(ctx) }
     0
 }
 
-#[tracepoint(name = "tracepoint_profile")]
+#[tracepoint]
 pub fn tracepoint_profile(ctx: TracePointContext) -> u32 {
     unsafe { collect_trace(ctx) }
     0

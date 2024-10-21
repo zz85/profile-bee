@@ -160,8 +160,8 @@ pub fn collapse_to_json(stacks: &[&str]) -> String {
 }
 
 pub fn generate_html_file(filename: &Path, data: &str) {
-    let html = flamegraph_html(&data);
-    std::fs::write(&filename, &html).expect("Unable to write stack html file");
+    let html = flamegraph_html(data);
+    std::fs::write(filename, html).expect("Unable to write stack html file");
 }
 
 // Uses https://github.com/spiermar/d3-flame-graph

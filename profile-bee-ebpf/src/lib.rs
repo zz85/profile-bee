@@ -3,12 +3,12 @@
 /// Shared reusable profiling ebpf components that can be included in
 /// different ebpf applications.
 ///
-use aya_bpf::{
+use aya_ebpf::{
     bindings::BPF_F_USER_STACK,
     helpers::bpf_get_smp_processor_id,
     macros::map,
     maps::{HashMap, Queue, StackTrace, PerfEventArray},
-    BpfContext,
+    EbpfContext,
 };
 
 // use aya_log_ebpf::info;
@@ -48,7 +48,7 @@ static STACKS: Queue<StackInfo> = Queue::with_max_entries(STACK_ENTRIES, 0);
 pub static mut STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
 
 #[inline(always)]
-pub unsafe fn collect_trace<C: BpfContext>(ctx: C) {
+pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     let pid = ctx.pid();
 
     if skip_idle() && pid == 0 {

@@ -4,14 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use addr2line::{
-    demangle, gimli,
-    object::{Object, ObjectSymbol},
-    ObjectContext,
-};
+use addr2line::{demangle, gimli, Loader};
 
 use aya::{maps::stack_trace::StackTrace, util::kernel_symbols};
-use memmap::Mmap;
 use profile_bee_common::StackInfo;
 use thiserror::Error;
 
@@ -66,7 +61,7 @@ pub struct SymbolFinder {
 }
 
 pub struct ObjItem {
-    ctx: Option<ObjectContext>,
+    ctx: Option<Loader>,
     symbols: Vec<Symbol>,
 }
 
@@ -94,15 +89,16 @@ impl SymbolFinder {
         meta: &StackInfo,
     ) -> Vec<StackFrameInfo> {
         let kernel_stack = trace
-            .resolve(&self.ksyms)
             .frames()
             .iter()
             .map(|frame| {
                 let mut info = StackFrameInfo::prepare(meta);
-                info.symbol = frame
-                    .symbol_name
-                    .as_deref()
-                    .map(|name| format!("{}_[k]", name));
+                if let Some(sym) = self.ksyms.range(..=frame.ip).next_back().map(|(_, s)| s) {
+                    info.symbol = Some(format!("{sym}_[k]"));
+                    // println!("{:#x} {}", frame.ip, sym);
+                } else {
+                    // println!("{:#x}", frame.ip);
+                }
 
                 info
             })
@@ -278,45 +274,20 @@ impl StackFrameInfo {
                 return None;
             }
 
-            let data = {
-                let file = file.unwrap();
-                let mmapped_file = unsafe { Mmap::map(&file) };
-                if mmapped_file.is_err() {
-                    println!(
-                        "Couldn't mmap {:?} {:?} {} {:#8x} {:#8x} - pid {}",
-                        target,
-                        mmapped_file.err(),
-                        self.cmd,
-                        self.address,
-                        virtual_address,
-                        self.pid
-                    );
+            let loader = match Loader::new(&target) {
+                Err(e) => {
+                    println!("Error while loading target {target:?} : {e:?}");
                     return None;
                 }
-
-                &mmapped_file.unwrap()[..]
+                Ok(loader) => loader,
             };
 
-            let object: addr2line::object::File<_> = addr2line::object::File::parse(data).unwrap();
+            // finder.use_dwarf
 
-            // TODO binary search tree
-            let symbols = object
-                .symbols()
-                .chain(object.dynamic_symbols())
-                .map(|s| Symbol {
-                    address: s.address(),
-                    size: s.size(),
-                    name: s.name().map(|v| v.to_owned()).ok(),
-                })
-                .collect();
-
-            let ctx = if finder.use_dwarf {
-                ObjectContext::new(&object).ok()
-            } else {
-                None
+            let item = ObjItem {
+                ctx: Some(loader),
+                symbols: vec![],
             };
-
-            let item = ObjItem { ctx, symbols };
 
             Some(item)
         });

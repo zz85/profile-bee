@@ -1,8 +1,8 @@
 use std::{collections::HashMap, ffi::OsString, fs, os::unix::fs::MetadataExt, path::PathBuf};
 
-use procfs::process::{MMapPath, MemoryMap, Process, Stat};
+use procfs::process::{MMPermissions, MMapPath, MemoryMap, MemoryMaps, Process, Stat};
 
-use crate::symbols::{ObjItem, StackFrameInfo};
+use crate::symbols::StackFrameInfo;
 
 pub struct ProcessInfo {
     pub process: Option<Process>,
@@ -100,7 +100,7 @@ pub struct ProcessMapper {
 }
 
 impl ProcessMapper {
-    pub fn new(maps: Option<Vec<MemoryMap>>) -> Option<Self> {
+    pub fn new(maps: Option<MemoryMaps>) -> Option<Self> {
         let maps = maps?;
         let maps = maps
             .into_iter()
@@ -115,14 +115,14 @@ impl ProcessMapper {
         Some(ProcessMapper { maps })
     }
 
-    fn is_exec(flags: &str) -> bool {
-        &flags[2..3] == "x"
+    fn is_exec(flags: &MMPermissions) -> bool {
+        flags.contains(MMPermissions::EXECUTE)
     }
-    fn is_write(flags: &str) -> bool {
-        &flags[1..2] == "w"
+    fn is_write(flags: &MMPermissions) -> bool {
+        flags.contains(MMPermissions::WRITE)
     }
-    fn is_read(flags: &str) -> bool {
-        &flags[0..1] == "r"
+    fn is_read(flags: &MMPermissions) -> bool {
+        flags.contains(MMPermissions::READ)
     }
 
     pub fn lookup(&self, address: usize, info: &mut StackFrameInfo) {

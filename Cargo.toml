@@ -1,5 +1,6 @@
 [workspace]
 members = ["profile-bee", "profile-bee-common", "xtask"]
+resolver = "2"
 
 [profile.release]
 debug = true

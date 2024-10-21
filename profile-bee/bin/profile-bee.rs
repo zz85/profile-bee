@@ -1,13 +1,14 @@
+use anyhow::anyhow;
 use aya::maps::perf::AsyncPerfEventArray;
-use aya::maps::{HashMap, MapRefMut, Queue, StackTraceMap};
+use aya::maps::{HashMap, Queue, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
 };
 use aya::programs::{TracePoint, UProbe};
 
-use aya::{include_bytes_aligned, util::online_cpus, Bpf};
-use aya::{BpfLoader, Btf};
+use aya::{include_bytes_aligned, util::online_cpus};
+use aya::{Btf, EbpfLoader};
 use bytes::BytesMut;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
@@ -112,9 +113,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let skip_idle = if opt.skip_idle { 1u8 } else { 0u8 };
 
-    let mut bpf = BpfLoader::new()
-        .set_global("SKIP_IDLE", &skip_idle)
-        .set_global("NOTIFY_TYPE", &opt.stream_mode)
+    let mut bpf = EbpfLoader::new()
+        .set_global("SKIP_IDLE", &skip_idle, true)
+        .set_global("NOTIFY_TYPE", &opt.stream_mode, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {
@@ -164,47 +165,61 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         if opt.self_profile {
             program.attach(
                 PerfTypeId::Software,
-                PERF_COUNT_SW_CPU_CLOCK as u64,
+                PERF_COUNT_SW_CPU_CLOCK,
                 PerfEventScope::CallingProcessAnyCpu,
                 SamplePolicy::Frequency(opt.frequency),
+                true,
             )?;
         } else if let Some(pid) = opt.pid {
             program.attach(
                 PerfTypeId::Software,
-                PERF_COUNT_SW_CPU_CLOCK as u64,
+                PERF_COUNT_SW_CPU_CLOCK,
                 PerfEventScope::OneProcessAnyCpu { pid },
                 SamplePolicy::Frequency(opt.frequency),
+                true,
             )?;
         } else if let Some(cpu) = opt.cpu {
             program.attach(
                 PerfTypeId::Software,
-                PERF_COUNT_SW_CPU_CLOCK as u64,
+                PERF_COUNT_SW_CPU_CLOCK,
                 PerfEventScope::AllProcessesOneCpu { cpu },
                 SamplePolicy::Frequency(opt.frequency),
+                true,
             )?;
         } else {
-            let cpus = online_cpus()?;
+            let cpus = online_cpus().map_err(|(_, error)| error)?;
             let nprocs = cpus.len();
             eprintln!("CPUs: {}", nprocs);
 
             for cpu in cpus {
                 program.attach(
                     PerfTypeId::Software,
-                    PERF_COUNT_SW_CPU_CLOCK as u64,
+                    PERF_COUNT_SW_CPU_CLOCK,
                     PerfEventScope::AllProcessesOneCpu { cpu },
                     // SamplePolicy::Period(1000000),
                     SamplePolicy::Frequency(opt.frequency),
+                    true,
                 )?;
             }
         }
     }
 
     const STACK_INFO_SIZE: usize = std::mem::size_of::<StackInfo>();
-    let mut stacks = Queue::<_, [u8; STACK_INFO_SIZE]>::try_from(bpf.map_mut("STACKS")?)?;
-    let stack_traces = StackTraceMap::try_from(bpf.map("stack_traces")?)?;
+    let mut stacks = Queue::<_, [u8; STACK_INFO_SIZE]>::try_from(
+        bpf.take_map("STACKS").ok_or(anyhow!("STACKS not found"))?,
+    )?;
+    let stack_traces = StackTraceMap::try_from(
+        bpf.take_map("stack_traces")
+            .ok_or(anyhow!("stack_traces not found"))?,
+    )?;
 
-    let mut counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(bpf.map_mut("counts")?)?;
-    let mut perf_stacks = AsyncPerfEventArray::try_from(bpf.map_mut("PERF_STACKS")?)?;
+    let mut counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(
+        bpf.take_map("counts").ok_or(anyhow!("counts not found"))?,
+    )?;
+    let mut perf_stacks = AsyncPerfEventArray::try_from(
+        bpf.take_map("PERF_STACKS")
+            .ok_or(anyhow!("PERF_STACKS not found"))?,
+    )?;
 
     let mut symbols = SymbolFinder::new(!opt.no_dwarf);
 
@@ -216,7 +231,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let (perf_tx, perf_rx) = mpsc::channel();
     // let (tx2, rx2) = tokio::sync::mpsc::channel(10000);
 
-    for cpu_id in online_cpus()? {
+    for cpu_id in online_cpus().map_err(|(_, e)| e)? {
         let mut buf = perf_stacks.open(cpu_id, None)?;
         let perf_tx = perf_tx.clone();
 
@@ -312,7 +327,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         if local_counting {
             for (stack, value) in trace_count.iter() {
                 let combined =
-                    format_stack_trace(&stack, &stack_traces, &mut symbols, opt.group_by_cpu);
+                    format_stack_trace(stack, &stack_traces, &mut symbols, opt.group_by_cpu);
 
                 samples += *value as u64;
                 stacks.push(FrameCount {
@@ -359,16 +374,15 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
         if let Some(svg) = &opt.svg {
             let _ = output_svg(
-                &svg,
+                svg,
                 &out,
                 format!(
                     "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
                     opt.time, opt.frequency
                 ),
             )
-            .map_err(|e| {
-                println!("Failed to write svg file {:?}", svg);
-                e
+            .inspect_err(|e| {
+                println!("Failed to write svg file {:?} - {:?}", e, svg);
             });
         }
 
@@ -376,7 +390,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
 
             if let Some(json_path) = &opt.json {
-                std::fs::write(&json_path, &json).expect("Unable to write stack html file");
+                std::fs::write(json_path, &json).expect("Unable to write stack html file");
             }
 
             if let Some(html_path) = &opt.html {
