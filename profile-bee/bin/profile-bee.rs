@@ -8,7 +8,7 @@ use aya::programs::{
 use aya::programs::{TracePoint, UProbe};
 
 use aya::{include_bytes_aligned, util::online_cpus};
-use aya::{Btf, EbpfLoader};
+use aya::{Btf, Ebpf, EbpfLoader};
 use bytes::BytesMut;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
@@ -91,17 +91,14 @@ struct Opt {
 
     /// method of passes events/traces to
     /// user space.
-    /// 1 - always, 2 - new stacktraces
+    /// 1 - always - all events
+    /// 2 - new stack traces
     /// 3 - none
     #[arg(long, default_value_t = 2)]
     stream_mode: u8,
 }
 
-#[tokio::main]
-async fn main() -> std::result::Result<(), anyhow::Error> {
-    let opt = Opt::parse();
-    env_logger::init();
-
+fn load_ebpf(opt: &Opt) -> Result<Ebpf, anyhow::Error> {
     // This will include your eBPF object file as raw bytes at compile-time and load it at
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
@@ -113,7 +110,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let skip_idle = if opt.skip_idle { 1u8 } else { 0u8 };
 
-    let mut bpf = EbpfLoader::new()
+    let bpf = EbpfLoader::new()
         .set_global("SKIP_IDLE", &skip_idle, true)
         .set_global("NOTIFY_TYPE", &opt.stream_mode, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
@@ -126,6 +123,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // this might be useful for debugging, but definitely disable bpf logging for performance purposes
     // aya_log::BpfLogger::init(&mut bpf)?;
 
+    Ok(bpf)
+}
+
+#[tokio::main]
+async fn main() -> std::result::Result<(), anyhow::Error> {
+    let opt = Opt::parse();
+    env_logger::init();
+
     use tokio::sync::broadcast;
     let (tx, rx) = broadcast::channel(16);
 
@@ -136,6 +141,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     println!("starting {:?}", opt);
+
+    let mut bpf = load_ebpf(&opt)?;
 
     if let Some(kprobe) = &opt.kprobe {
         let program: &mut KProbe = bpf.program_mut("kprobe_profile").unwrap().try_into()?;

@@ -24,6 +24,7 @@ static SKIP_IDLE: u8 = 0;
 #[no_mangle]
 static NOTIFY_TYPE: u8 = EVENT_TRACE_ALWAYS;
 
+#[inline]
 unsafe fn skip_idle() -> bool {
     let skip = core::ptr::read_volatile(&SKIP_IDLE);
     skip > 0
@@ -51,47 +52,40 @@ pub static mut STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZ
 pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     let pid = ctx.pid();
 
-    if skip_idle() && pid == 0 {
-        // not profiling idle
+    if pid == 0 && skip_idle() {
+        // skip profiling idle traces
         return;
     }
 
     let cmd = ctx.command().unwrap_or_default();
     let tgid = ctx.tgid(); // thread group id
+    let cpu = bpf_get_smp_processor_id();
+    let user_stack_id = STACK_TRACES.get_stackid(&ctx, BPF_F_USER_STACK.into()).map_or(-1, |stack_id| stack_id as i32);
+    let kernel_stack_id = STACK_TRACES.get_stackid(&ctx, 0).map_or(-1, |stack_id| stack_id as i32);
 
-    let mut key = StackInfo {
+    let stack_info = StackInfo {
         tgid,
-        user_stack_id: -1,
-        kernel_stack_id: -1,
+        user_stack_id,
+        kernel_stack_id,
         cmd,
-        cpu: u32::MAX,
+        cpu,
     };
-
-    key.cpu = bpf_get_smp_processor_id();
-
-    if let Ok(stack_id) = STACK_TRACES.get_stackid(&ctx, BPF_F_USER_STACK.into()) {
-        key.user_stack_id = stack_id as i32;
-    }
-
-    if let Ok(stack_id) = STACK_TRACES.get_stackid(&ctx, 0) {
-        key.kernel_stack_id = stack_id as i32;
-    }
 
     let notify_code = notify_type();
     // only assume true for "always mode"
     let mut notify = notify_code == EVENT_TRACE_ALWAYS;
 
-    if let Some(count) = COUNTS.get_ptr_mut(&key) {
+    // kernel space summarization
+    if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
         *count += 1;
     } else {
-        // update hashmap with count and and only push new keys to queue for symbol resolution
-        let _ = COUNTS.insert(&key, &1, 0); // BPF_F_NO_PREALLOC
+        // update hashmap with count and and only push new stack_infos to queue for symbol resolution
+        let _ = COUNTS.insert(&stack_info, &1, 0); // BPF_F_NO_PREALLOC
 
-        if notify_code == EVENT_TRACE_NEW {
-            notify = true;
-        }
+        notify = true;
     }
 
+    // update user space
     if notify {
         // notify
         if let Err(_e) = STACKS.push(&key, 0) {
