@@ -2,6 +2,7 @@ use aya::maps::{MapData, StackTraceMap};
 use profile_bee_common::StackInfo;
 use symbols::{StackFrameInfo, StackInfoExt, SymbolFinder};
 
+mod cache;
 pub mod html;
 pub mod process;
 pub mod symbols;
@@ -37,34 +38,19 @@ pub fn format_stack_trace(
         return vec![idle, idle_cpu];
     }
 
-    let kernel_stacks = if ktrace_id > -1 {
-        stack_traces
-            .get(&(ktrace_id as u32), 0)
-            .map(|mut trace| symbols.resolve_kernel_trace(&mut trace, stack_info))
-            .ok()
+    let kernel_stack = if ktrace_id > -1 {
+        stack_traces.get(&(ktrace_id as u32), 0).ok()
     } else {
         None
     };
 
-    let user_stacks = if utrace_id > -1 {
-        stack_traces
-            .get(&(utrace_id as u32), 0)
-            .map(|trace| symbols.resolve_user_trace(&trace, stack_info))
-            .ok()
+    let user_stack = if utrace_id > -1 {
+        stack_traces.get(&(utrace_id as u32), 0).ok()
     } else {
         None
     };
 
-    let mut combined = match (kernel_stacks, user_stacks) {
-        (Some(kernel_stacks), None) => kernel_stacks,
-        (None, Some(user_stacks)) => user_stacks,
-        (Some(kernel_stacks), Some(user_stacks)) => kernel_stacks
-            .into_iter()
-            .chain(user_stacks.into_iter())
-            .collect::<Vec<_>>(),
-        _ => Default::default(),
-    };
-
+    let mut combined = symbols.resolve_stack_trace(kernel_stack, user_stack, stack_info);
     let pid_info = StackFrameInfo::process_only(stack_info);
     combined.push(pid_info);
 

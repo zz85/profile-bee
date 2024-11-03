@@ -246,7 +246,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                     //     stack,
                     //     profile_bee::symbols::str_from_u8_nul_utf8(&stack.cmd).unwrap()
                     // );
-                    perf_tx.send(stack).unwrap();
+                    let _ = perf_tx.send(stack);
                 }
                 Ok(())
             }) {
@@ -392,6 +392,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     println!("{}", symbols.process_cache.stats());
+    println!("{}", symbols.addr_cache.stats());
 
     // TODO fix this
     /*

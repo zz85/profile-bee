@@ -17,7 +17,7 @@ pub struct ProcessInfo {
 }
 
 impl ProcessInfo {
-    fn new(pid: usize) -> Self {
+    pub fn new(pid: usize) -> Self {
         let process = Process::new(pid as i32).ok();
 
         let (environ, cmdline, stat, cwd, maps) = process
@@ -75,23 +75,6 @@ impl ProcessInfo {
 
     pub fn cmdline(&self) -> Option<&Vec<String>> {
         self.cmdline.as_ref()
-    }
-}
-
-#[derive(Default)]
-pub struct ProcessCache {
-    map: HashMap<usize, ProcessInfo>,
-}
-
-impl ProcessCache {
-    pub fn get(&mut self, pid: usize) -> Option<&ProcessInfo> {
-        self.map.entry(pid).or_insert_with(|| ProcessInfo::new(pid));
-
-        self.map.get(&pid)
-    }
-
-    pub fn stats(&self) -> String {
-        format!("Processes cache entries: {}", self.map.len())
     }
 }
 

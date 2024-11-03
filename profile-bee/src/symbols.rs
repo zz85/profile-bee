@@ -10,7 +10,7 @@ use aya::{maps::stack_trace::StackTrace, util::kernel_symbols};
 use profile_bee_common::StackInfo;
 use thiserror::Error;
 
-use crate::process::ProcessCache;
+use crate::cache::{AddrCache, ProcessCache};
 
 #[derive(Debug, Error)]
 pub enum SymbolError {
@@ -55,7 +55,7 @@ pub struct SymbolFinder {
     ksyms: BTreeMap<u64, String>,
     // TODO we should store inode, exe and starttime as a way to check staleness
     obj_cache: HashMap<(u64, PathBuf), Option<ObjItem>>,
-    addr_cache: HashMap<(i32, u64), StackFrameInfo>,
+    pub addr_cache: AddrCache,
     pub process_cache: ProcessCache,
     use_dwarf: bool,
 }
@@ -85,7 +85,7 @@ impl SymbolFinder {
     /// takes an Aya StackTrace contain StackFrames into our StackFrameInfo struct
     pub fn resolve_kernel_trace(
         &self,
-        trace: &mut StackTrace,
+        trace: &StackTrace,
         meta: &StackInfo,
     ) -> Vec<StackFrameInfo> {
         let kernel_stack = trace
@@ -117,6 +117,11 @@ impl SymbolFinder {
             .iter()
             .map(|frame| {
                 let address = frame.ip;
+
+                if let Some(info) = self.addr_cache.get(meta.tgid as _, address) {
+                    return info;
+                }
+
                 let mut info = StackFrameInfo::prepare(meta);
 
                 let process = self.process_cache.get(meta.tgid as usize);
@@ -131,24 +136,35 @@ impl SymbolFinder {
                 }
                 mapper.as_ref().unwrap().lookup(address as _, &mut info);
 
-                let key = (meta.tgid as _, address);
-                let found = self.addr_cache.contains_key(&key);
+                info.resolve(address, self, meta.tgid as _);
 
-                if found {
-                    let g = self.addr_cache.get(&key).cloned().unwrap_or_default();
-                    return g;
-                } else {
-                }
-
-                info.resolve(address, self, meta.tgid as usize);
-                self.addr_cache.insert(key, info.clone());
-
-                // println!("User Frame: {}", info.fmt());
+                self.addr_cache.insert(meta.tgid as _, address, &info);
 
                 info
             })
             .collect::<Vec<_>>();
         user_stack
+    }
+
+    pub fn resolve_stack_trace(
+        &mut self,
+        kernel_stack: Option<StackTrace>,
+        user_stack: Option<StackTrace>,
+        meta: &StackInfo,
+    ) -> Vec<StackFrameInfo> {
+        let kernel_stacks = kernel_stack.map(|trace| self.resolve_kernel_trace(&trace, meta));
+        let user_stacks = user_stack.map(|trace| self.resolve_user_trace(&trace, meta));
+
+        let combined = match (kernel_stacks, user_stacks) {
+            (Some(kernel_stacks), None) => kernel_stacks,
+            (None, Some(user_stacks)) => user_stacks,
+            (Some(kernel_stacks), Some(user_stacks)) => kernel_stacks
+                .into_iter()
+                .chain(user_stacks.into_iter())
+                .collect::<Vec<_>>(),
+            _ => Default::default(),
+        };
+        combined
     }
 }
 
