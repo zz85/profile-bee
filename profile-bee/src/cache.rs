@@ -1,7 +1,4 @@
-use crate::{
-    process::ProcessInfo,
-    symbols::{StackFrameInfo, SymbolFinder},
-};
+use crate::{process::ProcessInfo, symbols::StackFrameInfo};
 use std::collections::HashMap;
 
 /// Process lookup
@@ -65,6 +62,44 @@ impl AddrCache {
         let hits = self.total - self.miss;
         format!(
             "AddrCache entries: {}, hits: {}, miss: {}, hit ratio: {:.2}",
+            self.map.len(),
+            hits,
+            self.miss,
+            hits as f64 / self.total as f64 * 100.0
+        )
+    }
+}
+
+/// Top level points to formatted stack trace format
+#[derive(Default)]
+pub struct PointerStackFramesCache {
+    map: HashMap<(i32, i32), Vec<StackFrameInfo>>,
+    total: usize,
+    miss: usize,
+}
+
+impl PointerStackFramesCache {
+    pub fn get(&mut self, ktrace_id: i32, utrace_id: i32) -> Option<Vec<StackFrameInfo>> {
+        let key = (ktrace_id, utrace_id);
+        self.total += 1;
+
+        if let Some(ok) = self.map.get(&key) {
+            return Some(ok.clone());
+        }
+
+        self.miss += 1;
+
+        None
+    }
+
+    pub fn insert(&mut self, ktrace_id: i32, utrace_id: i32, stacks: Vec<StackFrameInfo>) {
+        self.map.insert((ktrace_id, utrace_id), stacks);
+    }
+
+    pub fn stats(&self) -> String {
+        let hits = self.total - self.miss;
+        format!(
+            "PointerStackFramesCache entries: {}, hits: {}, miss: {}, hit ratio: {:.2}",
             self.map.len(),
             hits,
             self.miss,

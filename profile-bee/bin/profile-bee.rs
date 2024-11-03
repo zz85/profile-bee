@@ -11,8 +11,8 @@ use aya::{Btf, Ebpf, EbpfLoader};
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use log::info;
-use profile_bee::format_stack_trace;
 use profile_bee::html::{collapse_to_json, generate_html_file};
+use profile_bee::Profiler;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::{signal, task};
 
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use profile_bee::symbols::{FrameCount, SymbolFinder};
+use profile_bee::symbols::FrameCount;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -220,7 +220,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         bpf.take_map("counts").ok_or(anyhow!("counts not found"))?,
     )?;
 
-    let mut symbols = SymbolFinder::new(!opt.no_dwarf);
+    let mut profiler = Profiler::new(); // !opt.no_dwarf
 
     // Local counting
     let mut trace_count = std::collections::HashMap::<StackInfo, usize>::new();
@@ -282,8 +282,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             *trace += 1;
 
             if *trace == 1 {
-                let _combined =
-                    format_stack_trace(&stack, &stack_traces, &mut symbols, opt.group_by_cpu);
+                let _combined = profiler.get_stack(&stack, &stack_traces, opt.group_by_cpu);
             }
 
             if started.elapsed().as_millis() > opt.time as _ {
@@ -300,8 +299,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
         if local_counting {
             for (stack, value) in trace_count.iter() {
-                let combined =
-                    format_stack_trace(stack, &stack_traces, &mut symbols, opt.group_by_cpu);
+                let combined = profiler.get_stack(&stack, &stack_traces, opt.group_by_cpu);
 
                 samples += *value as u64;
                 stacks.push(FrameCount {
@@ -316,8 +314,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
                 samples += value;
 
-                let combined =
-                    format_stack_trace(&stack, &stack_traces, &mut symbols, opt.group_by_cpu);
+                let combined = profiler.get_stack(&stack, &stack_traces, opt.group_by_cpu);
 
                 stacks.push(FrameCount {
                     frames: combined,
@@ -391,8 +388,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         }
     }
 
-    println!("{}", symbols.process_cache.stats());
-    println!("{}", symbols.addr_cache.stats());
+    profiler.print_stats();
 
     // TODO fix this
     /*
