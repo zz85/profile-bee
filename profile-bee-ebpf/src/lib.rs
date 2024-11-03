@@ -7,7 +7,7 @@ use aya_ebpf::{
     bindings::BPF_F_USER_STACK,
     helpers::bpf_get_smp_processor_id,
     macros::map,
-    maps::{HashMap, Queue, StackTrace, PerfEventArray},
+    maps::{HashMap, Queue, StackTrace, PerfEventArray, RingBuf},
     EbpfContext,
 };
 
@@ -44,6 +44,9 @@ static mut PERF_STACKS: PerfEventArray<StackInfo> = PerfEventArray::new(0);
 
 #[map]
 static STACKS: Queue<StackInfo> = Queue::with_max_entries(STACK_ENTRIES, 0);
+
+#[map]
+static RING_BUF: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
 
 #[map(name = "stack_traces")]
 pub static mut STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
@@ -88,12 +91,16 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     // update user space
     if notify {
         // notify
-        if let Err(_e) = STACKS.push(&key, 0) {
-            // info!(&ctx, "Error pushing stack: {}", e);
-        }
+        // if let Err(_e) = STACKS.push(&stack_info, 0) {
+        //     // info!(&ctx, "Error pushing stack: {}", e);
+        // }
 
         // send perf event
-        // PERF_STACKS.output(&ctx, &key, 0);
+        // PERF_STACKS.output(&ctx, &stack_info, 0);
 
+        if let Some(mut v) = RING_BUF.reserve::<StackInfo>(0) {
+            v.write(stack_info);
+            v.submit(0);
+        }
     }
 }

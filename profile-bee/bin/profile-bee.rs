@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use aya::maps::perf::AsyncPerfEventArray;
-use aya::maps::{HashMap, Queue, StackTraceMap};
+use aya::maps::{HashMap, Queue, RingBuf, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
@@ -9,7 +9,6 @@ use aya::programs::{TracePoint, UProbe};
 
 use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
-use bytes::BytesMut;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use log::info;
@@ -236,31 +235,68 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let mut queue_processed = 0;
 
     let (perf_tx, perf_rx) = mpsc::channel();
-    // let (tx2, rx2) = tokio::sync::mpsc::channel(10000);
 
-    for cpu_id in online_cpus().map_err(|(_, e)| e)? {
-        let mut buf = perf_stacks.open(cpu_id, None)?;
-        let perf_tx = perf_tx.clone();
+    // for cpu_id in online_cpus().map_err(|(_, e)| e)? {
+    //     let mut buf = perf_stacks.open(cpu_id, None)?;
+    //     let perf_tx = perf_tx.clone();
 
-        task::spawn(async move {
-            let mut buffers = (0..1000)
-                .map(|_| BytesMut::with_capacity(1024))
-                .collect::<Vec<_>>();
+    //     task::spawn(async move {
+    //         let mut buffers = (0..1000)
+    //             .map(|_| BytesMut::with_capacity(1024))
+    //             .collect::<Vec<_>>();
 
-            loop {
-                let events = buf.read_events(&mut buffers).await.unwrap();
-                for i in 0..events.read {
-                    let buf = &mut buffers[i];
-                    let ptr = buf.as_ptr() as *const StackInfo;
-                    let payload = unsafe { ptr.read_unaligned() };
+    //         loop {
+    //             let events = buf.read_events(&mut buffers).await.unwrap();
+    //             for i in 0..events.read {
+    //                 let buf = &mut buffers[i];
+    //                 let ptr = buf.as_ptr() as *const StackInfo;
+    //                 let payload = unsafe { ptr.read_unaligned() };
 
-                    perf_tx.send(payload).unwrap();
+    //                 let _ = perf_tx.send(payload);
+    //             }
+
+    //             // tokio::time::sleep(Duration::from_millis(1000)).await;
+    //         }
+    //     });
+    // }
+
+    // loop {
+    //     while let Some(x) = ring_buf.next() {
+    //         // println!("Received: {:?}", x);
+    //         let stack: StackInfo = unsafe { *x.as_ptr().cast() };
+    //         // println!("Stack {:?}, cmd: {}", stack, profile_bee::symbols::str_from_u8_nul_utf8(&stack.cmd).unwrap());
+    //     }
+    // }
+
+    task::spawn(async move {
+        let ring_buf = RingBuf::try_from(bpf.map_mut("RING_BUF").unwrap()).unwrap();
+        use tokio::io::unix::AsyncFd;
+        let mut fd = AsyncFd::new(ring_buf).unwrap();
+
+        while let Ok(mut guard) = fd.readable_mut().await {
+            match guard.try_io(|inner| {
+                let ring_buf = inner.get_mut();
+                while let Some(item) = ring_buf.next() {
+                    // println!("Received: {:?}", item);
+
+                    let stack: StackInfo = unsafe { *item.as_ptr().cast() };
+                    // println!(
+                    //     "Stack {:?}, cmd: {}",
+                    //     stack,
+                    //     profile_bee::symbols::str_from_u8_nul_utf8(&stack.cmd).unwrap()
+                    // );
+                    perf_tx.send(stack).unwrap();
                 }
-
-                // tokio::time::sleep(Duration::from_millis(1000)).await;
+                Ok(())
+            }) {
+                Ok(_) => {
+                    guard.clear_ready();
+                    continue;
+                }
+                Err(_would_block) => continue,
             }
-        });
-    }
+        }
+    });
 
     loop {
         let started = Instant::now();
@@ -276,7 +312,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             // let _ = counts.insert(k, 0, 0);
         }
 
-        /*
+        /* Perf mpsc RX loop */
         while let Ok(stack) = perf_rx.recv() {
             queue_processed += 1;
 
@@ -292,9 +328,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             if started.elapsed().as_millis() > opt.time as _ {
                 break;
             }
-        }*/
+        }
 
-        /**/
+        /*
         loop {
             if started.elapsed().as_millis() > opt.time as _ {
                 break;
@@ -323,6 +359,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 }
             }
         }
+        */
 
         println!("Processed {} queue events", queue_processed);
 
