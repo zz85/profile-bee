@@ -40,13 +40,7 @@ unsafe fn notify_type() -> u8 {
 pub static mut COUNTS: HashMap<StackInfo, u64> = HashMap::with_max_entries(STACK_ENTRIES, 0);
 
 #[map]
-static mut PERF_STACKS: PerfEventArray<StackInfo> = PerfEventArray::new(0);
-
-#[map]
-static STACKS: Queue<StackInfo> = Queue::with_max_entries(STACK_ENTRIES, 0);
-
-#[map]
-static RING_BUF: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
+static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
 
 #[map(name = "stack_traces")]
 pub static mut STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
@@ -75,6 +69,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     };
 
     let notify_code = notify_type();
+
     // only assume true for "always mode"
     let mut notify = notify_code == EVENT_TRACE_ALWAYS;
 
@@ -88,17 +83,9 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         notify = true;
     }
 
-    // update user space
     if notify {
-        // notify
-        // if let Err(_e) = STACKS.push(&stack_info, 0) {
-        //     // info!(&ctx, "Error pushing stack: {}", e);
-        // }
-
-        // send perf event
-        // PERF_STACKS.output(&ctx, &stack_info, 0);
-
-        if let Some(mut v) = RING_BUF.reserve::<StackInfo>(0) {
+        // notify user space of new stack information
+        if let Some(mut v) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
             v.write(stack_info);
             v.submit(0);
         }

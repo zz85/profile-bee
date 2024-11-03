@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::File,
+    fs::{read_link, File},
     path::{Path, PathBuf},
 };
 
@@ -257,22 +257,36 @@ impl StackFrameInfo {
                 // since this is a cache entry, should prevent much reloading
                 return None;
             }
-            let target = PathBuf::from(format!("/proc/{}/root{}", id, &path));
 
-            let file = File::open(&target);
+            // read root path
+            let root_link = format!("/proc/{}/root", id);
+            let base = Path::new(&root_link);
+            let mut target = match read_link(&base) {
+                Ok(link) => link,
+                Err(_e) => {
+                    // println!("Can't read link {root_link}. Process  {path:?} might have terminated. - {e:?}");
+                    // Best attempt, use root
+                    PathBuf::new()
+                }
+            };
 
-            if file.is_err() {
-                println!(
-                    "Can't read {:?} {:?} {} {:#8x} {:#8x} - pid {}",
-                    target,
-                    file.err(),
-                    self.cmd,
-                    self.address,
-                    virtual_address,
-                    self.pid
-                );
-                return None;
-            }
+            target.push(path);
+
+            // let file = File::open(&target);
+            // TODO use mmap if dealing with large files eg. let mmapped_file = unsafe { Mmap::map(&file) };
+
+            // if file.is_err() {
+            //     println!(
+            //         "Can't read {:?} {:?} {} {:#8x} {:#8x} - pid {}",
+            //         target,
+            //         file.err(),
+            //         self.cmd,
+            //         self.address,
+            //         virtual_address,
+            //         self.pid
+            //     );
+            //     return None;
+            // }
 
             let loader = match Loader::new(&target) {
                 Err(e) => {

@@ -1,6 +1,5 @@
 use anyhow::anyhow;
-use aya::maps::perf::AsyncPerfEventArray;
-use aya::maps::{HashMap, Queue, RingBuf, StackTraceMap};
+use aya::maps::{HashMap, RingBuf, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
@@ -211,9 +210,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     const STACK_INFO_SIZE: usize = std::mem::size_of::<StackInfo>();
-    let mut stacks = Queue::<_, [u8; STACK_INFO_SIZE]>::try_from(
-        bpf.take_map("STACKS").ok_or(anyhow!("STACKS not found"))?,
-    )?;
+
     let stack_traces = StackTraceMap::try_from(
         bpf.take_map("stack_traces")
             .ok_or(anyhow!("stack_traces not found"))?,
@@ -221,10 +218,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let mut counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(
         bpf.take_map("counts").ok_or(anyhow!("counts not found"))?,
-    )?;
-    let mut perf_stacks = AsyncPerfEventArray::try_from(
-        bpf.take_map("PERF_STACKS")
-            .ok_or(anyhow!("PERF_STACKS not found"))?,
     )?;
 
     let mut symbols = SymbolFinder::new(!opt.no_dwarf);
@@ -236,40 +229,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let (perf_tx, perf_rx) = mpsc::channel();
 
-    // for cpu_id in online_cpus().map_err(|(_, e)| e)? {
-    //     let mut buf = perf_stacks.open(cpu_id, None)?;
-    //     let perf_tx = perf_tx.clone();
-
-    //     task::spawn(async move {
-    //         let mut buffers = (0..1000)
-    //             .map(|_| BytesMut::with_capacity(1024))
-    //             .collect::<Vec<_>>();
-
-    //         loop {
-    //             let events = buf.read_events(&mut buffers).await.unwrap();
-    //             for i in 0..events.read {
-    //                 let buf = &mut buffers[i];
-    //                 let ptr = buf.as_ptr() as *const StackInfo;
-    //                 let payload = unsafe { ptr.read_unaligned() };
-
-    //                 let _ = perf_tx.send(payload);
-    //             }
-
-    //             // tokio::time::sleep(Duration::from_millis(1000)).await;
-    //         }
-    //     });
-    // }
-
-    // loop {
-    //     while let Some(x) = ring_buf.next() {
-    //         // println!("Received: {:?}", x);
-    //         let stack: StackInfo = unsafe { *x.as_ptr().cast() };
-    //         // println!("Stack {:?}, cmd: {}", stack, profile_bee::symbols::str_from_u8_nul_utf8(&stack.cmd).unwrap());
-    //     }
-    // }
-
     task::spawn(async move {
-        let ring_buf = RingBuf::try_from(bpf.map_mut("RING_BUF").unwrap()).unwrap();
+        let ring_buf = RingBuf::try_from(bpf.map_mut("RING_BUF_STACKS").unwrap()).unwrap();
         use tokio::io::unix::AsyncFd;
         let mut fd = AsyncFd::new(ring_buf).unwrap();
 
@@ -329,37 +290,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 break;
             }
         }
-
-        /*
-        loop {
-            if started.elapsed().as_millis() > opt.time as _ {
-                break;
-            }
-
-            match stacks.pop(0) {
-                Ok(v) => {
-                    let stack: StackInfo = unsafe { *v.as_ptr().cast() };
-                    queue_processed += 1;
-
-                    // user space counting
-                    let trace = trace_count.entry(stack).or_insert(0);
-                    *trace += 1;
-
-                    if *trace == 1 {
-                        let _combined = format_stack_trace(
-                            &stack,
-                            &stack_traces,
-                            &mut symbols,
-                            opt.group_by_cpu,
-                        );
-                    }
-                }
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                }
-            }
-        }
-        */
 
         println!("Processed {} queue events", queue_processed);
 
