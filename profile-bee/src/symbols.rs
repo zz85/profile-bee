@@ -268,16 +268,27 @@ impl StackFrameInfo {
         let object_key = (self.ns.unwrap_or(self.pid as u64), object_path.into());
 
         let obj_cache = finder.obj_cache.entry(object_key).or_insert_with(|| {
-            let mut path = object_path.to_str().unwrap_or_default();
+            let path = object_path.to_str().unwrap_or_default();
             if path == "[vdso]" || path.starts_with('[') {
                 // since this is a cache entry, should prevent much reloading
                 return None;
             }
-            if let Some(striped) = path.strip_suffix(" (deleted)") {
-                path = striped; // try best if meet a deleted dso
-            }
-            // read root path
-            let target = PathBuf::from(format!("/proc/{}/root{}", id, path));
+            // try best if meet a deleted dso
+            let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+
+            let root_link = format!("/proc/{}/root", id);
+            let base = Path::new(&root_link);
+            let mut target = match read_link(&base) {
+                 Ok(link) => link,
+                Err(_e) => {
+                    // println!("Can't read link {root_link}. Process  {path:?} might have terminated. - {e:?}");
+                    // Best attempt, use root
+                    PathBuf::new()
+                }
+            };
+
+            target.push(path);
+
             // let file = File::open(&target);
             // TODO use mmap if dealing with large files eg. let mmapped_file = unsafe { Mmap::map(&file) };
 
