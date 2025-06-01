@@ -4,6 +4,10 @@ use procfs::process::{MMPermissions, MMapPath, MemoryMap, MemoryMaps, Process, S
 
 use crate::symbols::StackFrameInfo;
 
+/// Process information container
+///
+/// Holds metadata about a running process including environment variables,
+/// command line, working directory, and memory mappings needed for stack trace resolution.
 pub struct ProcessInfo {
     pub process: Option<Process>,
     pub environ: Option<HashMap<OsString, OsString>>,
@@ -78,6 +82,10 @@ impl ProcessInfo {
     }
 }
 
+/// Memory mapping resolver for processes
+///
+/// Maps virtual memory addresses to physical addresses and associated binary files
+/// by analyzing the process memory maps from /proc/<pid>/maps.
 pub struct ProcessMapper {
     maps: Vec<MemoryMap>,
 }

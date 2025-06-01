@@ -10,6 +10,9 @@ pub mod process;
 pub mod symbols;
 
 /// Profile library to track, lookup and cache stacktraces
+///
+/// Main entry point for the profiler that manages symbol resolution and caching
+/// for efficient stack trace processing and visualization.
 pub struct Profiler {
     symbols: SymbolFinder,
     cache: PointerStackFramesCache,

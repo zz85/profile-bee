@@ -1,19 +1,24 @@
  # profile-bee 🐝🦀🔥
 
-Profile Bee is an eBPF based CPU profiler written in Rust for performance and efficiency.
+Profile Bee is an eBPF-based CPU profiler written in Rust that provides efficient and lightweight profiling capabilities even though several features are experimental.
 
-Aya is used for building the BPF programs that is attached to perf events for sampling.
-The beauty of this tool is that it runs from a single binary without the need to install
+Leaveraging aya-tools for eBPF inegration, this runs as a single binary without the need for
 additional libraries such as bcctools or libbpf on target hosts.
 
-Stacktraces are retrieved in the user space program and symbols resolution is handled.
+In CPU sampling mode, eBPF is attached to perf events for sampling.
 
-Stacks are counted and sorted and can be output with the follow choices
+Stacktraces are retrieved in the user space program for symbols resolution.
 
+Stacks can be counted in kernel or sent via events in raw form.
+
+
+### Supported output formats
 - A SVG flamegraph (generated with inferno) you can load in your browser
 - [Branden Gregg's](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html) Stack Collapsed [format](https://github.com/BrendanGregg/flamegraph#2-fold-stacks) that can be loaded up using [speedscope visualizer](https://www.speedscope.app/)
-- D3 flamegraph JSON and HTML output
+- D3 flamegraph JSON and static HTML output
 - Your own custom format
+
+### Stack unwinding, Symbolization and Debug info
 
 Note: if symbols for your C/Rust programs doesn't appear correct, you may want to build your software with debug information.
 

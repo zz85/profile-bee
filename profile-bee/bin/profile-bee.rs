@@ -117,7 +117,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     // Setup eBPF profiler
     let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
-    
+
     let mut counts = ebpf_profiler.counts;
     let stack_traces = ebpf_profiler.stack_traces;
 
@@ -130,6 +130,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let (perf_tx, perf_rx) = mpsc::channel();
 
+    // use RingBuffer to send into mpsc channel
     task::spawn(async move {
         let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf).unwrap();
         use tokio::io::unix::AsyncFd;

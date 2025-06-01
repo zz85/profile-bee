@@ -9,12 +9,13 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 use profile_bee_common::StackInfo;
 
+/// Container for an eBPF stuff
+#[derive(Debug)]
 pub struct EbpfProfiler {
     pub bpf: Ebpf,
     pub stack_traces: StackTraceMap<MapData>,
     pub counts: HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
 }
-
 pub struct ProfilerConfig {
     pub skip_idle: bool,
     pub stream_mode: u8,
@@ -27,6 +28,7 @@ pub struct ProfilerConfig {
     pub self_profile: bool,
 }
 
+/// Creates an aya Ebpf object
 pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
     // This will include your eBPF object file as raw bytes at compile-time and load it at
     // runtime. This approach is recommended for most real-world use cases. If you would
@@ -83,9 +85,13 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         // https://elixir.bootlin.com/linux/v4.2/source/include/uapi/linux/perf_event.h#L103
         const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
 
+        // could change this to Hardware if your system supports
+        // `lscpu | grep -i pmu`
+        let perf_type = PerfTypeId::Software;
+
         if config.self_profile {
             program.attach(
-                PerfTypeId::Software,
+                perf_type,
                 PERF_COUNT_SW_CPU_CLOCK,
                 PerfEventScope::CallingProcessAnyCpu,
                 SamplePolicy::Frequency(config.frequency),
@@ -93,7 +99,7 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
             )?;
         } else if let Some(pid) = config.pid {
             program.attach(
-                PerfTypeId::Software,
+                perf_type,
                 PERF_COUNT_SW_CPU_CLOCK,
                 PerfEventScope::OneProcessAnyCpu { pid },
                 SamplePolicy::Frequency(config.frequency),
@@ -101,7 +107,7 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
             )?;
         } else if let Some(cpu) = config.cpu {
             program.attach(
-                PerfTypeId::Software,
+                perf_type,
                 PERF_COUNT_SW_CPU_CLOCK,
                 PerfEventScope::AllProcessesOneCpu { cpu },
                 SamplePolicy::Frequency(config.frequency),
@@ -114,10 +120,9 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
 
             for cpu in cpus {
                 program.attach(
-                    PerfTypeId::Software,
+                    perf_type.clone(),
                     PERF_COUNT_SW_CPU_CLOCK,
                     PerfEventScope::AllProcessesOneCpu { cpu },
-                    // SamplePolicy::Period(1000000),
                     SamplePolicy::Frequency(config.frequency),
                     true,
                 )?;

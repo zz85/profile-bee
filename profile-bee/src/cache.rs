@@ -1,7 +1,10 @@
 use crate::{process::ProcessInfo, symbols::StackFrameInfo};
 use std::collections::HashMap;
 
-/// Process lookup
+/// Process lookup cache
+///
+/// Caches process information to avoid repeated expensive lookups
+/// of process details from the /proc filesystem.
 #[derive(Default)]
 pub struct ProcessCache {
     map: HashMap<usize, ProcessInfo>,
@@ -32,7 +35,10 @@ impl ProcessCache {
     }
 }
 
-/// Address Cache
+/// Address to symbol resolution cache
+///
+/// Maps memory addresses to resolved stack frame information to avoid
+/// expensive symbol resolution for addresses seen multiple times.
 #[derive(Default)]
 pub struct AddrCache {
     map: HashMap<(i32, u64), StackFrameInfo>,
@@ -70,7 +76,10 @@ impl AddrCache {
     }
 }
 
-/// Top level points to formatted stack trace format
+/// Cache for formatted stack traces
+///
+/// Maps kernel and user stack trace IDs to fully resolved stack frame information
+/// to avoid repeated expensive symbol resolution and formatting operations.
 #[derive(Default)]
 pub struct PointerStackFramesCache {
     map: HashMap<(i32, i32), Vec<StackFrameInfo>>,
