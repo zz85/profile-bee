@@ -16,7 +16,13 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: clippy,miri,rustfmt,rust-src
+
+    # Installed *after* nightly so it is the default.
+    - uses: dtolnay/rust-toolchain@stable
     - name: Build
-      run: cargo build --verbose
+      run: cargo +nightly build --verbose
     - name: Run tests
       run: cargo test --verbose
