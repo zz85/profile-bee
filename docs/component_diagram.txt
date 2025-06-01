@@ -1,0 +1,29 @@
++------------------------------------------------------------------+
+|                          Profile Bee                                |
++------------------------------------------------------------------+
+                                |
+    +-------------------------------------------------------------------------+
+    |                            |                                |            |
++-------------------+  +-------------------+  +-------------------+  +-------------------+
+| eBPF Component    |  | Profiler Component|  | Symbol Resolution |  | Output Generation |
++-------------------+  +-------------------+  +-------------------+  +-------------------+
+| - Aya framework   |  | - Stack trace     |  | - Symbol lookup   |  | - SVG generator   |
+| - BPF maps        |  |   collection      |  | - Demangling      |  | - HTML generator  |
+| - Perf event      |  | - Stack           |  | - Source mapping  |  | - JSON formatter  |
+|   attachment      |  |   aggregation     |  | - Cache           |  | - Collapsed stack |
+| - Kprobe handlers |  | - Sampling        |  |   management      |  |   formatter       |
+| - Tracepoint      |  |   frequency       |  | - Debug info      |  | - Custom output   |
+|   handlers        |  |   control         |  |   parsing         |  |   formatters      |
++-------------------+  +-------------------+  +-------------------+  +-------------------+
+                                                                              |
+                                                                    +-------------------+
+                                                                    | Web Server        |
+                                                                    +-------------------+
+                                                                    | - Warp framework  |
+                                                                    | - WebSocket       |
+                                                                    |   streaming       |
+                                                                    | - Static file     |
+                                                                    |   serving         |
+                                                                    | - Real-time       |
+                                                                    |   updates         |
+                                                                    +-------------------+

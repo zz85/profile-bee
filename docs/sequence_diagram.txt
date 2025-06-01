@@ -1,0 +1,29 @@
+User                    eBPF Program             User Space Program        Output Generator
+ |                         |                         |                        |
+ | Start profiling         |                         |                        |
+ |------------------------>|                         |                        |
+ |                         |                         |                        |
+ |                         | Initialize BPF maps     |                        |
+ |                         |------------------------>|                        |
+ |                         |                         |                        |
+ |                         | Attach to perf events   |                        |
+ |                         |------------------------>|                        |
+ |                         |                         |                        |
+ |                         | Sample CPU stacks       |                        |
+ |                         |------------------------>|                        |
+ |                         |                         |                        |
+ |                         | Collect stack traces    |                        |
+ |                         |------------------------>|                        |
+ |                         |                         |                        |
+ |                         |                         | Resolve symbols        |
+ |                         |                         |----------------------->|
+ |                         |                         |                        |
+ |                         |                         | Aggregate stacks       |
+ |                         |                         |----------------------->|
+ |                         |                         |                        |
+ |                         |                         | Generate output        |
+ |                         |                         |----------------------->|
+ |                         |                         |                        |
+ | Profiling complete      |                         |                        |
+ |<--------------------------------------------------------------------|
+ |                         |                         |                        |

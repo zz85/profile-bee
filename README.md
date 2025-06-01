@@ -11,6 +11,8 @@ Stacktraces are retrieved in the user space program for symbols resolution.
 
 Stacks can be counted in kernel or sent via events in raw form.
 
+More documentation in [docs](docs) directory.
+
 
 ### Supported output formats
 - A SVG flamegraph (generated with inferno) you can load in your browser
