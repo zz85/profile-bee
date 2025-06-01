@@ -1,0 +1,19 @@
++----------------+     +----------------+     +----------------+     +----------------+
+| User starts    |     | eBPF program   |     | User space    |     | Output        |
+| profile-bee    +---->+ attaches to    +---->+ processes     +---->+ generation    |
+| with options   |     | perf events    |     | stack traces  |     | (SVG/HTML/etc)|
++----------------+     +----------------+     +----------------+     +----------------+
+                                |                    |
+                                v                    v
+                       +----------------+    +----------------+
+                       | Collect stack  |    | Symbol         |
+                       | samples at     |<---+ resolution     |
+                       | specified freq |    | and demangling |
+                       +----------------+    +----------------+
+                                |
+                                v
+                       +----------------+
+                       | Aggregate      |
+                       | stack counts   |
+                       | in BPF maps    |
+                       +----------------+

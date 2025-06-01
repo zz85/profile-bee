@@ -1,5 +1,9 @@
 #![no_std]
 
+/// Stack trace information shared between eBPF and userspace
+///
+/// Contains the process ID, stack trace IDs for both kernel and user stacks,
+/// process name, and CPU ID for a single stack sample collected by the profiler.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(C)]
 pub struct StackInfo {

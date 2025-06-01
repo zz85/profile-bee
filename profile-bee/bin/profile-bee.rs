@@ -1,24 +1,14 @@
-use anyhow::anyhow;
-use aya::maps::{HashMap, RingBuf, StackTraceMap};
-use aya::programs::{
-    perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
-    KProbe, PerfEvent,
-};
-use aya::programs::{TracePoint, UProbe};
-
-use aya::{include_bytes_aligned, util::online_cpus};
-use aya::{Btf, Ebpf, EbpfLoader};
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
-use log::info;
+use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig};
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::Profiler;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
-use tokio::{signal, task};
+use tokio::task;
 
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use profile_bee::symbols::FrameCount;
 
@@ -96,34 +86,6 @@ struct Opt {
     stream_mode: u8,
 }
 
-fn load_ebpf(opt: &Opt) -> Result<Ebpf, anyhow::Error> {
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
-    #[cfg(debug_assertions)]
-    let data = include_bytes_aligned!("../../target/bpfel-unknown-none/debug/profile-bee");
-    #[cfg(not(debug_assertions))]
-    let data = include_bytes_aligned!("../../target/bpfel-unknown-none/release/profile-bee");
-
-    let skip_idle = if opt.skip_idle { 1u8 } else { 0u8 };
-
-    let bpf = EbpfLoader::new()
-        .set_global("SKIP_IDLE", &skip_idle, true)
-        .set_global("NOTIFY_TYPE", &opt.stream_mode, true)
-        .btf(Btf::from_sys_fs().ok().as_ref())
-        .load(data)
-        .map_err(|e| {
-            println!("{:?}", e);
-            e
-        })?;
-
-    // this might be useful for debugging, but definitely disable bpf logging for performance purposes
-    // aya_log::BpfLogger::init(&mut bpf)?;
-
-    Ok(bpf)
-}
-
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
     let opt = Opt::parse();
@@ -140,85 +102,24 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     println!("starting {:?}", opt);
 
-    let mut bpf = load_ebpf(&opt)?;
+    // Create eBPF profiler configuration from command line options
+    let config = ProfilerConfig {
+        skip_idle: opt.skip_idle,
+        stream_mode: opt.stream_mode,
+        frequency: opt.frequency,
+        kprobe: opt.kprobe.clone(),
+        uprobe: opt.uprobe.clone(),
+        tracepoint: opt.tracepoint.clone(),
+        pid: opt.pid,
+        cpu: opt.cpu,
+        self_profile: opt.self_profile,
+    };
 
-    if let Some(kprobe) = &opt.kprobe {
-        let program: &mut KProbe = bpf.program_mut("kprobe_profile").unwrap().try_into()?;
-        program.load()?;
-        program.attach(kprobe, 0)?;
-    } else if let Some(uprobe) = &opt.uprobe {
-        let program: &mut UProbe = bpf.program_mut("uprobe_profile").unwrap().try_into()?;
-        program.load()?;
-        program.attach(Some(uprobe), 0, "libc", None)?;
-    } else if let Some(tracepoint) = &opt.tracepoint {
-        let program: &mut TracePoint = bpf.program_mut("tracepoint_profile").unwrap().try_into()?;
-        program.load()?;
+    // Setup eBPF profiler
+    let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
 
-        let mut split = tracepoint.split(':');
-        let category = split.next().expect("category");
-        let name = split.next().expect("name");
-
-        program.attach(category, name)?;
-    } else {
-        let program: &mut PerfEvent = bpf.program_mut("profile_cpu").unwrap().try_into()?;
-
-        program.load()?;
-
-        // https://elixir.bootlin.com/linux/v4.2/source/include/uapi/linux/perf_event.h#L103
-        const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
-
-        if opt.self_profile {
-            program.attach(
-                PerfTypeId::Software,
-                PERF_COUNT_SW_CPU_CLOCK,
-                PerfEventScope::CallingProcessAnyCpu,
-                SamplePolicy::Frequency(opt.frequency),
-                true,
-            )?;
-        } else if let Some(pid) = opt.pid {
-            program.attach(
-                PerfTypeId::Software,
-                PERF_COUNT_SW_CPU_CLOCK,
-                PerfEventScope::OneProcessAnyCpu { pid },
-                SamplePolicy::Frequency(opt.frequency),
-                true,
-            )?;
-        } else if let Some(cpu) = opt.cpu {
-            program.attach(
-                PerfTypeId::Software,
-                PERF_COUNT_SW_CPU_CLOCK,
-                PerfEventScope::AllProcessesOneCpu { cpu },
-                SamplePolicy::Frequency(opt.frequency),
-                true,
-            )?;
-        } else {
-            let cpus = online_cpus().map_err(|(_, error)| error)?;
-            let nprocs = cpus.len();
-            eprintln!("CPUs: {}", nprocs);
-
-            for cpu in cpus {
-                program.attach(
-                    PerfTypeId::Software,
-                    PERF_COUNT_SW_CPU_CLOCK,
-                    PerfEventScope::AllProcessesOneCpu { cpu },
-                    // SamplePolicy::Period(1000000),
-                    SamplePolicy::Frequency(opt.frequency),
-                    true,
-                )?;
-            }
-        }
-    }
-
-    const STACK_INFO_SIZE: usize = std::mem::size_of::<StackInfo>();
-
-    let stack_traces = StackTraceMap::try_from(
-        bpf.take_map("stack_traces")
-            .ok_or(anyhow!("stack_traces not found"))?,
-    )?;
-
-    let mut counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(
-        bpf.take_map("counts").ok_or(anyhow!("counts not found"))?,
-    )?;
+    let mut counts = ebpf_profiler.counts;
+    let stack_traces = ebpf_profiler.stack_traces;
 
     let mut profiler = Profiler::new(); // !opt.no_dwarf
 
@@ -229,8 +130,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let (perf_tx, perf_rx) = mpsc::channel();
 
+    // use RingBuffer to send into mpsc channel
     task::spawn(async move {
-        let ring_buf = RingBuf::try_from(bpf.map_mut("RING_BUF_STACKS").unwrap()).unwrap();
+        let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf).unwrap();
         use tokio::io::unix::AsyncFd;
         let mut fd = AsyncFd::new(ring_buf).unwrap();
 
@@ -238,14 +140,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             match guard.try_io(|inner| {
                 let ring_buf = inner.get_mut();
                 while let Some(item) = ring_buf.next() {
-                    // println!("Received: {:?}", item);
-
                     let stack: StackInfo = unsafe { *item.as_ptr().cast() };
-                    // println!(
-                    //     "Stack {:?}, cmd: {}",
-                    //     stack,
-                    //     profile_bee::symbols::str_from_u8_nul_utf8(&stack.cmd).unwrap()
-                    // );
                     let _ = perf_tx.send(stack);
                 }
                 Ok(())
@@ -377,9 +272,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         if let Some(name) = &opt.collapse {
             println!("Writing to file: {}", name.display());
             std::fs::write(name, &out).expect("Unable to write stack collapsed file");
-        } else {
-            // println!("***************************");
-            // println!("{}", out);
         }
 
         if !opt.serve {
@@ -389,15 +281,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     profiler.print_stats();
-
-    // TODO fix this
-    /*
-    if opt.serve {
-        info!("Waiting for Ctrl-C...");
-        signal::ctrl_c().await?;
-        info!("Exiting...");
-    }
-    */
 
     Ok(())
 }

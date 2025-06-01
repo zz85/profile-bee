@@ -44,11 +44,20 @@ pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> core::result::Result<&str, std::
     ::std::str::from_utf8(&utf8_src[0..nul_range_end])
 }
 
+/// Container for stack frame information with count
+///
+/// Used to track how many times a particular stack trace appears
+/// in the profile data for generating accurate flamegraphs.
 pub struct FrameCount {
     pub frames: Vec<StackFrameInfo>,
     pub count: u64,
 }
 
+/// Symbol finder and resolver for stack traces
+///
+/// Handles resolving memory addresses to human-readable symbols and source locations
+/// using kernel symbols, debug information, and binary analysis.
+/// Maintains caches to improve performance for repeated lookups.
 #[derive(Default)]
 pub struct SymbolFinder {
     // kernel symbols
@@ -169,6 +178,10 @@ impl SymbolFinder {
 }
 
 /// Struct to contain information about a userspace/kernel stack frame
+///
+/// Represents a single frame in a stack trace with information about its
+/// memory address, associated binary, symbol name, and source location.
+/// Used for generating human-readable stack traces in flamegraphs.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct StackFrameInfo {
     pub pid: usize,
@@ -279,7 +292,7 @@ impl StackFrameInfo {
             let root_link = format!("/proc/{}/root", id);
             let base = Path::new(&root_link);
             let mut target = match read_link(&base) {
-                 Ok(link) => link,
+                Ok(link) => link,
                 Err(_e) => {
                     // println!("Can't read link {root_link}. Process  {path:?} might have terminated. - {e:?}");
                     // Best attempt, use root
