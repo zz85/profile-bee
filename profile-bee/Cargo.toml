@@ -32,6 +32,7 @@ warp = "0.3"
 bytes = "1"
 tokio-stream = "0.1"
 futures-util = "0.3"
+tracing = "0.1.41"
 
 [[bin]]
 name = "profile-bee"

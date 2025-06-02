@@ -156,3 +156,7 @@ pub fn setup_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<&mut MapData>, anyhow
 
     Ok(ring_buf)
 }
+
+impl EbpfProfiler {
+    // todo: move stuff from profile-bee bin into here
+}
