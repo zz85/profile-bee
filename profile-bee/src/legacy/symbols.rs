@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::{read_link, File},
+    fs::read_link,
     path::{Path, PathBuf},
 };
 
@@ -44,15 +44,6 @@ pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> core::result::Result<&str, std::
     ::std::str::from_utf8(&utf8_src[0..nul_range_end])
 }
 
-/// Container for stack frame information with count
-///
-/// Used to track how many times a particular stack trace appears
-/// in the profile data for generating accurate flamegraphs.
-pub struct FrameCount {
-    pub frames: Vec<StackFrameInfo>,
-    pub count: u64,
-}
-
 /// Symbol finder and resolver for stack traces
 ///
 /// Handles resolving memory addresses to human-readable symbols and source locations
@@ -66,7 +57,6 @@ pub struct SymbolFinder {
     obj_cache: HashMap<(u64, PathBuf), Option<ObjItem>>,
     pub addr_cache: AddrCache,
     pub process_cache: ProcessCache,
-    use_dwarf: bool,
 }
 
 pub struct ObjItem {
@@ -81,12 +71,11 @@ struct Symbol {
 }
 
 impl SymbolFinder {
-    pub fn new(use_dwarf: bool) -> Self {
+    pub fn new() -> Self {
         // load kernel symbols from /proc/kallsyms
         let ksyms = kernel_symbols().unwrap();
         Self {
             ksyms,
-            use_dwarf,
             ..Default::default()
         }
     }
@@ -125,6 +114,7 @@ impl SymbolFinder {
             .frames()
             .iter()
             .map(|frame| {
+                // instruction pointer
                 let address = frame.ip;
 
                 if let Some(info) = self.addr_cache.get(meta.tgid as _, address) {
@@ -325,8 +315,6 @@ impl StackFrameInfo {
                 }
                 Ok(loader) => loader,
             };
-
-            // finder.use_dwarf
 
             let item = ObjItem {
                 ctx: Some(loader),

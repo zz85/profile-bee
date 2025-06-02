@@ -1,4 +1,4 @@
-use crate::{process::ProcessInfo, symbols::StackFrameInfo};
+use crate::legacy::{process::ProcessInfo, symbols::StackFrameInfo};
 use std::collections::HashMap;
 
 /// Process lookup cache

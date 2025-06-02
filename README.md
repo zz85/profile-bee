@@ -13,7 +13,6 @@ Stacks can be counted in kernel or sent via events in raw form.
 
 More documentation in [docs](docs) directory.
 
-
 ### Supported output formats
 - A SVG flamegraph (generated with inferno) you can load in your browser
 - [Branden Gregg's](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html) Stack Collapsed [format](https://github.com/BrendanGregg/flamegraph#2-fold-stacks) that can be loaded up using [speedscope visualizer](https://www.speedscope.app/)
@@ -66,8 +65,8 @@ profile-bee --pid <pid> ...
 ```
 
 ### Features
-- Rust and C++ symbols demangling supported (via gimli)
-- Some source mapping supported (via addr2line)
+- Rust and C++ symbols demangling supported (via gimli/blazesym)
+- Some source mapping supported
 - Simple symbol lookup cache
 - SVG Flamegraph generation (via inferno)
 - BPF based stacktrace aggregation for reducing kernel <-> userspace transfers
@@ -85,15 +84,16 @@ profile-bee --pid <pid> ...
 ### TODOs
 - Optimize CPU usage
 - Check stack correctness (compare with perf, pprof etc)
-- switch over to Perf buffers
 - implement uprobing/USDT
 - pid nesting
 - Off CPU profiling
-- Optimize symbol lookup via binary search
 - Publish to crates.io
-~~- Measure cache hit ratio~~
-- Stacktrace and Hashmap clearing
-- Missing symbols
+- ~~Optimize symbol lookup via binary search~~
+- ~~Measure cache hit ratio~~
+- ~~Missing symbols~~
+- ~~switch over to Perf buffers~~
+- ~~Stacktrace and Hashmap clearing~~
+
 
 ### Alternatives
 - Perf
