@@ -7,6 +7,7 @@ mod cache;
 pub mod ebpf;
 pub mod html;
 pub mod process;
+pub mod spawn;
 pub mod symbols;
 
 /// Profile library to track, lookup and cache stacktraces

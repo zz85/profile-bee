@@ -2,6 +2,7 @@ use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig};
 use profile_bee::html::{collapse_to_json, generate_html_file};
+use profile_bee::spawn::SpawnProcess;
 use profile_bee::Profiler;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
@@ -84,6 +85,10 @@ struct Opt {
     /// 3 - none
     #[arg(long, default_value_t = 2)]
     stream_mode: u8,
+
+    /// Spawn command and profile
+    #[arg(short, long)]
+    cmd: Option<String>,
 }
 
 #[tokio::main]
@@ -100,6 +105,29 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         });
     }
 
+    let mut stopping = None;
+    let mut spawn = None;
+
+    let pid = if let Some(cmd) = &opt.cmd {
+        println!("Running cmd: {cmd}");
+
+        let args: Vec<_> = cmd.split(" ").collect();
+
+        let (pid, mut child, stopper) = SpawnProcess::spawn(&args[0], &args[1..])?;
+
+        // child.monitor();
+        // child.monitor_stderr();
+
+        stopping = Some(stopper);
+        spawn = Some(child);
+
+        Some(pid)
+    } else {
+        opt.pid.clone()
+    };
+
+    println!("Profile pid {pid:?}");
+
     println!("starting {:?}", opt);
 
     // Create eBPF profiler configuration from command line options
@@ -110,7 +138,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         kprobe: opt.kprobe.clone(),
         uprobe: opt.uprobe.clone(),
         tracepoint: opt.tracepoint.clone(),
-        pid: opt.pid,
+        pid,
         cpu: opt.cpu,
         self_profile: opt.self_profile,
     };
@@ -130,6 +158,43 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let (perf_tx, perf_rx) = mpsc::channel();
 
+    enum PerfWork {
+        StackInfo(StackInfo),
+        Stop,
+    }
+
+    let stop_tx = perf_tx.clone();
+    let time_stop_tx = perf_tx.clone();
+    let child_stopper_tx = perf_tx.clone();
+
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(opt.time as _)).await;
+        time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
+    });
+
+    // when profiling work is done
+    let stopper = stopping.clone();
+
+    // 3 ways to stop
+    // - 1. user defined duration
+    // - 2. ctrl-c received
+    // - 3. child process stops
+    tokio::spawn(async move {
+        if let Some(mut child) = spawn {
+            child.work_done().await;
+            child_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
+        }
+    });
+
+    tokio::spawn(async move {
+        println!("Waiting for Ctrl-C...");
+
+        tokio::signal::ctrl_c().await.unwrap_or_default();
+        println!("Received Ctrl-C");
+        drop(stopping);
+        stop_tx.send(PerfWork::Stop).unwrap_or_default();
+    });
+
     // use RingBuffer to send into mpsc channel
     task::spawn(async move {
         let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf).unwrap();
@@ -141,7 +206,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 let ring_buf = inner.get_mut();
                 while let Some(item) = ring_buf.next() {
                     let stack: StackInfo = unsafe { *item.as_ptr().cast() };
-                    let _ = perf_tx.send(stack);
+                    let _ = perf_tx.send(PerfWork::StackInfo(stack));
                 }
                 Ok(())
             }) {
@@ -154,9 +219,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         }
     });
 
+    let started = Instant::now();
     loop {
-        let started = Instant::now();
-
         // Clear counters
         trace_count.clear();
         samples = 0;
@@ -170,6 +234,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
         /* Perf mpsc RX loop */
         while let Ok(stack) = perf_rx.recv() {
+            let PerfWork::StackInfo(stack) = stack else {
+                break;
+            };
             queue_processed += 1;
 
             // user space counting
@@ -178,10 +245,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
             if *trace == 1 {
                 let _combined = profiler.get_stack(&stack, &stack_traces, opt.group_by_cpu);
-            }
-
-            if started.elapsed().as_millis() > opt.time as _ {
-                break;
             }
         }
 
@@ -279,6 +342,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             break;
         }
     }
+
+    drop(stopper);
+    println!("Profiler ran for {:?}", started.elapsed());
 
     profiler.print_stats();
 
