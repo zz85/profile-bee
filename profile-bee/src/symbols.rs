@@ -125,6 +125,7 @@ impl SymbolFinder {
             .frames()
             .iter()
             .map(|frame| {
+                // instruction pointer
                 let address = frame.ip;
 
                 if let Some(info) = self.addr_cache.get(meta.tgid as _, address) {

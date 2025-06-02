@@ -97,6 +97,41 @@ impl Profiler {
             None
         };
 
+        let pid = stack_info.tgid;
+        use blazesym::symbolize::source::Process;
+        use blazesym::symbolize::source::Source;
+        use blazesym::symbolize::Input;
+        use blazesym::symbolize::Symbolizer;
+        use blazesym::Addr;
+        use blazesym::Pid;
+
+        let src = Source::Process(Process::new(Pid::from(pid)));
+        let symbolizer = Symbolizer::new();
+
+        if let Some(user_stack) = &user_stack {
+            let addrs: Vec<Addr> = user_stack
+                .frames()
+                .iter()
+                .map(|frame| {
+                    let instruction_pointer = frame.ip;
+                    instruction_pointer
+                })
+                .collect();
+
+            let syms = symbolizer.symbolize(&src, Input::AbsAddr(&addrs)).unwrap();
+            println!("Addrs {addrs:?}");
+            println!("Syms {syms:?}");
+
+            for s in syms {
+                let s = s.as_sym().unwrap();
+                // s.addr
+                // s.module
+                // s.name
+                // let info = s.code_info.unwrap();
+
+            }
+        }
+
         let mut combined = symbols.resolve_stack_trace(kernel_stack, user_stack, stack_info);
         let pid_info = StackFrameInfo::process_only(stack_info);
         combined.push(pid_info);

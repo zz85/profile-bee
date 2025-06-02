@@ -33,6 +33,7 @@ bytes = "1"
 tokio-stream = "0.1"
 futures-util = "0.3"
 tracing = "0.1.41"
+blazesym = "0.2.0-rc.3"
 
 [[bin]]
 name = "profile-bee"

@@ -71,3 +71,25 @@ Sampling at 49 Hertz of PID 19008 by user + kernel stack for 5 secs.
 
 
 sudo target/release/profile-bee --time 5000 --svg test.svg --skip-idle --pid 19008
+------------
+objdump -d sample-fp
+objdump -d sample-no-fp
+
+
+
+-------------------
+blazesym
+
+- FPs
+Syms [Sym(Sym { name: "hot", module: Some("profile-bee/sample/sample-fp"), addr: 4195447, offset: 4, size: Some(6), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(4), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }), Sym(Sym { name: "function_c", module: Some("profile-bee/sample/sample-fp"), addr: 4195453, offset: 9, size: Some(12), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(9), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }), Sym(Sym { name: "function_b", module: Some("profile-bee/sample/sample-fp"), addr: 4195465, offset: 9, size: Some(12), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(14), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }), Sym(Sym { name: "function_a", module: Some("profile-bee/sample/sample-fp"), addr: 4195477, offset: 9, size: Some(12), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(19), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }), Sym(Sym { name: "main", module: Some("profile-bee/sample/sample-fp"), addr: 4195489, offset: 9, size: Some(16), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(23), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }), Sym(Sym { name: "__libc_start_main", module: Some("/usr/lib64/libc-2.26.so"), addr: 135248, offset: 234, size: Some(440), code_info: None, inlined: [], _non_exhaustive: () }), Unknown(Unmapped)]
+
+- No FPs
+
+Syms [Sym(Sym { name: "hot", module: Some("profile-bee/sample/sample-no-fp"), addr: 4195447, offset: 0, size: Some(2), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(4), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }), Unknown(Unmapped)]
+Syms [Sym(Sym { name: "hot", module: Some("profile-bee/sample/sample-no-fp"), addr: 4195447, offset: 0, size: Some(2), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(4), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }), Unknown(Unmapped)]
+Processed 3 queue events
+Processing stacks...
+Syms [Sym(Sym { name: "hot", module: Some("profile-bee/sample/sample-no-fp"), addr: 4195447, offset: 0, size: Some(2), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(4), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }), Unknown(Unmapped)]
+
+
+-----------
