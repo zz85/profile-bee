@@ -1,0 +1,73 @@
+gcc sample_callstack.c -O3 -g -fomit-frame-pointer -o sample-no-fp
+gcc sample_callstack.c -O3 -g -fno-omit-frame-pointer -o sample-fp 
+gcc sample_callstack.c -g -fomit-frame-pointer -o sample-no-fp
+gcc sample_callstack.c  -g -fno-omit-frame-pointer -o sample-fp 
+
+
+/usr/share/bcc/tools/profile -- ./sample-no-fp 
+
+perf record -- ./sample-no-fp
+
+perf record --call-graph fp  -- ./sample-fp
+perf report --stdio
+
+perf record --call-graph fp  -- ./sample-no-fp
+perf report --stdio
+
+perf record --call-graph dwarf  -- ./sample-fp
+perf report --stdio
+
+perf record --call-graph dwarf  -- ./sample-no-fp 
+perf report --stdio
+
+
+---------
+O3 no-fp
+sudo /usr/share/bcc/tools/profile -d 5 -p (no-fp)
+Sampling at 49 Hertz of PID 12789 by user + kernel stack for 5 secs.
+
+    main
+    [unknown]
+    -                sample-no-fp (12789)
+        245
+
+--------------------
+O3 fp
+
+% sudo /usr/share/bcc/tools/profile -d 5 -p <fp>
+Sampling at 49 Hertz of PID 13996 by user + kernel stack for 5 secs.
+
+    main
+    __libc_start_main
+    [unknown]
+    -                sample-fp (13996)
+        245
+
+
+--------------
+fp
+
+% sudo /usr/share/bcc/tools/profile -d 5 -p 15324
+Sampling at 49 Hertz of PID 15324 by user + kernel stack for 5 secs.
+
+    hot
+    function_c
+    function_b
+    function_a
+    main
+    __libc_start_main
+    [unknown]
+    -                sample-fp (15324)
+        245
+
+-------------------------
+% sudo /usr/share/bcc/tools/profile -d 5 -p 19008
+Sampling at 49 Hertz of PID 19008 by user + kernel stack for 5 secs.
+
+    hot
+    [unknown]
+    -                sample-no-fp (19008)
+        245
+
+
+sudo target/release/profile-bee --time 5000 --svg test.svg --skip-idle --pid 19008
