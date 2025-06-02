@@ -66,7 +66,6 @@ pub struct SymbolFinder {
     obj_cache: HashMap<(u64, PathBuf), Option<ObjItem>>,
     pub addr_cache: AddrCache,
     pub process_cache: ProcessCache,
-    use_dwarf: bool,
 }
 
 pub struct ObjItem {
@@ -81,12 +80,11 @@ struct Symbol {
 }
 
 impl SymbolFinder {
-    pub fn new(use_dwarf: bool) -> Self {
+    pub fn new() -> Self {
         // load kernel symbols from /proc/kallsyms
         let ksyms = kernel_symbols().unwrap();
         Self {
             ksyms,
-            use_dwarf,
             ..Default::default()
         }
     }
@@ -326,8 +324,6 @@ impl StackFrameInfo {
                 }
                 Ok(loader) => loader,
             };
-
-            // finder.use_dwarf
 
             let item = ObjItem {
                 ctx: Some(loader),

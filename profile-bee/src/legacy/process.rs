@@ -2,7 +2,7 @@ use std::{collections::HashMap, ffi::OsString, fs, os::unix::fs::MetadataExt, pa
 
 use procfs::process::{MMPermissions, MMapPath, MemoryMap, MemoryMaps, Process, Stat};
 
-use crate::symbols::StackFrameInfo;
+use crate::legacy::symbols::StackFrameInfo;
 
 /// Process information container
 ///

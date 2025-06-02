@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use profile_bee::symbols::FrameCount;
+use profile_bee::legacy::symbols::FrameCount;
 
 /// Message type for the profiler's communication channel
 enum PerfWork {
