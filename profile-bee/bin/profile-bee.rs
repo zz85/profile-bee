@@ -2,6 +2,7 @@ use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig};
 use profile_bee::html::{collapse_to_json, generate_html_file};
+use profile_bee::spawn::SpawnProcess;
 use profile_bee::Profiler;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
@@ -84,6 +85,10 @@ struct Opt {
     /// 3 - none
     #[arg(long, default_value_t = 2)]
     stream_mode: u8,
+
+    /// Spawn command and profile
+    #[arg(short, long)]
+    cmd: Option<String>,
 }
 
 #[tokio::main]
@@ -100,6 +105,39 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         });
     }
 
+    let mut stopping = None;
+
+    let pid = if let Some(cmd) = &opt.cmd {
+        println!("Cmd {cmd}");
+
+        let args: Vec<_> = cmd.split(" ").collect();
+
+        let (pid, mut child, stopper) = SpawnProcess::spawn(&args[0], &args[1..])?;
+
+        // child.monitor();
+        // child.monitor_stderr();
+
+        stopping = Some(stopper.clone());
+
+        std::thread::spawn(move || {
+            let _ = child.close_signal();
+        });
+
+        tokio::spawn(async {
+            println!("Waiting for Ctrl-C...");
+
+            tokio::signal::ctrl_c().await.unwrap_or_default();
+            println!("Received Ctrl-C");
+            drop(stopper);
+        });
+
+        Some(pid)
+    } else {
+        opt.pid.clone()
+    };
+
+    println!("Profile pid {pid:?}");
+
     println!("starting {:?}", opt);
 
     // Create eBPF profiler configuration from command line options
@@ -110,7 +148,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         kprobe: opt.kprobe.clone(),
         uprobe: opt.uprobe.clone(),
         tracepoint: opt.tracepoint.clone(),
-        pid: opt.pid,
+        pid,
         cpu: opt.cpu,
         self_profile: opt.self_profile,
     };
@@ -188,6 +226,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         println!("Processed {} queue events", queue_processed);
 
         println!("Processing stacks...");
+
+        let _ = stopping.take();
 
         let mut stacks = Vec::new();
         let local_counting = opt.stream_mode == EVENT_TRACE_ALWAYS;
