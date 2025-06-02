@@ -5,7 +5,7 @@ use inferno::flamegraph::{self, Options};
 use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig};
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::spawn::{SpawnProcess, StopHandler};
-use profile_bee::Profiler;
+use profile_bee::TraceHandler;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
 
@@ -143,7 +143,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
 
-    let mut profiler = Profiler::new(); // !opt.no_dwarf
+    let mut profiler = TraceHandler::new(); // !opt.no_dwarf
 
     // Set up communication channels
     let (perf_tx, perf_rx) = mpsc::channel();
@@ -284,7 +284,7 @@ fn process_profiling_data(
     counts: &mut aya::maps::HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
     stack_traces: &StackTraceMap<MapData>,
     perf_rx: &mpsc::Receiver<PerfWork>,
-    profiler: &mut Profiler,
+    profiler: &mut TraceHandler,
     stream_mode: u8,
     group_by_cpu: bool,
 ) -> Vec<String> {
@@ -371,7 +371,7 @@ fn process_profiling_data(
 /// Process stack traces counted in user space
 fn process_local_counting(
     trace_count: HashMap<StackInfo, usize>,
-    profiler: &mut Profiler,
+    profiler: &mut TraceHandler,
     stack_traces: &StackTraceMap<MapData>,
 
     group_by_cpu: bool,
@@ -393,7 +393,7 @@ fn process_local_counting(
 fn process_kernel_counting(
     counts: &mut aya::maps::HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
 
-    profiler: &mut Profiler,
+    profiler: &mut TraceHandler,
     stack_traces: &aya::maps::StackTraceMap<MapData>,
     group_by_cpu: bool,
     samples: &mut u64,
