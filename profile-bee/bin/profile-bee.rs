@@ -1,17 +1,26 @@
+use aya::maps::{MapData, StackTraceMap};
+use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig};
 use profile_bee::html::{collapse_to_json, generate_html_file};
-use profile_bee::spawn::SpawnProcess;
+use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::Profiler;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
 
 use profile_bee::symbols::FrameCount;
+
+/// Message type for the profiler's communication channel
+enum PerfWork {
+    StackInfo(StackInfo),
+    Stop,
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -105,30 +114,15 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         });
     }
 
-    let mut stopping = None;
-    let mut spawn = None;
+    println!("Starting {:?}", opt);
 
-    let pid = if let Some(cmd) = &opt.cmd {
-        println!("Running cmd: {cmd}");
+    let (stopper, spawn) = setup_process_to_profile(&opt.cmd)?;
 
-        let args: Vec<_> = cmd.split(" ").collect();
-
-        let (pid, mut child, stopper) = SpawnProcess::spawn(&args[0], &args[1..])?;
-
-        // child.monitor();
-        // child.monitor_stderr();
-
-        stopping = Some(stopper);
-        spawn = Some(child);
-
-        Some(pid)
+    let pid = if let Some(cmd) = &spawn {
+        Some(cmd.pid())
     } else {
         opt.pid.clone()
     };
-
-    println!("Profile pid {pid:?}");
-
-    println!("starting {:?}", opt);
 
     // Create eBPF profiler configuration from command line options
     let config = ProfilerConfig {
@@ -146,196 +140,39 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // Setup eBPF profiler
     let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
 
-    let mut counts = ebpf_profiler.counts;
-    let stack_traces = ebpf_profiler.stack_traces;
+    let counts = &mut ebpf_profiler.counts;
+    let stack_traces = &ebpf_profiler.stack_traces;
 
     let mut profiler = Profiler::new(); // !opt.no_dwarf
 
-    // Local counting
-    let mut trace_count = std::collections::HashMap::<StackInfo, usize>::new();
-    let mut samples;
-    let mut queue_processed = 0;
-
+    // Set up communication channels
     let (perf_tx, perf_rx) = mpsc::channel();
 
-    enum PerfWork {
-        StackInfo(StackInfo),
-        Stop,
-    }
+    // Set up stopping mechanisms
+    setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn);
 
-    let stop_tx = perf_tx.clone();
-    let time_stop_tx = perf_tx.clone();
-    let child_stopper_tx = perf_tx.clone();
-
-    tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_millis(opt.time as _)).await;
-        time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
-    });
-
-    // when profiling work is done
-    let stopper = stopping.clone();
-
-    // 3 ways to stop
-    // - 1. user defined duration
-    // - 2. ctrl-c received
-    // - 3. child process stops
-    tokio::spawn(async move {
-        if let Some(mut child) = spawn {
-            child.work_done().await;
-            child_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
-        }
-    });
-
-    tokio::spawn(async move {
-        println!("Waiting for Ctrl-C...");
-
-        tokio::signal::ctrl_c().await.unwrap_or_default();
-        println!("Received Ctrl-C");
-        drop(stopping);
-        stop_tx.send(PerfWork::Stop).unwrap_or_default();
-    });
-
-    // use RingBuffer to send into mpsc channel
     task::spawn(async move {
-        let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf).unwrap();
-        use tokio::io::unix::AsyncFd;
-        let mut fd = AsyncFd::new(ring_buf).unwrap();
-
-        while let Ok(mut guard) = fd.readable_mut().await {
-            match guard.try_io(|inner| {
-                let ring_buf = inner.get_mut();
-                while let Some(item) = ring_buf.next() {
-                    let stack: StackInfo = unsafe { *item.as_ptr().cast() };
-                    let _ = perf_tx.send(PerfWork::StackInfo(stack));
-                }
-                Ok(())
-            }) {
-                Ok(_) => {
-                    guard.clear_ready();
-                    continue;
-                }
-                Err(_would_block) => continue,
-            }
+        // Set up ring buffer to collect stack traces
+        if let Err(e) = setup_ring_buffer_task(&mut ebpf_profiler.bpf, perf_tx).await {
+            eprintln!("Failed to set up ring buffer: {:?}", e);
         }
     });
 
     let started = Instant::now();
+
     loop {
-        // Clear counters
-        trace_count.clear();
-        samples = 0;
+        // Process collected data
+        let stacks = process_profiling_data(
+            counts,
+            stack_traces,
+            &perf_rx,
+            &mut profiler,
+            opt.stream_mode,
+            opt.group_by_cpu,
+        );
 
-        // clear "counts" hashmap
-        let keys = counts.keys().flatten().collect::<Vec<_>>();
-        for k in keys {
-            let _ = counts.remove(&k);
-            // let _ = counts.insert(k, 0, 0);
-        }
-
-        /* Perf mpsc RX loop */
-        while let Ok(stack) = perf_rx.recv() {
-            let PerfWork::StackInfo(stack) = stack else {
-                break;
-            };
-            queue_processed += 1;
-
-            // user space counting
-            let trace = trace_count.entry(stack).or_insert(0);
-            *trace += 1;
-
-            if *trace == 1 {
-                let _combined = profiler.get_stack(&stack, &stack_traces, opt.group_by_cpu);
-            }
-        }
-
-        println!("Processed {} queue events", queue_processed);
-
-        println!("Processing stacks...");
-
-        let mut stacks = Vec::new();
-        let local_counting = opt.stream_mode == EVENT_TRACE_ALWAYS;
-
-        if local_counting {
-            for (stack, value) in trace_count.iter() {
-                let combined = profiler.get_stack(&stack, &stack_traces, opt.group_by_cpu);
-
-                samples += *value as u64;
-                stacks.push(FrameCount {
-                    frames: combined,
-                    count: *value as u64,
-                });
-            }
-        } else {
-            // kernel counting
-            for (key, value) in counts.iter().flatten() {
-                let stack: StackInfo = unsafe { *key.as_ptr().cast() };
-
-                samples += value;
-
-                let combined = profiler.get_stack(&stack, &stack_traces, opt.group_by_cpu);
-
-                stacks.push(FrameCount {
-                    frames: combined,
-                    count: value,
-                });
-            }
-        }
-
-        // TODO stack processing can be expensive, so consider moving into a separate task
-        // to avoid blocking the collection loop
-
-        println!("Total samples: {}", samples);
-
-        let mut out = stacks
-            .into_iter()
-            .map(|frames| {
-                let key = frames
-                    .frames
-                    .iter()
-                    .map(|s| s.fmt_symbol())
-                    .collect::<Vec<_>>()
-                    .join(";");
-                let count = frames.count;
-                format!("{} {}", &key, count)
-            })
-            .collect::<Vec<_>>();
-        out.sort();
-
-        if let Some(svg) = &opt.svg {
-            let _ = output_svg(
-                svg,
-                &out,
-                format!(
-                    "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
-                    opt.time, opt.frequency
-                ),
-            )
-            .inspect_err(|e| {
-                println!("Failed to write svg file {:?} - {:?}", e, svg);
-            });
-        }
-
-        if opt.html.is_some() || opt.json.is_some() || opt.serve {
-            let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
-
-            if let Some(json_path) = &opt.json {
-                std::fs::write(json_path, &json).expect("Unable to write stack html file");
-            }
-
-            if let Some(html_path) = &opt.html {
-                generate_html_file(html_path, &json);
-            }
-
-            let r = tx.send(json);
-            println!("Sending {:?}", r);
-        }
-
-        let out = out.join("\n");
-
-        if let Some(name) = &opt.collapse {
-            println!("Writing to file: {}", name.display());
-            std::fs::write(name, &out).expect("Unable to write stack collapsed file");
-        }
+        // Generate and save output files
+        output_results(&opt, &stacks, &tx)?;
 
         if !opt.serve {
             // only loop with serve mode
@@ -344,9 +181,284 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     drop(stopper);
+
     println!("Profiler ran for {:?}", started.elapsed());
 
     profiler.print_stats();
+
+    Ok(())
+}
+
+/// Sets up the process to profile if a command is provided
+fn setup_process_to_profile(
+    cmd: &Option<String>,
+) -> anyhow::Result<(Option<StopHandler>, Option<SpawnProcess>)> {
+    if let Some(cmd) = cmd {
+        println!("Running cmd: {cmd}");
+
+        // todo: use shelltools
+        let args: Vec<_> = cmd.split(' ').collect();
+        let (child, stopper) = SpawnProcess::spawn(&args[0], &args[1..])?;
+
+        println!("Profile pid {}..", child.pid());
+
+        Ok((Some(stopper), Some(child)))
+    } else {
+        Ok((None, None))
+    }
+}
+
+/// Sets up the mechanisms that can stop the profiling
+fn setup_stopping_mechanisms(
+    duration: usize,
+    perf_tx: mpsc::Sender<PerfWork>,
+    stopping: Option<StopHandler>,
+    spawn: Option<SpawnProcess>,
+) {
+    // 3 ways to stop
+    // - 1. user defined duration
+    // - 2. ctrl-c received
+    // - 3. child process stops
+
+    // Timer-based stopping
+    let time_stop_tx = perf_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
+        time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
+    });
+
+    // Child process completion stopping
+    if let Some(mut child) = spawn {
+        let child_stopper_tx = perf_tx.clone();
+        tokio::spawn(async move {
+            child.work_done().await;
+            child_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
+        });
+    }
+
+    // Ctrl-C stopping
+    let stop_tx = perf_tx.clone();
+    let stopping = stopping;
+    tokio::spawn(async move {
+        println!("Waiting for Ctrl-C...");
+        tokio::signal::ctrl_c().await.unwrap_or_default();
+        println!("Received Ctrl-C");
+        drop(stopping);
+        stop_tx.send(PerfWork::Stop).unwrap_or_default();
+    });
+}
+
+/// Sets up the ring buffer task to collect stack traces
+async fn setup_ring_buffer_task(
+    ebpf: &mut Ebpf,
+    perf_tx: mpsc::Sender<PerfWork>,
+) -> anyhow::Result<()> {
+    // Setup the ring buffer before spawning the task
+    let ring_buf = setup_ring_buffer(ebpf)?;
+
+    use tokio::io::unix::AsyncFd;
+    let mut fd = AsyncFd::new(ring_buf)?;
+
+    while let Ok(mut guard) = fd.readable_mut().await {
+        match guard.try_io(|inner| {
+            let ring_buf = inner.get_mut();
+            while let Some(item) = ring_buf.next() {
+                let stack: StackInfo = unsafe { *item.as_ptr().cast() };
+                let _ = perf_tx.send(PerfWork::StackInfo(stack));
+            }
+            Ok(())
+        }) {
+            Ok(_) => {
+                guard.clear_ready();
+                continue;
+            }
+            Err(_would_block) => continue,
+        }
+    }
+
+    Ok(())
+}
+
+// Processes the profiling data collected from eBPF
+fn process_profiling_data(
+    counts: &mut aya::maps::HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
+    stack_traces: &StackTraceMap<MapData>,
+    perf_rx: &mpsc::Receiver<PerfWork>,
+    profiler: &mut Profiler,
+    stream_mode: u8,
+    group_by_cpu: bool,
+) -> Vec<String> {
+    // Local counting
+    let mut trace_count = HashMap::<StackInfo, usize>::new();
+    let mut queue_processed = 0;
+    let mut samples = 0;
+
+    // Clear counters
+    trace_count.clear();
+
+    // Clear "counts" hashmap
+    let keys = counts.keys().flatten().collect::<Vec<_>>();
+    for k in keys {
+        let _ = counts.remove(&k);
+    }
+
+    /* Perf mpsc RX loop */
+    while let Ok(work) = perf_rx.recv() {
+        match work {
+            PerfWork::StackInfo(stack) => {
+                queue_processed += 1;
+
+                // User space counting
+                let trace = trace_count.entry(stack).or_insert(0);
+                *trace += 1;
+
+                if *trace == 1 {
+                    let _combined = profiler.get_stack(&stack, &stack_traces, group_by_cpu);
+                }
+            }
+            PerfWork::Stop => break,
+        }
+    }
+
+    println!("Processed {} queue events", queue_processed);
+    println!("Processing stacks...");
+
+    let mut stacks = Vec::new();
+    let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
+
+    if local_counting {
+        process_local_counting(
+            trace_count,
+            profiler,
+            stack_traces,
+            group_by_cpu,
+            &mut samples,
+            &mut stacks,
+        );
+    } else {
+        process_kernel_counting(
+            counts,
+            profiler,
+            stack_traces,
+            group_by_cpu,
+            &mut samples,
+            &mut stacks,
+        );
+    }
+
+    // TODO stack processing can be expensive, so consider moving into a separate task
+    // to avoid blocking the collection loop
+    println!("Total samples: {}", samples);
+
+    let mut out = stacks
+        .into_iter()
+        .map(|frames| {
+            let key = frames
+                .frames
+                .iter()
+                .map(|s| s.fmt_symbol())
+                .collect::<Vec<_>>()
+                .join(";");
+            let count = frames.count;
+            format!("{} {}", &key, count)
+        })
+        .collect::<Vec<_>>();
+    out.sort();
+
+    out
+}
+
+/// Process stack traces counted in user space
+fn process_local_counting(
+    trace_count: HashMap<StackInfo, usize>,
+    profiler: &mut Profiler,
+    stack_traces: &StackTraceMap<MapData>,
+
+    group_by_cpu: bool,
+    samples: &mut u64,
+    stacks: &mut Vec<FrameCount>,
+) {
+    for (stack, value) in trace_count.iter() {
+        let combined = profiler.get_stack(stack, stack_traces, group_by_cpu);
+
+        *samples += *value as u64;
+        stacks.push(FrameCount {
+            frames: combined,
+            count: *value as u64,
+        });
+    }
+}
+
+/// Process stack traces counted in kernel space
+fn process_kernel_counting(
+    counts: &mut aya::maps::HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
+
+    profiler: &mut Profiler,
+    stack_traces: &aya::maps::StackTraceMap<MapData>,
+    group_by_cpu: bool,
+    samples: &mut u64,
+    stacks: &mut Vec<FrameCount>,
+) {
+    for (key, value) in counts.iter().flatten() {
+        let stack: StackInfo = unsafe { *key.as_ptr().cast() };
+
+        *samples += value;
+
+        let combined = profiler.get_stack(&stack, stack_traces, group_by_cpu);
+
+        stacks.push(FrameCount {
+            frames: combined,
+            count: value,
+        });
+    }
+}
+
+/// Outputs the results in the requested formats
+fn output_results(
+    opt: &Opt,
+    stacks: &[String],
+    tx: &tokio::sync::broadcast::Sender<String>,
+) -> anyhow::Result<()> {
+    // Generate SVG if requested
+    if let Some(svg) = &opt.svg {
+        output_svg(
+            svg,
+            stacks,
+            format!(
+                "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
+                opt.time, opt.frequency
+            ),
+        )
+        .map_err(|e| {
+            println!("Failed to write svg file {:?} - {:?}", e, svg);
+            e
+        })?;
+    }
+
+    // Generate HTML/JSON if requested
+    if opt.html.is_some() || opt.json.is_some() || opt.serve {
+        let json = collapse_to_json(&stacks.iter().map(|v| v.as_str()).collect::<Vec<_>>());
+
+        if let Some(json_path) = &opt.json {
+            std::fs::write(json_path, &json)
+                .map_err(|e| anyhow::anyhow!("Unable to write JSON file: {}", e))?;
+        }
+
+        if let Some(html_path) = &opt.html {
+            generate_html_file(html_path, &json);
+        }
+
+        if let Err(e) = tx.send(json) {
+            println!("Error sending JSON data: {:?}", e);
+        }
+    }
+
+    // Write collapsed stacks if requested
+    if let Some(name) = &opt.collapse {
+        println!("Writing to file: {}", name.display());
+        std::fs::write(name, stacks.join("\n"))
+            .map_err(|e| anyhow::anyhow!("Unable to write stack collapsed file: {}", e))?;
+    }
 
     Ok(())
 }

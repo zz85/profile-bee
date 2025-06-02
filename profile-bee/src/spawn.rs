@@ -27,13 +27,14 @@ impl Drop for StopHandler {
 }
 
 pub struct SpawnProcess {
+    pid: u32,
     child: Child,
     running: Arc<AtomicBool>,
     stopper_rx: Receiver<Nothing>,
 }
 
 impl SpawnProcess {
-    pub fn spawn(program: &str, args: &[&str]) -> Result<(u32, Self, StopHandler), Error> {
+    pub fn spawn(program: &str, args: &[&str]) -> Result<(Self, StopHandler), Error> {
         let running = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel::<Nothing>(1);
 
@@ -48,14 +49,18 @@ impl SpawnProcess {
         let stop = StopHandler { tx };
 
         Ok((
-            pid,
             Self {
+                pid,
                 child,
                 running,
                 stopper_rx: rx,
             },
             stop,
         ))
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
     fn running(&self) -> bool {
