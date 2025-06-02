@@ -30,6 +30,9 @@ and `-fno-omit-frame-pointer` for gcc. With framepointers, you could get symbols
 ### Usage
 
 ```
+# Profile a commnd (runs top for 5 seconds), writing flamegraph to test.svg
+profile-bee --svg test.svg --cmd "top -b -n 5 -d 1"
+
 # Profile system wide for 5s, generating a html flamegraph
 profile-bee --time 5000 --html flamegraphs.html
 
@@ -88,7 +91,7 @@ profile-bee --pid <pid> ...
 - Off CPU profiling
 - Optimize symbol lookup via binary search
 - Publish to crates.io
-- Measure cache hit ratio
+~~- Measure cache hit ratio~~
 - Stacktrace and Hashmap clearing
 - Missing symbols
 

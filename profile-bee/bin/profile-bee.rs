@@ -106,9 +106,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     let mut stopping = None;
+    let mut spawn = None;
 
     let pid = if let Some(cmd) = &opt.cmd {
-        println!("Cmd {cmd}");
+        println!("Running cmd: {cmd}");
 
         let args: Vec<_> = cmd.split(" ").collect();
 
@@ -118,11 +119,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         // child.monitor_stderr();
 
         stopping = Some(stopper);
-
-        tokio::spawn(async move {
-            // listen on stopping
-            let _ = child.close_signal().await;
-        });
+        spawn = Some(child);
 
         Some(pid)
     } else {
@@ -168,13 +165,26 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let stop_tx = perf_tx.clone();
     let time_stop_tx = perf_tx.clone();
+    let child_stopper_tx = perf_tx.clone();
 
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(opt.time as _)).await;
         time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
     });
 
+    // when profiling work is done
     let stopper = stopping.clone();
+
+    // 3 ways to stop
+    // - 1. user defined duration
+    // - 2. ctrl-c received
+    // - 3. child process stops
+    tokio::spawn(async move {
+        if let Some(mut child) = spawn {
+            child.work_done().await;
+            child_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
+        }
+    });
 
     tokio::spawn(async move {
         println!("Waiting for Ctrl-C...");

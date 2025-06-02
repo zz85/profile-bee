@@ -74,6 +74,29 @@ impl SpawnProcess {
         r
     }
 
+    pub async fn work_done(&mut self) {
+        tokio::select! {
+            _ = self.child.wait() => {
+                // Listen to when process stops
+                println!("Child process stopped");
+                self.running.store(false, Ordering::SeqCst);
+            },
+            stopper = self.stopper_rx.recv() => {
+                match stopper {
+                    // listen on stop signals from other applications
+                    Some(_) => {
+                        println!("close signal done...");
+                        let _ = self.kill().await;
+                    }
+                    None => {
+                        println!("Disconnected");
+                        let _ = self.kill().await;
+                    }
+                }
+            }
+        }
+    }
+
     /// Spawn new thread to monitor output in real-time
     // pub fn monitor(&mut self) {
     //     if let Some(stdout) = self.child.stdout.take() {
