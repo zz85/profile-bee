@@ -2,7 +2,7 @@
 
 Profile Bee is an eBPF-based CPU profiler written in Rust that provides efficient and lightweight profiling capabilities even though several features are experimental.
 
-Leaveraging aya-tools for eBPF inegration, this runs as a single binary without the need for
+Leveraging aya-tools for eBPF integration, this runs as a single binary without the need for
 additional libraries such as bcctools or libbpf on target hosts.
 
 In CPU sampling mode, eBPF is attached to perf events for sampling.
@@ -30,7 +30,7 @@ and `-fno-omit-frame-pointer` for gcc. With framepointers, you could get symbols
 ### Usage
 
 ```
-# Profile a commnd (runs top for 5 seconds), writing flamegraph to test.svg
+# Profile a command (runs top for 5 seconds), writing flamegraph to test.svg
 profile-bee --svg test.svg --cmd "top -b -n 5 -d 1"
 
 # Profile system wide for 5s, generating a html flamegraph
