@@ -117,18 +117,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         // child.monitor();
         // child.monitor_stderr();
 
-        stopping = Some(stopper.clone());
+        stopping = Some(stopper);
 
-        std::thread::spawn(move || {
-            let _ = child.close_signal();
-        });
-
-        tokio::spawn(async {
-            println!("Waiting for Ctrl-C...");
-
-            tokio::signal::ctrl_c().await.unwrap_or_default();
-            println!("Received Ctrl-C");
-            drop(stopper);
+        tokio::spawn(async move {
+            // listen on stopping
+            let _ = child.close_signal().await;
         });
 
         Some(pid)
@@ -168,6 +161,30 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let (perf_tx, perf_rx) = mpsc::channel();
 
+    enum PerfWork {
+        StackInfo(StackInfo),
+        Stop,
+    }
+
+    let stop_tx = perf_tx.clone();
+    let time_stop_tx = perf_tx.clone();
+
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(opt.time as _)).await;
+        time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
+    });
+
+    let stopper = stopping.clone();
+
+    tokio::spawn(async move {
+        println!("Waiting for Ctrl-C...");
+
+        tokio::signal::ctrl_c().await.unwrap_or_default();
+        println!("Received Ctrl-C");
+        drop(stopping);
+        stop_tx.send(PerfWork::Stop).unwrap_or_default();
+    });
+
     // use RingBuffer to send into mpsc channel
     task::spawn(async move {
         let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf).unwrap();
@@ -179,7 +196,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 let ring_buf = inner.get_mut();
                 while let Some(item) = ring_buf.next() {
                     let stack: StackInfo = unsafe { *item.as_ptr().cast() };
-                    let _ = perf_tx.send(stack);
+                    let _ = perf_tx.send(PerfWork::StackInfo(stack));
                 }
                 Ok(())
             }) {
@@ -192,9 +209,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         }
     });
 
+    let started = Instant::now();
     loop {
-        let started = Instant::now();
-
         // Clear counters
         trace_count.clear();
         samples = 0;
@@ -208,6 +224,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
         /* Perf mpsc RX loop */
         while let Ok(stack) = perf_rx.recv() {
+            let PerfWork::StackInfo(stack) = stack else {
+                break;
+            };
             queue_processed += 1;
 
             // user space counting
@@ -217,17 +236,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             if *trace == 1 {
                 let _combined = profiler.get_stack(&stack, &stack_traces, opt.group_by_cpu);
             }
-
-            if started.elapsed().as_millis() > opt.time as _ {
-                break;
-            }
         }
 
         println!("Processed {} queue events", queue_processed);
 
         println!("Processing stacks...");
-
-        let _ = stopping.take();
 
         let mut stacks = Vec::new();
         let local_counting = opt.stream_mode == EVENT_TRACE_ALWAYS;
@@ -319,6 +332,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             break;
         }
     }
+
+    drop(stopper);
+    println!("Profiler ran for {:?}", started.elapsed());
 
     profiler.print_stats();
 

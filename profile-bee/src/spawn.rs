@@ -1,7 +1,8 @@
 use std::io::{self, BufRead, Error, Read};
-use std::process::{Child, Command, Stdio};
+// use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::process::{Child, Command};
 
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -38,11 +39,11 @@ impl SpawnProcess {
 
         let child = Command::new(program)
             .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // .stdout(Stdio::piped())
+            // .stderr(Stdio::piped())
             .spawn()?;
 
-        let pid = child.id();
+        let pid = child.id().expect("pid");
 
         let stop = StopHandler { tx };
 
@@ -61,78 +62,67 @@ impl SpawnProcess {
         self.running.load(Ordering::SeqCst)
     }
 
-    fn kill(&mut self) -> Result<(), Error> {
+    async fn kill(&mut self) -> Result<(), Error> {
         if !self.running() {
             println!("already stopped");
             return Ok(());
         }
         self.running.store(false, Ordering::SeqCst);
         println!("killing...");
-        let r = self.child.kill();
+        let r = self.child.kill().await;
         println!("done...");
         r
     }
 
     /// Spawn new thread to monitor output in real-time
-    pub fn monitor(&mut self) {
-        if let Some(stdout) = self.child.stdout.take() {
-            std::thread::spawn(move || {
-                let mut reader = io::BufReader::new(stdout);
-                let mut buffer = String::new();
-                while let Ok(n) = reader.read_line(&mut buffer) {
-                    if n == 0 {
-                        break;
-                    }
-                    print!("{}", buffer);
-                    buffer.clear();
-                }
-            });
-        }
-    }
+    // pub fn monitor(&mut self) {
+    //     if let Some(stdout) = self.child.stdout.take() {
+    //         std::thread::spawn(move || {
+    //             let mut reader = io::BufReader::new(stdout);
+    //             let mut buffer = String::new();
+    //             while let Ok(n) = reader.read_line(&mut buffer) {
+    //                 if n == 0 {
+    //                     break;
+    //                 }
+    //                 print!("{}", buffer);
+    //                 buffer.clear();
+    //             }
+    //         });
+    //     }
+    // }
 
-    pub fn monitor_stderr(&mut self) {
-        if let Some(stderr) = self.child.stderr.take() {
-            std::thread::spawn(move || {
-                let mut reader = io::BufReader::new(stderr);
-                let mut buffer = String::new();
-                while let Ok(n) = reader.read_line(&mut buffer) {
-                    if n == 0 {
-                        break;
-                    }
-                    eprint!("{}", buffer);
-                    buffer.clear();
-                }
-            });
-        }
-    }
+    // pub fn monitor_stderr(&mut self) {
+    //     if let Some(stderr) = self.child.stderr.take() {
+    //         std::thread::spawn(move || {
+    //             let mut reader = io::BufReader::new(stderr);
+    //             let mut buffer = String::new();
+    //             while let Ok(n) = reader.read_line(&mut buffer) {
+    //                 if n == 0 {
+    //                     break;
+    //                 }
+    //                 eprint!("{}", buffer);
+    //                 buffer.clear();
+    //             }
+    //         });
+    //     }
+    // }
 
-    pub fn close_signal(&mut self) -> Result<(), Error> {
-        loop {
-            match self.stopper_rx.try_recv() {
-                Ok(_) => {
-                    println!("close signal done...");
-                    return self.kill();
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    if !self.running() {
-                        println!("No running");
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    println!("Disconnected");
-                    return self.kill();
-                }
+    pub async fn close_signal(&mut self) -> Result<(), Error> {
+        match self.stopper_rx.recv().await {
+            Some(_) => {
+                println!("close signal done...");
+                return self.kill().await;
+            }
+            None => {
+                println!("Disconnected");
+                return self.kill().await;
             }
         }
-
-        Ok(())
     }
 
     // Wait for the command to complete
-    pub fn wait(&mut self) -> Result<(), Error> {
-        let _status = self.child.wait()?;
+    pub async fn wait(&mut self) -> Result<(), Error> {
+        let _status = self.child.wait().await?;
         self.running.store(false, Ordering::SeqCst);
         Ok(())
     }
