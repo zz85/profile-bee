@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use profile_bee::legacy::symbols::FrameCount;
+use profile_bee::types::FrameCount;
 
 /// Message type for the profiler's communication channel
 enum PerfWork {
@@ -313,7 +313,8 @@ fn process_profiling_data(
                 *trace += 1;
 
                 if *trace == 1 {
-                    let _combined = profiler.get_stack(&stack, &stack_traces, group_by_cpu);
+                    let _combined =
+                        profiler.get_stacked_frames(&stack, &stack_traces, group_by_cpu);
                 }
             }
             PerfWork::Stop => break,
@@ -379,7 +380,7 @@ fn process_local_counting(
     stacks: &mut Vec<FrameCount>,
 ) {
     for (stack, value) in trace_count.iter() {
-        let combined = profiler.get_stack(stack, stack_traces, group_by_cpu);
+        let combined = profiler.get_stacked_frames(stack, stack_traces, group_by_cpu);
 
         *samples += *value as u64;
         stacks.push(FrameCount {
@@ -404,7 +405,7 @@ fn process_kernel_counting(
 
         *samples += value;
 
-        let combined = profiler.get_stack(&stack, stack_traces, group_by_cpu);
+        let combined = profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu);
 
         stacks.push(FrameCount {
             frames: combined,

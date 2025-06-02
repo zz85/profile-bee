@@ -6,7 +6,8 @@ pub mod ebpf;
 pub mod html;
 pub mod spawn;
 
-pub mod legacy;
+mod legacy;
+pub mod types;
 
 mod trace_handler;
 pub use trace_handler::*;

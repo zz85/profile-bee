@@ -1,7 +1,4 @@
-use crate::{
-    cache::PointerStackFramesCache, legacy::symbols::StackInfoExt, legacy::symbols::SymbolFinder,
-    StackFrameInfo, StackInfo,
-};
+use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
 use aya::maps::MapData;
 use aya::maps::StackTraceMap;
 use blazesym::symbolize::source::Kernel;
@@ -12,6 +9,7 @@ use blazesym::symbolize::Symbolized;
 use blazesym::symbolize::Symbolizer;
 use blazesym::Addr;
 use blazesym::Pid;
+use profile_bee_common::StackInfo;
 
 pub struct SymbolFormatter;
 
@@ -111,22 +109,21 @@ impl TraceHandler {
         Ok(syms)
     }
 
-    pub fn get_stack(
+    pub fn get_stacked_frames(
         &mut self,
         stack_info: &StackInfo,
         stack_traces: &StackTraceMap<MapData>,
         group_by_cpu: bool,
     ) -> Vec<StackFrameInfo> {
-        let ktrace_id = stack_info.kernel_stack_id;
-        let utrace_id = stack_info.user_stack_id;
-
-        if let Some(stacks) = self.cache.get(ktrace_id, utrace_id) {
-            return stacks;
-        }
+        // let ktrace_id = stack_info.kernel_stack_id;
+        // let utrace_id = stack_info.user_stack_id;
+        // if let Some(stacks) = self.cache.get(ktrace_id, utrace_id) {
+        //     return stacks;
+        // }
 
         let stacks = self.format_stack_trace(stack_info, stack_traces, group_by_cpu);
 
-        self.cache.insert(ktrace_id, utrace_id, stacks.clone());
+        // self.cache.insert(ktrace_id, utrace_id, stacks.clone());
 
         stacks
     }

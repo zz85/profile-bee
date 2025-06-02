@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::{read_link, File},
+    fs::read_link,
     path::{Path, PathBuf},
 };
 
@@ -42,15 +42,6 @@ pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> core::result::Result<&str, std::
         .position(|&c| c == b'\0')
         .unwrap_or(utf8_src.len()); // default to length if no `\0` present
     ::std::str::from_utf8(&utf8_src[0..nul_range_end])
-}
-
-/// Container for stack frame information with count
-///
-/// Used to track how many times a particular stack trace appears
-/// in the profile data for generating accurate flamegraphs.
-pub struct FrameCount {
-    pub frames: Vec<StackFrameInfo>,
-    pub count: u64,
 }
 
 /// Symbol finder and resolver for stack traces
