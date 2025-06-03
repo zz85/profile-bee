@@ -99,7 +99,7 @@ impl TraceHandler {
             .symbolizer
             .symbolize(&src, Input::AbsAddr(addrs))
             .map_err(|e| {
-                tracing::error!("Failed to symbolize {:?}", e);
+                tracing::trace!("Failed to symbolize {:?}", e);
                 "failed to run symbolize"
             })?
             .into_iter()
@@ -193,6 +193,10 @@ impl TraceHandler {
         } else {
             None
         };
+
+        println!("User stack: {}", utrace_id);
+        println!("Addrs: {:?}", user_stack);
+        println!("IP: {}", stack_info.pt_regs.ip);
 
         let pid = stack_info.tgid;
         let addrs = user_stack.unwrap_or_default();

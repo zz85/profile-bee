@@ -281,7 +281,7 @@ async fn setup_ring_buffer_task(
 
 // Processes the profiling data collected from eBPF
 fn process_profiling_data(
-    counts: &mut aya::maps::HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
+    counts: &mut aya::maps::HashMap<MapData, [u8; StackInfo::STRUCT_SIZE], u64>,
     stack_traces: &StackTraceMap<MapData>,
     perf_rx: &mpsc::Receiver<PerfWork>,
     profiler: &mut TraceHandler,
@@ -392,7 +392,7 @@ fn process_local_counting(
 
 /// Process stack traces counted in kernel space
 fn process_kernel_counting(
-    counts: &mut aya::maps::HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
+    counts: &mut aya::maps::HashMap<MapData, [u8; StackInfo::STRUCT_SIZE], u64>,
 
     profiler: &mut TraceHandler,
     stack_traces: &aya::maps::StackTraceMap<MapData>,

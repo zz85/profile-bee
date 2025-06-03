@@ -51,8 +51,8 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
             e
         })?;
 
-    // this might be useful for debugging, but definitely disable bpf logging for performance purposes
-    // aya_log::BpfLogger::init(&mut bpf)?;
+    // // this might be useful for debugging, but definitely disable bpf logging for performance purposes
+    // aya_log::EbpfLogger::init(&mut bpf)?;
 
     Ok(bpf)
 }
@@ -130,14 +130,12 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         }
     }
 
-    const STACK_INFO_SIZE: usize = std::mem::size_of::<StackInfo>();
-
     let stack_traces = StackTraceMap::try_from(
         bpf.take_map("stack_traces")
             .ok_or(anyhow!("stack_traces not found"))?,
     )?;
 
-    let counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(
+    let counts = HashMap::<_, [u8; StackInfo::STRUCT_SIZE], u64>::try_from(
         bpf.take_map("counts").ok_or(anyhow!("counts not found"))?,
     )?;
 

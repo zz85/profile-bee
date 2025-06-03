@@ -4,15 +4,18 @@
 /// different ebpf applications.
 ///
 use aya_ebpf::{
-    bindings::BPF_F_USER_STACK,
+    bindings::{BPF_FIB_LKUP_RET_NO_NEIGH, BPF_F_USER_STACK},
     helpers::bpf_get_smp_processor_id,
     macros::map,
-    maps::{HashMap, Queue, StackTrace, PerfEventArray, RingBuf},
+    maps::{HashMap, PerfEventArray, Queue, RingBuf, StackTrace},
     EbpfContext,
 };
 
+// mod pt_regs;
+// pub use pt_regs::*;
+
 // use aya_log_ebpf::info;
-use profile_bee_common::{StackInfo, EVENT_TRACE_NEW, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{pt_regs, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW};
 
 pub const STACK_ENTRIES: u32 = 16392;
 pub const STACK_SIZE: u32 = 2048;
@@ -60,12 +63,42 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     let user_stack_id = STACK_TRACES.get_stackid(&ctx, BPF_F_USER_STACK.into()).map_or(-1, |stack_id| stack_id as i32);
     let kernel_stack_id = STACK_TRACES.get_stackid(&ctx, 0).map_or(-1, |stack_id| stack_id as i32);
 
+
+    let regs: *const pt_regs = unsafe { ctx.as_ptr() as _ };
+    let regs = *regs;
+
+
+    // let regs = pt_regs {
+    //     r15: 0,
+    //     r14: 0,
+    //     r13: 0,
+    //     r12: 0,
+    //     bp: 0,
+    //     bx: 0,
+    //     r11: 0,
+    //     r10: 0,
+    //     r9: 0,
+    //     r8: 0,
+    //     ax: 0,
+    //     cx: 0,
+    //     dx: 0,
+    //     si: 0,
+    //     di: 0,
+    //     orig_ax: 0,
+    //     ip: 0,
+    //     cs: 0,
+    //     flags: 0,
+    //     sp: 0,
+    //     ss: 0,
+    // };
+
     let stack_info = StackInfo {
         tgid,
         user_stack_id,
         kernel_stack_id,
         cmd,
         cpu,
+        pt_regs: regs,
     };
 
     let notify_code = notify_type();
