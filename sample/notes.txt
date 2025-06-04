@@ -103,3 +103,23 @@ User stack: 77
 Addrs: Some([4195451, 4195462, 4195474, 4195486, 4195498, 140102769934650, 684025482208100693])
 IP: 4195451
 
+
+
+--------------
+No-FP
+
+User stack: 369
+Addrs: Some([4195447, 693032681462841685])
+IP (instruction pointer): 4195447
+BP (base pointer): 4195488
+SP (stack pointer): 140725936131928
+
+
+FP
+IP (instruction pointer): 4195451
+BP (base pointer): 140720375336496
+SP (stack pointer): 140720375336496
+
+140720375336496 - 140720375336496
+BP > SP
+

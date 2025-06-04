@@ -1,11 +1,13 @@
 #![no_std]
 
+use core::mem::offset_of;
+
 /// Shared reusable profiling ebpf components that can be included in
 /// different ebpf applications.
 ///
 use aya_ebpf::{
     bindings::{BPF_FIB_LKUP_RET_NO_NEIGH, BPF_F_USER_STACK},
-    helpers::bpf_get_smp_processor_id,
+    helpers::{bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_kernel},
     macros::map,
     maps::{HashMap, PerfEventArray, Queue, RingBuf, StackTrace},
     EbpfContext,
@@ -60,37 +62,45 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     let cmd = ctx.command().unwrap_or_default();
     let tgid = ctx.tgid(); // thread group id
     let cpu = bpf_get_smp_processor_id();
-    let user_stack_id = STACK_TRACES.get_stackid(&ctx, BPF_F_USER_STACK.into()).map_or(-1, |stack_id| stack_id as i32);
-    let kernel_stack_id = STACK_TRACES.get_stackid(&ctx, 0).map_or(-1, |stack_id| stack_id as i32);
+    let user_stack_id = STACK_TRACES
+        .get_stackid(&ctx, BPF_F_USER_STACK.into())
+        .map_or(-1, |stack_id| stack_id as i32);
+    let kernel_stack_id = STACK_TRACES
+        .get_stackid(&ctx, 0)
+        .map_or(-1, |stack_id| stack_id as i32);
 
+    let ctx_ptr = ctx.as_ptr();
+    let regs  = ctx_ptr as *const pt_regs;
+    let regs = &*regs;
 
-    let regs: *const pt_regs = unsafe { ctx.as_ptr() as _ };
-    let regs = *regs;
+    // instruction pointer
+    let ip = regs.ip;
+    // base pointer (frame pointer)
+    let bp = regs.bp;
 
+    unsafe fn get_frame(bp: u64) -> (u64, u64) {
+        let offset = 8; // x86_64 dependent!
+        let ret_offset: u64 = bp + offset;
 
-    // let regs = pt_regs {
-    //     r15: 0,
-    //     r14: 0,
-    //     r13: 0,
-    //     r12: 0,
-    //     bp: 0,
-    //     bx: 0,
-    //     r11: 0,
-    //     r10: 0,
-    //     r9: 0,
-    //     r8: 0,
-    //     ax: 0,
-    //     cx: 0,
-    //     dx: 0,
-    //     si: 0,
-    //     di: 0,
-    //     orig_ax: 0,
-    //     ip: 0,
-    //     cs: 0,
-    //     flags: 0,
-    //     sp: 0,
-    //     ss: 0,
-    // };
+        // return address is the instruction pointer
+        let Ok(ret_addr) = bpf_probe_read::<u64>(ret_offset as *const u8 as _)
+        else {
+            return (0, 0);
+        };
+
+        // base pointer is the frame pointer!
+        let bp: u64 = bpf_probe_read(bp as *const u8 as _).unwrap_or_default();
+
+        (ret_addr, bp)
+    }
+
+    let mut pointers = [0u64; 4];
+
+    let (ret_addr, bp) = get_frame(bp);
+    let (ret_addr, bp) = get_frame(bp);
+    let (ret_addr, bp) = get_frame(bp);
+    let (ret_addr, bp) = get_frame(bp);
+    let (ret_addr, bp) = get_frame(bp);
 
     let stack_info = StackInfo {
         tgid,
@@ -98,7 +108,9 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         kernel_stack_id,
         cmd,
         cpu,
-        pt_regs: regs,
+        ip: ip, // frame pointer
+        bp: bp,
+        ret_addr
     };
 
     let notify_code = notify_type();
@@ -119,8 +131,28 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     if notify {
         // notify user space of new stack information
         if let Some(mut v) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
-            v.write(stack_info);
+            let moo = v.write(stack_info);
+            // moo.pt_regs.ip = ret;
+            // moo.pt_regs.bp = bp;
+            // moo.pt_regs.ss = new_fp;
             v.submit(0);
         }
     }
 }
+
+// void get_stack_bounds(u64 *stack_start, u64 *stack_end) {
+//     struct task_struct *task;
+//     task = (struct task_struct *)bpf_get_current_task();
+    
+//     // Read stack pointer and stack size from task_struct
+//     bpf_probe_read(stack_start, sizeof(*stack_start), &task->stack);
+//     *stack_end = *stack_start + THREAD_SIZE;  // THREAD_SIZE is typically 16KB on x86_64
+// }
+// or get from /proc/[pid]/maps
+// bool valid_fp(u64 fp, u64 stack_start, u64 stack_end) {
+//     // Check if frame pointer is within stack bounds and properly aligned
+//     return (fp >= stack_start) && 
+//            (fp < stack_end) && 
+//            ((fp & 0x7) == 0);  // 8-byte aligned
+// }
+
