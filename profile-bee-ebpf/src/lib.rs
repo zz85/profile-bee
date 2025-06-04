@@ -78,29 +78,39 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     // base pointer (frame pointer)
     let bp = regs.bp;
 
-    unsafe fn get_frame(bp: u64) -> (u64, u64) {
+    unsafe fn get_frame(fp: &mut u64) -> u64 {
+        let bp = *fp;
         let offset = 8; // x86_64 dependent!
         let ret_offset: u64 = bp + offset;
 
         // return address is the instruction pointer
         let Ok(ret_addr) = bpf_probe_read::<u64>(ret_offset as *const u8 as _)
         else {
-            return (0, 0);
+            return 0;
         };
+
+        // TODO santify check the frameoiunt
 
         // base pointer is the frame pointer!
         let bp: u64 = bpf_probe_read(bp as *const u8 as _).unwrap_or_default();
 
-        (ret_addr, bp)
+        *fp = bp;
+
+        ret_addr
     }
 
-    let mut pointers = [0u64; 4];
+    let mut pointers = [0u64; 8];
 
-    let (ret_addr, bp) = get_frame(bp);
-    let (ret_addr, bp) = get_frame(bp);
-    let (ret_addr, bp) = get_frame(bp);
-    let (ret_addr, bp) = get_frame(bp);
-    let (ret_addr, bp) = get_frame(bp);
+    pointers[0] = ip;
+
+    let mut bp = bp;
+    for i in 1..pointers.len() {
+        let ret_addr = get_frame(&mut bp);
+        if ret_addr == 0 {
+            break;
+        }
+        pointers[i] = ret_addr;
+    }
 
     let stack_info = StackInfo {
         tgid,
@@ -110,7 +120,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         cpu,
         ip: ip, // frame pointer
         bp: bp,
-        ret_addr
+        pointers
     };
 
     let notify_code = notify_type();

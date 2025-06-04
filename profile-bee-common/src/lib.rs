@@ -14,7 +14,7 @@ pub struct StackInfo {
     pub cpu: u32,
     pub bp: u64,
     pub ip: u64,
-    pub ret_addr: u64,
+    pub pointers: [u64; 8],
 }
 
 impl StackInfo {
