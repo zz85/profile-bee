@@ -69,29 +69,9 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         .get_stackid(&ctx, 0)
         .map_or(-1, |stack_id| stack_id as i32);
 
-    let ctx_ptr = ctx.as_ptr();
-    let regs  = ctx_ptr as *const pt_regs;
-    let regs = &*regs;
+    let mut pointers = [0u64; 16];
 
-    // instruction pointer
-    let ip = regs.ip;
-    // base pointer (frame pointer)
-    let bp = regs.bp;
-
-    let mut pointers = [0u64; 8];
-
-    pointers[0] = ip;
-
-    let mut bp = bp;
-    let mut len = 0;
-    for i in 1..pointers.len() {
-        let Some(ret_addr) = get_frame(&mut bp) else {
-            break;
-        };
-
-        pointers[i] = ret_addr;
-        len = i;
-    }
+    let (ip, bp, len) = copy_stack(&ctx, &mut pointers[..]);
 
     let stack_info = StackInfo {
         tgid,
@@ -101,7 +81,8 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         cpu,
         ip: ip, // frame pointer
         bp: bp,
-        pointers
+        pointers, // instruction pointers
+        len,
     };
 
     let notify_code = notify_type();
@@ -131,6 +112,37 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     }
 }
 
+const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
+
+#[inline(always)]
+unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize) {
+    let ctx_ptr = ctx.as_ptr();
+    let regs  = ctx_ptr as *const pt_regs;
+    let regs = &*regs;
+
+    // instruction pointer
+    let ip = regs.ip;
+
+    // base pointer (frame pointer)
+    let bp = regs.bp;
+
+    pointers[0] = ip;
+
+    let mut bp = bp;
+    let mut len = pointers.len();
+    for i in 1..pointers.len() {
+        let Some(ret_addr) = get_frame(&mut bp) else {
+            len = i;
+            break;
+        };
+
+        pointers[i] = ret_addr;
+    }
+
+    (ip, bp, len)
+}
+
+#[inline(always)]
 unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
     let bp = *fp;
     if bp == 0 {
@@ -143,12 +155,15 @@ unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
     // return address is the instruction pointer
     let ret_addr = bpf_probe_read::<u64>(ret_offset as *const u8 as _).ok()?;
     
-    // TODO santify check if this is the framepointer
-
     // base pointer is the frame pointer!
     let bp: u64 = bpf_probe_read(bp as *const u8 as _).unwrap_or_default();
 
     *fp = bp;
+
+    // TODO santify check whether is the framepointer
+    // if ret_addr < __START_KERNEL_MAP {
+    //     return None;
+    // }
 
     Some(ret_addr)
 }

@@ -198,17 +198,16 @@ impl TraceHandler {
         println!("Addrs: {:?}", user_stack);
         println!("IP (instruction pointer): {}", stack_info.ip);
         println!("BP (base pointer aka Frame pointer): {}", stack_info.bp);
-        // println!("Ctx (stack pointer): {}", stack_info.ss);
-        println!("ret_addr (ret_addr pointer): {:?}", stack_info.pointers);
 
         let pid = stack_info.tgid;
 
         let src: Source<'_> = Source::Process(Process::new(Pid::from(pid)));
-        let a = &stack_info.pointers;
-        // VirtOffset u64::from_be AbsAddr
+        let addrs = &stack_info.pointers[..stack_info.len];
 
-        let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(a));
+        println!("instruction pointers: {:?}", stack_info.pointers);
+        println!("addrs: {:?}", addrs);
 
+        let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(addrs));
         println!("What's IP {syms:?}");
 
         let addrs = user_stack.unwrap_or_default();
