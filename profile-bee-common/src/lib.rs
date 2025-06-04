@@ -30,3 +30,7 @@ pub struct FramePointers {
     pub pointers: [u64; 16],
     pub len: usize, // stack len
 }
+
+impl FramePointers {
+    pub const STRUCT_SIZE: usize = size_of::<FramePointers>();
+}

@@ -7,14 +7,16 @@ use aya::programs::{
 use aya::programs::{TracePoint, UProbe};
 use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
-use profile_bee_common::StackInfo;
+use profile_bee_common::{FramePointers, StackInfo};
 
 /// Container for an eBPF stuff
 #[derive(Debug)]
 pub struct EbpfProfiler {
     pub bpf: Ebpf,
     pub stack_traces: StackTraceMap<MapData>,
-    pub counts: HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
+    pub counts: HashMap<MapData, [u8; StackInfo::STRUCT_SIZE], u64>,
+    pub stacked_pointers:
+        HashMap<MapData, [u8; StackInfo::STRUCT_SIZE], [u8; FramePointers::STRUCT_SIZE]>,
 }
 pub struct ProfilerConfig {
     pub skip_idle: bool,
@@ -139,14 +141,17 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         bpf.take_map("counts").ok_or(anyhow!("counts not found"))?,
     )?;
 
-    // let custom_traces = HashMap::<_, [u8; StackInfo::STRUCT_SIZE], u64>::try_from(
-    //     bpf.take_map("custom_traces").ok_or(anyhow!("counts not found"))?,
-    // )?;
+    let stacked_pointers =
+        HashMap::<_, [u8; StackInfo::STRUCT_SIZE], [u8; FramePointers::STRUCT_SIZE]>::try_from(
+            bpf.take_map("stacked_pointers")
+                .ok_or(anyhow!("stacked_pointers not found"))?,
+        )?;
 
     Ok(EbpfProfiler {
         bpf,
         stack_traces,
         counts,
+        stacked_pointers,
     })
 }
 

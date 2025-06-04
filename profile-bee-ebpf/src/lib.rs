@@ -44,7 +44,7 @@ unsafe fn notify_type() -> u8 {
 #[map(name = "counts")]
 pub static mut COUNTS: HashMap<StackInfo, u64> = HashMap::with_max_entries(STACK_ENTRIES, 0);
 
-#[map(name = "custom_traces")]
+#[map(name = "stacked_pointers")]
 pub static mut STACK_ID_TO_TRACES: HashMap<StackInfo, FramePointers> = HashMap::with_max_entries(STACK_SIZE, 0);
 
 #[map]

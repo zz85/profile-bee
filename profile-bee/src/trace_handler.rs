@@ -134,6 +134,7 @@ impl TraceHandler {
         &self,
         stack_info: &StackInfo,
         stack_traces: &StackTraceMap<MapData>,
+        // stacked_pointers: &StackFrameInfo
         group_by_cpu: bool,
     ) -> Vec<StackFrameInfo> {
         let ktrace_id = stack_info.kernel_stack_id;
