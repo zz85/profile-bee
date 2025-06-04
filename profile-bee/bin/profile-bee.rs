@@ -313,6 +313,7 @@ fn process_profiling_data(
                 *trace += 1;
 
                 if *trace == 1 {
+                    // todo pass hashmap or stacked pointers information here
                     let _combined =
                         profiler.get_stacked_frames(&stack, &stack_traces, group_by_cpu);
                 }

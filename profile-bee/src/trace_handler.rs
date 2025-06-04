@@ -202,13 +202,13 @@ impl TraceHandler {
         let pid = stack_info.tgid;
 
         let src: Source<'_> = Source::Process(Process::new(Pid::from(pid)));
-        let addrs = &stack_info.pointers[..stack_info.len];
+        // let addrs = &stack_info.pointers[..stack_info.len];
 
-        println!("instruction pointers: {:?}", stack_info.pointers);
-        println!("addrs: {:?}", addrs);
+        // println!("instruction pointers: {:?}", stack_info.pointers);
+        // println!("addrs: {:?}", addrs);
 
-        let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(addrs));
-        println!("What's IP {syms:?}");
+        // let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(addrs));
+        // println!("What's IP {syms:?}");
 
         let addrs = user_stack.unwrap_or_default();
         let user_syms = self

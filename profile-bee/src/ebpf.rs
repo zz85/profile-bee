@@ -139,6 +139,10 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         bpf.take_map("counts").ok_or(anyhow!("counts not found"))?,
     )?;
 
+    // let custom_traces = HashMap::<_, [u8; StackInfo::STRUCT_SIZE], u64>::try_from(
+    //     bpf.take_map("custom_traces").ok_or(anyhow!("counts not found"))?,
+    // )?;
+
     Ok(EbpfProfiler {
         bpf,
         stack_traces,

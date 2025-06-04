@@ -6,7 +6,7 @@ use core::mem::offset_of;
 /// different ebpf applications.
 ///
 use aya_ebpf::{
-    bindings::{BPF_FIB_LKUP_RET_NO_NEIGH, BPF_F_USER_STACK},
+    bindings::{pt_regs, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_F_USER_STACK},
     helpers::{bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_kernel},
     macros::map,
     maps::{HashMap, PerfEventArray, Queue, RingBuf, StackTrace},
@@ -17,7 +17,7 @@ use aya_ebpf::{
 // pub use pt_regs::*;
 
 // use aya_log_ebpf::info;
-use profile_bee_common::{pt_regs, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW};
+use profile_bee_common::{FramePointers, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW};
 
 pub const STACK_ENTRIES: u32 = 16392;
 pub const STACK_SIZE: u32 = 2048;
@@ -43,6 +43,9 @@ unsafe fn notify_type() -> u8 {
 
 #[map(name = "counts")]
 pub static mut COUNTS: HashMap<StackInfo, u64> = HashMap::with_max_entries(STACK_ENTRIES, 0);
+
+#[map(name = "custom_traces")]
+pub static mut STACK_ID_TO_TRACES: HashMap<StackInfo, FramePointers> = HashMap::with_max_entries(STACK_SIZE, 0);
 
 #[map]
 static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
@@ -70,9 +73,9 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         .map_or(-1, |stack_id| stack_id as i32);
 
     let mut pointers = [0u64; 16];
-
-    let (ip, bp, len) = copy_stack(&ctx, &mut pointers[..]);
-
+    let (ip, bp, len) = copy_stack(&ctx, &mut pointers);
+    let pointer = FramePointers{ pointers, len };
+    
     let stack_info = StackInfo {
         tgid,
         user_stack_id,
@@ -81,9 +84,9 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         cpu,
         ip: ip, // frame pointer
         bp: bp,
-        pointers, // instruction pointers
-        len,
     };
+
+    STACK_ID_TO_TRACES.insert(&stack_info, &pointer, 0);
 
     let notify_code = notify_type();
 
@@ -103,10 +106,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     if notify {
         // notify user space of new stack information
         if let Some(mut v) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
-            let moo = v.write(stack_info);
-            // moo.pt_regs.ip = ret;
-            // moo.pt_regs.bp = bp;
-            // moo.pt_regs.ss = new_fp;
+            let _writable = v.write(stack_info);
             v.submit(0);
         }
     }
@@ -121,10 +121,10 @@ unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64
     let regs = &*regs;
 
     // instruction pointer
-    let ip = regs.ip;
+    let ip = regs.rip;
 
     // base pointer (frame pointer)
-    let bp = regs.bp;
+    let bp = regs.rbp;
 
     pointers[0] = ip;
 
