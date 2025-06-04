@@ -78,38 +78,19 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     // base pointer (frame pointer)
     let bp = regs.bp;
 
-    unsafe fn get_frame(fp: &mut u64) -> u64 {
-        let bp = *fp;
-        let offset = 8; // x86_64 dependent!
-        let ret_offset: u64 = bp + offset;
-
-        // return address is the instruction pointer
-        let Ok(ret_addr) = bpf_probe_read::<u64>(ret_offset as *const u8 as _)
-        else {
-            return 0;
-        };
-
-        // TODO santify check the frameoiunt
-
-        // base pointer is the frame pointer!
-        let bp: u64 = bpf_probe_read(bp as *const u8 as _).unwrap_or_default();
-
-        *fp = bp;
-
-        ret_addr
-    }
-
     let mut pointers = [0u64; 8];
 
     pointers[0] = ip;
 
     let mut bp = bp;
+    let mut len = 0;
     for i in 1..pointers.len() {
-        let ret_addr = get_frame(&mut bp);
-        if ret_addr == 0 {
+        let Some(ret_addr) = get_frame(&mut bp) else {
             break;
-        }
+        };
+
         pointers[i] = ret_addr;
+        len = i;
     }
 
     let stack_info = StackInfo {
@@ -149,6 +130,29 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         }
     }
 }
+
+unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
+    let bp = *fp;
+    if bp == 0 {
+        return None;
+    }
+
+    let offset = 8; // x86_64 dependent!
+    let ret_offset: u64 = bp + offset;
+
+    // return address is the instruction pointer
+    let ret_addr = bpf_probe_read::<u64>(ret_offset as *const u8 as _).ok()?;
+    
+    // TODO santify check if this is the framepointer
+
+    // base pointer is the frame pointer!
+    let bp: u64 = bpf_probe_read(bp as *const u8 as _).unwrap_or_default();
+
+    *fp = bp;
+
+    Some(ret_addr)
+}
+
 
 // void get_stack_bounds(u64 *stack_start, u64 *stack_end) {
 //     struct task_struct *task;
