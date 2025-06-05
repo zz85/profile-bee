@@ -9,7 +9,7 @@ use aya_ebpf::{
     bindings::{pt_regs, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_F_USER_STACK},
     helpers::{bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_kernel},
     macros::map,
-    maps::{HashMap, PerfEventArray, Queue, RingBuf, StackTrace},
+    maps::{HashMap, PerCpuArray, PerfEventArray, Queue, RingBuf, StackTrace},
     EbpfContext,
 };
 
@@ -40,12 +40,15 @@ unsafe fn notify_type() -> u8 {
 }
 
 /* Setup maps */
+#[map]
+static mut STORAGE: PerCpuArray<FramePointers> = PerCpuArray::with_max_entries(1, 0);
 
 #[map(name = "counts")]
-pub static mut COUNTS: HashMap<StackInfo, u64> = HashMap::with_max_entries(STACK_ENTRIES, 0);
+pub static COUNTS: HashMap<StackInfo, u64> = HashMap::with_max_entries(STACK_ENTRIES, 0);
 
 #[map(name = "stacked_pointers")]
-pub static mut STACK_ID_TO_TRACES: HashMap<StackInfo, FramePointers> = HashMap::with_max_entries(STACK_SIZE, 0);
+pub static mut STACK_ID_TO_TRACES: HashMap<StackInfo, FramePointers> =
+    HashMap::with_max_entries(STACK_SIZE, 0);
 
 #[map]
 static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
@@ -74,8 +77,8 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
     let mut pointers = [0u64; 16];
     let (ip, bp, len) = copy_stack(&ctx, &mut pointers);
-    let pointer = FramePointers{ pointers, len };
-    
+    let pointer = FramePointers { pointers, len };
+
     let stack_info = StackInfo {
         tgid,
         user_stack_id,
@@ -117,7 +120,7 @@ const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 #[inline(always)]
 unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize) {
     let ctx_ptr = ctx.as_ptr();
-    let regs  = ctx_ptr as *const pt_regs;
+    let regs = ctx_ptr as *const pt_regs;
     let regs = &*regs;
 
     // instruction pointer
@@ -154,7 +157,7 @@ unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
 
     // return address is the instruction pointer
     let ret_addr = bpf_probe_read::<u64>(ret_offset as *const u8 as _).ok()?;
-    
+
     // base pointer is the frame pointer!
     let bp: u64 = bpf_probe_read(bp as *const u8 as _).unwrap_or_default();
 
@@ -168,11 +171,10 @@ unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
     Some(ret_addr)
 }
 
-
 // void get_stack_bounds(u64 *stack_start, u64 *stack_end) {
 //     struct task_struct *task;
 //     task = (struct task_struct *)bpf_get_current_task();
-    
+
 //     // Read stack pointer and stack size from task_struct
 //     bpf_probe_read(stack_start, sizeof(*stack_start), &task->stack);
 //     *stack_end = *stack_start + THREAD_SIZE;  // THREAD_SIZE is typically 16KB on x86_64
@@ -180,8 +182,7 @@ unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
 // or get from /proc/[pid]/maps
 // bool valid_fp(u64 fp, u64 stack_start, u64 stack_end) {
 //     // Check if frame pointer is within stack bounds and properly aligned
-//     return (fp >= stack_start) && 
-//            (fp < stack_end) && 
+//     return (fp >= stack_start) &&
+//            (fp < stack_end) &&
 //            ((fp & 0x7) == 0);  // 8-byte aligned
 // }
-

@@ -2,11 +2,11 @@ use aya::maps::{MapData, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
-use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig};
+use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig};
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
-use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{FramePointers, StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
 
 use std::collections::HashMap;
@@ -142,6 +142,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
+    let stacked_pointers = &ebpf_profiler.stacked_pointers;
 
     let mut profiler = TraceHandler::new(); // !opt.no_dwarf
 
@@ -169,6 +170,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             &mut profiler,
             opt.stream_mode,
             opt.group_by_cpu,
+            stacked_pointers,
         );
 
         // Generate and save output files
@@ -287,6 +289,7 @@ fn process_profiling_data(
     profiler: &mut TraceHandler,
     stream_mode: u8,
     group_by_cpu: bool,
+    stacked_pointers: &aya::maps::HashMap<MapData, StackInfo, FramePointers>,
 ) -> Vec<String> {
     // Local counting
     let mut trace_count = HashMap::<StackInfo, usize>::new();
@@ -314,8 +317,13 @@ fn process_profiling_data(
 
                 if *trace == 1 {
                     // todo pass hashmap or stacked pointers information here
-                    let _combined =
-                        profiler.get_stacked_frames(&stack, &stack_traces, group_by_cpu);
+
+                    let _combined = profiler.get_exp_stacked_frames(
+                        &stack,
+                        &stack_traces,
+                        group_by_cpu,
+                        stacked_pointers,
+                    );
                 }
             }
             PerfWork::Stop => break,
@@ -375,7 +383,6 @@ fn process_local_counting(
     trace_count: HashMap<StackInfo, usize>,
     profiler: &mut TraceHandler,
     stack_traces: &StackTraceMap<MapData>,
-
     group_by_cpu: bool,
     samples: &mut u64,
     stacks: &mut Vec<FrameCount>,

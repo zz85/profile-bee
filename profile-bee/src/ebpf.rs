@@ -15,8 +15,7 @@ pub struct EbpfProfiler {
     pub bpf: Ebpf,
     pub stack_traces: StackTraceMap<MapData>,
     pub counts: HashMap<MapData, [u8; StackInfo::STRUCT_SIZE], u64>,
-    pub stacked_pointers:
-        HashMap<MapData, [u8; StackInfo::STRUCT_SIZE], [u8; FramePointers::STRUCT_SIZE]>,
+    pub stacked_pointers: HashMap<MapData, StackInfo, FramePointers>,
 }
 pub struct ProfilerConfig {
     pub skip_idle: bool,
@@ -141,11 +140,10 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         bpf.take_map("counts").ok_or(anyhow!("counts not found"))?,
     )?;
 
-    let stacked_pointers =
-        HashMap::<_, [u8; StackInfo::STRUCT_SIZE], [u8; FramePointers::STRUCT_SIZE]>::try_from(
-            bpf.take_map("stacked_pointers")
-                .ok_or(anyhow!("stacked_pointers not found"))?,
-        )?;
+    let stacked_pointers = HashMap::<_, _, _>::try_from(
+        bpf.take_map("stacked_pointers")
+            .ok_or(anyhow!("stacked_pointers not found"))?,
+    )?;
 
     Ok(EbpfProfiler {
         bpf,
