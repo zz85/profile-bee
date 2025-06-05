@@ -1,6 +1,5 @@
 #![no_std]
 
-use aya::Pod;
 use core::mem::size_of;
 
 /// Stack trace information shared between eBPF and userspace
@@ -23,8 +22,6 @@ impl StackInfo {
     pub const STRUCT_SIZE: usize = size_of::<StackInfo>();
 }
 
-unsafe impl Pod for StackInfo {}
-
 pub static EVENT_TRACE_ALWAYS: u8 = 1;
 pub static EVENT_TRACE_NEW: u8 = 2;
 pub static EVENT_TRACE_NONE: u8 = 3;
@@ -32,11 +29,9 @@ pub static EVENT_TRACE_NONE: u8 = 3;
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(C)]
 pub struct FramePointers {
-    pub pointers: [u64; 16],
-    pub len: u64, // Changed from usize to u64 for consistent size across platforms
+    pub pointers: [u64; 1024],
+    pub len: usize, // stack len
 }
-
-unsafe impl Pod for FramePointers {}
 
 impl FramePointers {
     pub const STRUCT_SIZE: usize = size_of::<FramePointers>();

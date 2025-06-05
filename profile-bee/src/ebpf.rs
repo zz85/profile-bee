@@ -9,13 +9,26 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 use profile_bee_common::{FramePointers, StackInfo};
 
+use aya::Pod;
+
+// Create a newtype wrapper around StackInfo
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct StackInfoPod(pub profile_bee_common::StackInfo);
+unsafe impl Pod for StackInfoPod {}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramePointersPod(pub profile_bee_common::FramePointers);
+unsafe impl Pod for FramePointersPod {}
+
 /// Container for an eBPF stuff
 #[derive(Debug)]
 pub struct EbpfProfiler {
     pub bpf: Ebpf,
     pub stack_traces: StackTraceMap<MapData>,
     pub counts: HashMap<MapData, [u8; StackInfo::STRUCT_SIZE], u64>,
-    pub stacked_pointers: HashMap<MapData, StackInfo, FramePointers>,
+    pub stacked_pointers: HashMap<MapData, StackInfoPod, FramePointersPod>,
 }
 pub struct ProfilerConfig {
     pub skip_idle: bool,

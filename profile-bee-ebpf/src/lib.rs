@@ -1,6 +1,5 @@
 #![no_std]
 
-use core::mem::offset_of;
 
 /// Shared reusable profiling ebpf components that can be included in
 /// different ebpf applications.
@@ -12,9 +11,6 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray, PerfEventArray, Queue, RingBuf, StackTrace},
     EbpfContext,
 };
-
-// mod pt_regs;
-// pub use pt_regs::*;
 
 // use aya_log_ebpf::info;
 use profile_bee_common::{FramePointers, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW};
@@ -47,14 +43,14 @@ static mut STORAGE: PerCpuArray<FramePointers> = PerCpuArray::with_max_entries(1
 pub static COUNTS: HashMap<StackInfo, u64> = HashMap::with_max_entries(STACK_ENTRIES, 0);
 
 #[map(name = "stacked_pointers")]
-pub static mut STACK_ID_TO_TRACES: HashMap<StackInfo, FramePointers> =
+pub static STACK_ID_TO_TRACES: HashMap<StackInfo, FramePointers> =
     HashMap::with_max_entries(STACK_SIZE, 0);
 
 #[map]
 static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
 
 #[map(name = "stack_traces")]
-pub static mut STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
+pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
 
 #[inline(always)]
 pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
@@ -75,9 +71,16 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         .get_stackid(&ctx, 0)
         .map_or(-1, |stack_id| stack_id as i32);
 
-    let mut pointers = [0u64; 16];
-    let (ip, bp, len) = copy_stack(&ctx, &mut pointers);
-    let pointer = FramePointers { pointers, len };
+    // Use CPU based storage so it doesn't occupy space on stack
+    let Some(pointer) = STORAGE.get_ptr_mut(0) else {
+        return;   
+    };
+
+    let pointer = &mut *pointer;
+    // let mut pointers = [0u64; 32];
+    let (ip, bp, len) = copy_stack(&ctx, &mut pointer.pointers);
+    pointer.len = len;
+    // let pointer = FramePointers { pointers, len };
 
     let stack_info = StackInfo {
         tgid,
@@ -89,7 +92,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         bp: bp,
     };
 
-    STACK_ID_TO_TRACES.insert(&stack_info, &pointer, 0);
+    let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
 
     let notify_code = notify_type();
 

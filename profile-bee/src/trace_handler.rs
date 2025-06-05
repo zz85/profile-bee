@@ -1,3 +1,4 @@
+use crate::ebpf::{FramePointersPod, StackInfoPod};
 use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
 use aya::maps::MapData;
 use aya::maps::StackTraceMap;
@@ -116,7 +117,7 @@ impl TraceHandler {
         stack_info: &StackInfo,
         stack_traces: &StackTraceMap<MapData>,
         group_by_cpu: bool,
-        stacked_pointers: &aya::maps::HashMap<MapData, StackInfo, FramePointers>,
+        stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     ) -> Vec<StackFrameInfo> {
         let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
 
@@ -125,7 +126,9 @@ impl TraceHandler {
         // println!("IP (instruction pointer): {}", stack_info.ip);
         // println!("BP (base pointer aka Frame pointer): {}", stack_info.bp);
 
-        let pointers = stacked_pointers.get(stack_info, 0).unwrap();
+        let key = StackInfoPod(stack_info.clone());
+
+        let pointers = stacked_pointers.get(&key, 0).unwrap().0;
 
         let pid = stack_info.tgid;
         let src: Source<'_> = Source::Process(Process::new(Pid::from(pid)));
