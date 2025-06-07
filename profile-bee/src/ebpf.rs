@@ -7,14 +7,27 @@ use aya::programs::{
 use aya::programs::{TracePoint, UProbe};
 use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
-use profile_bee_common::StackInfo;
 
-/// Container for an eBPF stuff
+use aya::Pod;
+
+// Create a newtype wrapper around StackInfo
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct StackInfoPod(pub profile_bee_common::StackInfo);
+unsafe impl Pod for StackInfoPod {}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramePointersPod(pub profile_bee_common::FramePointers);
+unsafe impl Pod for FramePointersPod {}
+
+/// Wrapper for eBPF stuff
 #[derive(Debug)]
 pub struct EbpfProfiler {
     pub bpf: Ebpf,
     pub stack_traces: StackTraceMap<MapData>,
-    pub counts: HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
+    pub counts: HashMap<MapData, StackInfoPod, u64>,
+    pub stacked_pointers: HashMap<MapData, StackInfoPod, FramePointersPod>,
 }
 pub struct ProfilerConfig {
     pub skip_idle: bool,
@@ -51,8 +64,8 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
             e
         })?;
 
-    // this might be useful for debugging, but definitely disable bpf logging for performance purposes
-    // aya_log::BpfLogger::init(&mut bpf)?;
+    // // this might be useful for debugging, but definitely disable bpf logging for performance purposes
+    // aya_log::EbpfLogger::init(&mut bpf)?;
 
     Ok(bpf)
 }
@@ -130,21 +143,26 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         }
     }
 
-    const STACK_INFO_SIZE: usize = std::mem::size_of::<StackInfo>();
-
     let stack_traces = StackTraceMap::try_from(
         bpf.take_map("stack_traces")
             .ok_or(anyhow!("stack_traces not found"))?,
     )?;
 
-    let counts = HashMap::<_, [u8; STACK_INFO_SIZE], u64>::try_from(
-        bpf.take_map("counts").ok_or(anyhow!("counts not found"))?,
-    )?;
+    let counts = bpf
+        .take_map("counts")
+        .ok_or(anyhow!("counts not found"))?
+        .try_into()?;
+
+    let stacked_pointers = bpf
+        .take_map("stacked_pointers")
+        .ok_or(anyhow!("stacked_pointers not found"))?
+        .try_into()?;
 
     Ok(EbpfProfiler {
         bpf,
         stack_traces,
         counts,
+        stacked_pointers,
     })
 }
 

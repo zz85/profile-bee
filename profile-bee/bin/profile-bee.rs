@@ -2,14 +2,17 @@ use aya::maps::{MapData, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
-use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig};
+use profile_bee::ebpf::FramePointersPod;
+use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod};
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
+use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -103,7 +106,14 @@ struct Opt {
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
     let opt = Opt::parse();
-    env_logger::init();
+    // Initialize the tracing subscriber with environment variables
+    tracing_subscriber::fmt()
+        // Use EnvFilter to read from RUST_LOG environment variable
+        .with_env_filter(EnvFilter::from_default_env())
+        // Optional: Configure span events
+        .with_span_events(FmtSpan::FULL)
+        // Initialize the subscriber
+        .init();
 
     use tokio::sync::broadcast;
     let (tx, rx) = broadcast::channel(16);
@@ -142,6 +152,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
+    let stacked_pointers = &ebpf_profiler.stacked_pointers;
 
     let mut profiler = TraceHandler::new(); // !opt.no_dwarf
 
@@ -169,6 +180,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             &mut profiler,
             opt.stream_mode,
             opt.group_by_cpu,
+            stacked_pointers,
         );
 
         // Generate and save output files
@@ -281,12 +293,13 @@ async fn setup_ring_buffer_task(
 
 // Processes the profiling data collected from eBPF
 fn process_profiling_data(
-    counts: &mut aya::maps::HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
+    counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
     stack_traces: &StackTraceMap<MapData>,
     perf_rx: &mpsc::Receiver<PerfWork>,
     profiler: &mut TraceHandler,
     stream_mode: u8,
     group_by_cpu: bool,
+    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
 ) -> Vec<String> {
     // Local counting
     let mut trace_count = HashMap::<StackInfo, usize>::new();
@@ -313,8 +326,16 @@ fn process_profiling_data(
                 *trace += 1;
 
                 if *trace == 1 {
-                    let _combined =
-                        profiler.get_stacked_frames(&stack, &stack_traces, group_by_cpu);
+                    // let _combined = profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu);
+
+                    // todo pass hashmap or stacked pointers information here
+
+                    let _combined = profiler.get_exp_stacked_frames(
+                        &stack,
+                        &stack_traces,
+                        group_by_cpu,
+                        stacked_pointers,
+                    );
                 }
             }
             PerfWork::Stop => break,
@@ -374,7 +395,6 @@ fn process_local_counting(
     trace_count: HashMap<StackInfo, usize>,
     profiler: &mut TraceHandler,
     stack_traces: &StackTraceMap<MapData>,
-
     group_by_cpu: bool,
     samples: &mut u64,
     stacks: &mut Vec<FrameCount>,
@@ -392,7 +412,7 @@ fn process_local_counting(
 
 /// Process stack traces counted in kernel space
 fn process_kernel_counting(
-    counts: &mut aya::maps::HashMap<MapData, [u8; std::mem::size_of::<StackInfo>()], u64>,
+    counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
 
     profiler: &mut TraceHandler,
     stack_traces: &aya::maps::StackTraceMap<MapData>,
@@ -401,7 +421,7 @@ fn process_kernel_counting(
     stacks: &mut Vec<FrameCount>,
 ) {
     for (key, value) in counts.iter().flatten() {
-        let stack: StackInfo = unsafe { *key.as_ptr().cast() };
+        let stack: StackInfo = key.0;
 
         *samples += value;
 

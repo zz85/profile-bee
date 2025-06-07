@@ -18,8 +18,6 @@ aya-log = "0.2.1"
 profile-bee-common = { path = "../profile-bee-common", features=["user"] }
 anyhow = "1.0.42"
 clap = { version = "4.0", features = ["derive"] }
-env_logger = "0.11.5"
-log = "0.4"
 tokio = { version = "1.18", features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time", "process"] }
 thiserror = "1.0"
 addr2line = "0.24"
@@ -34,6 +32,8 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 tracing = "0.1.41"
 blazesym = "0.2.0-rc.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 
 [[bin]]
 name = "profile-bee"
