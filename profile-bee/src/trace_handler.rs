@@ -10,7 +10,6 @@ use blazesym::symbolize::Symbolized;
 use blazesym::symbolize::Symbolizer;
 use blazesym::Addr;
 use blazesym::Pid;
-use profile_bee_common::FramePointers;
 use profile_bee_common::StackInfo;
 
 pub struct SymbolFormatter;
@@ -121,24 +120,22 @@ impl TraceHandler {
     ) -> Vec<StackFrameInfo> {
         let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
 
-        // println!("User stack: {}", utrace_id);
-        // println!("Addrs: {:?}", user_stack);
-        // println!("IP (instruction pointer): {}", stack_info.ip);
-        // println!("BP (base pointer aka Frame pointer): {}", stack_info.bp);
-
         let key = StackInfoPod(stack_info.clone());
 
-        let pointers = stacked_pointers.get(&key, 0).unwrap().0;
+        if let Ok(pointers) = stacked_pointers.get(&key, 0) {
+            let pointers = pointers.0;
+            let pid = stack_info.tgid;
+            let src: Source<'_> = Source::Process(Process::new(Pid::from(pid)));
+            let addrs = &pointers.pointers[..pointers.len as usize];
 
-        let pid = stack_info.tgid;
-        let src: Source<'_> = Source::Process(Process::new(Pid::from(pid)));
-        let addrs = &pointers.pointers[..pointers.len as usize];
+            tracing::info!("IP (instruction pointer): {}", stack_info.ip);
+            tracing::info!("BP (base pointer aka Frame pointer): {}", stack_info.bp);
+            tracing::info!("User stack: {:?}", user_stack);
+            tracing::info!("addrs: {:?}", addrs);
 
-        println!("User stack: {:?}", user_stack);
-        println!("addrs: {:?}", addrs);
-
-        let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(addrs));
-        println!("What's IP {syms:?}");
+            let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(addrs));
+            tracing::info!("IP Symbolization {syms:?}");
+        }
 
         let stacks = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);
 

@@ -1,14 +1,13 @@
 #![no_std]
 
-
 /// Shared reusable profiling ebpf components that can be included in
 /// different ebpf applications.
 ///
 use aya_ebpf::{
-    bindings::{pt_regs, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_F_USER_STACK},
-    helpers::{bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_kernel},
+    bindings::{pt_regs, BPF_F_USER_STACK},
+    helpers::{bpf_get_smp_processor_id, bpf_probe_read},
     macros::map,
-    maps::{HashMap, PerCpuArray, PerfEventArray, Queue, RingBuf, StackTrace},
+    maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
     EbpfContext,
 };
 
@@ -77,10 +76,8 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     };
 
     let pointer = &mut *pointer;
-    // let mut pointers = [0u64; 32];
     let (ip, bp, len) = copy_stack(&ctx, &mut pointer.pointers);
     pointer.len = len;
-    // let pointer = FramePointers { pointers, len };
 
     let stack_info = StackInfo {
         tgid,
@@ -111,30 +108,30 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
     if notify {
         // notify user space of new stack information
-        if let Some(mut v) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
-            let _writable = v.write(stack_info);
-            v.submit(0);
+        if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+            let _writable = entry.write(stack_info);
+            entry.submit(0);
         }
     }
 }
 
 const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
+/// puts the userspace stack in the target pointer slice
 #[inline(always)]
 unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize) {
-    let ctx_ptr = ctx.as_ptr();
-    let regs = ctx_ptr as *const pt_regs;
+    // refernce pt_regs
+    let regs =  ctx.as_ptr() as *const pt_regs;
     let regs = &*regs;
 
     // instruction pointer
     let ip = regs.rip;
 
     // base pointer (frame pointer)
-    let bp = regs.rbp;
+    let mut bp = regs.rbp;
 
     pointers[0] = ip;
 
-    let mut bp = bp;
     let mut len = pointers.len();
     for i in 1..pointers.len() {
         let Some(ret_addr) = get_frame(&mut bp) else {
@@ -148,6 +145,7 @@ unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64
     (ip, bp, len)
 }
 
+/// unwind frame pointer
 #[inline(always)]
 unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
     let bp = *fp;
@@ -155,34 +153,40 @@ unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
         return None;
     }
 
-    let offset = 8; // x86_64 dependent!
-    let ret_offset: u64 = bp + offset;
+    const RETURN_OFFSET: u64 = 8; // x86_64 offset to get return addr from the base pointer
+    let return_addr: u64 = bp + RETURN_OFFSET;
 
     // return address is the instruction pointer
-    let ret_addr = bpf_probe_read::<u64>(ret_offset as *const u8 as _).ok()?;
+    let ip = bpf_probe_read::<u64>(return_addr as *const u8 as _).ok()?;
 
-    // base pointer is the frame pointer!
+    // frame pointer points to the base pointer!
     let bp: u64 = bpf_probe_read(bp as *const u8 as _).unwrap_or_default();
 
     *fp = bp;
 
-    // TODO santify check whether is the framepointer
-    // if ret_addr < __START_KERNEL_MAP {
-    //     return None;
-    // }
+    // santity check whether is the framepointer
+    if invalid_userspace_pointer(ip) {
+        return None;
+    }
 
-    Some(ret_addr)
+    Some(ip)
 }
 
+#[inline(always)]
+fn invalid_userspace_pointer(ip: u64) -> bool {
+    ip == 0 || ip >= __START_KERNEL_MAP
+}
+
+// Make this simple now - checking for valid pointers can include
+// checking with stack pointer address or getting valid ranges
+// from from /proc/[pid]/maps
 // void get_stack_bounds(u64 *stack_start, u64 *stack_end) {
 //     struct task_struct *task;
 //     task = (struct task_struct *)bpf_get_current_task();
-
 //     // Read stack pointer and stack size from task_struct
 //     bpf_probe_read(stack_start, sizeof(*stack_start), &task->stack);
 //     *stack_end = *stack_start + THREAD_SIZE;  // THREAD_SIZE is typically 16KB on x86_64
 // }
-// or get from /proc/[pid]/maps
 // bool valid_fp(u64 fp, u64 stack_start, u64 stack_end) {
 //     // Check if frame pointer is within stack bounds and properly aligned
 //     return (fp >= stack_start) &&

@@ -14,6 +14,7 @@ pub struct StackInfo {
     pub kernel_stack_id: i32,
     pub cmd: [u8; 16],
     pub cpu: u32,
+    // for dev debugging
     pub bp: u64,
     pub ip: u64,
 }
@@ -29,22 +30,26 @@ pub static EVENT_TRACE_NONE: u8 = 3;
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(C)]
 pub struct FramePointers {
+    /// Maximum stack depth supported (1024 frames * 8 bytes = 8KB)
     pub pointers: [u64; 1024],
-    pub len: usize, // stack len
+    /// Describes depth of stack trace (number of frames)
+    /// This could be optional because the array is 0 terminated
+    pub len: usize,
 }
 
 impl FramePointers {
     pub const STRUCT_SIZE: usize = size_of::<FramePointers>();
 }
 
-/// If we want to use a userspace buffer for longer stacks
+/// Currently not used, but this would be used for
+/// sending events to UserSpace via RingBuf
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(C)]
-pub struct StackPackage {
-    stack_info: StackInfo,
-    frame_pointers: Option<FramePointers>,
+pub struct ProbeEvent {
+    pub stack_info: StackInfo,
+    pub frame_pointers: Option<FramePointers>,
 }
 
-impl StackPackage {
-    pub const STRUCT_SIZE: usize = size_of::<StackPackage>();
+impl ProbeEvent {
+    pub const STRUCT_SIZE: usize = size_of::<ProbeEvent>();
 }
