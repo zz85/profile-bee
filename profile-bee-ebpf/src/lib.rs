@@ -76,8 +76,43 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     };
 
     let pointer = &mut *pointer;
-    let (ip, bp, len) = copy_stack(&ctx, &mut pointer.pointers);
+    let (ip, bp, len, sp) = copy_stack(&ctx, &mut pointer.pointers);
     pointer.len = len;
+
+    // // unwind 1 - hot
+    // let cfa = sp + 8;
+    // let Ok(ip) = bpf_probe_read::<u64>((cfa - 8) as *const u8 as _) else {
+    //     return;
+    // };
+    // let sp = cfa;
+
+    // // unwind 2 - func c
+    // let cfa = sp + 8;
+    // let Ok(ip) = bpf_probe_read::<u64>((cfa - 8) as *const u8 as _) else {
+    //     return;
+    // };
+    // let sp = cfa;
+
+    // // unwind 3 - func b
+    // let cfa = sp + 8;
+    // let Ok(ip) = bpf_probe_read::<u64>((cfa - 8) as *const u8 as _) else {
+    //     return;
+    // };
+    // let sp = cfa;
+
+    // // unwind 4 - func a
+    // let cfa = sp + 8;
+    // let Ok(ip) = bpf_probe_read::<u64>((cfa - 8) as *const u8 as _) else {
+    //     return;
+    // };
+    // let sp = cfa;
+
+    // // // unwind 5 - main
+    // let cfa = sp + 8;
+    // let Ok(ip) = bpf_probe_read::<u64>((cfa - 8) as *const u8 as _) else {
+    //     return;
+    // };
+    // let sp = cfa;
 
     let stack_info = StackInfo {
         tgid,
@@ -87,6 +122,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         cpu,
         ip: ip, // frame pointer
         bp: bp,
+        sp: sp, // stack pointer
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
@@ -119,16 +155,17 @@ const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
 /// puts the userspace stack in the target pointer slice
 #[inline(always)]
-unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize) {
+unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
     // refernce pt_regs
     let regs =  ctx.as_ptr() as *const pt_regs;
     let regs = &*regs;
 
     // instruction pointer
     let ip = regs.rip;
+    let sp = regs.rsp;
 
     // base pointer (frame pointer)
-    let mut bp = regs.rbp;
+    let mut bp = regs.rbp;    
 
     pointers[0] = ip;
 
@@ -142,7 +179,7 @@ unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64
         pointers[i] = ret_addr;
     }
 
-    (ip, bp, len)
+    (ip, bp, len, sp)
 }
 
 /// unwind frame pointer

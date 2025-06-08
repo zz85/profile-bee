@@ -11,3 +11,6 @@ pub mod types;
 
 mod trace_handler;
 pub use trace_handler::*;
+
+mod unwinder;
+pub use unwinder::*;

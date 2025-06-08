@@ -61,6 +61,7 @@ pub struct TraceHandler {
     symbolizer: Symbolizer,
     /// Simple Cache
     cache: PointerStackFramesCache,
+    done: bool,
 }
 
 impl TraceHandler {
@@ -68,6 +69,7 @@ impl TraceHandler {
         TraceHandler {
             symbolizer: Symbolizer::new(),
             cache: Default::default(),
+            done: false,
         }
     }
 
@@ -118,6 +120,11 @@ impl TraceHandler {
         group_by_cpu: bool,
         stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     ) -> Vec<StackFrameInfo> {
+        if self.done {
+            return vec![];
+        }
+        self.done = true;
+
         let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
 
         let key = StackInfoPod(stack_info.clone());
@@ -130,11 +137,23 @@ impl TraceHandler {
 
             tracing::info!("IP (instruction pointer): {}", stack_info.ip);
             tracing::info!("BP (base pointer aka Frame pointer): {}", stack_info.bp);
+            tracing::info!("RSP (stack pointer): {}", stack_info.sp);
             tracing::info!("User stack: {:?}", user_stack);
             tracing::info!("addrs: {:?}", addrs);
 
-            let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(addrs));
+            let _ = crate::find_instruction(pid as _, stack_info.ip, stack_info.sp);
+
+            let syms = self
+                .symbolizer
+                .symbolize(&src, Input::AbsAddr(&[stack_info.ip]));
             tracing::info!("IP Symbolization {syms:?}");
+
+            let syms = self.symbolizer.symbolize(
+                &src,
+                // Input::AbsAddr(&user_stack.as_ref().unwrap().clone()[..3]),
+                Input::AbsAddr(&user_stack.as_ref().unwrap().clone()[..1]),
+            );
+            tracing::info!("IP Symbolization original {syms:?}");
         }
 
         let stacks = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);

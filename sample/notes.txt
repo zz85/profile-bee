@@ -1,10 +1,12 @@
-gcc sample_callstack.c -O3 -g -fomit-frame-pointer -o sample-no-fp
-gcc sample_callstack.c -O3 -g -fno-omit-frame-pointer -o sample-fp 
+gcc sample_callstack.c -O3 -g -fomit-frame-pointer -o sample-no-fp-debug
+gcc sample_callstack.c -O3 -g -fno-omit-frame-pointer -o sample-fp-debug
 gcc sample_callstack.c -g -fomit-frame-pointer -o sample-no-fp
-gcc sample_callstack.c  -g -fno-omit-frame-pointer -o sample-fp 
+gcc sample_callstack.c  -g -fno-omit-frame-pointer -o sample-fp
+rustc -O -g inefficient.rs
+rustc -O -g fibonacci.rs
 
 
-/usr/share/bcc/tools/profile -- ./sample-no-fp 
+/usr/share/bcc/tools/profile -- ./sample-no-fp
 
 perf record -- ./sample-no-fp
 
@@ -17,7 +19,7 @@ perf report --stdio
 perf record --call-graph dwarf  -- ./sample-fp
 perf report --stdio
 
-perf record --call-graph dwarf  -- ./sample-no-fp 
+perf record --call-graph dwarf  -- ./sample-no-fp
 perf report --stdio
 
 
@@ -81,7 +83,7 @@ objdump -d sample-no-fp
 blazesym
 
 - FPs
-Syms [Sym(Sym { name: "hot", module: Some("profile-bee/sample/sample-fp"), addr: 4195447, offset: 4, size: Some(6), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(4), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }), 
+Syms [Sym(Sym { name: "hot", module: Some("profile-bee/sample/sample-fp"), addr: 4195447, offset: 4, size: Some(6), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(4), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }),
 Sym(Sym { name: "function_c", module: Some("profile-bee/sample/sample-fp"), addr: 4195453, offset: 9, size: Some(12), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(9), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }),
 Sym(Sym { name: "function_b", module: Some("profile-bee/sample/sample-fp"), addr: 4195465, offset: 9, size: Some(12), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(14), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }),
 Sym(Sym { name: "function_a", module: Some("profile-bee/sample/sample-fp"), addr: 4195477, offset: 9, size: Some(12), code_info: Some(CodeInfo { dir: Some(""), file: "sample_callstack.c", line: Some(19), column: None, _non_exhaustive: () }), inlined: [], _non_exhaustive: () }),

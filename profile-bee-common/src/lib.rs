@@ -17,6 +17,7 @@ pub struct StackInfo {
     // for dev debugging
     pub bp: u64,
     pub ip: u64,
+    pub sp: u64,
 }
 
 impl StackInfo {

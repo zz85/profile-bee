@@ -12,7 +12,6 @@ use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -125,6 +124,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     println!("Starting {:?}", opt);
+
+    // profile_bee::load(&opt.cmd.unwrap()).unwrap();
+    // return Ok(());
 
     let (stopper, spawn) = setup_process_to_profile(&opt.cmd)?;
 
