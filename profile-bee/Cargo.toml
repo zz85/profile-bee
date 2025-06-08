@@ -34,7 +34,6 @@ tracing = "0.1.41"
 blazesym = "0.2.0-rc.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ehframe = { version = "*", path = "../vendor/cargo-trace/ehframe" }
-bpf-utils = { version = "*", path = "../vendor/cargo-trace/bpf-utils" }
 
 [[bin]]
 name = "profile-bee"
