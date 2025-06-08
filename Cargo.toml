@@ -1,7 +1,7 @@
 [workspace]
 members = ["profile-bee", "profile-bee-common", "xtask",
-    # "vendor/cargo-trace/ehframe",
-    "vendor/cargo-trace/bpf-utils",
+    "vendor/cargo-trace/ehframe",
+    # "vendor/cargo-trace/bpf-utils",
 ]
 resolver = "2"
 

@@ -102,41 +102,41 @@ impl BinaryInfo {
         }
     }
 
-    pub fn resolve_symbol(&self, ip: usize) -> Result<Option<String>> {
-        if let Some(entry) = self.binary(ip) {
-            let offset = ip - entry.start_addr;
-            if let Some(dwarf) = entry.dwarf.as_ref() {
-                if let Some(frame) = dwarf.find_frames(offset)?.next()? {
-                    if let Some(function) = frame.function {
-                        return Ok(Some(function.demangle()?.to_string()));
-                    }
-                }
-            }
-            if let Some(symbol) = entry.elf.resolve_address(offset)? {
-                return Ok(Some(symbol.to_owned()));
-            }
-        }
-        Ok(None)
-    }
+    // pub fn resolve_symbol(&self, ip: usize) -> Result<Option<String>> {
+    //     if let Some(entry) = self.binary(ip) {
+    //         let offset = ip - entry.start_addr;
+    //         if let Some(dwarf) = entry.dwarf.as_ref() {
+    //             if let Some(frame) = dwarf.find_frames(offset)?.next()? {
+    //                 if let Some(function) = frame.function {
+    //                     return Ok(Some(function.demangle()?.to_string()));
+    //                 }
+    //             }
+    //         }
+    //         if let Some(symbol) = entry.elf.resolve_address(offset)? {
+    //             return Ok(Some(symbol.to_owned()));
+    //         }
+    //     }
+    //     Ok(None)
+    // }
 
-    pub fn resolve_location(&self, ip: usize) -> Result<Option<Location<'_>>> {
-        if let Some(entry) = self.binary(ip) {
-            let offset = ip - entry.start_addr;
-            if let Some(dwarf) = entry.dwarf.as_ref() {
-                if let Some(frame) = dwarf.find_frames(offset)?.next()? {
-                    if let Some(loc) = frame.location {
-                        return Ok(Some(loc));
-                    }
-                }
-            }
-            return Ok(Some(Location {
-                file: entry.elf.path().to_str(),
-                line: None,
-                column: None,
-            }));
-        }
-        Ok(None)
-    }
+    // pub fn resolve_location(&self, ip: usize) -> Result<Option<Location<'_>>> {
+    //     if let Some(entry) = self.binary(ip) {
+    //         let offset = ip - entry.start_addr;
+    //         if let Some(dwarf) = entry.dwarf.as_ref() {
+    //             if let Some(frame) = dwarf.find_frames(offset)?.next()? {
+    //                 if let Some(loc) = frame.location {
+    //                     return Ok(Some(loc));
+    //                 }
+    //             }
+    //         }
+    //         return Ok(Some(Location {
+    //             file: entry.elf.path().to_str(),
+    //             line: None,
+    //             column: None,
+    //         }));
+    //     }
+    //     Ok(None)
+    // }
 
     pub fn print_frame(&self, i: usize, ip: usize) -> Result<()> {
         let symbol = self

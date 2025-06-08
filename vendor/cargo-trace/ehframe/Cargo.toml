@@ -6,7 +6,7 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0.38"
-gimli = "0.23.0"
+gimli = "0.31.1"
 libc = "0.2.86"
 log = "0.4.14"
-object = "0.23.0"
+object = "0.37.0"

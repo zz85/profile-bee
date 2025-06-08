@@ -1,8 +1,10 @@
 use anyhow::Result;
 use gimli::{
-    CfaRule, NativeEndian, Reader, RegisterRule, UninitializedUnwindContext, UnwindSection,
+    CfaRule, NativeEndian, RegisterRule, UnwindContext, UnwindSection
 };
 use object::{Object, ObjectSection};
+
+mod load;
 
 /// Dwarf instruction.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -115,8 +117,8 @@ pub enum Reg {
 }
 
 impl Reg {
-    fn from_gimli(reg: gimli::Register) -> Option<Self> {
-        Some(match reg {
+    fn from_gimli(reg: &gimli::Register) -> Option<Self> {
+        Some(match *reg {
             gimli::X86_64::RA => Self::Rip,
             gimli::X86_64::RSP => Self::Rsp,
             _ => return None,
@@ -147,8 +149,8 @@ pub struct UnwindTableRow {
 }
 
 impl UnwindTableRow {
-    pub fn parse<R: Eq + Reader>(
-        row: &gimli::UnwindTableRow<R>,
+    pub fn parse(
+        row: &gimli::UnwindTableRow<usize>,
         _encoding: gimli::Encoding,
     ) -> Result<Self> {
         Ok(Self {
@@ -164,7 +166,7 @@ impl UnwindTableRow {
             },
             rsp: match row.cfa() {
                 CfaRule::RegisterAndOffset { register, offset } => {
-                    if let Some(reg) = Reg::from_gimli(*register) {
+                    if let Some(reg) = Reg::from_gimli(&register) {
                         Instruction::reg_offset(reg, *offset)
                     } else {
                         log::debug!("unimpl rsp {:?}", row.cfa());
@@ -200,7 +202,7 @@ pub struct UnwindTable {
 }
 
 impl UnwindTable {
-    pub fn parse<'a, O: Object<'a, 'a>>(file: &'a O) -> Result<Self> {
+    pub fn parse<'a, O: Object<'a>>(file: &'a O) -> Result<Self> {
         let section = file.section_by_name(".eh_frame").unwrap();
         let data = section.uncompressed_data()?;
         let mut eh_frame = gimli::EhFrame::new(&data, NativeEndian);
@@ -220,7 +222,7 @@ impl UnwindTable {
             bases = bases.set_got(section.address());
         }
 
-        let mut ctx = UninitializedUnwindContext::new();
+        let mut ctx = UnwindContext::new();
         let mut entries = eh_frame.entries(&bases);
         let mut rows = vec![];
         while let Some(entry) = entries.next()? {
@@ -231,7 +233,8 @@ impl UnwindTable {
                     let encoding = fde.cie().encoding();
                     let mut table = fde.rows(&eh_frame, &bases, &mut ctx)?;
                     while let Some(row) = table.next_row()? {
-                        rows.push(UnwindTableRow::parse(row, encoding)?);
+                        let unwind_row = UnwindTableRow::parse(row, encoding)?;
+                        rows.push(unwind_row);
                     }
                 }
             }

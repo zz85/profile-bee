@@ -1,4 +1,4 @@
-use addr2line::{gimli, object, Context, FrameIter, Location};
+use addr2line::{Context, FrameIter, Location};
 use anyhow::Result;
 use ehframe::UnwindTable;
 use memmap::Mmap;
@@ -46,7 +46,8 @@ impl Elf {
         if self.0.obj.has_debug_symbols() {
             return Dwarf::new(self.clone());
         }
-        let debug_path = locate_dwarf::locate_debug_symbols(&self.0.obj, self.path())?;
+        let debug_path =
+            locate_dwarf::locate_debug_symbols(&self.0.obj, self.path())?.expect("debug_path");
         Dwarf::open(&debug_path)
     }
 
@@ -58,76 +59,52 @@ impl Elf {
         UnwindTable::parse(&self.0.obj)
     }
 
-    pub fn resolve_symbol(&self, symbol: &str, offset: usize) -> Result<Option<usize>> {
-        for sym in self.0.obj.symbols() {
-            if sym.name() == Ok(symbol) {
-                if offset < sym.size() as usize {
-                    return Ok(Some(sym.address() as usize + offset));
-                } else {
-                    return Err(OffsetOutOfRange(symbol.to_string(), offset).into());
-                }
-            }
-        }
-        Ok(None)
-    }
+    // pub fn resolve_symbol(&self, symbol: &str, offset: usize) -> Result<Option<usize>> {
+    //     for sym in self.0.obj.symbols() {
+    //         if sym.name() == Ok(symbol) {
+    //             if offset < sym.size() as usize {
+    //                 return Ok(Some(sym.address() as usize + offset));
+    //             } else {
+    //                 return Err(OffsetOutOfRange(symbol.to_string(), offset).into());
+    //             }
+    //         }
+    //     }
+    //     Ok(None)
+    // }
 
-    pub fn resolve_address(&self, address: usize) -> Result<Option<&str>> {
-        for sym in self.0.obj.symbols() {
-            if sym.address() <= address as u64 && sym.address() + sym.size() > address as u64 {
-                return Ok(Some(sym.name()?));
-            }
-        }
-        Ok(None)
-    }
-
-    // Enable in next release of object
-    /*pub fn dynamic(&self) -> Result<Vec<String>> {
-        let mut libs = vec![];
-        for segment in self.0.obj.raw_segments() {
-            if let Some(entries) = segment.dynamic(NativeEndian, self.0.obj.data())? {
-                let mut strtab = 0;
-                let mut strsz = 0;
-                let mut dt_needed = vec![];
-                for entry in entries {
-                    match entry.d_tag(NativeEndian) as u32 {
-                        object::elf::DT_STRTAB => strtab = entry.d_val(NativeEndian),
-                        object::elf::DT_STRSZ => strsz = entry.d_val(NativeEndian),
-                        object::elf::DT_NEEDED => dt_needed.push(entry.d_val(NativeEndian)),
-                        _ => {}
-                    }
-                }
-                let mut dynstr = object::StringTable::default();
-                for segment in self.0.obj.raw_segments() {
-                    if let Ok(Some(data)) =
-                        segment.data_range(NativeEndian, self.0.obj.data(), strtab, strsz)
-                    {
-                        dynstr = object::StringTable::new(data);
-                        break;
-                    }
-                }
-                for needed in dt_needed {
-                    if let Ok(lib) = dynstr.get(needed as _) {
-                        let lib = std::str::from_utf8(lib)?;
-                        libs.push(lib.to_string());
-                    }
-                }
-            }
-        }
-        Ok(libs)
-    }*/
+    // pub fn resolve_address(&self, address: usize) -> Result<Option<&str>> {
+    //     for sym in self.0.obj.symbols() {
+    //         if sym.address() <= address as u64 && sym.address() + sym.size() > address as u64 {
+    //             return Ok(Some(sym.name()?));
+    //         }
+    //     }
+    //     Ok(None)
+    // }
 }
-
-type Reader = gimli::EndianRcSlice<gimli::RunTimeEndian>;
 
 pub struct Dwarf {
     elf: Elf,
-    ctx: Context<Reader>,
+    // ctx: Context<object::read::ReadRef<'static>>,
 }
 
 impl Dwarf {
     pub fn new(elf: Elf) -> Result<Self> {
-        let ctx = Context::new(&elf.0.obj)?;
-        Ok(Self { elf, ctx })
+        let load_section = |id: gimli::SectionId| -> Result<_> {
+            let data = elf
+                .0
+                .obj
+                .section_by_name(id.name())
+                .map(|section| section.uncompressed_data().unwrap_or_default())
+                .unwrap_or_default();
+            Ok(gimli::EndianSlice::new(&data, gimli::NativeEndian))
+        };
+
+        let dwarf = gimli::Dwarf::load(&load_section)?;
+        // let ctx = addr2line::Context::from_dwarf(dwarf)?;
+
+        Ok(Self { elf
+            // , ctx 
+            })
     }
 
     pub fn open<T: AsRef<Path>>(path: T) -> Result<Self> {
@@ -143,13 +120,13 @@ impl Dwarf {
         self.elf.path()
     }
 
-    pub fn resolve_location(&self, address: usize) -> Result<Option<Location<'_>>> {
-        Ok(self.ctx.find_location(address as _)?)
-    }
+    // pub fn resolve_location(&self, address: usize) -> Result<Option<Location<'_>>> {
+    //     Ok(self.ctx.find_location(address as _).unwrap())
+    // }
 
-    pub fn find_frames(&self, probe: usize) -> Result<FrameIter<'_, Reader>> {
-        Ok(self.ctx.find_frames(probe as _)?)
-    }
+    // pub fn find_frames(&self, probe: usize) -> Result<FrameIter<'_, object::read::ReadRef<'static>>> {
+    //     Ok(self.ctx.find_frames(probe as _).unwrap())
+    // }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -193,14 +170,12 @@ mod tests {
         assert_eq!(symbol, "main");
         println!("address of main: 0x{:x}", address);
         println!("build id: {}", elf.build_id()?);
-        //println!("dynamic: {:?}", elf.dynamic()?);
         let dwarf = elf.dwarf()?;
-        let location = dwarf.resolve_location(0x5340)?.unwrap();
-        println!(
-            "location: {:?}:{:?}:{:?}",
-            location.file, location.line, location.column
-        );
-        //assert_eq!(location.line.unwrap(), 1);
+        // let location = dwarf.resolve_location(0x5340)?.unwrap();
+        // println!(
+        //     "location: {:?}:{:?}:{:?}",
+        //     location.file, location.line, location.column
+        // );
         Ok(())
     }
 }

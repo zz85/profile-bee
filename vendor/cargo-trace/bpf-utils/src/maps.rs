@@ -63,7 +63,7 @@ impl AddressMap {
             let start = usize::from_str_radix(start, 16)?;
             let end = address.next().unwrap();
             let end = usize::from_str_radix(end, 16)?;
-            let mut entry = entries.entry(path.into()).or_insert((start, end));
+            let entry = entries.entry(path.into()).or_insert((start, end));
             entry.0 = usize::min(entry.0, start);
             entry.1 = usize::max(entry.1, end);
         }
