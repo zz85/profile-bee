@@ -1,7 +1,7 @@
 gcc sample_callstack.c -O3 -g -fomit-frame-pointer -o sample-no-fp
 gcc sample_callstack.c -O3 -g -fno-omit-frame-pointer -o sample-fp 
 gcc sample_callstack.c -g -fomit-frame-pointer -o sample-no-fp
-gcc sample_callstack.c  -g -fno-omit-frame-pointer -o sample-fp 
+gcc sample_callstack.c  -g -fno-omit-frame-pointer -o sample-fp
 
 
 /usr/share/bcc/tools/profile -- ./sample-no-fp 

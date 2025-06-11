@@ -130,10 +130,15 @@ impl TraceHandler {
 
             tracing::info!("IP (instruction pointer): {}", stack_info.ip);
             tracing::info!("BP (base pointer aka Frame pointer): {}", stack_info.bp);
+            tracing::info!("RSP (stack pointer): {}", stack_info.sp);
             tracing::info!("User stack: {:?}", user_stack);
             tracing::info!("addrs: {:?}", addrs);
 
-            let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(addrs));
+            let _ = crate::find_instruction(pid as _, stack_info.ip, stack_info.sp);
+
+            let syms = self
+                .symbolizer
+                .symbolize(&src, Input::AbsAddr(&[stack_info.ip]));
             tracing::info!("IP Symbolization {syms:?}");
         }
 
