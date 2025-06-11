@@ -1,7 +1,5 @@
 [workspace]
-members = ["profile-bee", "profile-bee-common", "xtask",
-    "vendor/cargo-trace/ehframe",
-]
+members = ["profile-bee", "profile-bee-common", "xtask",]
 resolver = "2"
 
 [profile.release]

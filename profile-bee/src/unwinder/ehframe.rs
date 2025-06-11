@@ -1,10 +1,6 @@
 use anyhow::Result;
-use gimli::{
-    CfaRule, NativeEndian, RegisterRule, UnwindContext, UnwindSection
-};
+use gimli::{CfaRule, NativeEndian, RegisterRule, UnwindContext, UnwindSection};
 use object::{Object, ObjectSection};
-
-mod load;
 
 /// Dwarf instruction.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -149,10 +145,7 @@ pub struct UnwindTableRow {
 }
 
 impl UnwindTableRow {
-    pub fn parse(
-        row: &gimli::UnwindTableRow<usize>,
-        _encoding: gimli::Encoding,
-    ) -> Result<Self> {
+    pub fn parse(row: &gimli::UnwindTableRow<usize>, _encoding: gimli::Encoding) -> Result<Self> {
         Ok(Self {
             start_address: row.start_address() as _,
             end_address: row.end_address() as _,
@@ -160,7 +153,7 @@ impl UnwindTableRow {
                 RegisterRule::Undefined => Instruction::undef(),
                 RegisterRule::Offset(offset) => Instruction::cfa_offset(offset),
                 _ => {
-                    log::debug!("unimpl rip {:?}", row.register(gimli::X86_64::RA));
+                    tracing::debug!("unimpl rip {:?}", row.register(gimli::X86_64::RA));
                     Instruction::unimpl()
                 }
             },
@@ -169,12 +162,12 @@ impl UnwindTableRow {
                     if let Some(reg) = Reg::from_gimli(&register) {
                         Instruction::reg_offset(reg, *offset)
                     } else {
-                        log::debug!("unimpl rsp {:?}", row.cfa());
+                        tracing::debug!("unimpl rsp {:?}", row.cfa());
                         Instruction::unimpl()
                     }
                 }
                 _ => {
-                    log::debug!("unimpl cfa {:?}", row.cfa());
+                    tracing::debug!("unimpl cfa {:?}", row.cfa());
                     Instruction::unimpl()
                 }
             },
