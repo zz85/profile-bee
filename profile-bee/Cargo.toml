@@ -37,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gimli = "0.31.1"
 libc = "0.2.86"
 object = "0.37.0"
+procmaps = "0.4.1"
 
 [[bin]]
 name = "profile-bee"

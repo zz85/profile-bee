@@ -1,9 +1,9 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use procmaps::Mappings;
 
 #[derive(Debug)]
 pub struct AddressMap {
@@ -40,33 +40,28 @@ impl std::fmt::Display for AddressEntry {
 
 impl AddressMap {
     pub fn load_pid(pid: u32) -> Result<Self> {
-        Self::load(format!("/proc/{}/maps", pid))
-    }
+        let maps = Mappings::from_pid(pid as _)?;
+        let maps = &*maps;
 
-    pub fn load_self() -> Result<Self> {
-        Self::load("/proc/self/maps")
-    }
-
-    fn load<T: AsRef<Path>>(path: T) -> Result<Self> {
-        let file = BufReader::new(File::open(path)?);
         let mut entries = HashMap::<PathBuf, (usize, usize)>::new();
-        for line in file.lines() {
-            let line = line?;
-            let mut columns = line.split(' ');
-            let address = columns.next().unwrap();
-            let path = columns.last().unwrap();
-            if !Path::new(path).exists() {
+        for map in maps {
+            let procmaps::Path::MappedFile(path) = &map.pathname else {
+                continue;
+            };
+
+            let filtered = map.perms.executable && map.perms.readable && !map.perms.writable;
+
+            if !filtered {
                 continue;
             }
-            let mut address = address.split('-');
-            let start = address.next().unwrap();
-            let start = usize::from_str_radix(start, 16)?;
-            let end = address.next().unwrap();
-            let end = usize::from_str_radix(end, 16)?;
-            let entry = entries.entry(path.into()).or_insert((start, end));
-            entry.0 = usize::min(entry.0, start);
-            entry.1 = usize::max(entry.1, end);
+
+            let entry = entries
+                .entry(path.into())
+                .or_insert((map.base, map.ceiling));
+            entry.0 = usize::min(entry.0, map.base);
+            entry.1 = usize::max(entry.1, map.ceiling);
         }
+
         let mut map: Vec<AddressEntry> = entries
             .into_iter()
             .map(|(path, (start, end))| AddressEntry {
@@ -76,6 +71,7 @@ impl AddressMap {
             })
             .collect();
         map.sort_unstable_by_key(|entry| entry.start_addr);
+
         Ok(Self { map })
     }
 }
@@ -94,7 +90,7 @@ mod tests {
 
     #[test]
     fn test_maps() {
-        let maps = AddressMap::load_self().unwrap();
+        let maps = AddressMap::load_pid(std::process::id()).unwrap();
         println!("{}", maps);
     }
 }
