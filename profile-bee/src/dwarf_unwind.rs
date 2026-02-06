@@ -14,6 +14,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Minimum number of frames from frame pointer unwinding before DWARF is skipped
+/// If FP unwinding produces this many or more frames, we assume it's sufficient
+const MIN_FRAMES_FOR_FP_UNWINDING: usize = 10;
+
 /// DWARF-based stack unwinder
 ///
 /// Manages DWARF unwind information and performs stack unwinding
@@ -114,7 +118,7 @@ impl DwarfUnwinder {
         }
 
         // If we already have a good stack from frame pointers, just return it
-        if initial_addresses.len() > 10 {
+        if initial_addresses.len() >= MIN_FRAMES_FOR_FP_UNWINDING {
             tracing::trace!("Frame pointer unwinding produced sufficient frames, skipping DWARF");
             return Ok(None);
         }

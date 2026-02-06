@@ -71,7 +71,7 @@ impl TraceHandler {
         TraceHandler {
             symbolizer: Symbolizer::new(),
             cache: Default::default(),
-            dwarf_unwinder: DwarfUnwinder::new(true), // DWARF enabled by default
+            dwarf_unwinder: DwarfUnwinder::new(true), // Enable DWARF unwinding
         }
     }
 
@@ -297,10 +297,10 @@ impl TraceHandler {
         let pid = stack_info.tgid;
 
         let addrs = user_stack.unwrap_or_default();
-        
+
         // Try to enhance with DWARF unwinding if enabled
         let enhanced_addrs = self.enhance_with_dwarf_unwinding(pid, &addrs);
-        
+
         let user_syms = self
             .symbolize_user_stack(pid, &enhanced_addrs)
             .ok()
