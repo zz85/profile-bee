@@ -21,10 +21,33 @@ More documentation in [docs](docs) directory.
 
 ### Stack unwinding, Symbolization and Debug info
 
-Note: if symbols for your C/Rust programs doesn't appear correct, you may want to build your software with debug information.
+Profile Bee supports two methods for stack unwinding:
 
-With rustc that's adding a `-g` flag when you compile. Another thing to consider doing is emitting frame pointer by setting `RUSTFLAGS="-Cforce-frame-pointers=yes"` with building (or modifying ./cargo/config)
-and `-fno-omit-frame-pointer` for gcc. With framepointers, you could get symbols while saving on the cost of dwarf parsing (using --no-dwarf)
+1. **Frame Pointer Unwinding** (default in eBPF): Fast and efficient, but requires binaries compiled with frame pointers enabled.
+2. **DWARF-based Unwinding** (userspace fallback): Works with binaries compiled without frame pointers by parsing `.eh_frame` sections.
+
+#### Frame Pointer Method
+For best performance with frame pointer unwinding, compile your programs with:
+- Rust: `RUSTFLAGS="-Cforce-frame-pointers=yes"` (or modify `.cargo/config`)
+- C/C++: `-fno-omit-frame-pointer` flag with gcc/clang
+
+#### DWARF Method
+DWARF unwinding is automatically enabled by default and serves as a fallback when:
+- Binaries are compiled without frame pointers (common in optimized builds)
+- Frame pointer unwinding produces incomplete stack traces
+
+To disable DWARF unwinding (for performance in frame-pointer-only scenarios):
+```bash
+profile-bee --no-dwarf ...
+```
+
+**Note**: For symbol resolution, you still need debug information:
+- Rust: Add `-g` flag when compiling
+- C/C++: Compile with debug symbols (`-g` flag)
+
+**Technical Details**: DWARF unwinding parses `.eh_frame` or `.debug_frame` sections from binaries to reconstruct call stacks using Call Frame Information (CFI). This enables profiling of production binaries that don't have frame pointers enabled for optimization reasons.
+
+For more information on DWARF-based profiling, see [Polar Signals' article on profiling without frame pointers](https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers).
 
 ### Usage
 
@@ -65,6 +88,8 @@ profile-bee --pid <pid> ...
 ```
 
 ### Features
+- **DWARF-based stack unwinding** for profiling binaries without frame pointers
+- Frame pointer-based unwinding in eBPF for maximum performance
 - Rust and C++ symbols demangling supported (via gimli/blazesym)
 - Some source mapping supported
 - Simple symbol lookup cache
