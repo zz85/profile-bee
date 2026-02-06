@@ -23,31 +23,53 @@ More documentation in [docs](docs) directory.
 
 Profile Bee supports two methods for stack unwinding:
 
-1. **Frame Pointer Unwinding** (default in eBPF): Fast and efficient, but requires binaries compiled with frame pointers enabled.
-2. **DWARF-based Unwinding** (userspace fallback): Works with binaries compiled without frame pointers by parsing `.eh_frame` sections.
+1. **Frame Pointer Unwinding** (eBPF kernel space): Fast and efficient, but requires binaries compiled with frame pointers enabled.
+2. **DWARF-based Unwinding** (userspace fallback): Infrastructure for parsing `.eh_frame` sections (algorithm not yet implemented).
 
-#### Frame Pointer Method
+#### Where Does Unwinding Happen?
+
+**eBPF (Kernel Space)**: Frame pointer unwinding runs in the kernel for maximum performance
+- Directly reads CPU registers (RIP, RBP) during sampling
+- Walks frame pointer chain in kernel context
+- Can sample at high frequency (99-9999 Hz) with minimal overhead
+- **Limitation**: Only works with `-fno-omit-frame-pointer` binaries
+
+**Userland (User Space)**: DWARF unwinding infrastructure exists for fallback
+- Parses process memory maps and ELF binaries
+- Extracts and caches `.eh_frame` sections
+- **Status**: Infrastructure complete, CFI evaluation algorithm not yet implemented
+- See `docs/dwarf_unwinding_design.md` for complete architecture details
+
+#### Frame Pointer Method (WORKS NOW)
+
 For best performance with frame pointer unwinding, compile your programs with:
 - Rust: `RUSTFLAGS="-Cforce-frame-pointers=yes"` (or modify `.cargo/config`)
 - C/C++: `-fno-omit-frame-pointer` flag with gcc/clang
 
-#### DWARF Method
-DWARF unwinding is automatically enabled by default and serves as a fallback when:
-- Binaries are compiled without frame pointers (common in optimized builds)
-- Frame pointer unwinding produces incomplete stack traces
+#### DWARF Method (INFRASTRUCTURE ONLY)
 
-To disable DWARF unwinding (for performance in frame-pointer-only scenarios):
-```bash
-profile-bee --no-dwarf ...
-```
+**Current status**: The DWARF unwinding infrastructure is in place but the actual unwinding algorithm is not yet implemented.
+
+What works:
+- ✅ Process memory map reading
+- ✅ ELF binary parsing
+- ✅ `.eh_frame` section extraction and caching
+- ✅ Integration with TraceHandler
+
+What's missing:
+- ❌ DWARF CFI instruction evaluation
+- ❌ Canonical Frame Address computation
+- ❌ Stack walking using DWARF unwind rules
+
+The `--no-dwarf` flag exists but currently has no effect since the DWARF algorithm isn't implemented yet.
 
 **Note**: For symbol resolution, you still need debug information:
 - Rust: Add `-g` flag when compiling
 - C/C++: Compile with debug symbols (`-g` flag)
 
-**Technical Details**: DWARF unwinding parses `.eh_frame` or `.debug_frame` sections from binaries to reconstruct call stacks using Call Frame Information (CFI). This enables profiling of production binaries that don't have frame pointers enabled for optimization reasons.
-
-For more information on DWARF-based profiling, see [Polar Signals' article on profiling without frame pointers](https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers).
+For more information on DWARF-based profiling, see:
+- [Polar Signals' article on profiling without frame pointers](https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers)
+- `docs/dwarf_unwinding_design.md` for architecture details
 
 ### Usage
 

@@ -1,11 +1,48 @@
 /// DWARF-based stack unwinding for processes without frame pointers
 ///
-/// This module provides DWARF CFI (Call Frame Information) based stack unwinding
-/// as a fallback when frame pointer unwinding fails or is incomplete.
+/// # Architecture: Hybrid Unwinding (eBPF + Userland)
 ///
-/// References:
+/// Profile-bee uses a two-stage unwinding approach:
+///
+/// ## 1. eBPF (Kernel Space) - Frame Pointer Unwinding
+/// - **Location**: `profile-bee-ebpf/src/lib.rs` (functions: `copy_stack`, `get_frame`)
+/// - **What**: Walks frame pointer chain in kernel context
+/// - **Advantage**: Fast, low overhead, runs at high frequency (99-9999 Hz)
+/// - **Limitation**: Only works for binaries compiled with `-fno-omit-frame-pointer`
+///
+/// ## 2. Userland (This Module) - DWARF Unwinding  
+/// - **Location**: This file (`dwarf_unwind.rs`)
+/// - **What**: Uses DWARF CFI to unwind optimized code without frame pointers
+/// - **When**: Activates as fallback when eBPF FP unwinding produces <10 frames
+/// - **Status**: **Infrastructure complete, algorithm NOT yet implemented**
+///
+/// # Current Implementation Status
+///
+/// ✅ **COMPLETE**: Infrastructure
+/// - Process memory map reading (`/proc/[pid]/maps`)
+/// - ELF binary parsing (`object` crate)
+/// - `.eh_frame`/`.debug_frame` section extraction
+/// - Per-binary caching of unwind information
+/// - Integration with TraceHandler
+///
+/// ❌ **TODO**: DWARF Unwinding Algorithm (see line 163)
+/// - Parse `.eh_frame` with gimli
+/// - Evaluate DWARF CFI instructions
+/// - Compute Canonical Frame Address (CFA)
+/// - Walk stack using DWARF unwind rules
+///
+/// # Why Userland for DWARF?
+///
+/// DWARF unwinding cannot be done in eBPF because:
+/// - `.eh_frame` sections can be megabytes (exceeds eBPF program size limits)
+/// - Complex parsing and expression evaluation (stack-based DWARF VM)
+/// - Need to read process maps and binary files from filesystem
+/// - Gimli library is userspace-only
+///
+/// # References
 /// - https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers
 /// - https://github.com/gimli-rs/gimli for DWARF parsing
+/// - See `docs/dwarf_unwinding_design.md` for complete architecture
 use anyhow::{Context, Result};
 use blazesym::Addr;
 use object::{Object, ObjectSection};
@@ -145,6 +182,34 @@ impl DwarfUnwinder {
     }
 
     /// Attempt DWARF-based unwinding
+    ///
+    /// # Current Implementation Status: INCOMPLETE
+    ///
+    /// This method currently only:
+    /// ✅ Reads process memory maps
+    /// ✅ Parses ELF binaries and extracts `.eh_frame` sections
+    /// ✅ Caches unwind information
+    ///
+    /// ❌ Does NOT actually unwind the stack (see TODO below)
+    ///
+    /// # What's Needed for Full Implementation
+    ///
+    /// To complete DWARF unwinding, this method needs to:
+    /// 1. Use gimli to parse `.eh_frame` and find FDE (Frame Description Entry) for each IP
+    /// 2. Evaluate DWARF CFI instructions (DW_CFA_def_cfa, DW_CFA_offset, etc.)
+    /// 3. Compute Canonical Frame Address (CFA) for each frame
+    /// 4. Extract return address from saved registers
+    /// 5. Repeat for each frame until reaching stack bottom
+    ///
+    /// # Why It's Not Implemented Yet
+    ///
+    /// DWARF unwinding requires:
+    /// - Complex gimli API usage (UnwindContext, RegisterRule evaluation)
+    /// - Architecture-specific register handling (x86_64, ARM, etc.)
+    /// - Process memory reading (may require ptrace or process_vm_readv)
+    /// - Robust error handling for malformed unwind info
+    ///
+    /// The infrastructure is complete and ready for the algorithm implementation.
     fn try_dwarf_unwind(&mut self, pid: u32, _initial_addresses: &[Addr]) -> Result<Vec<Addr>> {
         // Read process memory maps to find loaded binaries
         let maps = get_process_maps(pid as i32)
@@ -160,23 +225,69 @@ impl DwarfUnwinder {
             }
         }
 
-        // TODO: Implement the actual DWARF unwinding algorithm
-        // This would involve:
-        // 1. Starting from the initial IP (instruction pointer)
-        // 2. Finding the corresponding .eh_frame FDE (Frame Description Entry)
-        // 3. Evaluating the DWARF expressions to compute CFA and return address
-        // 4. Repeating for each frame until we reach the end
+        // ==================================================================================
+        // TODO: ACTUAL DWARF UNWINDING ALGORITHM (NOT YET IMPLEMENTED)
+        // ==================================================================================
         //
-        // For now, this demonstrates the infrastructure is in place:
-        // - We can read process maps
-        // - We can load and parse .eh_frame sections
-        // - We cache the parsed data for performance
+        // The code above successfully loads .eh_frame sections from all binaries.
+        // Now we need to use them to actually unwind the stack.
         //
-        // A full implementation would use gimli's UnwindContext and evaluate
-        // CFI instructions to walk the stack. Reference implementations:
-        // - https://github.com/nbdd0121/unwinding
+        // ALGORITHM OUTLINE:
+        // ==================================================================================
+        //
+        // 1. START WITH INITIAL INSTRUCTION POINTERS from eBPF frame pointer unwinding
+        //
+        // 2. FOR EACH IP in initial_addresses:
+        //    a. Find which binary contains this IP (use process maps)
+        //    b. Get cached UnwindInfo for that binary
+        //    c. Parse .eh_frame with gimli to find FDE for this IP
+        //    d. Evaluate DWARF expressions to get CFA (Canonical Frame Address)
+        //    e. Read return address from computed location
+        //    f. Add return address to unwound stack
+        //    g. Repeat with return address as new IP
+        //
+        // 3. RETURN all discovered instruction pointers
+        //
+        // ==================================================================================
+        // IMPLEMENTATION NOTES:
+        // ==================================================================================
+        //
+        // Use gimli's UnwindContext:
+        //   let eh_frame = EhFrame::new(&eh_frame_data, NativeEndian);
+        //   let mut ctx = UnwindContext::new();
+        //   let row = eh_frame.unwind_info_for_address(bases, &mut ctx, ip)?;
+        //
+        // Evaluate CFA rule:
+        //   match row.cfa() {
+        //       CfaRule::RegisterAndOffset { register, offset } => {
+        //           // CFA = register_value + offset
+        //       }
+        //       CfaRule::Expression(expr) => {
+        //           // Evaluate DWARF expression (complex)
+        //       }
+        //   }
+        //
+        // Get return address:
+        //   let ra_rule = row.register(RETURN_ADDRESS_REGISTER);
+        //   match ra_rule {
+        //       RegisterRule::Offset(offset) => {
+        //           // Return address is at CFA + offset
+        //       }
+        //       // ... handle other register rules
+        //   }
+        //
+        // CHALLENGES:
+        // - Need to read process memory (may require ptrace permissions)
+        // - Register state tracking across frames
+        // - Architecture-specific register definitions
+        // - Error handling for corrupt/missing unwind info
+        //
+        // REFERENCES:
+        // - https://github.com/nbdd0121/unwinding/blob/master/src/unwinder/frame.rs
+        // - https://github.com/gimli-rs/gimli/tree/master/examples
         // - https://github.com/parca-dev/parca-agent/blob/main/pkg/stack/unwind/
-        // - https://github.com/grafana/opentelemetry-ebpf-profiler
+        //
+        // ==================================================================================
 
         tracing::trace!(
             "DWARF infrastructure ready with {} cached binaries",
