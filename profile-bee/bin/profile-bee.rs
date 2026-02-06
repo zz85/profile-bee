@@ -154,7 +154,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let stack_traces = &ebpf_profiler.stack_traces;
     let stacked_pointers = &ebpf_profiler.stacked_pointers;
 
-    let mut profiler = TraceHandler::new(); // !opt.no_dwarf
+    // Create TraceHandler with DWARF support based on --no-dwarf flag
+    let mut profiler = TraceHandler::with_dwarf(!opt.no_dwarf);
 
     // Set up communication channels
     let (perf_tx, perf_rx) = mpsc::channel();

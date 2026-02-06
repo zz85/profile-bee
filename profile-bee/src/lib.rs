@@ -11,3 +11,6 @@ pub mod types;
 
 mod trace_handler;
 pub use trace_handler::*;
+
+pub mod dwarf_unwind;
+pub use dwarf_unwind::DwarfUnwinder;

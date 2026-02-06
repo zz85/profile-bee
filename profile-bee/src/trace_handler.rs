@@ -1,3 +1,4 @@
+use crate::dwarf_unwind::DwarfUnwinder;
 use crate::ebpf::{FramePointersPod, StackInfoPod};
 use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
 use aya::maps::MapData;
@@ -61,6 +62,8 @@ pub struct TraceHandler {
     symbolizer: Symbolizer,
     /// Simple Cache
     cache: PointerStackFramesCache,
+    /// DWARF-based stack unwinder for binaries without frame pointers
+    dwarf_unwinder: DwarfUnwinder,
 }
 
 impl TraceHandler {
@@ -68,6 +71,16 @@ impl TraceHandler {
         TraceHandler {
             symbolizer: Symbolizer::new(),
             cache: Default::default(),
+            dwarf_unwinder: DwarfUnwinder::new(true), // DWARF enabled by default
+        }
+    }
+
+    /// Create a new TraceHandler with DWARF unwinding control
+    pub fn with_dwarf(use_dwarf: bool) -> Self {
+        TraceHandler {
+            symbolizer: Symbolizer::new(),
+            cache: Default::default(),
+            dwarf_unwinder: DwarfUnwinder::new(use_dwarf),
         }
     }
 
@@ -93,7 +106,7 @@ impl TraceHandler {
     }
 
     /// convert user mode stacked frames into symbols
-    fn symbolize_user_stack(&self, pid: u32, addrs: &[Addr]) -> Result<Vec<StackFrameInfo>, &str> {
+    fn symbolize_user_stack(&mut self, pid: u32, addrs: &[Addr]) -> Result<Vec<StackFrameInfo>, &str> {
         let src: Source<'_> = Source::Process(Process::new(Pid::from(pid)));
 
         let syms = self
@@ -108,6 +121,35 @@ impl TraceHandler {
             .collect::<Vec<_>>();
 
         Ok(syms)
+    }
+
+    /// Enhance user stack with DWARF unwinding if enabled and needed
+    ///
+    /// This method attempts to extend stack traces using DWARF information
+    /// when frame pointer unwinding produces incomplete results.
+    fn enhance_with_dwarf_unwinding(&mut self, pid: u32, addrs: &[Addr]) -> Vec<Addr> {
+        if !self.dwarf_unwinder.is_enabled() {
+            return addrs.to_vec();
+        }
+
+        // Try DWARF unwinding to get additional frames
+        match self.dwarf_unwinder.unwind_stack(pid, addrs) {
+            Ok(Some(additional_addrs)) => {
+                tracing::debug!(
+                    "DWARF unwinding found {} additional frames",
+                    additional_addrs.len()
+                );
+                additional_addrs
+            }
+            Ok(None) => {
+                // DWARF unwinding returned no additional frames, use original
+                addrs.to_vec()
+            }
+            Err(e) => {
+                tracing::trace!("DWARF unwinding failed: {:?}", e);
+                addrs.to_vec()
+            }
+        }
     }
 
     /// Converts stacks traces into StackFrameInfo structs
@@ -224,7 +266,7 @@ impl TraceHandler {
     /// Return is an array sorted from the bottom (root) to the top (inner most function)
     /// Looks up symbolization
     fn format_stack_trace(
-        &self,
+        &mut self,
         stack_info: &StackInfo,
         kernel_stack: Option<Vec<u64>>,
         user_stack: Option<Vec<u64>>,
@@ -255,8 +297,12 @@ impl TraceHandler {
         let pid = stack_info.tgid;
 
         let addrs = user_stack.unwrap_or_default();
+        
+        // Try to enhance with DWARF unwinding if enabled
+        let enhanced_addrs = self.enhance_with_dwarf_unwinding(pid, &addrs);
+        
         let user_syms = self
-            .symbolize_user_stack(pid, &addrs)
+            .symbolize_user_stack(pid, &enhanced_addrs)
             .ok()
             .unwrap_or_default();
 
