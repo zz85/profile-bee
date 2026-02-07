@@ -119,7 +119,7 @@ impl TraceHandler {
         group_by_cpu: bool,
         stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     ) -> Vec<StackFrameInfo> {
-        let (kernel_stack, _user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
+        let (kernel_stack, fp_user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
 
         let key = StackInfoPod(stack_info.clone());
 
@@ -136,12 +136,11 @@ impl TraceHandler {
                 );
                 Some(addrs)
             } else {
-                None
+                fp_user_stack
             }
         } else {
             // Fall back to kernel's FP-based stack trace
-            let (_kernel, user) = self.get_instruction_pointers(stack_info, stack_traces);
-            user
+            fp_user_stack
         };
 
         let stacks = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);

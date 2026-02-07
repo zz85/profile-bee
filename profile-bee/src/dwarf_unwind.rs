@@ -155,6 +155,8 @@ pub struct DwarfUnwindManager {
     pub proc_info: HashMap<u32, ProcInfo>,
     /// Next free index in the global unwind table
     next_table_index: u32,
+    /// Cache of parsed ELF binary unwind entries, keyed by resolved path
+    binary_cache: HashMap<std::path::PathBuf, (u32, u32)>, // (table_start, table_count)
 }
 
 impl DwarfUnwindManager {
@@ -163,6 +165,7 @@ impl DwarfUnwindManager {
             global_table: Vec::new(),
             proc_info: HashMap::new(),
             next_table_index: 0,
+            binary_cache: HashMap::new(),
         }
     }
 
@@ -225,44 +228,53 @@ impl DwarfUnwindManager {
                 continue;
             }
 
-            // Generate unwind table for this binary
-            let unwind_entries = match generate_unwind_table(&resolved_path) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    tracing::debug!(
-                        "Skipping {} for pid {}: {}",
-                        resolved_path.display(),
-                        tgid,
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            if unwind_entries.is_empty() {
-                continue;
-            }
-
             let start_addr = map.address.0;
             let end_addr = map.address.1;
             let file_offset = map.offset;
 
             // Calculate load bias
-            // For PIE executables and shared libraries, we need to account
-            // for the difference between the virtual address in the file
-            // and where it's actually loaded in memory.
             let load_bias = start_addr - file_offset;
 
-            let table_start = self.next_table_index;
-            let entry_count = unwind_entries.len() as u32;
+            // Check if we've already parsed this binary
+            let (table_start, table_count) = if let Some(&(ts, tc)) = self.binary_cache.get(&resolved_path) {
+                (ts, tc)
+            } else {
+                // Generate unwind table for this binary
+                let unwind_entries = match generate_unwind_table(&resolved_path) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        tracing::debug!(
+                            "Skipping {} for pid {}: {}",
+                            resolved_path.display(),
+                            tgid,
+                            e
+                        );
+                        continue;
+                    }
+                };
 
-            if self.next_table_index + entry_count > MAX_UNWIND_TABLE_SIZE {
-                tracing::warn!("Global unwind table full, skipping remaining mappings for pid {}", tgid);
-                break;
-            }
+                if unwind_entries.is_empty() {
+                    continue;
+                }
 
-            self.global_table.extend_from_slice(&unwind_entries);
-            self.next_table_index += entry_count;
+                let ts = self.next_table_index;
+                let tc = unwind_entries.len() as u32;
+
+                if self.next_table_index + tc > MAX_UNWIND_TABLE_SIZE {
+                    tracing::warn!(
+                        "Global unwind table full ({}/{} entries used), skipping remaining mappings for pid {}",
+                        self.next_table_index, MAX_UNWIND_TABLE_SIZE, tgid,
+                    );
+                    break;
+                }
+
+                self.global_table.extend_from_slice(&unwind_entries);
+                self.next_table_index += tc;
+
+                self.binary_cache.insert(resolved_path.clone(), (ts, tc));
+
+                (ts, tc)
+            };
 
             let idx = proc_info.mapping_count as usize;
             proc_info.mappings[idx] = ExecMapping {
@@ -270,7 +282,7 @@ impl DwarfUnwindManager {
                 end: end_addr,
                 load_bias,
                 table_start,
-                table_count: entry_count,
+                table_count,
             };
             proc_info.mapping_count += 1;
         }
