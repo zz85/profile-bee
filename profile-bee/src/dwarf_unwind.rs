@@ -94,7 +94,11 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
                                 // Unsupported register for CFA
                                 continue;
                             };
-                            (reg_type, *offset as i32)
+                            // Skip entries with offsets that don't fit in i32
+                            let Ok(offset_i32) = i32::try_from(*offset) else {
+                                continue;
+                            };
+                            (reg_type, offset_i32)
                         }
                         CfaRule::Expression(_) => {
                             (CFA_REG_EXPRESSION, 0)
@@ -109,7 +113,12 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
                     // Get return address rule
                     let ra_rule = row.register(X86_64_RA);
                     let (ra_type, ra_offset) = match ra_rule {
-                        RegisterRule::Offset(offset) => (REG_RULE_OFFSET, offset as i32),
+                        RegisterRule::Offset(offset) => {
+                            let Ok(offset_i32) = i32::try_from(offset) else {
+                                continue;
+                            };
+                            (REG_RULE_OFFSET, offset_i32)
+                        }
                         RegisterRule::SameValue => (REG_RULE_SAME_VALUE, 0),
                         RegisterRule::Undefined => (REG_RULE_UNDEFINED, 0),
                         _ => continue, // Skip complex rules
@@ -118,7 +127,12 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
                     // Get RBP rule (important for restoring frame pointer)
                     let rbp_rule = row.register(X86_64_RBP);
                     let (rbp_type, rbp_offset) = match rbp_rule {
-                        RegisterRule::Offset(offset) => (REG_RULE_OFFSET, offset as i32),
+                        RegisterRule::Offset(offset) => {
+                            let Ok(offset_i32) = i32::try_from(offset) else {
+                                continue;
+                            };
+                            (REG_RULE_OFFSET, offset_i32)
+                        }
                         RegisterRule::SameValue => (REG_RULE_SAME_VALUE, 0),
                         RegisterRule::Undefined => (REG_RULE_UNDEFINED, 0),
                         _ => (REG_RULE_UNDEFINED, 0),
@@ -232,8 +246,8 @@ impl DwarfUnwindManager {
             let end_addr = map.address.1;
             let file_offset = map.offset;
 
-            // Calculate load bias
-            let load_bias = start_addr - file_offset;
+            // Calculate load bias (use wrapping to handle edge cases)
+            let load_bias = start_addr.wrapping_sub(file_offset);
 
             // Check if we've already parsed this binary
             let (table_start, table_count) = if let Some(&(ts, tc)) = self.binary_cache.get(&resolved_path) {
@@ -258,7 +272,17 @@ impl DwarfUnwindManager {
                 }
 
                 let ts = self.next_table_index;
-                let tc = unwind_entries.len() as u32;
+                let tc = match u32::try_from(unwind_entries.len()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::warn!(
+                            "Unwind table too large for {}: {} entries",
+                            resolved_path.display(),
+                            unwind_entries.len(),
+                        );
+                        continue;
+                    }
+                };
 
                 if self.next_table_index + tc > MAX_UNWIND_TABLE_SIZE {
                     tracing::warn!(
