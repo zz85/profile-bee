@@ -2,6 +2,7 @@ use aya::maps::{MapData, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
+use profile_bee::dwarf_unwind::DwarfUnwindManager;
 use profile_bee::ebpf::FramePointersPod;
 use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod};
 use profile_bee::html::{collapse_to_json, generate_html_file};
@@ -78,6 +79,10 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     no_dwarf: bool,
 
+    /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
+    #[arg(long, default_value_t = false)]
+    dwarf: bool,
+
     /// PID to profile
     #[arg(short, long)]
     pid: Option<u32>,
@@ -145,10 +150,36 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         pid,
         cpu: opt.cpu,
         self_profile: opt.self_profile,
+        dwarf: opt.dwarf,
     };
 
     // Setup eBPF profiler
     let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
+
+    // If DWARF unwinding is enabled, load unwind tables for the target process
+    if opt.dwarf {
+        if let Some(target_pid) = pid {
+            println!("Loading DWARF unwind tables for pid {}...", target_pid);
+            let mut dwarf_manager = DwarfUnwindManager::new();
+            match dwarf_manager.load_process(target_pid) {
+                Ok(()) => {
+                    println!(
+                        "Loaded {} unwind entries for pid {}",
+                        dwarf_manager.table_size(),
+                        target_pid,
+                    );
+                    if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
+                        eprintln!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to load DWARF info for pid {}: {}", target_pid, e);
+                }
+            }
+        } else {
+            eprintln!("DWARF unwinding requires a target PID (--pid or --cmd). Falling back to frame pointer unwinding.");
+        }
+    }
 
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;

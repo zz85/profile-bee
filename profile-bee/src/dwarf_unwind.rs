@@ -351,4 +351,78 @@ mod tests {
         // Should be 32 bytes
         assert_eq!(std::mem::size_of::<UnwindEntry>(), 32);
     }
+
+    #[test]
+    fn test_unwind_table_return_address_rules() {
+        // Parse the current test binary and verify return address rules are sensible
+        let exe = std::env::current_exe().unwrap();
+        let entries = generate_unwind_table(&exe).unwrap();
+
+        let mut offset_count = 0;
+        for entry in &entries {
+            if entry.ra_type == REG_RULE_OFFSET {
+                offset_count += 1;
+                // For x86_64, return address is typically at CFA-8
+                assert_eq!(
+                    entry.ra_offset, -8,
+                    "Return address offset should be -8 for x86_64, got {}",
+                    entry.ra_offset
+                );
+            }
+        }
+        assert!(
+            offset_count > 0,
+            "Expected at least some entries with CFA-relative return address"
+        );
+    }
+
+    #[test]
+    fn test_load_current_process() {
+        let pid = std::process::id();
+        let mut manager = DwarfUnwindManager::new();
+        let result = manager.load_process(pid);
+        assert!(
+            result.is_ok(),
+            "Failed to load current process: {:?}",
+            result
+        );
+        assert!(
+            manager.table_size() > 0,
+            "Expected non-empty unwind table for current process"
+        );
+        assert!(
+            manager.proc_info.contains_key(&pid),
+            "Expected proc_info entry for current process"
+        );
+        let info = &manager.proc_info[&pid];
+        assert!(
+            info.mapping_count > 0,
+            "Expected at least one executable mapping"
+        );
+    }
+
+    #[test]
+    fn test_libc_unwind_table() {
+        // Parse libc's .eh_frame to verify we can handle shared libraries
+        let libc_paths = [
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib64/libc.so.6",
+        ];
+
+        let libc_path = libc_paths.iter().find(|p| Path::new(p).exists());
+        if let Some(path) = libc_path {
+            let entries = generate_unwind_table(Path::new(path)).unwrap();
+            assert!(
+                !entries.is_empty(),
+                "Expected non-empty unwind table for libc"
+            );
+            // libc should have many unwind entries
+            assert!(
+                entries.len() > 100,
+                "Expected >100 entries for libc, got {}",
+                entries.len()
+            );
+        }
+    }
 }
