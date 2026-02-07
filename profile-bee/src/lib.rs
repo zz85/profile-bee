@@ -9,5 +9,7 @@ pub mod spawn;
 mod legacy;
 pub mod types;
 
+pub mod dwarf_unwind;
+
 mod trace_handler;
 pub use trace_handler::*;
