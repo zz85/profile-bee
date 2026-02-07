@@ -152,9 +152,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
-    let stacked_pointers = &ebpf_profiler.stacked_pointers;
+    let stack_snapshots = &ebpf_profiler.stacked_pointers;
 
-    let mut profiler = TraceHandler::new(); // !opt.no_dwarf
+    let mut profiler = TraceHandler::new(!opt.no_dwarf);
 
     // Set up communication channels
     let (perf_tx, perf_rx) = mpsc::channel();
@@ -180,7 +180,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             &mut profiler,
             opt.stream_mode,
             opt.group_by_cpu,
-            stacked_pointers,
+            stack_snapshots,
         );
 
         // Generate and save output files
@@ -299,7 +299,7 @@ fn process_profiling_data(
     profiler: &mut TraceHandler,
     stream_mode: u8,
     group_by_cpu: bool,
-    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
+    stack_snapshots: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
 ) -> Vec<String> {
     // Local counting
     let mut trace_count = HashMap::<StackInfo, usize>::new();
@@ -324,19 +324,6 @@ fn process_profiling_data(
                 // User space counting
                 let trace = trace_count.entry(stack).or_insert(0);
                 *trace += 1;
-
-                if *trace == 1 {
-                    // let _combined = profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu);
-
-                    // todo pass hashmap or stacked pointers information here
-
-                    let _combined = profiler.get_exp_stacked_frames(
-                        &stack,
-                        &stack_traces,
-                        group_by_cpu,
-                        stacked_pointers,
-                    );
-                }
             }
             PerfWork::Stop => break,
         }
@@ -354,6 +341,7 @@ fn process_profiling_data(
             profiler,
             stack_traces,
             group_by_cpu,
+            stack_snapshots,
             &mut samples,
             &mut stacks,
         );
@@ -363,6 +351,7 @@ fn process_profiling_data(
             profiler,
             stack_traces,
             group_by_cpu,
+            stack_snapshots,
             &mut samples,
             &mut stacks,
         );
@@ -396,11 +385,13 @@ fn process_local_counting(
     profiler: &mut TraceHandler,
     stack_traces: &StackTraceMap<MapData>,
     group_by_cpu: bool,
+    stack_snapshots: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     samples: &mut u64,
     stacks: &mut Vec<FrameCount>,
 ) {
     for (stack, value) in trace_count.iter() {
-        let combined = profiler.get_stacked_frames(stack, stack_traces, group_by_cpu);
+        let combined =
+            profiler.get_stacked_frames(stack, stack_traces, group_by_cpu, Some(stack_snapshots));
 
         *samples += *value as u64;
         stacks.push(FrameCount {
@@ -417,6 +408,7 @@ fn process_kernel_counting(
     profiler: &mut TraceHandler,
     stack_traces: &aya::maps::StackTraceMap<MapData>,
     group_by_cpu: bool,
+    stack_snapshots: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     samples: &mut u64,
     stacks: &mut Vec<FrameCount>,
 ) {
@@ -425,7 +417,8 @@ fn process_kernel_counting(
 
         *samples += value;
 
-        let combined = profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu);
+        let combined =
+            profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu, Some(stack_snapshots));
 
         stacks.push(FrameCount {
             frames: combined,

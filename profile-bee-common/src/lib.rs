@@ -30,11 +30,12 @@ pub static EVENT_TRACE_NONE: u8 = 3;
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(C)]
 pub struct FramePointers {
-    /// Maximum stack depth supported (1024 frames * 8 bytes = 8KB)
+    /// Maximum raw stack snapshot size (1024 words * 8 bytes = 8 KiB) used for DWARF unwinding.
     pub pointers: [u64; 1024],
-    /// Describes depth of stack trace (number of frames)
-    /// This could be optional because the array is 0 terminated
+    /// Describes depth of captured raw stack words for DWARF unwinding
     pub len: usize,
+    /// Stack pointer used for the snapshot
+    pub stack_pointer: u64,
 }
 
 impl FramePointers {

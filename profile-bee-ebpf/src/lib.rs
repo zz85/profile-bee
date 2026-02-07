@@ -76,8 +76,9 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     };
 
     let pointer = &mut *pointer;
-    let (ip, bp, len) = copy_stack(&ctx, &mut pointer.pointers);
+    let (ip, bp, stack_pointer, len) = copy_stack(&ctx, &mut pointer.pointers);
     pointer.len = len;
+    pointer.stack_pointer = stack_pointer;
 
     let stack_info = StackInfo {
         tgid,
@@ -119,8 +120,8 @@ const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
 /// puts the userspace stack in the target pointer slice
 #[inline(always)]
-unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize) {
-    // refernce pt_regs
+unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, u64, usize) {
+    // reference pt_regs
     let regs =  ctx.as_ptr() as *const pt_regs;
     let regs = &*regs;
 
@@ -128,53 +129,39 @@ unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64
     let ip = regs.rip;
 
     // base pointer (frame pointer)
-    let mut bp = regs.rbp;
+    let bp = regs.rbp;
 
-    pointers[0] = ip;
+    // stack pointer
+    let stack_pointer = regs.rsp;
+    if invalid_userspace_pointer(stack_pointer) {
+        return (ip, bp, stack_pointer, 0);
+    }
 
     let mut len = pointers.len();
-    for i in 1..pointers.len() {
-        let Some(ret_addr) = get_frame(&mut bp) else {
+    let mut addr = stack_pointer;
+    // Read word-by-word since the helper reads typed values.
+    for i in 0..pointers.len() {
+        if invalid_userspace_pointer(addr) {
             len = i;
             break;
-        };
+        }
 
-        pointers[i] = ret_addr;
+        if let Some(value) = bpf_probe_read::<u64>(addr as *const u8 as _).ok() {
+            pointers[i] = value;
+        } else {
+            len = i;
+            break;
+        }
+
+        addr += core::mem::size_of::<u64>() as u64;
     }
 
-    (ip, bp, len)
-}
-
-/// unwind frame pointer
-#[inline(always)]
-unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
-    let bp = *fp;
-    if bp == 0 {
-        return None;
-    }
-
-    const RETURN_OFFSET: u64 = 8; // x86_64 offset to get return addr from the base pointer
-    let return_addr: u64 = bp + RETURN_OFFSET;
-
-    // return address is the instruction pointer
-    let ip = bpf_probe_read::<u64>(return_addr as *const u8 as _).ok()?;
-
-    // frame pointer points to the base pointer!
-    let bp: u64 = bpf_probe_read(bp as *const u8 as _).unwrap_or_default();
-
-    *fp = bp;
-
-    // santity check whether is the framepointer
-    if invalid_userspace_pointer(ip) {
-        return None;
-    }
-
-    Some(ip)
+    (ip, bp, stack_pointer, len)
 }
 
 #[inline(always)]
-fn invalid_userspace_pointer(ip: u64) -> bool {
-    ip == 0 || ip >= __START_KERNEL_MAP
+fn invalid_userspace_pointer(addr: u64) -> bool {
+    addr == 0 || addr >= __START_KERNEL_MAP
 }
 
 // Make this simple now - checking for valid pointers can include

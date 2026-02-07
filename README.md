@@ -24,7 +24,7 @@ More documentation in [docs](docs) directory.
 Note: if symbols for your C/Rust programs doesn't appear correct, you may want to build your software with debug information.
 
 With rustc that's adding a `-g` flag when you compile. Another thing to consider doing is emitting frame pointer by setting `RUSTFLAGS="-Cforce-frame-pointers=yes"` with building (or modifying ./cargo/config)
-and `-fno-omit-frame-pointer` for gcc. With framepointers, you could get symbols while saving on the cost of dwarf parsing (using --no-dwarf)
+and `-fno-omit-frame-pointer` for gcc. With frame pointers, you could get symbols while saving on the cost of DWARF unwinding (using --no-dwarf). By default profile-bee captures user stack snapshots and uses DWARF CFI to unwind when frame pointers are unavailable.
 
 ### Usage
 

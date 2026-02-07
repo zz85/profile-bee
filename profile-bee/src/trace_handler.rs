@@ -1,3 +1,4 @@
+use crate::dwarf_unwinder::DwarfUnwinder;
 use crate::ebpf::{FramePointersPod, StackInfoPod};
 use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
 use aya::maps::MapData;
@@ -61,13 +62,19 @@ pub struct TraceHandler {
     symbolizer: Symbolizer,
     /// Simple Cache
     cache: PointerStackFramesCache,
+    enable_dwarf_unwinding: bool,
+    dwarf_unwinder: DwarfUnwinder,
 }
 
 impl TraceHandler {
-    pub fn new() -> Self {
+    /// Create a trace handler. DWARF unwinding is attempted when enabled; if stack snapshots
+    /// are missing, symbolization falls back to kernel frame-pointer stacks.
+    pub fn new(enable_dwarf_unwinding: bool) -> Self {
         TraceHandler {
             symbolizer: Symbolizer::new(),
             cache: Default::default(),
+            enable_dwarf_unwinding,
+            dwarf_unwinder: DwarfUnwinder::new(),
         }
     }
 
@@ -111,45 +118,15 @@ impl TraceHandler {
     }
 
     /// Converts stacks traces into StackFrameInfo structs
-    pub fn get_exp_stacked_frames(
-        &mut self,
-        stack_info: &StackInfo,
-        stack_traces: &StackTraceMap<MapData>,
-        group_by_cpu: bool,
-        stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
-    ) -> Vec<StackFrameInfo> {
-        let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
-
-        let key = StackInfoPod(stack_info.clone());
-
-        if let Ok(pointers) = stacked_pointers.get(&key, 0) {
-            let pointers = pointers.0;
-            let pid = stack_info.tgid;
-            let src: Source<'_> = Source::Process(Process::new(Pid::from(pid)));
-            let addrs = &pointers.pointers[..pointers.len as usize];
-
-            tracing::info!("IP (instruction pointer): {}", stack_info.ip);
-            tracing::info!("BP (base pointer aka Frame pointer): {}", stack_info.bp);
-            tracing::info!("User stack: {:?}", user_stack);
-            tracing::info!("addrs: {:?}", addrs);
-
-            let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(addrs));
-            tracing::info!("IP Symbolization {syms:?}");
-        }
-
-        let stacks = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);
-
-        stacks
-    }
-
-    /// Converts stacks traces into StackFrameInfo structs
     pub fn get_stacked_frames(
         &mut self,
         stack_info: &StackInfo,
         stack_traces: &StackTraceMap<MapData>,
         group_by_cpu: bool,
+        stack_snapshots: Option<&aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>>,
     ) -> Vec<StackFrameInfo> {
-        let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
+        let (kernel_stack, user_stack) =
+            self.get_instruction_pointers(stack_info, stack_traces, stack_snapshots);
         let stacks = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);
         stacks
     }
@@ -175,10 +152,12 @@ impl TraceHandler {
     // }
 
     /// Extract stacks from StackTraceMaps (kernel's implementation only support FP unwinding)
+    /// and optionally unwind user stacks using DWARF from stack snapshots.
     pub fn get_instruction_pointers(
         &mut self,
         stack_info: &StackInfo,
         stack_traces: &StackTraceMap<MapData>,
+        stack_snapshots: Option<&aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>>,
     ) -> (Option<Vec<u64>>, Option<Vec<u64>>) {
         let ktrace_id = stack_info.kernel_stack_id;
         let utrace_id = stack_info.user_stack_id;
@@ -200,22 +179,34 @@ impl TraceHandler {
             None
         };
 
-        let user_stack = if utrace_id > -1 {
-            stack_traces.get(&(utrace_id as u32), 0).ok().map(|stack| {
-                let addrs: Vec<Addr> = stack
-                    .frames()
-                    .iter()
-                    .map(|frame| {
-                        let instruction_pointer = frame.ip;
-                        instruction_pointer
-                    })
-                    .collect();
+        let key = StackInfoPod(*stack_info);
 
-                addrs
-            })
+        let user_stack = if self.enable_dwarf_unwinding {
+            stack_snapshots
+                .and_then(|map| map.get(&key, 0).ok())
+                .and_then(|pointers| self.dwarf_unwinder.unwind_stack(stack_info, &pointers.0))
         } else {
             None
         };
+
+        let user_stack = user_stack.or_else(|| {
+            if utrace_id > -1 {
+                stack_traces.get(&(utrace_id as u32), 0).ok().map(|stack| {
+                    let addrs: Vec<Addr> = stack
+                        .frames()
+                        .iter()
+                        .map(|frame| {
+                            let instruction_pointer = frame.ip;
+                            instruction_pointer
+                        })
+                        .collect();
+
+                    addrs
+                })
+            } else {
+                None
+            }
+        });
 
         (kernel_stack, user_stack)
     }
