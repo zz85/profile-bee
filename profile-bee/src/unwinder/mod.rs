@@ -1,6 +1,81 @@
 mod ehframe;
 mod maps;
 
+pub fn get_mappings(pid: usize) -> anyhow::Result<DwarfUnwindInfo> {
+    let map = maps::AddressMap::load_pid(pid as _)?;
+
+    tracing::info!("Address maps entries: {}", map.len());
+
+    let mut total_entries = 0;
+    let mut unwind = DwarfUnwindInfo::default();
+
+    for entry in map.iter() {
+        let path = entry.path.to_str().unwrap();
+        let unwind_table = get_unwind_table(path).unwrap();
+
+        tracing::info!(
+            "Unwind table entries for {path}: {}",
+            unwind_table.rows.len()
+        );
+        total_entries += unwind_table.rows.len();
+
+        for row in unwind_table.rows.iter() {
+            let addr = row.start_address;
+            let absolute_addr = entry.start_addr <= addr && addr <= entry.end_addr;
+
+            let addr = if absolute_addr {
+                addr
+            } else {
+                entry.start_addr + addr
+            };
+
+            tracing::debug!(
+                "abs: {absolute_addr}, addr: {addr} = {} + {}",
+                entry.start_addr,
+                row.start_address
+            );
+
+            // RSP instruction is to derive CFA offset, which later becomes RSP
+            let rsp = row.rsp;
+            let cfa_offset = match (rsp.op(), rsp.reg(), rsp.offset()) {
+                (Op::Register, Some(Reg::Rsp), Some(offset)) => Some(offset),
+                _ => None,
+            };
+
+            // RIP instruction is instruction from the stack
+            let rip = row.rip;
+            let rip_offset = match (rip.op(), rip.reg(), rip.offset()) {
+                (Op::CfaOffset, None, Some(offset)) => Some(offset),
+                // (Op::Register, Some(Reg::Rip), Some(offset)) => {
+                //     tracing::info!("RIP register offset: {offset}");
+                //     Some(offset)
+                // }
+                _ => None,
+            };
+
+            if let (Some(cfa_offset), Some(rip_offset)) = (cfa_offset, rip_offset) {
+                unwind.deltas[unwind.len] = DwarfDelta {
+                    addr: addr as _,
+                    cfa_offset: cfa_offset as _,
+                    rip_offset: rip_offset as _,
+                };
+
+                unwind.len += 1;
+            }
+
+            // println!("RSP instrustion {rsp:?}");
+            // println!("RIP instrustion {rip:?}");
+            // println!("CFA offset: {cfa_offset:?} RIP offset: {rip_offset:?}");
+        }
+    }
+
+    tracing::info!("Total unwind table entries: {total_entries}");
+
+    unwind.deltas[..total_entries].sort_unstable_by_key(|delta| delta.addr);
+
+    Ok(unwind)
+}
+
 pub fn find_instruction(pid: usize, ip: u64, rsp: u64) -> anyhow::Result<()> {
     let map = maps::AddressMap::load_pid(pid as _)?;
 
@@ -46,12 +121,12 @@ pub fn find_instruction(pid: usize, ip: u64, rsp: u64) -> anyhow::Result<()> {
 
     let rsp = 0;
 
-    // rip: Instruction { op: CfaOffset, reg: None, offset: Some(-8) },
     // rsp: Instruction { op: Register, reg: Some(Rsp), offset: Some(16) } },
+    // rip: Instruction { op: CfaOffset, reg: None, offset: Some(-8) },
 
     // UnwindTableRow { start_address: 4195451, end_address: 4195453,
-    // rip: Instruction { op: CfaOffset, reg: None, offset: Some(-8) },
     // rsp: Instruction { op: Unimplemented, reg: None, offset: None } },
+    // rip: Instruction { op: CfaOffset, reg: None, offset: Some(-8) },
 
     // no-fp
     // RSP instrustion Instruction { op: Register, reg: Some(Rsp), offset: Some(8) }
@@ -150,6 +225,7 @@ pub unsafe fn unwind_context(&mut self) -> bool {
 
 use blazesym::symbolize::cache::Elf;
 use object::{Object, ObjectSection};
+use profile_bee_common::{DwarfDelta, DwarfUnwindInfo};
 use std::error::Error;
 use std::fs;
 use std::path::Path;

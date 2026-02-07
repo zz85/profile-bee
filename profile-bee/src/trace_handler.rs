@@ -1,4 +1,4 @@
-use crate::ebpf::{FramePointersPod, StackInfoPod};
+use crate::ebpf::{DwarfUnwindInfoPod, FramePointersPod, StackInfoPod};
 use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
 use aya::maps::MapData;
 use aya::maps::StackTraceMap;
@@ -112,6 +112,25 @@ impl TraceHandler {
         Ok(syms)
     }
 
+    // Generate unwind table and uploads to ebpf hashmap
+    pub fn upload_unwind(
+        &mut self,
+        stack_info: &StackInfo,
+        unwind: &mut aya::maps::HashMap<MapData, u32, DwarfUnwindInfoPod>,
+    ) {
+        let pid = stack_info.tgid;
+        tracing::info!("Checking unwind table for pid: {}", pid);
+
+        if unwind.get(&pid, 0).is_err() {
+            tracing::info!("Unwind table not found..");
+            if let Ok(unwind_table) = crate::get_mappings(pid as _) {
+                tracing::info!("Uploading unwind table..");
+                let table = DwarfUnwindInfoPod(unwind_table);
+                unwind.insert(pid, table, 0).unwrap();
+            }
+        }
+    }
+
     /// Converts stacks traces into StackFrameInfo structs
     pub fn get_exp_stacked_frames(
         &mut self,
@@ -120,10 +139,10 @@ impl TraceHandler {
         group_by_cpu: bool,
         stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     ) -> Vec<StackFrameInfo> {
-        if self.done {
-            return vec![];
-        }
-        self.done = true;
+        // if self.done {
+        //     return vec![];
+        // }
+        // self.done = true;
 
         let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
 
@@ -141,7 +160,8 @@ impl TraceHandler {
             tracing::info!("User stack: {:?}", user_stack);
             tracing::info!("addrs: {:?}", addrs);
 
-            let _ = crate::find_instruction(pid as _, stack_info.ip, stack_info.sp);
+            // let _ = crate::get_mappings(pid as _);
+            // let _ = crate::find_instruction(pid as _, stack_info.ip, stack_info.sp);
 
             let syms = self
                 .symbolizer
@@ -151,7 +171,10 @@ impl TraceHandler {
             let syms = self.symbolizer.symbolize(
                 &src,
                 // Input::AbsAddr(&user_stack.as_ref().unwrap().clone()[..3]),
-                Input::AbsAddr(&user_stack.as_ref().unwrap().clone()[..1]),
+                Input::AbsAddr(
+                    // &user_stack.as_ref().unwrap().clone()[..1]
+                    &addrs[1..],
+                ),
             );
             tracing::info!("IP Symbolization original {syms:?}");
         }

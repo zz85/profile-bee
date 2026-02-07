@@ -2,8 +2,8 @@ use aya::maps::{MapData, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
-use profile_bee::ebpf::FramePointersPod;
 use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod};
+use profile_bee::ebpf::{DwarfUnwindInfoPod, FramePointersPod};
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
@@ -155,6 +155,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
     let stacked_pointers = &ebpf_profiler.stacked_pointers;
+    let unwind = &mut ebpf_profiler.unwind;
 
     let mut profiler = TraceHandler::new(); // !opt.no_dwarf
 
@@ -183,6 +184,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             opt.stream_mode,
             opt.group_by_cpu,
             stacked_pointers,
+            unwind,
         );
 
         // Generate and save output files
@@ -302,6 +304,7 @@ fn process_profiling_data(
     stream_mode: u8,
     group_by_cpu: bool,
     stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
+    unwind: &mut aya::maps::HashMap<MapData, u32, DwarfUnwindInfoPod>,
 ) -> Vec<String> {
     // Local counting
     let mut trace_count = HashMap::<StackInfo, usize>::new();
@@ -331,6 +334,8 @@ fn process_profiling_data(
                     // let _combined = profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu);
 
                     // todo pass hashmap or stacked pointers information here
+
+                    profiler.upload_unwind(&stack, unwind);
 
                     let _combined = profiler.get_exp_stacked_frames(
                         &stack,

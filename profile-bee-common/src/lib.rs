@@ -54,3 +54,30 @@ pub struct ProbeEvent {
 impl ProbeEvent {
     pub const STRUCT_SIZE: usize = size_of::<ProbeEvent>();
 }
+
+// Dwarf unwind info
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+#[repr(C)]
+pub struct DwarfDelta {
+    pub addr: u64,
+    // offset from
+    pub cfa_offset: i8,
+    pub rip_offset: i8,
+}
+
+//Table of Dwarf Delta
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(C)]
+pub struct DwarfUnwindInfo {
+    pub deltas: [DwarfDelta; 100000],
+    pub len: usize,
+}
+
+impl Default for DwarfUnwindInfo {
+    fn default() -> Self {
+        Self {
+            deltas: [DwarfDelta::default(); 100000],
+            len: 0,
+        }
+    }
+}

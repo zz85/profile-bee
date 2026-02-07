@@ -12,7 +12,9 @@ use aya_ebpf::{
 };
 
 // use aya_log_ebpf::info;
-use profile_bee_common::{FramePointers, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW};
+use profile_bee_common::{
+    DwarfDelta, DwarfUnwindInfo, FramePointers, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW,
+};
 
 pub const STACK_ENTRIES: u32 = 16392;
 pub const STACK_SIZE: u32 = 2048;
@@ -41,6 +43,9 @@ static mut STORAGE: PerCpuArray<FramePointers> = PerCpuArray::with_max_entries(1
 #[map(name = "counts")]
 pub static COUNTS: HashMap<StackInfo, u64> = HashMap::with_max_entries(STACK_ENTRIES, 0);
 
+#[map(name = "unwind")]
+pub static UNWIND: HashMap<u32, DwarfUnwindInfo> = HashMap::with_max_entries(100, 0);
+
 #[map(name = "stacked_pointers")]
 pub static STACK_ID_TO_TRACES: HashMap<StackInfo, FramePointers> =
     HashMap::with_max_entries(STACK_SIZE, 0);
@@ -50,6 +55,39 @@ static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
 
 #[map(name = "stack_traces")]
 pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
+
+const MAX_BIN_SEARCH_DEPTH: usize = 10; // 18
+
+#[inline(always)]
+fn binary_search(rip: u64, unwind: &DwarfUnwindInfo) -> Option<usize> {
+    let mut left = 0;
+    let mut right = unwind.len.min(unwind.deltas.len()) - 1;
+
+    let mut i = 0;
+
+    for _ in 0..MAX_BIN_SEARCH_DEPTH {
+        if left > right {
+            break;
+        }
+        i = (left + right) / 2;
+        let pc = unwind.deltas.get(i)?.addr;
+        if pc == rip {
+            return Some(i);
+        } else if pc < rip {
+            left = i;
+        } else {
+            right = i;
+        }
+    }
+
+    //      if left > 0 {
+    //     Some(left - 1)
+    // } else {
+    //     None
+    // }
+
+    Some(i)
+}
 
 #[inline(always)]
 pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
@@ -72,12 +110,51 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
     // Use CPU based storage so it doesn't occupy space on stack
     let Some(pointer) = STORAGE.get_ptr_mut(0) else {
-        return;   
+        return;
     };
 
     let pointer = &mut *pointer;
     let (ip, bp, len, sp) = copy_stack(&ctx, &mut pointer.pointers);
     pointer.len = len;
+
+    if let Some(unwind_info) = UNWIND.get(&tgid) {
+        pointer.pointers[0] = unwind_info.len as _;
+        // let slice = &unwind_info.deltas[0..unwind_info.len.min(unwind_info.deltas.len())];
+        // let res = binary_search(ip, slice);
+
+        let res = binary_search(ip, unwind_info);
+
+        pointer.pointers[0] = 9999;
+
+        if let Some(i) = res {
+            if let Some(dwarf) = unwind_info.deltas.get(i) {
+            // let dwarf = unwind_info.deltas[i];
+                pointer.pointers[0] = 8888;
+                let cfa = if dwarf.cfa_offset >= 0 {
+                    sp + (dwarf.cfa_offset as u64)
+                } else {
+                    sp + (dwarf.cfa_offset.abs() as u64)
+                };
+
+                let ip_loc = if dwarf.rip_offset >= 0 {
+                    cfa + (dwarf.rip_offset as u64)
+                } else {
+                    cfa - (dwarf.rip_offset.abs() as u64)
+                };
+
+                let Ok(ip) = bpf_probe_read::<u64>(ip_loc as *const u8 as _) else {
+                    return;
+                };
+
+                let sp = cfa;
+
+                pointer.pointers[1] = ip;
+                pointer.len += 1;
+            }
+        }
+    }
+
+    let sp = pointer.pointers[0];
 
     // // unwind 1 - hot
     // let cfa = sp + 8;
@@ -157,7 +234,7 @@ const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 #[inline(always)]
 unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
     // refernce pt_regs
-    let regs =  ctx.as_ptr() as *const pt_regs;
+    let regs = ctx.as_ptr() as *const pt_regs;
     let regs = &*regs;
 
     // instruction pointer
@@ -165,9 +242,11 @@ unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64
     let sp = regs.rsp;
 
     // base pointer (frame pointer)
-    let mut bp = regs.rbp;    
+    let mut bp = regs.rbp;
 
     pointers[0] = ip;
+
+    return (ip, bp, 1, sp);
 
     let mut len = pointers.len();
     for i in 1..pointers.len() {
