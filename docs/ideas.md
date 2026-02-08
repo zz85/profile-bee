@@ -45,6 +45,32 @@ Key ideas from async-profiler-agent:
 
 Profile-bee's advantage: no external `.so` needed, DWARF unwinding built in, native Rust/C++ support, kernel stacks included.
 
+### 3. Cargo Subcommand (cargo-flamegraph model)
+
+A `cargo-profile-bee` binary that integrates with the cargo build workflow:
+
+```bash
+# Build in release, run, profile, and generate flamegraph — one command
+cargo profile-bee --svg out.svg -- --release --bin my-server
+
+# Profile tests
+cargo profile-bee --svg test.svg -- test -- my_heavy_test
+
+# Profile benchmarks
+cargo profile-bee --svg bench.svg -- bench
+
+# With DWARF unwinding (for optimized builds without frame pointers)
+cargo profile-bee --dwarf --svg out.svg -- --release --bin my-server
+```
+
+Key ergonomics from cargo-flamegraph:
+- Handles build → spawn → profile → output in one step
+- Passes cargo args after `--` naturally
+- Auto-opens SVG in browser on completion
+- No need to manually find the binary path
+
+The vendored `cargo-trace` already has some of this plumbing. The main work is wiring it into profile-bee's profiler and output pipeline.
+
 ## Integrations
 
 ### flamelens
