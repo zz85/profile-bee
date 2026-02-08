@@ -315,6 +315,17 @@ test_dwarf_pie_binary() {
     assert_min_depth "$file" 4
 }
 
+test_dwarf_rust_binary() {
+    # DWARF unwinding on a Rust binary compiled with -C opt-level=2 -C force-frame-pointers=no
+    # At O2, tail calls eliminate intermediate functions, but we should still get
+    # hot_loop and the Rust runtime frames (lang_start, etc.)
+    local file
+    file=$(run_profiler "$FIXTURE_DIR/rust-no-fp" "dwarf-rust" --dwarf)
+    assert_stack_contains "$file" "hot_loop"
+    assert_stack_contains "$file" "main"
+    assert_min_depth "$file" 5
+}
+
 test_samples_collected() {
     # Basic sanity: we should collect a non-zero number of samples
     local file
@@ -358,6 +369,7 @@ run_test "DWARF callstack O2 (no-FP, optimized)"    test_dwarf_callstack_O2
 run_test "DWARF deep recursion (no-FP, 20 levels)"  test_dwarf_deep
 run_test "DWARF shared library (cross-.so calls)"   test_dwarf_shared_library
 run_test "DWARF PIE binary (position-independent)"  test_dwarf_pie_binary
+run_test "DWARF Rust binary (O2, no frame pointers)" test_dwarf_rust_binary
 echo ""
 
 echo "── Comparison: DWARF vs FP ──"
