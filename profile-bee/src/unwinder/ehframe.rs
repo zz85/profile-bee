@@ -246,3 +246,98 @@ impl std::fmt::Display for UnwindTable {
         Ok(())
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_self_binary() {
+        let exe = std::env::current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let file = object::File::parse(&*data).unwrap();
+        let table = UnwindTable::parse(&file).unwrap();
+
+        assert!(!table.rows.is_empty(), "Should have unwind rows for test binary");
+        // Rows should be sorted by start_address
+        for w in table.rows.windows(2) {
+            assert!(w[0].start_address <= w[1].start_address, "Rows not sorted");
+        }
+    }
+
+    #[test]
+    fn test_rows_have_valid_ranges() {
+        let exe = std::env::current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let file = object::File::parse(&*data).unwrap();
+        let table = UnwindTable::parse(&file).unwrap();
+
+        for row in &table.rows {
+            assert!(
+                row.start_address <= row.end_address,
+                "start {} > end {}",
+                row.start_address,
+                row.end_address
+            );
+        }
+    }
+
+    #[test]
+    fn test_most_rows_have_rsp_register_rule() {
+        // On x86_64, most CFA rules are RSP+offset
+        let exe = std::env::current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let file = object::File::parse(&*data).unwrap();
+        let table = UnwindTable::parse(&file).unwrap();
+
+        let rsp_count = table
+            .rows
+            .iter()
+            .filter(|r| matches!(r.rsp.op(), Op::Register) && r.rsp.reg() == Some(Reg::Rsp))
+            .count();
+
+        let ratio = rsp_count as f64 / table.rows.len() as f64;
+        assert!(
+            ratio > 0.5,
+            "Expected >50% RSP-based CFA rules, got {:.0}%",
+            ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn test_most_rip_rules_are_cfa_minus_8() {
+        // On x86_64, return address is typically at CFA-8
+        let exe = std::env::current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let file = object::File::parse(&*data).unwrap();
+        let table = UnwindTable::parse(&file).unwrap();
+
+        let cfa_minus_8 = table
+            .rows
+            .iter()
+            .filter(|r| {
+                matches!(r.rip.op(), Op::CfaOffset) && r.rip.offset() == Some(-8)
+            })
+            .count();
+
+        let ratio = cfa_minus_8 as f64 / table.rows.len() as f64;
+        assert!(
+            ratio > 0.5,
+            "Expected >50% CFA-8 return address rules, got {:.0}%",
+            ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn test_instruction_display() {
+        let ins = Instruction::cfa_offset(-8);
+        assert_eq!(ins.to_string(), "cfa-8");
+
+        let ins = Instruction::reg_offset(Reg::Rsp, 16);
+        assert_eq!(ins.to_string(), "rsp+16");
+
+        let ins = Instruction::undef();
+        assert_eq!(ins.to_string(), "undef");
+    }
+}

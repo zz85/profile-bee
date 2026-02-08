@@ -1,0 +1,5 @@
+# Built test fixture binaries (rebuild with build_fixtures.sh)
+fixtures/bin/
+
+# Test output files
+output/
