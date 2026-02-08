@@ -193,7 +193,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let (perf_tx, perf_rx) = mpsc::channel();
 
     // Set up stopping mechanisms
-    setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn);
+    // Pass the external PID if we're monitoring one (not spawned)
+    let external_pid = if spawn.is_none() { opt.pid } else { None };
+    setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn, external_pid);
 
     task::spawn(async move {
         // Set up ring buffer to collect stack traces
@@ -253,17 +255,25 @@ fn setup_process_to_profile(
     }
 }
 
+/// Helper function to check if a process with given PID exists
+fn pid_exists(pid: u32) -> bool {
+    // Check if /proc/[pid] exists
+    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
 /// Sets up the mechanisms that can stop the profiling
 fn setup_stopping_mechanisms(
     duration: usize,
     perf_tx: mpsc::Sender<PerfWork>,
     stopping: Option<StopHandler>,
     spawn: Option<SpawnProcess>,
+    external_pid: Option<u32>,
 ) {
-    // 3 ways to stop
+    // 4 ways to stop
     // - 1. user defined duration
     // - 2. ctrl-c received
-    // - 3. child process stops
+    // - 3. child process stops (for --cmd spawned processes)
+    // - 4. external PID exits (for --pid attached processes)
 
     // Timer-based stopping
     let time_stop_tx = perf_tx.clone();
@@ -272,12 +282,30 @@ fn setup_stopping_mechanisms(
         time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
     });
 
-    // Child process completion stopping
+    // Child process completion stopping (for --cmd spawned processes)
     if let Some(mut child) = spawn {
         let child_stopper_tx = perf_tx.clone();
         tokio::spawn(async move {
             child.work_done().await;
             child_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
+        });
+    }
+
+    // External PID monitoring (for --pid attached processes)
+    if let Some(pid) = external_pid {
+        let pid_stopper_tx = perf_tx.clone();
+        tokio::spawn(async move {
+            println!("Monitoring PID {} for termination...", pid);
+            // Poll every 100ms to check if the process still exists
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                if !pid_exists(pid) {
+                    println!("Target PID {} has exited", pid);
+                    pid_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
+                    break;
+                }
+            }
         });
     }
 
