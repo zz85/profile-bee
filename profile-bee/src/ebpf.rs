@@ -199,9 +199,9 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
     })
 }
 
-pub fn setup_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<&mut MapData>, anyhow::Error> {
+pub fn setup_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<MapData>, anyhow::Error> {
     let ring_buf = RingBuf::try_from(
-        bpf.map_mut("RING_BUF_STACKS")
+        bpf.take_map("RING_BUF_STACKS")
             .ok_or(anyhow!("RING_BUF_STACKS not found"))?,
     )?;
 
@@ -214,25 +214,36 @@ impl EbpfProfiler {
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
     ) -> Result<(), anyhow::Error> {
-        // Get the unwind_table array map
-        let mut unwind_table: Array<&mut MapData, UnwindEntryPod> =
-            Array::try_from(
-                self.bpf
-                    .map_mut("unwind_table")
-                    .ok_or(anyhow!("unwind_table map not found"))?,
-            )?;
+        self.update_dwarf_tables(manager, 0..manager.table_size() as u32)
+    }
 
-        // Load all unwind entries into the global array
-        for (idx, entry) in manager.global_table.iter().enumerate() {
-            unwind_table.set(idx as u32, UnwindEntryPod(*entry), 0)?;
+    /// Incrementally update eBPF maps with new unwind entries in the given range,
+    /// and refresh all proc_info entries.
+    pub fn update_dwarf_tables(
+        &mut self,
+        manager: &crate::dwarf_unwind::DwarfUnwindManager,
+        new_entries: std::ops::Range<u32>,
+    ) -> Result<(), anyhow::Error> {
+        if !new_entries.is_empty() {
+            let mut unwind_table: Array<&mut MapData, UnwindEntryPod> =
+                Array::try_from(
+                    self.bpf
+                        .map_mut("unwind_table")
+                        .ok_or(anyhow!("unwind_table map not found"))?,
+                )?;
+
+            for idx in new_entries.clone() {
+                unwind_table.set(idx, UnwindEntryPod(manager.global_table[idx as usize]), 0)?;
+            }
+
+            tracing::info!(
+                "Loaded {} new unwind table entries (indices {}..{})",
+                new_entries.len(),
+                new_entries.start,
+                new_entries.end,
+            );
         }
 
-        tracing::info!(
-            "Loaded {} unwind table entries into eBPF map",
-            manager.global_table.len()
-        );
-
-        // Get the proc_info hash map
         let mut proc_info_map: HashMap<&mut MapData, ProcInfoKeyPod, ProcInfoPod> =
             HashMap::try_from(
                 self.bpf
@@ -240,7 +251,6 @@ impl EbpfProfiler {
                     .ok_or(anyhow!("proc_info map not found"))?,
             )?;
 
-        // Load per-process mapping information
         for (&tgid, proc_info) in &manager.proc_info {
             let key = ProcInfoKeyPod(ProcInfoKey { tgid, _pad: 0 });
             let value = ProcInfoPod(*proc_info);

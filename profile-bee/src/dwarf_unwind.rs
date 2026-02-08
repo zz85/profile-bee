@@ -281,12 +281,24 @@ impl DwarfUnwindManager {
         }
     }
 
-    /// Load unwind information for a process by scanning its memory mappings
+    /// Load unwind information for a process by scanning its memory mappings.
+    /// Returns Ok(()) if the process was loaded (or already loaded).
     pub fn load_process(&mut self, tgid: u32) -> Result<(), String> {
         if self.proc_info.contains_key(&tgid) {
             return Ok(());
         }
+        self.scan_and_update(tgid)
+    }
 
+    /// Rescan a process's memory mappings and load any new ones.
+    /// Returns the range of new global_table entries added (for incremental eBPF updates).
+    pub fn refresh_process(&mut self, tgid: u32) -> Result<std::ops::Range<u32>, String> {
+        let old_index = self.next_table_index;
+        self.scan_and_update(tgid)?;
+        Ok(old_index..self.next_table_index)
+    }
+
+    fn scan_and_update(&mut self, tgid: u32) -> Result<(), String> {
         let process = Process::new(tgid as i32)
             .map_err(|e| format!("Failed to open process {}: {}", tgid, e))?;
 
@@ -294,7 +306,17 @@ impl DwarfUnwindManager {
             .maps()
             .map_err(|e| format!("Failed to read maps for {}: {}", tgid, e))?;
 
-        let mut proc_info = ProcInfo {
+        // Collect existing mapping addresses so we can skip them
+        let existing = self.proc_info.get(&tgid);
+        let existing_ranges: Vec<(u64, u64)> = existing
+            .map(|pi| {
+                (0..pi.mapping_count as usize)
+                    .map(|i| (pi.mappings[i].begin, pi.mappings[i].end))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut proc_info = existing.copied().unwrap_or(ProcInfo {
             mapping_count: 0,
             _pad: 0,
             mappings: [ExecMapping {
@@ -304,7 +326,7 @@ impl DwarfUnwindManager {
                 table_start: 0,
                 table_count: 0,
             }; MAX_PROC_MAPS],
-        };
+        });
 
         let root_path = format!("/proc/{}/root", tgid);
 
@@ -313,7 +335,6 @@ impl DwarfUnwindManager {
                 break;
             }
 
-            // Only process executable mappings that map to files
             let perms = &map.perms;
             use procfs::process::MMPermissions;
             if !perms.contains(MMPermissions::EXECUTE) || !perms.contains(MMPermissions::READ) {
@@ -331,7 +352,11 @@ impl DwarfUnwindManager {
             let file_offset = map.offset;
             let is_vdso = matches!(&map.pathname, MMapPath::Vdso);
 
-            // Construct the actual path (may be in a container namespace)
+            // Skip mappings we already have
+            if existing_ranges.iter().any(|&(b, e)| b == start_addr && e == end_addr) {
+                continue;
+            }
+
             let resolved_path = if is_vdso {
                 file_path.clone()
             } else {
@@ -348,16 +373,12 @@ impl DwarfUnwindManager {
                 continue;
             }
 
-            // Calculate load bias (use wrapping to handle edge cases)
             let load_bias = start_addr.wrapping_sub(file_offset);
 
-            // Check if we've already parsed this binary
             let (table_start, table_count) = if let Some(&(ts, tc)) = self.binary_cache.get(&resolved_path) {
                 (ts, tc)
             } else {
-                // Generate unwind table for this binary
                 let unwind_entries = if is_vdso {
-                    // Read vDSO from process memory
                     match read_vdso(tgid, start_addr, end_addr) {
                         Ok(data) => match generate_unwind_table_from_bytes(&data) {
                             Ok(entries) => entries,
