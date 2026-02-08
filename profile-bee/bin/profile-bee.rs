@@ -102,9 +102,13 @@ struct Opt {
     #[arg(long, default_value_t = 2)]
     stream_mode: u8,
 
-    /// Spawn command and profile
-    #[arg(short, long)]
+    /// Spawn command and profile (deprecated: use `-- <command>` instead)
+    #[arg(long)]
     cmd: Option<String>,
+
+    /// Command and arguments to spawn and profile (use after `--`)
+    #[arg(last = true)]
+    command: Vec<String>,
 }
 
 #[tokio::main]
@@ -133,7 +137,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // profile_bee::load(&opt.cmd.unwrap()).unwrap();
     // return Ok(());
 
-    let (stopper, spawn) = setup_process_to_profile(&opt.cmd)?;
+    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
 
     let pid = if let Some(cmd) = &spawn {
         Some(cmd.pid())
@@ -239,15 +243,31 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 /// Sets up the process to profile if a command is provided
 fn setup_process_to_profile(
     cmd: &Option<String>,
+    command: &[String],
 ) -> anyhow::Result<(Option<StopHandler>, Option<SpawnProcess>)> {
+    // Prefer the new command format (--) over the old --cmd format
+    if !command.is_empty() {
+        let program = &command[0];
+        let args: Vec<&str> = command[1..].iter().map(|s| s.as_str()).collect();
+        
+        println!("Running command: {} {}", program, args.join(" "));
+        
+        let (child, stopper) = SpawnProcess::spawn(program, &args)?;
+        println!("Profiling PID {}..", child.pid());
+        
+        return Ok((Some(stopper), Some(child)));
+    }
+    
+    // Fall back to old --cmd format for backward compatibility
     if let Some(cmd) = cmd {
+        eprintln!("Warning: --cmd is deprecated. Use '-- <command> <args>' instead.");
         println!("Running cmd: {cmd}");
 
         // todo: use shelltools
         let args: Vec<_> = cmd.split(' ').collect();
         let (child, stopper) = SpawnProcess::spawn(&args[0], &args[1..])?;
 
-        println!("Profile pid {}..", child.pid());
+        println!("Profiling PID {}..", child.pid());
 
         Ok((Some(stopper), Some(child)))
     } else {
@@ -255,10 +275,36 @@ fn setup_process_to_profile(
     }
 }
 
-/// Helper function to check if a process with given PID exists
+/// Monitor a PID and return when it exits
+async fn monitor_pid_exit(pid: u32) {
+    use tokio::time::{sleep, Duration};
+    
+    // Check if the PID exists initially
+    if !pid_exists(pid) {
+        eprintln!("Warning: PID {} does not exist or is not accessible", pid);
+        return;
+    }
+    
+    println!("Monitoring PID {} for exit...", pid);
+    
+    // Poll every 100ms to check if the process is still alive
+    loop {
+        sleep(Duration::from_millis(100)).await;
+        
+        if !pid_exists(pid) {
+            println!("Target PID {} has exited", pid);
+            break;
+        }
+    }
+}
+
+/// Check if a PID exists and is accessible
 fn pid_exists(pid: u32) -> bool {
+    use std::fs;
+    
     // Check if /proc/[pid] exists
-    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+    let proc_path = format!("/proc/{}", pid);
+    fs::metadata(&proc_path).is_ok()
 }
 
 /// Sets up the mechanisms that can stop the profiling
@@ -267,13 +313,13 @@ fn setup_stopping_mechanisms(
     perf_tx: mpsc::Sender<PerfWork>,
     stopping: Option<StopHandler>,
     spawn: Option<SpawnProcess>,
-    external_pid: Option<u32>,
+    target_pid: Option<u32>,
 ) {
     // 4 ways to stop
     // - 1. user defined duration
     // - 2. ctrl-c received
-    // - 3. child process stops (for --cmd spawned processes)
-    // - 4. external PID exits (for --pid attached processes)
+    // - 3. child process stops (when spawned with -- or --cmd)
+    // - 4. target PID exits (when profiling with --pid)
 
     // Timer-based stopping
     let time_stop_tx = perf_tx.clone();
@@ -282,7 +328,7 @@ fn setup_stopping_mechanisms(
         time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
     });
 
-    // Child process completion stopping (for --cmd spawned processes)
+    // Child process completion stopping (for spawned processes)
     if let Some(mut child) = spawn {
         let child_stopper_tx = perf_tx.clone();
         tokio::spawn(async move {
@@ -290,22 +336,16 @@ fn setup_stopping_mechanisms(
             child_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
         });
     }
-
-    // External PID monitoring (for --pid attached processes)
-    if let Some(pid) = external_pid {
-        let pid_stopper_tx = perf_tx.clone();
+    
+    // Target PID monitoring (for --pid option)
+    // Only monitor if we have a target PID and didn't spawn the process ourselves
+    if let Some(pid) = target_pid {
+        // Only set up PID monitoring if we're not already monitoring a spawned process
+        // (i.e., the PID came from --pid, not from a spawned command)
+        let pid_stop_tx = perf_tx.clone();
         tokio::spawn(async move {
-            println!("Monitoring PID {} for termination...", pid);
-            // Poll every 100ms to check if the process still exists
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
-            loop {
-                interval.tick().await;
-                if !pid_exists(pid) {
-                    println!("Target PID {} has exited", pid);
-                    pid_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
-                    break;
-                }
-            }
+            monitor_pid_exit(pid).await;
+            pid_stop_tx.send(PerfWork::Stop).unwrap_or_default();
         });
     }
 
