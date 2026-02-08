@@ -107,7 +107,7 @@ run_profiler() {
 # Check that a collapse file contains a stack matching a pattern.
 # Usage: assert_stack_contains <collapse_file> <grep_pattern> <description>
 assert_stack_contains() {
-    local file="$1" pattern="$2" desc="$3"
+    local file="$1" pattern="$2" desc="${3:-}"
     if grep -q "$pattern" "$file"; then
         return 0
     else
@@ -123,7 +123,7 @@ assert_stack_contains() {
 # Check minimum number of frames in the deepest stack.
 # Usage: assert_min_depth <collapse_file> <min_frames> <description>
 assert_min_depth() {
-    local file="$1" min="$2" desc="$3"
+    local file="$1" min="$2" desc="${3:-}"
     # Count semicolons in the longest line (each ; = one frame boundary)
     local max_depth
     max_depth=$(awk -F';' '{print NF}' "$file" | sort -rn | head -1)
@@ -292,6 +292,29 @@ test_dwarf_nonexistent_binary() {
     return 0
 }
 
+test_dwarf_shared_library() {
+    # DWARF unwinding across shared library boundary (no frame pointers)
+    local file
+    file=$(run_profiler "$FIXTURE_DIR/sharedlib-no-fp" "dwarf-sharedlib" --dwarf)
+    assert_stack_contains "$file" "lib_hot"
+    assert_stack_contains "$file" "caller_a"
+    assert_stack_contains "$file" "caller_b"
+    assert_stack_contains "$file" "main"
+    assert_min_depth "$file" 6
+}
+
+test_dwarf_pie_binary() {
+    # DWARF unwinding on a PIE (position-independent) binary without frame pointers
+    local file
+    file=$(run_profiler "$FIXTURE_DIR/callstack-pie-no-fp" "dwarf-pie" --dwarf)
+    assert_stack_contains "$file" "hot"
+    assert_stack_contains "$file" "function_a"
+    assert_stack_contains "$file" "function_b"
+    assert_stack_contains "$file" "function_c"
+    assert_stack_contains "$file" "main"
+    assert_min_depth "$file" 4
+}
+
 test_samples_collected() {
     # Basic sanity: we should collect a non-zero number of samples
     local file
@@ -333,6 +356,8 @@ echo "── DWARF Unwinding ──"
 run_test "DWARF callstack (no-FP binary)"           test_dwarf_callstack
 run_test "DWARF callstack O2 (no-FP, optimized)"    test_dwarf_callstack_O2
 run_test "DWARF deep recursion (no-FP, 20 levels)"  test_dwarf_deep
+run_test "DWARF shared library (cross-.so calls)"   test_dwarf_shared_library
+run_test "DWARF PIE binary (position-independent)"  test_dwarf_pie_binary
 echo ""
 
 echo "── Comparison: DWARF vs FP ──"
