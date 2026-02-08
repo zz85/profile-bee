@@ -5,14 +5,20 @@
 ///
 use aya_ebpf::{
     bindings::{pt_regs, BPF_F_USER_STACK},
-    helpers::{bpf_get_smp_processor_id, bpf_probe_read},
+    helpers::{bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_user},
     macros::map,
-    maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
+    maps::{Array, HashMap, PerCpuArray, RingBuf, StackTrace},
     EbpfContext,
 };
 
 // use aya_log_ebpf::info;
-use profile_bee_common::{FramePointers, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW};
+use profile_bee_common::{
+    FramePointers, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW,
+    UnwindEntry, ProcInfo, ProcInfoKey,
+    CFA_REG_RSP, CFA_REG_RBP, CFA_REG_PLT, CFA_REG_DEREF_RSP,
+    REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
+    MAX_DWARF_STACK_DEPTH, MAX_UNWIND_TABLE_SIZE, MAX_PROC_MAPS,
+};
 
 pub const STACK_ENTRIES: u32 = 16392;
 pub const STACK_SIZE: u32 = 2048;
@@ -24,6 +30,10 @@ static SKIP_IDLE: u8 = 0;
 #[no_mangle]
 static NOTIFY_TYPE: u8 = EVENT_TRACE_ALWAYS;
 
+/// Whether to use DWARF-based unwinding (1) or frame-pointer based (0)
+#[no_mangle]
+static DWARF_ENABLED: u8 = 0;
+
 #[inline]
 unsafe fn skip_idle() -> bool {
     let skip = core::ptr::read_volatile(&SKIP_IDLE);
@@ -32,6 +42,12 @@ unsafe fn skip_idle() -> bool {
 
 unsafe fn notify_type() -> u8 {
     core::ptr::read_volatile(&NOTIFY_TYPE)
+}
+
+#[inline]
+unsafe fn dwarf_enabled() -> bool {
+    let enabled = core::ptr::read_volatile(&DWARF_ENABLED);
+    enabled > 0
 }
 
 /* Setup maps */
@@ -50,6 +66,16 @@ static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
 
 #[map(name = "stack_traces")]
 pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
+
+// DWARF unwind maps
+
+/// Global unwind table: array of UnwindEntry indexed by position
+#[map(name = "unwind_table")]
+pub static UNWIND_TABLE: Array<UnwindEntry> = Array::with_max_entries(MAX_UNWIND_TABLE_SIZE, 0);
+
+/// Per-process unwind info: maps tgid to ProcInfo (exec mappings)
+#[map(name = "proc_info")]
+pub static PROC_INFO: HashMap<ProcInfoKey, ProcInfo> = HashMap::with_max_entries(1024, 0);
 
 #[inline(always)]
 pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
@@ -72,11 +98,18 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
     // Use CPU based storage so it doesn't occupy space on stack
     let Some(pointer) = STORAGE.get_ptr_mut(0) else {
-        return;   
+        return;
     };
 
     let pointer = &mut *pointer;
-    let (ip, bp, len) = copy_stack(&ctx, &mut pointer.pointers);
+
+    let (ip, bp, len, sp) = if dwarf_enabled() {
+        let (ip, bp, len) = dwarf_copy_stack(&ctx, &mut pointer.pointers, tgid);
+        let regs = ctx.as_ptr() as *const pt_regs;
+        (ip, bp, len, (*regs).rsp)
+    } else {
+        copy_stack(&ctx, &mut pointer.pointers)
+    };
     pointer.len = len;
 
     let stack_info = StackInfo {
@@ -87,6 +120,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         cpu,
         ip: ip, // frame pointer
         bp: bp,
+        sp: sp, // stack pointer
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
@@ -117,15 +151,228 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
 const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
+/// DWARF-based stack unwinding using pre-loaded unwind tables
+#[inline(always)]
+unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: u32) -> (u64, u64, usize) {
+    let regs = ctx.as_ptr() as *const pt_regs;
+    let regs = &*regs;
+
+    let ip = regs.rip;
+    let mut sp = regs.rsp;
+    let mut bp = regs.rbp;
+
+    pointers[0] = ip;
+
+    // Look up the process's unwind information
+    let proc_key = ProcInfoKey { tgid, _pad: 0 };
+    let proc_info = match PROC_INFO.get(&proc_key) {
+        Some(info) => info,
+        None => {
+            let (ip, bp, len, _sp) = copy_stack(ctx, pointers);
+            return (ip, bp, len);
+        }
+    };
+
+    let mut current_ip = ip;
+    let mut len = 1usize;
+
+    let mapping_count = proc_info.mapping_count as usize;
+
+    let mut i = 1usize;
+    for _ in 1..MAX_DWARF_STACK_DEPTH {
+        if i >= pointers.len() {
+            break;
+        }
+        if invalid_userspace_pointer(current_ip) {
+            break;
+        }
+
+        // Find the mapping that contains current_ip
+        let mut found_mapping = false;
+        let mut table_start: u32 = 0;
+        let mut table_count: u32 = 0;
+        let mut load_bias: u64 = 0;
+
+        for m in 0..MAX_PROC_MAPS {
+            if m >= mapping_count {
+                break;
+            }
+            let mapping = &proc_info.mappings[m];
+            if current_ip >= mapping.begin && current_ip < mapping.end {
+                table_start = mapping.table_start;
+                table_count = mapping.table_count;
+                load_bias = mapping.load_bias;
+                found_mapping = true;
+                break;
+            }
+        }
+
+        if !found_mapping || table_count == 0 {
+            // No DWARF info — try FP-based step as fallback
+            if let Some((ra, nbp)) = try_fp_step(bp) {
+                pointers[i] = ra;
+                len = i + 1;
+                current_ip = ra;
+                sp = bp + 16;
+                bp = nbp;
+                i += 1;
+                continue;
+            }
+            break;
+        }
+
+        // Convert virtual address to file-relative address for table lookup
+        let relative_pc = (current_ip - load_bias) as u32;
+
+        // Binary search for the unwind entry covering this PC
+        let entry = match binary_search_unwind_entry(table_start, table_count, relative_pc) {
+            Some(e) => e,
+            None => {
+                // No unwind entry — try FP-based step as fallback
+                if let Some((ra, nbp)) = try_fp_step(bp) {
+                    pointers[i] = ra;
+                    len = i + 1;
+                    current_ip = ra;
+                    sp = bp + 16;
+                    bp = nbp;
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        // Compute CFA (Canonical Frame Address) based on rule type
+        let cfa = match entry.cfa_type {
+            CFA_REG_RSP => sp.wrapping_add(entry.cfa_offset as i64 as u64),
+            CFA_REG_RBP => bp.wrapping_add(entry.cfa_offset as i64 as u64),
+            CFA_REG_PLT => {
+                // PLT stub: CFA = RSP + offset + ((RIP & 15) >= 11 ? 8 : 0)
+                // The 8 comes from the DWARF expression `lit3; shl` (1 << 3 = 8)
+                let base = sp.wrapping_add(entry.cfa_offset as i64 as u64);
+                if (current_ip & 15) >= 11 {
+                    base.wrapping_add(8)
+                } else {
+                    base
+                }
+            }
+            CFA_REG_DEREF_RSP => {
+                // Signal frame: CFA = *(RSP + offset)
+                let addr = sp.wrapping_add(entry.cfa_offset as i64 as u64);
+                match bpf_probe_read_user(addr as *const u64) {
+                    Ok(val) => val,
+                    Err(_) => break,
+                }
+            }
+            _ => break,
+        };
+
+        if cfa == 0 {
+            break;
+        }
+
+        // Return address is always at CFA-8 on x86_64
+        let ra_addr = cfa.wrapping_sub(8);
+        let return_addr = match bpf_probe_read_user(ra_addr as *const u64) {
+            Ok(val) => val,
+            Err(_) => break,
+        };
+
+        if return_addr == 0 {
+            break;
+        }
+
+        // Restore RBP if needed
+        let new_bp = match entry.rbp_type {
+            REG_RULE_OFFSET => {
+                let bp_addr = (cfa as i64 + entry.rbp_offset as i64) as u64;
+                match bpf_probe_read_user(bp_addr as *const u64) {
+                    Ok(val) => val,
+                    Err(_) => bp,
+                }
+            }
+            REG_RULE_SAME_VALUE => bp,
+            _ => bp,
+        };
+
+        pointers[i] = return_addr;
+        len = i + 1;
+
+        // Update for next iteration
+        current_ip = return_addr;
+        sp = cfa;
+        bp = new_bp;
+
+        i += 1;
+    }
+
+    (ip, bp, len)
+}
+
+/// Try a single frame-pointer-based unwind step.
+/// Returns (return_address, new_bp) if successful.
+#[inline(always)]
+unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
+    if bp == 0 || invalid_userspace_pointer(bp) {
+        return None;
+    }
+    let new_bp = bpf_probe_read_user(bp as *const u64).ok()?;
+    let ra = bpf_probe_read_user((bp + 8) as *const u64).ok()?;
+    if ra == 0 || invalid_userspace_pointer(ra) {
+        return None;
+    }
+    Some((ra, new_bp))
+}
+
+/// Max binary search iterations (covers 2^19 = 512K entries per mapping)
+const MAX_BIN_SEARCH_DEPTH: u32 = 19;
+
+#[inline(always)]
+unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relative_pc: u32) -> Option<UnwindEntry> {
+    if table_count == 0 {
+        return None;
+    }
+
+    let mut lo: u32 = 0;
+    let mut hi: u32 = table_count;
+
+    for _ in 0..MAX_BIN_SEARCH_DEPTH {
+        if lo >= hi {
+            break;
+        }
+        let mid = lo + (hi - lo) / 2;
+        let idx = table_start + mid;
+
+        let entry = match UNWIND_TABLE.get(idx) {
+            Some(e) => e,
+            None => return None,
+        };
+
+        if entry.pc <= relative_pc {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if lo == 0 {
+        return None;
+    }
+
+    let result_idx = table_start + lo - 1;
+    UNWIND_TABLE.get(result_idx).copied()
+}
+
 /// puts the userspace stack in the target pointer slice
 #[inline(always)]
-unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize) {
+unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
     // refernce pt_regs
-    let regs =  ctx.as_ptr() as *const pt_regs;
+    let regs = ctx.as_ptr() as *const pt_regs;
     let regs = &*regs;
 
     // instruction pointer
     let ip = regs.rip;
+    let sp = regs.rsp;
 
     // base pointer (frame pointer)
     let mut bp = regs.rbp;
@@ -142,7 +389,7 @@ unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64
         pointers[i] = ret_addr;
     }
 
-    (ip, bp, len)
+    (ip, bp, len, sp)
 }
 
 /// unwind frame pointer

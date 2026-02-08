@@ -33,7 +33,10 @@ futures-util = "0.3"
 tracing = "0.1.41"
 blazesym = "0.2.0-rc.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
+gimli = "0.31.1"
+object = "0.37.0"
+libc = "0.2.86"
+procmaps = "0.4.1"
 
 [[bin]]
 name = "profile-bee"

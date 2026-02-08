@@ -111,6 +111,7 @@ impl TraceHandler {
     }
 
     /// Converts stacks traces into StackFrameInfo structs
+    /// Uses DWARF-unwound frame pointers from eBPF when available
     pub fn get_exp_stacked_frames(
         &mut self,
         stack_info: &StackInfo,
@@ -118,24 +119,29 @@ impl TraceHandler {
         group_by_cpu: bool,
         stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     ) -> Vec<StackFrameInfo> {
-        let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
+        let (kernel_stack, fp_user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
 
         let key = StackInfoPod(stack_info.clone());
 
-        if let Ok(pointers) = stacked_pointers.get(&key, 0) {
+        // Try to use DWARF-unwound frame pointers from eBPF
+        let user_stack = if let Ok(pointers) = stacked_pointers.get(&key, 0) {
             let pointers = pointers.0;
-            let pid = stack_info.tgid;
-            let src: Source<'_> = Source::Process(Process::new(Pid::from(pid)));
-            let addrs = &pointers.pointers[..pointers.len as usize];
-
-            tracing::info!("IP (instruction pointer): {}", stack_info.ip);
-            tracing::info!("BP (base pointer aka Frame pointer): {}", stack_info.bp);
-            tracing::info!("User stack: {:?}", user_stack);
-            tracing::info!("addrs: {:?}", addrs);
-
-            let syms = self.symbolizer.symbolize(&src, Input::AbsAddr(addrs));
-            tracing::info!("IP Symbolization {syms:?}");
-        }
+            let len = (pointers.len as usize).min(pointers.pointers.len());
+            let fp_len = fp_user_stack.as_ref().map_or(0, |v| v.len());
+            if len > fp_len {
+                let addrs: Vec<u64> = pointers.pointers[..len].to_vec();
+                tracing::debug!(
+                    "Using DWARF-unwound stack ({} frames) for pid {}",
+                    addrs.len(),
+                    stack_info.tgid,
+                );
+                Some(addrs)
+            } else {
+                fp_user_stack
+            }
+        } else {
+            fp_user_stack
+        };
 
         let stacks = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);
 

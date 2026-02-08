@@ -21,10 +21,53 @@ More documentation in [docs](docs) directory.
 
 ### Stack unwinding, Symbolization and Debug info
 
-Note: if symbols for your C/Rust programs doesn't appear correct, you may want to build your software with debug information.
+Profile Bee supports two methods for stack unwinding:
 
-With rustc that's adding a `-g` flag when you compile. Another thing to consider doing is emitting frame pointer by setting `RUSTFLAGS="-Cforce-frame-pointers=yes"` with building (or modifying ./cargo/config)
-and `-fno-omit-frame-pointer` for gcc. With framepointers, you could get symbols while saving on the cost of dwarf parsing (using --no-dwarf)
+1. **Frame Pointer Unwinding** (eBPF): Fast, but requires binaries compiled with `-fno-omit-frame-pointer`.
+2. **DWARF-based Unwinding** (eBPF + userspace): Profiles binaries without frame pointers by using `.eh_frame` unwind tables.
+
+Both methods run the actual stack walking in eBPF (kernel space) for performance. Symbolization always happens in userspace.
+
+#### Frame Pointer Method
+
+The default. The kernel's `bpf_get_stackid` walks the frame pointer chain. Works out of the box for binaries compiled with frame pointers:
+- Rust: `RUSTFLAGS="-Cforce-frame-pointers=yes"`
+- C/C++: `-fno-omit-frame-pointer` flag
+
+#### DWARF Method
+
+Enabled with `--dwarf`. Handles binaries compiled without frame pointers (the default for most `-O2`/`-O3` builds).
+
+**How it works:**
+1. At startup, userspace parses `/proc/[pid]/maps` and `.eh_frame` sections from each executable mapping
+2. Pre-evaluates DWARF CFI rules into a flat `UnwindEntry` table (PC → CFA rule + RA rule)
+3. Loads the table into eBPF maps before profiling begins
+4. At sample time, the eBPF program binary-searches the table and walks the stack using CFA computation + `bpf_probe_read_user`
+
+This is the same approach used by [parca-agent](https://github.com/parca-dev/parca-agent) and other production eBPF profilers.
+
+```bash
+# Profile a no-frame-pointer binary with DWARF unwinding
+profile-bee --dwarf --cmd "./my-optimized-binary" --svg output.svg --time 5000
+
+# Without --dwarf, the same binary would produce shallow/incomplete stacks
+```
+
+See `docs/dwarf_unwinding_design.md` for architecture details.
+
+#### Current limitations
+
+- DWARF unwinding only works for the `--cmd`/`--pid` target process (not system-wide)
+- Max 16 executable mappings per process, 500K unwind table entries, 32 frame depth
+- No dynamic library hot-loading (dlopen after startup)
+
+**Note**: For symbol resolution, you still need debug information:
+- Rust: Add `-g` flag when compiling
+- C/C++: Compile with debug symbols (`-g` flag)
+
+For more information on DWARF-based profiling, see:
+- [Polar Signals' article on profiling without frame pointers](https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers)
+- `docs/dwarf_unwinding_design.md` for architecture details
 
 ### Usage
 
@@ -65,6 +108,8 @@ profile-bee --pid <pid> ...
 ```
 
 ### Features
+- **DWARF-based stack unwinding** for profiling binaries without frame pointers
+- Frame pointer-based unwinding in eBPF for maximum performance
 - Rust and C++ symbols demangling supported (via gimli/blazesym)
 - Some source mapping supported
 - Simple symbol lookup cache
@@ -78,8 +123,9 @@ profile-bee --pid <pid> ...
 
 ### Limitations
 - Linux only
+- DWARF unwinding: single target process only (not system-wide), max 16 mappings / 500K entries / 32 frames
 - Interpreted / JIT stacktraces not yet supported
-- [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) and binary offsets not calculated
+- [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) `.eh_frame` parsed for DWARF unwinding; VDSO symbolization not yet supported
 
 ### TODOs
 - Optimize CPU usage

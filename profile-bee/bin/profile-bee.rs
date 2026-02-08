@@ -2,8 +2,9 @@ use aya::maps::{MapData, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
-use profile_bee::ebpf::FramePointersPod;
+use profile_bee::dwarf_unwind::DwarfUnwindManager;
 use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod};
+use profile_bee::ebpf::FramePointersPod;
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
@@ -12,7 +13,6 @@ use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -78,6 +78,10 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     no_dwarf: bool,
 
+    /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
+    #[arg(long, default_value_t = false)]
+    dwarf: bool,
+
     /// PID to profile
     #[arg(short, long)]
     pid: Option<u32>,
@@ -126,6 +130,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     println!("Starting {:?}", opt);
 
+    // profile_bee::load(&opt.cmd.unwrap()).unwrap();
+    // return Ok(());
+
     let (stopper, spawn) = setup_process_to_profile(&opt.cmd)?;
 
     let pid = if let Some(cmd) = &spawn {
@@ -145,16 +152,42 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         pid,
         cpu: opt.cpu,
         self_profile: opt.self_profile,
+        dwarf: opt.dwarf,
     };
 
     // Setup eBPF profiler
     let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
 
+    // If DWARF unwinding is enabled, load unwind tables for the target process
+    if opt.dwarf {
+        if let Some(target_pid) = pid {
+            println!("Loading DWARF unwind tables for pid {}...", target_pid);
+            let mut dwarf_manager = DwarfUnwindManager::new();
+            match dwarf_manager.load_process(target_pid) {
+                Ok(()) => {
+                    println!(
+                        "Loaded {} unwind entries for pid {}",
+                        dwarf_manager.table_size(),
+                        target_pid,
+                    );
+                    if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
+                        eprintln!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to load DWARF info for pid {}: {}", target_pid, e);
+                }
+            }
+        } else {
+            eprintln!("DWARF unwinding requires a target PID (--pid or --cmd). Falling back to frame pointer unwinding.");
+        }
+    }
+
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
     let stacked_pointers = &ebpf_profiler.stacked_pointers;
 
-    let mut profiler = TraceHandler::new(); // !opt.no_dwarf
+    let mut profiler = TraceHandler::new();
 
     // Set up communication channels
     let (perf_tx, perf_rx) = mpsc::channel();
@@ -326,10 +359,6 @@ fn process_profiling_data(
                 *trace += 1;
 
                 if *trace == 1 {
-                    // let _combined = profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu);
-
-                    // todo pass hashmap or stacked pointers information here
-
                     let _combined = profiler.get_exp_stacked_frames(
                         &stack,
                         &stack_traces,
@@ -356,6 +385,7 @@ fn process_profiling_data(
             group_by_cpu,
             &mut samples,
             &mut stacks,
+            stacked_pointers,
         );
     } else {
         process_kernel_counting(
@@ -365,6 +395,7 @@ fn process_profiling_data(
             group_by_cpu,
             &mut samples,
             &mut stacks,
+            stacked_pointers,
         );
     }
 
@@ -398,9 +429,10 @@ fn process_local_counting(
     group_by_cpu: bool,
     samples: &mut u64,
     stacks: &mut Vec<FrameCount>,
+    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
 ) {
     for (stack, value) in trace_count.iter() {
-        let combined = profiler.get_stacked_frames(stack, stack_traces, group_by_cpu);
+        let combined = profiler.get_exp_stacked_frames(stack, stack_traces, group_by_cpu, stacked_pointers);
 
         *samples += *value as u64;
         stacks.push(FrameCount {
@@ -419,13 +451,14 @@ fn process_kernel_counting(
     group_by_cpu: bool,
     samples: &mut u64,
     stacks: &mut Vec<FrameCount>,
+    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
 ) {
     for (key, value) in counts.iter().flatten() {
         let stack: StackInfo = key.0;
 
         *samples += value;
 
-        let combined = profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu);
+        let combined = profiler.get_exp_stacked_frames(&stack, stack_traces, group_by_cpu, stacked_pointers);
 
         stacks.push(FrameCount {
             frames: combined,
