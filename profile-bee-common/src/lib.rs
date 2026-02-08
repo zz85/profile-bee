@@ -61,6 +61,10 @@ impl ProbeEvent {
 pub const CFA_REG_RSP: u8 = 0;
 pub const CFA_REG_RBP: u8 = 1;
 pub const CFA_REG_EXPRESSION: u8 = 2;
+/// PLT stub: CFA = RSP + offset + ((RIP & 15) >= 11 ? offset : 0)
+pub const CFA_REG_PLT: u8 = 3;
+/// Signal frame: CFA = *(RSP + offset)  (dereference)
+pub const CFA_REG_DEREF_RSP: u8 = 4;
 
 /// How to recover a register value
 pub const REG_RULE_OFFSET: u8 = 0;

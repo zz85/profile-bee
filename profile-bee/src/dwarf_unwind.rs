@@ -15,7 +15,7 @@ use gimli::{
 use object::{Object, ObjectSection};
 use profile_bee_common::{
     UnwindEntry, ExecMapping, ProcInfo,
-    CFA_REG_EXPRESSION, CFA_REG_RBP, CFA_REG_RSP,
+    CFA_REG_EXPRESSION, CFA_REG_RBP, CFA_REG_RSP, CFA_REG_PLT, CFA_REG_DEREF_RSP,
     REG_RULE_OFFSET, REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED,
     MAX_PROC_MAPS, MAX_UNWIND_TABLE_SIZE,
 };
@@ -33,6 +33,62 @@ pub fn generate_unwind_table(elf_path: &Path) -> Result<Vec<UnwindEntry>, String
 }
 
 /// Generates a compact unwind table from ELF binary bytes
+/// Classify a DWARF CFA expression into a known pattern.
+///
+/// Recognizes two common expressions found in glibc/ld-linux:
+/// 1. PLT stub: `breg7(rsp)+8; breg16(rip)+0; lit15; and; lit11; ge; lit3; shl; plus`
+///    → CFA = RSP + 8 + ((RIP & 15) >= 11 ? 8 : 0)
+/// 2. Signal frame: `breg7(rsp)+N; deref`
+///    → CFA = *(RSP + N)
+fn classify_cfa_expression(
+    unwind_expr: &gimli::UnwindExpression<usize>,
+    eh_frame_data: &[u8],
+) -> (u8, i16) {
+    use gimli::Operation;
+
+    // Extract expression bytes from the section
+    let start = unwind_expr.offset;
+    let end = start + unwind_expr.length;
+    if end > eh_frame_data.len() {
+        return (CFA_REG_EXPRESSION, 0);
+    }
+    let expr_bytes = &eh_frame_data[start..end];
+    let expr = gimli::Expression(gimli::EndianSlice::new(expr_bytes, NativeEndian));
+
+    let mut ops = expr.operations(gimli::Encoding {
+        address_size: 8,
+        format: gimli::Format::Dwarf64,
+        version: 4,
+    });
+
+    // First op should be RegisterOffset { register: RSP, offset: N } (DW_OP_breg7)
+    let Ok(Some(Operation::RegisterOffset { register, offset, .. })) = ops.next() else {
+        return (CFA_REG_EXPRESSION, 0);
+    };
+    if register != X86_64_RSP {
+        return (CFA_REG_EXPRESSION, 0);
+    }
+    let base_offset = offset;
+
+    match ops.next() {
+        // Signal frame: breg7(rsp)+N; deref → CFA = *(RSP + N)
+        Ok(Some(Operation::Deref { .. })) => {
+            let Ok(off) = i16::try_from(base_offset) else {
+                return (CFA_REG_EXPRESSION, 0);
+            };
+            (CFA_REG_DEREF_RSP, off)
+        }
+        // PLT stub: breg7(rsp)+N; breg16(rip)+0; ... → CFA = RSP + N + ((RIP&15)>=11 ? N : 0)
+        Ok(Some(Operation::RegisterOffset { register: reg2, offset: 0, .. })) if reg2 == X86_64_RA => {
+            let Ok(off) = i16::try_from(base_offset) else {
+                return (CFA_REG_EXPRESSION, 0);
+            };
+            (CFA_REG_PLT, off)
+        }
+        _ => (CFA_REG_EXPRESSION, 0),
+    }
+}
+
 pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>, String> {
     use object::ObjectSegment;
 
@@ -110,8 +166,8 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
                             };
                             (reg_type, offset_i16)
                         }
-                        CfaRule::Expression(_) => {
-                            (CFA_REG_EXPRESSION, 0i16)
+                        CfaRule::Expression(expr) => {
+                            classify_cfa_expression(expr, eh_frame_data)
                         }
                     };
 
@@ -350,7 +406,7 @@ mod tests {
         // All entries should have valid CFA types
         for entry in &entries {
             assert!(
-                entry.cfa_type == CFA_REG_RSP || entry.cfa_type == CFA_REG_RBP,
+                matches!(entry.cfa_type, CFA_REG_RSP | CFA_REG_RBP | CFA_REG_PLT | CFA_REG_DEREF_RSP),
                 "Unexpected CFA type: {}",
                 entry.cfa_type
             );

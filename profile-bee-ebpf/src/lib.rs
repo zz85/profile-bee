@@ -15,7 +15,7 @@ use aya_ebpf::{
 use profile_bee_common::{
     FramePointers, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW,
     UnwindEntry, ProcInfo, ProcInfoKey,
-    CFA_REG_RSP, CFA_REG_RBP,
+    CFA_REG_RSP, CFA_REG_RBP, CFA_REG_PLT, CFA_REG_DEREF_RSP,
     REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
     MAX_DWARF_STACK_DEPTH, MAX_UNWIND_TABLE_SIZE, MAX_PROC_MAPS,
 };
@@ -224,6 +224,23 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
         let cfa = match entry.cfa_type {
             CFA_REG_RSP => sp.wrapping_add(entry.cfa_offset as i64 as u64),
             CFA_REG_RBP => bp.wrapping_add(entry.cfa_offset as i64 as u64),
+            CFA_REG_PLT => {
+                // PLT stub: CFA = RSP + offset + ((RIP & 15) >= 11 ? offset : 0)
+                let base = sp.wrapping_add(entry.cfa_offset as i64 as u64);
+                if (current_ip & 15) >= 11 {
+                    base.wrapping_add(entry.cfa_offset as i64 as u64)
+                } else {
+                    base
+                }
+            }
+            CFA_REG_DEREF_RSP => {
+                // Signal frame: CFA = *(RSP + offset)
+                let addr = sp.wrapping_add(entry.cfa_offset as i64 as u64);
+                match bpf_probe_read_user(addr as *const u64) {
+                    Ok(val) => val,
+                    Err(_) => break,
+                }
+            }
             _ => break,
         };
 
