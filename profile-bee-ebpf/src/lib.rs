@@ -330,8 +330,6 @@ unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64
 
     pointers[0] = ip;
 
-    return (ip, bp, 1, sp);
-
     let mut len = pointers.len();
     for i in 1..pointers.len() {
         let Some(ret_addr) = get_frame(&mut bp) else {

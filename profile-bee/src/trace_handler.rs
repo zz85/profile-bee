@@ -1,4 +1,4 @@
-use crate::ebpf::{DwarfUnwindInfoPod, FramePointersPod, StackInfoPod};
+use crate::ebpf::{FramePointersPod, StackInfoPod};
 use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
 use aya::maps::MapData;
 use aya::maps::StackTraceMap;
@@ -108,25 +108,6 @@ impl TraceHandler {
             .collect::<Vec<_>>();
 
         Ok(syms)
-    }
-
-    // Generate unwind table and uploads to ebpf hashmap
-    pub fn upload_unwind(
-        &mut self,
-        stack_info: &StackInfo,
-        unwind: &mut aya::maps::HashMap<MapData, u32, DwarfUnwindInfoPod>,
-    ) {
-        let pid = stack_info.tgid;
-        tracing::info!("Checking unwind table for pid: {}", pid);
-
-        if unwind.get(&pid, 0).is_err() {
-            tracing::info!("Unwind table not found..");
-            if let Ok(unwind_table) = crate::get_mappings(pid as _) {
-                tracing::info!("Uploading unwind table..");
-                let table = DwarfUnwindInfoPod(unwind_table);
-                unwind.insert(pid, table, 0).unwrap();
-            }
-        }
     }
 
     /// Converts stacks traces into StackFrameInfo structs

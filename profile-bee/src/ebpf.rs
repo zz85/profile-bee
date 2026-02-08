@@ -24,11 +24,6 @@ unsafe impl Pod for FramePointersPod {}
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
-pub struct DwarfUnwindInfoPod(pub profile_bee_common::DwarfUnwindInfo);
-unsafe impl Pod for DwarfUnwindInfoPod {}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
 pub struct UnwindEntryPod(pub UnwindEntry);
 unsafe impl Pod for UnwindEntryPod {}
 

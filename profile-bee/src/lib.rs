@@ -14,5 +14,4 @@ pub mod dwarf_unwind;
 mod trace_handler;
 pub use trace_handler::*;
 
-mod unwinder;
-pub use unwinder::*;
+

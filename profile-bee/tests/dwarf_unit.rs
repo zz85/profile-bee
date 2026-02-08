@@ -1,8 +1,7 @@
 //! Integration tests for DWARF unwind table generation.
 //!
-//! These tests validate that both the `dwarf_unwind` module (used for eBPF map loading)
-//! and the `unwinder/ehframe` module (userspace infrastructure) can parse the same
-//! binaries and produce sensible results.
+//! These tests validate that the `dwarf_unwind` module can parse binaries
+//! and produce sensible unwind tables for eBPF map loading.
 
 use profile_bee::dwarf_unwind::{generate_unwind_table, DwarfUnwindManager};
 use profile_bee_common::*;

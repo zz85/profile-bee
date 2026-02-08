@@ -55,31 +55,6 @@ impl ProbeEvent {
     pub const STRUCT_SIZE: usize = size_of::<ProbeEvent>();
 }
 
-// Dwarf unwind info (compact format used by unwinder/ module)
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
-#[repr(C)]
-pub struct DwarfDelta {
-    pub addr: u64,
-    pub cfa_offset: i8,
-    pub rip_offset: i8,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-#[repr(C)]
-pub struct DwarfUnwindInfo {
-    pub deltas: [DwarfDelta; 100000],
-    pub len: usize,
-}
-
-impl Default for DwarfUnwindInfo {
-    fn default() -> Self {
-        Self {
-            deltas: [DwarfDelta::default(); 100000],
-            len: 0,
-        }
-    }
-}
-
 // --- DWARF Unwind Table Types (used by eBPF-side unwinding) ---
 
 /// How to compute the CFA (Canonical Frame Address)
