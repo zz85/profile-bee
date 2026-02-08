@@ -102,8 +102,11 @@ profile-bee --kprobe vfs_write --time 200 --svg kprobe.svg
 # Profile using a tracepoint over a interval of 200ms
 profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 
-# Profile specific pid (or cpu)
-profile-bee --pid <pid> ...
+# Profile specific pid (automatically stops when the process exits)
+profile-bee --pid <pid> --svg output.svg --time 10000
+
+# Profile specific cpu
+profile-bee --cpu 0 --svg output.svg --time 5000
 
 ```
 
@@ -118,6 +121,7 @@ profile-bee --pid <pid> ...
 - Basic Kernel and tracepoint probing
 - Group by CPUs
 - Profile target PIDs, CPU id, or itself
+- **Automatic termination** when target PID (via `--pid`) or spawned process (via `--cmd`) exits
 - Static d3 flamegraph JSON and/or HTML output
 - Real time flamegraphs served over integrated web server (using warp)
 
