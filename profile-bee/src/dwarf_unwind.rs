@@ -89,6 +89,19 @@ fn classify_cfa_expression(
     }
 }
 
+fn read_vdso(tgid: u32, start: u64, end: u64) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(format!("/proc/{}/mem", tgid))
+        .map_err(|e| format!("Failed to open /proc/{}/mem: {}", tgid, e))?;
+    f.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("Failed to seek to vDSO: {}", e))?;
+    let len = (end - start) as usize;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf)
+        .map_err(|e| format!("Failed to read vDSO: {}", e))?;
+    Ok(buf)
+}
+
 pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>, String> {
     use object::ObjectSegment;
 
@@ -305,28 +318,32 @@ impl DwarfUnwindManager {
             }
 
             let file_path = match &map.pathname {
-                MMapPath::Path(p) => p,
+                MMapPath::Path(p) => p.to_path_buf(),
+                MMapPath::Vdso => std::path::PathBuf::from("[vdso]"),
                 _ => continue,
             };
-
-            // Construct the actual path (may be in a container namespace)
-            let resolved_path = {
-                let mut p = std::path::PathBuf::from(&root_path);
-                p.push(file_path.strip_prefix("/").unwrap_or(file_path));
-                if p.exists() {
-                    p
-                } else {
-                    file_path.to_path_buf()
-                }
-            };
-
-            if !resolved_path.exists() {
-                continue;
-            }
 
             let start_addr = map.address.0;
             let end_addr = map.address.1;
             let file_offset = map.offset;
+            let is_vdso = matches!(&map.pathname, MMapPath::Vdso);
+
+            // Construct the actual path (may be in a container namespace)
+            let resolved_path = if is_vdso {
+                file_path.clone()
+            } else {
+                let mut p = std::path::PathBuf::from(&root_path);
+                p.push(file_path.strip_prefix("/").unwrap_or(&file_path));
+                if p.exists() {
+                    p
+                } else {
+                    file_path.clone()
+                }
+            };
+
+            if !is_vdso && !resolved_path.exists() {
+                continue;
+            }
 
             // Calculate load bias (use wrapping to handle edge cases)
             let load_bias = start_addr.wrapping_sub(file_offset);
@@ -336,16 +353,33 @@ impl DwarfUnwindManager {
                 (ts, tc)
             } else {
                 // Generate unwind table for this binary
-                let unwind_entries = match generate_unwind_table(&resolved_path) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        tracing::debug!(
-                            "Skipping {} for pid {}: {}",
-                            resolved_path.display(),
-                            tgid,
-                            e
-                        );
-                        continue;
+                let unwind_entries = if is_vdso {
+                    // Read vDSO from process memory
+                    match read_vdso(tgid, start_addr, end_addr) {
+                        Ok(data) => match generate_unwind_table_from_bytes(&data) {
+                            Ok(entries) => entries,
+                            Err(e) => {
+                                tracing::debug!("Skipping [vdso] for pid {}: {}", tgid, e);
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::debug!("Skipping [vdso] for pid {}: {}", tgid, e);
+                            continue;
+                        }
+                    }
+                } else {
+                    match generate_unwind_table(&resolved_path) {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            tracing::debug!(
+                                "Skipping {} for pid {}: {}",
+                                resolved_path.display(),
+                                tgid,
+                                e
+                            );
+                            continue;
+                        }
                     }
                 };
 
