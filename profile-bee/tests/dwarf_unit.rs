@@ -28,18 +28,6 @@ fn test_both_parsers_handle_self_binary() {
         rsp_count,
         entries.len()
     );
-
-    // Return address should be at CFA-8 for most entries
-    let ra_offset_count = entries
-        .iter()
-        .filter(|e| e.ra_type == REG_RULE_OFFSET && e.ra_offset == -8)
-        .count();
-    assert!(
-        ra_offset_count > entries.len() / 2,
-        "Expected majority CFA-8 return address, got {}/{}",
-        ra_offset_count,
-        entries.len()
-    );
 }
 
 #[test]
@@ -73,8 +61,8 @@ fn test_unwind_entry_struct_size() {
     // eBPF requires predictable struct layout
     assert_eq!(
         std::mem::size_of::<UnwindEntry>(),
-        32,
-        "UnwindEntry must be 32 bytes for eBPF compatibility"
+        16,
+        "UnwindEntry must be 16 bytes for eBPF compatibility"
     );
 }
 
@@ -112,8 +100,8 @@ fn dump_callstack_no_fp_entries() {
     // hot=0x400527, function_c=0x400534, function_b=0x40053b, function_a=0x400542, main=0x400549
     for e in &entries {
         if e.pc >= 0x500 && e.pc <= 0x700 {
-            eprintln!("pc={:#010x} cfa_type={} cfa_off={:4} ra_type={} ra_off={:4} rbp_type={} rbp_off={:4}",
-                e.pc, e.cfa_type, e.cfa_offset, e.ra_type, e.ra_offset, e.rbp_type, e.rbp_offset);
+            eprintln!("pc={:#010x} cfa_type={} cfa_off={:4} rbp_type={} rbp_off={:4}",
+                e.pc, e.cfa_type, e.cfa_offset, e.rbp_type, e.rbp_offset);
         }
     }
 }

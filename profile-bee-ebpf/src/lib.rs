@@ -222,8 +222,8 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
 
         // Compute CFA (Canonical Frame Address) based on rule type
         let cfa = match entry.cfa_type {
-            CFA_REG_RSP => sp.wrapping_add(entry.cfa_offset as u64),
-            CFA_REG_RBP => bp.wrapping_add(entry.cfa_offset as u64),
+            CFA_REG_RSP => sp.wrapping_add(entry.cfa_offset as i64 as u64),
+            CFA_REG_RBP => bp.wrapping_add(entry.cfa_offset as i64 as u64),
             _ => break,
         };
 
@@ -231,17 +231,11 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
             break;
         }
 
-        // Get return address using the RA rule
-        let return_addr = match entry.ra_type {
-            REG_RULE_OFFSET => {
-                let ra_addr = (cfa as i64 + entry.ra_offset as i64) as u64;
-                match bpf_probe_read_user(ra_addr as *const u64) {
-                    Ok(val) => val,
-                    Err(_) => break,
-                }
-            }
-            REG_RULE_SAME_VALUE => current_ip,
-            _ => break,
+        // Return address is always at CFA-8 on x86_64
+        let ra_addr = cfa.wrapping_sub(8);
+        let return_addr = match bpf_probe_read_user(ra_addr as *const u64) {
+            Ok(val) => val,
+            Err(_) => break,
         };
 
         if return_addr == 0 {

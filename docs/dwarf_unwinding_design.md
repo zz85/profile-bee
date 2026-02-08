@@ -63,19 +63,20 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 
 ## Data Structures
 
-### UnwindEntry (32 bytes, stored in BPF Array map)
+### UnwindEntry (16 bytes, stored in BPF Array map)
 
 ```rust
 pub struct UnwindEntry {
     pub pc: u64,           // File-relative program counter
+    pub cfa_offset: i16,   // CFA = register + offset
+    pub rbp_offset: i16,   // RBP restore offset from CFA
     pub cfa_type: u8,      // 0=RSP, 1=RBP
-    pub cfa_offset: i32,   // CFA = register + offset
-    pub ra_type: u8,       // 0=OFFSET, 1=SAME_VALUE, 2=UNDEFINED
-    pub ra_offset: i32,    // Return address at CFA + offset
-    pub rbp_type: u8,      // How to restore RBP
-    pub rbp_offset: i32,   // RBP restore offset
+    pub rbp_type: u8,      // How to restore RBP (0=OFFSET, 1=SAME_VALUE, 2=UNDEFINED)
+    pub _pad: [u8; 2],
 }
 ```
+
+Return address is always at CFA-8 on x86_64, so RA rule/offset are not stored.
 
 ### ProcInfo (per-process, stored in BPF HashMap)
 
@@ -133,7 +134,7 @@ for i in 1..32:
     cfa = (entry.cfa_type == RSP) ? sp + entry.cfa_offset
                                   : bp + entry.cfa_offset
 
-    return_addr = bpf_probe_read_user(cfa + entry.ra_offset)
+    return_addr = bpf_probe_read_user(cfa - 8)  // RA always at CFA-8 on x86_64
 
     if return_addr == 0: break
 
@@ -155,8 +156,8 @@ The eBPF code is structured to pass the BPF verifier:
 ## Performance
 
 ### Memory
-- Typical process (binary + libc + ld): ~23K entries × 32B = **~720 KB**
-- Maximum (250K entries): **7.6 MB** pinned kernel memory
+- Typical process (binary + libc + ld): ~23K entries × 16B = **~360 KB**
+- Maximum (250K entries): **3.8 MB** pinned kernel memory
 - ProcInfo per process: ~200 bytes
 
 ### CPU (per sample, when DWARF enabled)

@@ -104,14 +104,14 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
                                 // Unsupported register for CFA
                                 continue;
                             };
-                            // Skip entries with offsets that don't fit in i32
-                            let Ok(offset_i32) = i32::try_from(*offset) else {
+                            // Skip entries with offsets that don't fit in i16
+                            let Ok(offset_i16) = i16::try_from(*offset) else {
                                 continue;
                             };
-                            (reg_type, offset_i32)
+                            (reg_type, offset_i16)
                         }
                         CfaRule::Expression(_) => {
-                            (CFA_REG_EXPRESSION, 0)
+                            (CFA_REG_EXPRESSION, 0i16)
                         }
                     };
 
@@ -120,45 +120,36 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
                         continue;
                     }
 
-                    // Get return address rule
+                    // Get return address rule — on x86_64 it's always CFA-8.
+                    // Skip entries where RA is not a simple CFA offset of -8.
                     let ra_rule = row.register(X86_64_RA);
-                    let (ra_type, ra_offset) = match ra_rule {
-                        RegisterRule::Offset(offset) => {
-                            let Ok(offset_i32) = i32::try_from(offset) else {
-                                continue;
-                            };
-                            (REG_RULE_OFFSET, offset_i32)
-                        }
-                        RegisterRule::SameValue => (REG_RULE_SAME_VALUE, 0),
-                        RegisterRule::Undefined => (REG_RULE_UNDEFINED, 0),
-                        _ => continue, // Skip complex rules
+                    match ra_rule {
+                        RegisterRule::Offset(offset) if offset == -8 => {}
+                        RegisterRule::Undefined => continue,
+                        _ => continue,
                     };
 
                     // Get RBP rule (important for restoring frame pointer)
                     let rbp_rule = row.register(X86_64_RBP);
                     let (rbp_type, rbp_offset) = match rbp_rule {
                         RegisterRule::Offset(offset) => {
-                            let Ok(offset_i32) = i32::try_from(offset) else {
+                            let Ok(offset_i16) = i16::try_from(offset) else {
                                 continue;
                             };
-                            (REG_RULE_OFFSET, offset_i32)
+                            (REG_RULE_OFFSET, offset_i16)
                         }
-                        RegisterRule::SameValue => (REG_RULE_SAME_VALUE, 0),
-                        RegisterRule::Undefined => (REG_RULE_UNDEFINED, 0),
-                        _ => (REG_RULE_UNDEFINED, 0),
+                        RegisterRule::SameValue => (REG_RULE_SAME_VALUE, 0i16),
+                        RegisterRule::Undefined => (REG_RULE_UNDEFINED, 0i16),
+                        _ => (REG_RULE_UNDEFINED, 0i16),
                     };
 
                     entries.push(UnwindEntry {
                         pc: pc - base_vaddr,
-                        cfa_type,
-                        _pad1: [0; 3],
-                        cfa_offset,
-                        ra_type,
-                        _pad2: [0; 3],
-                        ra_offset,
-                        rbp_type,
-                        _pad3: [0; 3],
+                        cfa_offset: cfa_offset as i16,
                         rbp_offset,
+                        cfa_type,
+                        rbp_type,
+                        _pad: [0; 2],
                     });
                 }
             }
@@ -394,31 +385,20 @@ mod tests {
             std::mem::size_of::<UnwindEntry>(),
             UnwindEntry::STRUCT_SIZE
         );
-        // Should be 32 bytes
-        assert_eq!(std::mem::size_of::<UnwindEntry>(), 32);
+        // Should be 16 bytes (compact format)
+        assert_eq!(std::mem::size_of::<UnwindEntry>(), 16);
     }
 
     #[test]
-    fn test_unwind_table_return_address_rules() {
-        // Parse the current test binary and verify return address rules are sensible
+    fn test_unwind_table_return_address_convention() {
+        // On x86_64, return address is always at CFA-8.
+        // The compact format hardcodes this, so we just verify the entries
+        // are generated (RA rule filtering happens during generation).
         let exe = std::env::current_exe().unwrap();
         let entries = generate_unwind_table(&exe).unwrap();
-
-        let mut offset_count = 0;
-        for entry in &entries {
-            if entry.ra_type == REG_RULE_OFFSET {
-                offset_count += 1;
-                // For x86_64, return address is typically at CFA-8
-                assert_eq!(
-                    entry.ra_offset, -8,
-                    "Return address offset should be -8 for x86_64, got {}",
-                    entry.ra_offset
-                );
-            }
-        }
         assert!(
-            offset_count > 0,
-            "Expected at least some entries with CFA-relative return address"
+            !entries.is_empty(),
+            "Expected non-empty unwind table"
         );
     }
 
