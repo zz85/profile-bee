@@ -324,7 +324,7 @@ unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
 }
 
 /// Max binary search iterations (covers 2^16 = 65K entries per mapping)
-const MAX_BIN_SEARCH_DEPTH: u32 = 16;
+const MAX_BIN_SEARCH_DEPTH: u32 = 18;
 
 #[inline(always)]
 unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relative_pc: u32) -> Option<UnwindEntry> {

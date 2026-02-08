@@ -91,6 +91,9 @@ fn classify_cfa_expression(
 
 fn read_vdso(tgid: u32, start: u64, end: u64) -> Result<Vec<u8>, String> {
     use std::io::{Read, Seek, SeekFrom};
+    if end <= start {
+        return Err("Invalid vDSO address range".to_string());
+    }
     let mut f = std::fs::File::open(format!("/proc/{}/mem", tgid))
         .map_err(|e| format!("Failed to open /proc/{}/mem: {}", tgid, e))?;
     f.seek(SeekFrom::Start(start))
