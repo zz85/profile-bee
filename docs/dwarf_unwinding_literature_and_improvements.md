@@ -175,13 +175,22 @@ Replace the single global 250K-entry array with per-binary or per-mapping tables
 
 ## Recommended Priority
 
-The most impactful quick wins:
+All high-impact quick wins are now complete:
 
-1. **Remove dead code** (#3) — immediate cleanup, no risk
-2. **Fix FP unwinding bug** (#5) — one-line fix, restores non-DWARF functionality
-3. **Compact UnwindEntry** (#1) — 4x memory efficiency improvement
-4. **Expression support** (#2) — better stack quality for glibc-heavy workloads
-5. **Signal trampolines** (#4) — deeper stacks through signal handlers
+1. ~~**Remove dead code** (#3)~~ ✅ Done
+2. ~~**Fix FP unwinding bug** (#5)~~ ✅ Done
+3. ~~**Compact UnwindEntry** (#1)~~ ✅ Done (12 bytes: u32 PC, i16 offsets)
+4. ~~**Expression support** (#2)~~ ✅ Done (PLT + signal frame)
+5. ~~**Signal trampolines** (#4)~~ ✅ Done (CFA_REG_DEREF_RSP + vDSO parsing)
+
+Additional improvements completed (from async-profiler analysis):
+- ✅ Entry deduplication (7-63% reduction depending on binary)
+- ✅ u32 PC (file-relative addresses fit in 32 bits)
+- ✅ FP-based fallback when no DWARF entry found
+- ✅ MAX_PROC_MAPS increased to 16
+- ✅ vDSO .eh_frame parsing from /proc/[pid]/mem
+
+Remaining medium-effort items: #6 (system-wide), #7 (dlopen), #8 (build-ID cache), #10 (validation).
 
 ## References
 
