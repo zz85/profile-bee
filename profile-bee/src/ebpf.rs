@@ -50,8 +50,6 @@ pub struct EbpfProfiler {
     pub stack_traces: StackTraceMap<MapData>,
     /// Count stacktraces
     pub counts: HashMap<MapData, StackInfoPod, u64>,
-    /// Send unwind infomation from pid
-    pub unwind: HashMap<MapData, u32, DwarfUnwindInfoPod>,
     /// Custom storage of StackTrace IPs
     pub stacked_pointers: HashMap<MapData, StackInfoPod, FramePointersPod>,
 }
@@ -187,17 +185,11 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         .ok_or(anyhow!("stacked_pointers not found"))?
         .try_into()?;
 
-    let unwind = bpf
-        .take_map("unwind")
-        .ok_or(anyhow!("stacked_pointers not found"))?
-        .try_into()?;
-
     Ok(EbpfProfiler {
         bpf,
         stack_traces,
         counts,
         stacked_pointers,
-        unwind,
     })
 }
 

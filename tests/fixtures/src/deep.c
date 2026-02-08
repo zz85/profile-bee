@@ -7,6 +7,7 @@
 
 #include <signal.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 volatile int keep_running = 1;
 void handle_signal(int sig) { keep_running = 0; }
@@ -26,6 +27,8 @@ __attribute__((noinline)) void recurse(int depth) {
 int main(void) {
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
+    signal(SIGALRM, handle_signal);
+    alarm(10);  // self-terminate after 10s to prevent orphan processes
     recurse(20);
     return 0;
 }

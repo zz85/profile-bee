@@ -7,6 +7,7 @@
 
 #include <signal.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 // Signal handler so we can stop cleanly from the test harness
 volatile int keep_running = 1;
@@ -25,6 +26,8 @@ __attribute__((noinline)) void function_a(void) { function_b(); }
 int main(void) {
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
+    signal(SIGALRM, handle_signal);
+    alarm(10);  // self-terminate after 10s to prevent orphan processes
     function_a();
     return 0;
 }

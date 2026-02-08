@@ -186,9 +186,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
     let stacked_pointers = &ebpf_profiler.stacked_pointers;
-    let unwind = &mut ebpf_profiler.unwind;
 
-    let mut profiler = TraceHandler::new(); // !opt.no_dwarf
+    let mut profiler = TraceHandler::new();
 
     // Set up communication channels
     let (perf_tx, perf_rx) = mpsc::channel();
@@ -215,7 +214,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             opt.stream_mode,
             opt.group_by_cpu,
             stacked_pointers,
-            unwind,
         );
 
         // Generate and save output files
@@ -335,7 +333,6 @@ fn process_profiling_data(
     stream_mode: u8,
     group_by_cpu: bool,
     stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
-    unwind: &mut aya::maps::HashMap<MapData, u32, DwarfUnwindInfoPod>,
 ) -> Vec<String> {
     // Local counting
     let mut trace_count = HashMap::<StackInfo, usize>::new();
@@ -362,12 +359,6 @@ fn process_profiling_data(
                 *trace += 1;
 
                 if *trace == 1 {
-                    // let _combined = profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu);
-
-                    // todo pass hashmap or stacked pointers information here
-
-                    profiler.upload_unwind(&stack, unwind);
-
                     let _combined = profiler.get_exp_stacked_frames(
                         &stack,
                         &stack_traces,

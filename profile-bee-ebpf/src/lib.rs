@@ -177,17 +177,13 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
     let mut current_ip = ip;
     let mut len = 1usize;
 
-    // Unwind loop - bounded by MAX_DWARF_STACK_DEPTH for eBPF verifier
-    let max_depth = if pointers.len() < MAX_DWARF_STACK_DEPTH {
-        pointers.len()
-    } else {
-        MAX_DWARF_STACK_DEPTH
-    };
-
     let mapping_count = proc_info.mapping_count as usize;
 
     let mut i = 1usize;
-    while i < max_depth {
+    for _ in 1..MAX_DWARF_STACK_DEPTH {
+        if i >= pointers.len() {
+            break;
+        }
         if invalid_userspace_pointer(current_ip) {
             break;
         }
@@ -198,8 +194,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
         let mut table_count: u32 = 0;
         let mut load_bias: u64 = 0;
 
-        let mut m = 0usize;
-        while m < MAX_PROC_MAPS {
+        for m in 0..MAX_PROC_MAPS {
             if m >= mapping_count {
                 break;
             }
@@ -211,7 +206,6 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
                 found_mapping = true;
                 break;
             }
-            m += 1;
         }
 
         if !found_mapping || table_count == 0 {
@@ -282,7 +276,9 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
     (ip, bp, len)
 }
 
-/// Binary search for an unwind entry in the global table
+/// Max binary search iterations (covers 2^16 = 65K entries per mapping)
+const MAX_BIN_SEARCH_DEPTH: u32 = 16;
+
 #[inline(always)]
 unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relative_pc: u64) -> Option<UnwindEntry> {
     if table_count == 0 {
@@ -292,8 +288,10 @@ unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relativ
     let mut lo: u32 = 0;
     let mut hi: u32 = table_count;
 
-    let mut iterations = 0u32;
-    while lo < hi && iterations < 20 {
+    for _ in 0..MAX_BIN_SEARCH_DEPTH {
+        if lo >= hi {
+            break;
+        }
         let mid = lo + (hi - lo) / 2;
         let idx = table_start + mid;
 
@@ -307,7 +305,6 @@ unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relativ
         } else {
             hi = mid;
         }
-        iterations += 1;
     }
 
     if lo == 0 {

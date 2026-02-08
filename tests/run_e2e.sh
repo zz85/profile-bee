@@ -16,9 +16,9 @@ OUTPUT_DIR="$SCRIPT_DIR/output"
 PROFILER="$PROJECT_DIR/target/release/profile-bee"
 
 # ── Configuration ────────────────────────────────────────────────────────────
-PROFILE_TIME_MS=1500    # how long to profile each test (ms)
+PROFILE_TIME_MS=1000    # how long to profile each test (ms)
 FREQUENCY=99            # sampling frequency (Hz)
-SETTLE_TIME=0.3         # seconds to let target process warm up before profiling
+TEST_TIMEOUT=30         # max seconds per individual test
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
@@ -70,7 +70,7 @@ mkdir -p "$OUTPUT_DIR"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-# Run profile-bee against a background process, return collapse file path.
+# Run profile-bee against a command, return collapse file path.
 # Usage: run_profiler <binary> <output_name> [extra_args...]
 run_profiler() {
     local binary="$1"
@@ -79,42 +79,28 @@ run_profiler() {
     local extra_args=("$@")
     local collapse_file="$OUTPUT_DIR/${name}.collapse"
 
-    # Start target in background
-    "$binary" &
-    local target_pid=$!
-    sleep "$SETTLE_TIME"
-
-    # Verify target is still running
-    if ! kill -0 "$target_pid" 2>/dev/null; then
-        echo "Target process died immediately"
-        return 1
-    fi
-
-    # Profile it
+    # Profile using --cmd (handles process lifecycle automatically)
     local profiler_output
-    profiler_output=$("$PROFILER" \
-        --pid "$target_pid" \
+    profiler_output=$(timeout "$TEST_TIMEOUT" "$PROFILER" \
+        --cmd "$binary" \
         --time "$PROFILE_TIME_MS" \
         --frequency "$FREQUENCY" \
         --collapse "$collapse_file" \
         --skip-idle \
-        "${extra_args[@]}" 2>&1) || true
-
-    # Clean up target
-    kill "$target_pid" 2>/dev/null || true
-    wait "$target_pid" 2>/dev/null || true
+        "${extra_args[@]+"${extra_args[@]}"}" 2>&1) || true
 
     if [[ "$VERBOSE" == "true" ]]; then
-        echo "--- profiler output ---"
-        echo "$profiler_output"
-        echo "--- end ---"
+        echo "--- profiler output ---" >&2
+        echo "$profiler_output" >&2
+        echo "--- end ---" >&2
     fi
 
     if [[ ! -f "$collapse_file" ]]; then
-        echo "Collapse file not created: $collapse_file"
+        echo "Collapse file not created: $collapse_file" >&2
         return 1
     fi
 
+    # Only output the file path on stdout
     echo "$collapse_file"
 }
 
@@ -125,10 +111,10 @@ assert_stack_contains() {
     if grep -q "$pattern" "$file"; then
         return 0
     else
-        echo "  Stack pattern not found: $pattern"
+        echo "  Stack pattern not found: $pattern" >&2
         if [[ "$VERBOSE" == "true" ]]; then
-            echo "  File contents:"
-            head -20 "$file" | sed 's/^/    /'
+            echo "  File contents:" >&2
+            head -20 "$file" | sed 's/^/    /' >&2
         fi
         return 1
     fi
@@ -144,7 +130,7 @@ assert_min_depth() {
     if [[ "$max_depth" -ge "$min" ]]; then
         return 0
     else
-        echo "  Max stack depth $max_depth < required $min"
+        echo "  Max stack depth $max_depth < required $min" >&2
         return 1
     fi
 }
@@ -161,20 +147,21 @@ run_test() {
     local func="$2"
 
     if [[ -n "$FILTER" ]] && [[ "$name" != *"$FILTER"* ]]; then
-        ((SKIPPED++))
+        SKIPPED=$((SKIPPED + 1))
         return
     fi
 
     printf "  %-55s " "$name"
 
-    local output
-    if output=$($func 2>&1); then
+    local output exit_code=0
+    output=$($func 2>&1) || exit_code=$?
+    if [[ "$exit_code" -eq 0 ]]; then
         echo -e "${GREEN}PASS${NC}"
-        ((PASSED++))
+        PASSED=$((PASSED + 1))
     else
         echo -e "${RED}FAIL${NC}"
         echo "$output" | sed 's/^/    /'
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
         FAILURES+=("$name")
     fi
 }
@@ -269,7 +256,7 @@ test_dwarf_vs_fp_depth() {
     if [[ "$dwarf_depth" -ge "$((fp_depth - 1))" ]]; then
         return 0  # DWARF at least as good as FP (allow 1 frame tolerance)
     else
-        echo "  DWARF depth ($dwarf_depth) significantly less than FP depth ($fp_depth)"
+        echo "  DWARF depth ($dwarf_depth) significantly less than FP depth ($fp_depth)" >&2
         return 1
     fi
 }
@@ -288,18 +275,18 @@ test_dwarf_improves_no_fp() {
     if [[ "$dwarf_depth" -gt "$no_dwarf_depth" ]]; then
         return 0
     else
-        echo "  DWARF depth ($dwarf_depth) not better than no-DWARF ($no_dwarf_depth)"
-        echo "  (This is the core value proposition of DWARF unwinding)"
+        echo "  DWARF depth ($dwarf_depth) not better than no-DWARF ($no_dwarf_depth)" >&2
+        echo "  (This is the core value proposition of DWARF unwinding)" >&2
         return 1
     fi
 }
 
 # ---------- Robustness tests ------------------------------------------------
 
-test_dwarf_nonexistent_pid() {
-    # --dwarf with a PID that doesn't exist should not crash
+test_dwarf_nonexistent_binary() {
+    # --dwarf with a binary that doesn't exist should not crash
     local output
-    output=$("$PROFILER" --pid 999999 --dwarf --time 200 --collapse "$OUTPUT_DIR/bad-pid.collapse" 2>&1) || true
+    output=$(timeout "$TEST_TIMEOUT" "$PROFILER" --cmd "/nonexistent/binary" --dwarf --time 200 --collapse "$OUTPUT_DIR/bad-bin.collapse" 2>&1) || true
     # Should exit without segfault — any output is fine
     return 0
 }
@@ -313,7 +300,7 @@ test_samples_collected() {
     if [[ "$count" -gt 0 ]]; then
         return 0
     else
-        echo "  No samples collected (count=0)"
+        echo "  No samples collected (count=0)" >&2
         return 1
     fi
 }
@@ -353,7 +340,7 @@ run_test "DWARF improves no-FP stacks"              test_dwarf_improves_no_fp
 echo ""
 
 echo "── Robustness ──"
-run_test "Non-existent PID doesn't crash"           test_dwarf_nonexistent_pid
+run_test "Non-existent binary doesn't crash"        test_dwarf_nonexistent_binary
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────────
