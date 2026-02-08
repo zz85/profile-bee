@@ -70,11 +70,17 @@ pub struct UnwindEntry {
     pub pc: u32,           // File-relative program counter (u32 sufficient for single-binary offsets)
     pub cfa_offset: i16,   // CFA = register + offset
     pub rbp_offset: i16,   // RBP restore offset from CFA
-    pub cfa_type: u8,      // 0=RSP, 1=RBP
+    pub cfa_type: u8,      // 0=RSP, 1=RBP, 3=PLT, 4=DEREF_RSP
     pub rbp_type: u8,      // How to restore RBP (0=OFFSET, 1=SAME_VALUE, 2=UNDEFINED)
     pub _pad: [u8; 2],
 }
 ```
+
+CFA types:
+- `CFA_REG_RSP (0)`: CFA = RSP + offset (most common)
+- `CFA_REG_RBP (1)`: CFA = RBP + offset (frame-pointer-based frames)
+- `CFA_REG_PLT (3)`: CFA = RSP + offset + ((RIP & 15) >= 11 ? offset : 0) — PLT stubs
+- `CFA_REG_DEREF_RSP (4)`: CFA = *(RSP + offset) — signal trampolines
 
 Return address is always at CFA-8 on x86_64, so RA rule/offset are not stored.
 
@@ -178,12 +184,12 @@ The eBPF code is structured to pass the BPF verifier:
 - **MAX_PROC_MAPS = 16**: processes with very many shared libraries may exceed this
 - **MAX_DWARF_STACK_DEPTH = 32**: stacks deeper than 32 frames are truncated
 - **MAX_UNWIND_TABLE_SIZE = 250K**: very large binaries (Chrome, Firefox) may exceed this
-- **No signal trampolines**: unwinding through signal handlers may stop early
+- **No signal trampolines**: unwinding through signal handlers may stop early on kernels where the vDSO lacks `.eh_frame` entries for `__restore_rt` (libc's `__restore_rt` is handled)
 - **x86_64 only**: register rules are hardcoded for x86_64 (RSP, RBP, RA)
 
 ## Testing
 
-12 E2E tests in `tests/run_e2e.sh`:
+13 E2E tests in `tests/run_e2e.sh`:
 
 | Test | What it validates |
 |------|-------------------|

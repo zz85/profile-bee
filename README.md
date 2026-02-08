@@ -60,7 +60,6 @@ See `docs/dwarf_unwinding_design.md` for architecture details.
 - DWARF unwinding only works for the `--cmd`/`--pid` target process (not system-wide)
 - Max 16 executable mappings per process, 250K unwind table entries, 32 frame depth
 - No dynamic library hot-loading (dlopen after startup)
-- No signal trampoline unwinding
 
 **Note**: For symbol resolution, you still need debug information:
 - Rust: Add `-g` flag when compiling

@@ -86,12 +86,14 @@ An earlier, incomplete iteration that should be removed:
 
 | Aspect | Profile-Bee | Parca Agent | OTel eBPF Profiler |
 |--------|------------|-------------|-------------------|
-| Row size | 32 bytes (i32 + padding) | 8 bytes (i16, packed) | ~similar to Parca |
-| DWARF expressions | Skipped entirely | 2 most common hardcoded | Full support |
+| Row size | 12 bytes (u32 PC, i16 offsets) | 8 bytes (i16, packed) | ~similar to Parca |
+| DWARF expressions | 2 most common (PLT + signal) | 2 most common hardcoded | Full support |
 | Scope | Single process only | System-wide, dynamic | System-wide, dynamic |
-| Max mappings/process | 8 | Dynamic | Dynamic |
+| Max mappings/process | 16 | Dynamic | Dynamic |
 | Max table entries | 250K global | Dynamic (sharded) | Dynamic |
-| Signal trampolines | Not handled | Handled | Handled |
+| Signal trampolines | Handled (libc) | Handled | Handled |
+| FP fallback | Yes (when no DWARF entry) | No | No |
+| Entry deduplication | Yes (consecutive identical) | No | No |
 | Architecture | x86_64 only | x86_64 + arm64 | x86_64 + arm64 |
 | dlopen support | None | Dynamic reload | Dynamic reload |
 | Inline frames | No | No | Yes |
