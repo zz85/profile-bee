@@ -83,7 +83,7 @@ Return address is always at CFA-8 on x86_64, so RA rule/offset are not stored.
 ```rust
 pub struct ProcInfo {
     pub mapping_count: u32,
-    pub mappings: [ExecMapping; 8],  // MAX_PROC_MAPS
+    pub mappings: [ExecMapping; 16],  // MAX_PROC_MAPS
 }
 
 pub struct ExecMapping {
@@ -175,7 +175,7 @@ The eBPF code is structured to pass the BPF verifier:
 
 - **Single process**: only loads tables for `--cmd`/`--pid` target
 - **No hot-reload**: dlopen'd libraries after startup won't have unwind tables
-- **MAX_PROC_MAPS = 8**: processes with many shared libraries may exceed this
+- **MAX_PROC_MAPS = 16**: processes with very many shared libraries may exceed this
 - **MAX_DWARF_STACK_DEPTH = 32**: stacks deeper than 32 frames are truncated
 - **MAX_UNWIND_TABLE_SIZE = 250K**: very large binaries (Chrome, Firefox) may exceed this
 - **No signal trampolines**: unwinding through signal handlers may stop early

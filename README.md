@@ -58,7 +58,7 @@ See `docs/dwarf_unwinding_design.md` for architecture details.
 #### Current limitations
 
 - DWARF unwinding only works for the `--cmd`/`--pid` target process (not system-wide)
-- Max 8 executable mappings per process, 250K unwind table entries, 32 frame depth
+- Max 16 executable mappings per process, 250K unwind table entries, 32 frame depth
 - No dynamic library hot-loading (dlopen after startup)
 - No signal trampoline unwinding
 
@@ -124,7 +124,7 @@ profile-bee --pid <pid> ...
 
 ### Limitations
 - Linux only
-- DWARF unwinding: single target process only (not system-wide), max 8 mappings / 250K entries / 32 frames
+- DWARF unwinding: single target process only (not system-wide), max 16 mappings / 250K entries / 32 frames
 - Interpreted / JIT stacktraces not yet supported
 - [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) and binary offsets not calculated
 
