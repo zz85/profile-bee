@@ -215,6 +215,24 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
     // Sort by PC address for binary search
     entries.sort_by_key(|e| e.pc);
 
+    // Deduplicate consecutive entries with identical unwind rules.
+    // The binary search finds the last entry with pc <= target, so keeping
+    // only the first entry of a run with identical rules is correct.
+    let before = entries.len();
+    entries.dedup_by(|b, a| {
+        a.cfa_type == b.cfa_type
+            && a.cfa_offset == b.cfa_offset
+            && a.rbp_type == b.rbp_type
+            && a.rbp_offset == b.rbp_offset
+    });
+    let after = entries.len();
+    if before != after {
+        tracing::debug!(
+            "Dedup: {} -> {} entries ({:.1}% reduction)",
+            before, after, (1.0 - after as f64 / before as f64) * 100.0
+        );
+    }
+
     Ok(entries)
 }
 
