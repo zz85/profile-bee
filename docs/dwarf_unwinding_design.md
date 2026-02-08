@@ -135,7 +135,7 @@ sp = RSP, bp = RBP, current_ip = RIP
 for i in 1..32:
     mapping = find_mapping(current_ip)        // linear scan, max 16
     relative_pc = current_ip - mapping.load_bias
-    entry = binary_search(relative_pc)        // max 16 iterations
+    entry = binary_search(relative_pc)        // max 19 iterations
 
     cfa = (entry.cfa_type == RSP) ? sp + entry.cfa_offset
                                   : bp + entry.cfa_offset
