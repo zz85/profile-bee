@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use aya::maps::{HashMap, MapData, RingBuf, StackTraceMap};
+use aya::maps::{Array, HashMap, MapData, RingBuf, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
@@ -9,6 +9,7 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 
 use aya::Pod;
+use profile_bee_common::{UnwindEntry, ProcInfo, ProcInfoKey};
 
 // Create a newtype wrapper around StackInfo
 #[repr(transparent)]
@@ -25,6 +26,21 @@ unsafe impl Pod for FramePointersPod {}
 #[derive(Debug, Clone, Copy)]
 pub struct DwarfUnwindInfoPod(pub profile_bee_common::DwarfUnwindInfo);
 unsafe impl Pod for DwarfUnwindInfoPod {}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct UnwindEntryPod(pub UnwindEntry);
+unsafe impl Pod for UnwindEntryPod {}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProcInfoKeyPod(pub ProcInfoKey);
+unsafe impl Pod for ProcInfoKeyPod {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct ProcInfoPod(pub ProcInfo);
+unsafe impl Pod for ProcInfoPod {}
 
 /// Wrapper for eBPF stuff
 #[derive(Debug)]
@@ -49,6 +65,7 @@ pub struct ProfilerConfig {
     pub pid: Option<u32>,
     pub cpu: Option<u32>,
     pub self_profile: bool,
+    pub dwarf: bool,
 }
 
 /// Creates an aya Ebpf object
@@ -63,10 +80,12 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
     let data = include_bytes_aligned!("../../target/bpfel-unknown-none/release/profile-bee");
 
     let skip_idle = if config.skip_idle { 1u8 } else { 0u8 };
+    let dwarf_enabled = if config.dwarf { 1u8 } else { 0u8 };
 
     let bpf = EbpfLoader::new()
         .set_global("SKIP_IDLE", &skip_idle, true)
         .set_global("NOTIFY_TYPE", &config.stream_mode, true)
+        .set_global("DWARF_ENABLED", &dwarf_enabled, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {
@@ -192,5 +211,50 @@ pub fn setup_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<&mut MapData>, anyhow
 }
 
 impl EbpfProfiler {
-    // todo: move stuff from profile-bee bin into here
+    /// Load DWARF unwind tables into eBPF maps for a process
+    pub fn load_dwarf_unwind_tables(
+        &mut self,
+        manager: &crate::dwarf_unwind::DwarfUnwindManager,
+    ) -> Result<(), anyhow::Error> {
+        // Get the unwind_table array map
+        let mut unwind_table: Array<&mut MapData, UnwindEntryPod> =
+            Array::try_from(
+                self.bpf
+                    .map_mut("unwind_table")
+                    .ok_or(anyhow!("unwind_table map not found"))?,
+            )?;
+
+        // Load all unwind entries into the global array
+        for (idx, entry) in manager.global_table.iter().enumerate() {
+            unwind_table.set(idx as u32, UnwindEntryPod(*entry), 0)?;
+        }
+
+        tracing::info!(
+            "Loaded {} unwind table entries into eBPF map",
+            manager.global_table.len()
+        );
+
+        // Get the proc_info hash map
+        let mut proc_info_map: HashMap<&mut MapData, ProcInfoKeyPod, ProcInfoPod> =
+            HashMap::try_from(
+                self.bpf
+                    .map_mut("proc_info")
+                    .ok_or(anyhow!("proc_info map not found"))?,
+            )?;
+
+        // Load per-process mapping information
+        for (&tgid, proc_info) in &manager.proc_info {
+            let key = ProcInfoKeyPod(ProcInfoKey { tgid, _pad: 0 });
+            let value = ProcInfoPod(*proc_info);
+            proc_info_map.insert(key, value, 0)?;
+
+            tracing::info!(
+                "Loaded process info for tgid {} ({} mappings)",
+                tgid,
+                proc_info.mapping_count,
+            );
+        }
+
+        Ok(())
+    }
 }

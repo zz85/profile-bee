@@ -61,7 +61,6 @@ pub struct TraceHandler {
     symbolizer: Symbolizer,
     /// Simple Cache
     cache: PointerStackFramesCache,
-    done: bool,
 }
 
 impl TraceHandler {
@@ -69,7 +68,6 @@ impl TraceHandler {
         TraceHandler {
             symbolizer: Symbolizer::new(),
             cache: Default::default(),
-            done: false,
         }
     }
 
@@ -132,6 +130,7 @@ impl TraceHandler {
     }
 
     /// Converts stacks traces into StackFrameInfo structs
+    /// Uses DWARF-unwound frame pointers from eBPF when available
     pub fn get_exp_stacked_frames(
         &mut self,
         stack_info: &StackInfo,
@@ -139,45 +138,28 @@ impl TraceHandler {
         group_by_cpu: bool,
         stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     ) -> Vec<StackFrameInfo> {
-        // if self.done {
-        //     return vec![];
-        // }
-        // self.done = true;
-
-        let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
+        let (kernel_stack, fp_user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
 
         let key = StackInfoPod(stack_info.clone());
 
-        if let Ok(pointers) = stacked_pointers.get(&key, 0) {
+        // Try to use DWARF-unwound frame pointers from eBPF
+        let user_stack = if let Ok(pointers) = stacked_pointers.get(&key, 0) {
             let pointers = pointers.0;
-            let pid = stack_info.tgid;
-            let src: Source<'_> = Source::Process(Process::new(Pid::from(pid)));
-            let addrs = &pointers.pointers[..pointers.len as usize];
-
-            tracing::info!("IP (instruction pointer): {}", stack_info.ip);
-            tracing::info!("BP (base pointer aka Frame pointer): {}", stack_info.bp);
-            tracing::info!("RSP (stack pointer): {}", stack_info.sp);
-            tracing::info!("User stack: {:?}", user_stack);
-            tracing::info!("addrs: {:?}", addrs);
-
-            // let _ = crate::get_mappings(pid as _);
-            // let _ = crate::find_instruction(pid as _, stack_info.ip, stack_info.sp);
-
-            let syms = self
-                .symbolizer
-                .symbolize(&src, Input::AbsAddr(&[stack_info.ip]));
-            tracing::info!("IP Symbolization {syms:?}");
-
-            let syms = self.symbolizer.symbolize(
-                &src,
-                // Input::AbsAddr(&user_stack.as_ref().unwrap().clone()[..3]),
-                Input::AbsAddr(
-                    // &user_stack.as_ref().unwrap().clone()[..1]
-                    &addrs[1..],
-                ),
-            );
-            tracing::info!("IP Symbolization original {syms:?}");
-        }
+            let len = pointers.len as usize;
+            if len > 0 {
+                let addrs: Vec<u64> = pointers.pointers[..len].to_vec();
+                tracing::debug!(
+                    "Using DWARF-unwound stack ({} frames) for pid {}",
+                    addrs.len(),
+                    stack_info.tgid,
+                );
+                Some(addrs)
+            } else {
+                fp_user_stack
+            }
+        } else {
+            fp_user_stack
+        };
 
         let stacks = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);
 
