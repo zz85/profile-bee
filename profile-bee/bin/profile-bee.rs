@@ -86,7 +86,7 @@ struct Opt {
     no_dwarf: bool,
 
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     dwarf: bool,
 
     /// PID to profile
