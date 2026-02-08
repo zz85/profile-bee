@@ -276,3 +276,85 @@ async-profiler implements its own DWARF CFI parser in ~300 lines of C++, directl
 | 4 | Default FP-based fallback when no entry found | Recover frames in partial-FP binaries |
 | 5 | Pack CFA register + offset into single field | Minor space optimization |
 | 6 | Parse `.eh_frame_hdr` for faster FDE lookup | Faster startup for large binaries |
+
+## Appendix: async-profiler — Off-CPU, Memory & Lock Profiling
+
+Beyond DWARF unwinding, async-profiler implements several profiling modes that are relevant to profile-bee's roadmap (which lists "Off CPU profiling" as a TODO). Here's how they work and what's applicable.
+
+### Wall-Clock / Off-CPU Profiling
+
+async-profiler's `-e wall` mode samples all threads equally regardless of whether they're running, sleeping, or blocked. This is the key to off-CPU profiling — it reveals where threads spend time waiting.
+
+**How it works:**
+1. A dedicated timer thread iterates over all threads every `interval` (default ~5ms)
+2. Sends `SIGPROF` (or configurable signal) to each thread
+3. The signal handler inspects the interrupted context to classify thread state:
+   - If PC points to a `syscall` instruction → `THREAD_SLEEPING`
+   - If the previous instruction was `syscall` and the return value is `EINTR` → `THREAD_SLEEPING`
+   - Otherwise → `THREAD_RUNNING`
+4. Stack trace is captured with the thread state annotation
+
+**Batch mode optimization (v4.2+):** Instead of recording every idle sample individually, consecutive idle samples for the same thread are batched into a single `WallClockEvent` with a `_time_span` and `_samples` count. This dramatically reduces overhead for mostly-idle threads. A lock-free MPSC ring buffer tracks per-thread CPU time to detect when a sleeping thread becomes runnable.
+
+**Throttling:** At most `THREADS_PER_TICK = 8` threads are signaled per timer tick, preventing overhead explosion with many threads.
+
+**Applicability to profile-bee:** An eBPF-based off-CPU profiler would use a different mechanism — typically attaching to `sched_switch` tracepoints to capture the moment a thread goes off-CPU and when it comes back. The stack is captured at the off-CPU transition. The key insight from async-profiler is the batching optimization: consecutive off-CPU periods for the same stack should be coalesced to reduce map pressure.
+
+### Native Memory Profiling (`nativemem`)
+
+async-profiler intercepts `malloc`, `calloc`, `realloc`, `free`, `posix_memalign`, and `aligned_alloc` via GOT/PLT patching (import table hooking). This is a non-intrusive approach that doesn't require recompilation.
+
+**How it works:**
+1. At startup, saves original function pointers from the GOT
+2. Patches the GOT entries in all loaded libraries to point to hook functions
+3. Hook functions call the original allocator, then record the allocation
+4. `dlopen` is also hooked to patch newly loaded libraries
+5. Sampling: not every allocation is recorded — a counter tracks total allocated bytes, and a sample is taken every `_interval` bytes (e.g., every 1MB)
+6. For leak detection: `free` calls are also recorded, and `jfrconv --leak` matches allocations with frees to show only unfreed memory
+
+**Key details:**
+- Detects nested malloc (e.g., musl's `calloc` calls `malloc` internally) to prevent double-counting
+- Uses dummy hooks for nested cases to preserve frame pointer chain
+- Hooks are compiled with `-fno-omit-frame-pointer` and `-fno-optimize-sibling-calls` to ensure stack traces are correct through the hook functions
+- Sampling interval is configurable: `--nativemem 1m` limits to one sample per MB allocated
+
+**Applicability to profile-bee:** eBPF can attach uprobes to `malloc`/`free` or use `tracepoint:kmem:kmalloc` for kernel allocations. The sampling approach (record every Nth byte of allocation) is directly applicable to avoid overwhelming the perf buffer. The leak detection pattern (matching alloc/free by address) could be implemented with a BPF hashmap keyed by address.
+
+### Native Lock Profiling (`--nativelock`)
+
+Intercepts `pthread_mutex_lock`, `pthread_rwlock_rdlock`, and `pthread_rwlock_wrlock` via the same GOT patching mechanism.
+
+**How it works:**
+1. Hook first tries `pthread_mutex_trylock` — if it succeeds, no contention, no recording
+2. If trylock fails, records `start_time` (via TSC), calls the real `pthread_mutex_lock`, records `end_time`
+3. The duration `end_time - start_time` is the contention time in nanoseconds
+4. Stack trace is captured at the lock acquisition point
+5. Sampling: uses interval-based sampling on total contention duration
+
+**Key insight:** Only contended locks are recorded (trylock succeeds = no contention = no overhead). This makes the profiler nearly zero-overhead for uncontended locks.
+
+**Applicability to profile-bee:** eBPF can attach uprobes to `pthread_mutex_lock` entry/return to measure contention time. The trylock-first optimization isn't possible from eBPF (we can't modify the program's behavior), but we can filter by duration — only record lock acquisitions that took longer than a threshold.
+
+### Architecture Comparison: Userspace Hooking vs eBPF
+
+| Aspect | async-profiler (userspace) | profile-bee (eBPF) |
+|--------|---------------------------|-------------------|
+| Mechanism | GOT/PLT patching, signal handlers | eBPF programs on tracepoints/uprobes |
+| Memory access | Direct pointer dereference | `bpf_probe_read_user` |
+| Crash safety | `setjmp`/`longjmp`, `SafeAccess` SIGSEGV handler | BPF verifier prevents crashes |
+| Scope | Single process (injected agent) | System-wide or per-process |
+| Overhead control | Sampling interval, thread throttling | Sampling frequency, map size limits |
+| dlopen handling | Hooks `dlopen` to patch new libraries | Would need `/proc/pid/maps` polling or mmap tracepoint |
+| Off-CPU | Signal all threads + classify state | `sched_switch` tracepoint |
+| Memory | GOT patching of malloc/free | uprobes on malloc/free or kmem tracepoints |
+| Locks | GOT patching of pthread_mutex_lock | uprobes on pthread_mutex_lock entry/return |
+
+### Concrete Ideas for profile-bee
+
+1. **Off-CPU profiling via `sched_switch`**: Attach eBPF to `sched:sched_switch` tracepoint. On switch-out, record the stack + timestamp in a BPF hashmap keyed by `(tgid, tid)`. On switch-in, compute the off-CPU duration and emit the event. Batch consecutive off-CPU periods for the same stack (async-profiler's insight).
+
+2. **Native memory profiling via uprobes**: Attach uprobes to `malloc`/`free` in libc. Use a BPF hashmap to track `address → (size, stack_id)`. Sample every Nth byte allocated (not every call). For leak detection, remove entries on `free` and periodically dump remaining entries.
+
+3. **Lock contention via uprobes**: Attach uprobes to `pthread_mutex_lock` entry and uretprobes to its return. Measure wall-clock duration between entry and return. Only emit events above a configurable threshold (e.g., >1ms). The stack at entry shows who's waiting; the lock address identifies which lock.
+
+4. **Hardware performance counters**: profile-bee already uses `perf_events` for CPU sampling. The same infrastructure supports `cache-misses`, `branch-misses`, `page-faults`, `context-switches`, etc. — just change the `perf_type_id` and `config` in the perf_event_open call. async-profiler supports all of these via `-e <event>`.
