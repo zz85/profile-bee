@@ -82,9 +82,6 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     group_by_cpu: bool,
 
-    #[arg(long, default_value_t = false)]
-    no_dwarf: bool,
-
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
     #[arg(long, default_value_t = true)]
     dwarf: bool,
