@@ -250,8 +250,9 @@ test_dwarf_vs_fp_depth() {
     dwarf_file=$(run_profiler "$FIXTURE_DIR/callstack-fp" "cmp-dwarf" --dwarf)
 
     local fp_depth dwarf_depth
-    fp_depth=$(awk -F';' '{print NF}' "$fp_file" | sort -rn | head -1)
-    dwarf_depth=$(awk -F';' '{print NF}' "$dwarf_file" | sort -rn | head -1)
+    # Count only userspace frames (exclude kernel frames ending with _k)
+    fp_depth=$(sed 's/;[^ ]*_k[^ ]*//g' "$fp_file" | awk -F';' '{print NF}' | sort -rn | head -1)
+    dwarf_depth=$(sed 's/;[^ ]*_k[^ ]*//g' "$dwarf_file" | awk -F';' '{print NF}' | sort -rn | head -1)
 
     if [[ "$dwarf_depth" -ge "$((fp_depth - 1))" ]]; then
         return 0  # DWARF at least as good as FP (allow 1 frame tolerance)

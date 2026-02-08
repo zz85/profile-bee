@@ -34,8 +34,18 @@ pub fn generate_unwind_table(elf_path: &Path) -> Result<Vec<UnwindEntry>, String
 
 /// Generates a compact unwind table from ELF binary bytes
 pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>, String> {
+    use object::ObjectSegment;
+
     let obj = object::File::parse(data)
         .map_err(|e| format!("Failed to parse ELF: {}", e))?;
+
+    // Find the base virtual address (first PT_LOAD segment with file offset 0)
+    // For non-PIE executables this is typically 0x400000, for PIE/shared libs it's 0.
+    // We subtract this from .eh_frame PCs to make entries file-relative.
+    let base_vaddr = obj.segments()
+        .find(|s| s.file_range().0 == 0)
+        .map(|s| s.address())
+        .unwrap_or(0);
 
     let eh_frame_section = obj
         .section_by_name(".eh_frame")
@@ -139,7 +149,7 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
                     };
 
                     entries.push(UnwindEntry {
-                        pc,
+                        pc: pc - base_vaddr,
                         cfa_type,
                         _pad1: [0; 3],
                         cfa_offset,

@@ -99,3 +99,22 @@ fn test_libc_has_unwind_info() {
         entries.len()
     );
 }
+
+#[test]
+fn dump_callstack_no_fp_entries() {
+    use profile_bee::dwarf_unwind::generate_unwind_table;
+    use std::path::Path;
+    // Try both relative paths (depends on cargo test working dir)
+    let candidates = ["tests/fixtures/bin/callstack-no-fp", "../tests/fixtures/bin/callstack-no-fp"];
+    let p = candidates.iter().map(Path::new).find(|p| p.exists());
+    let Some(p) = p else { eprintln!("callstack-no-fp not found, skipping"); return; };
+    let entries = generate_unwind_table(p).unwrap();
+    eprintln!("Total entries: {}", entries.len());
+    // hot=0x400527, function_c=0x400534, function_b=0x40053b, function_a=0x400542, main=0x400549
+    for e in &entries {
+        if e.pc >= 0x500 && e.pc <= 0x700 {
+            eprintln!("pc={:#010x} cfa_type={} cfa_off={:4} ra_type={} ra_off={:4} rbp_type={} rbp_off={:4}",
+                e.pc, e.cfa_type, e.cfa_offset, e.ra_type, e.ra_offset, e.rbp_type, e.rbp_offset);
+        }
+    }
+}

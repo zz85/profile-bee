@@ -385,6 +385,7 @@ fn process_profiling_data(
             group_by_cpu,
             &mut samples,
             &mut stacks,
+            stacked_pointers,
         );
     } else {
         process_kernel_counting(
@@ -394,6 +395,7 @@ fn process_profiling_data(
             group_by_cpu,
             &mut samples,
             &mut stacks,
+            stacked_pointers,
         );
     }
 
@@ -427,9 +429,10 @@ fn process_local_counting(
     group_by_cpu: bool,
     samples: &mut u64,
     stacks: &mut Vec<FrameCount>,
+    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
 ) {
     for (stack, value) in trace_count.iter() {
-        let combined = profiler.get_stacked_frames(stack, stack_traces, group_by_cpu);
+        let combined = profiler.get_exp_stacked_frames(stack, stack_traces, group_by_cpu, stacked_pointers);
 
         *samples += *value as u64;
         stacks.push(FrameCount {
@@ -448,13 +451,14 @@ fn process_kernel_counting(
     group_by_cpu: bool,
     samples: &mut u64,
     stacks: &mut Vec<FrameCount>,
+    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
 ) {
     for (key, value) in counts.iter().flatten() {
         let stack: StackInfo = key.0;
 
         *samples += value;
 
-        let combined = profiler.get_stacked_frames(&stack, stack_traces, group_by_cpu);
+        let combined = profiler.get_exp_stacked_frames(&stack, stack_traces, group_by_cpu, stacked_pointers);
 
         stacks.push(FrameCount {
             frames: combined,

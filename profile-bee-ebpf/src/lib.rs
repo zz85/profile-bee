@@ -168,7 +168,6 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
     let proc_info = match PROC_INFO.get(&proc_key) {
         Some(info) => info,
         None => {
-            // No DWARF info loaded for this process, fall back to FP unwinding
             let (ip, bp, len, _sp) = copy_stack(ctx, pointers);
             return (ip, bp, len);
         }
@@ -245,7 +244,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
             _ => break,
         };
 
-        if return_addr == 0 || return_addr == current_ip {
+        if return_addr == 0 {
             break;
         }
 
