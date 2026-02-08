@@ -247,10 +247,11 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
             CFA_REG_RSP => sp.wrapping_add(entry.cfa_offset as i64 as u64),
             CFA_REG_RBP => bp.wrapping_add(entry.cfa_offset as i64 as u64),
             CFA_REG_PLT => {
-                // PLT stub: CFA = RSP + offset + ((RIP & 15) >= 11 ? offset : 0)
+                // PLT stub: CFA = RSP + offset + ((RIP & 15) >= 11 ? 8 : 0)
+                // The 8 comes from the DWARF expression `lit3; shl` (1 << 3 = 8)
                 let base = sp.wrapping_add(entry.cfa_offset as i64 as u64);
                 if (current_ip & 15) >= 11 {
-                    base.wrapping_add(entry.cfa_offset as i64 as u64)
+                    base.wrapping_add(8)
                 } else {
                     base
                 }

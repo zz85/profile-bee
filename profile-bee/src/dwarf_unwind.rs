@@ -78,7 +78,7 @@ fn classify_cfa_expression(
             };
             (CFA_REG_DEREF_RSP, off)
         }
-        // PLT stub: breg7(rsp)+N; breg16(rip)+0; ... → CFA = RSP + N + ((RIP&15)>=11 ? N : 0)
+        // PLT stub: breg7(rsp)+N; breg16(rip)+0; ... → CFA = RSP + N + ((RIP&15)>=11 ? 8 : 0)
         Ok(Some(Operation::RegisterOffset { register: reg2, offset: 0, .. })) if reg2 == X86_64_RA => {
             let Ok(off) = i16::try_from(base_offset) else {
                 return (CFA_REG_EXPRESSION, 0);
