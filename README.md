@@ -57,9 +57,8 @@ See `docs/dwarf_unwinding_design.md` for architecture details.
 
 #### Current limitations
 
-- DWARF unwinding only works for the `--cmd`/`--pid` target process (not system-wide)
-- Max 16 executable mappings per process, 500K unwind table entries, 32 frame depth
-- No dynamic library hot-loading (dlopen after startup)
+- Max 16 executable mappings per process, 500K unwind table entries total, 32 frame depth
+- Libraries loaded via dlopen are detected within ~1 second
 
 **Note**: For symbol resolution, you still need debug information:
 - Rust: Add `-g` flag when compiling
@@ -134,7 +133,7 @@ profile-bee --dwarf --svg output.svg -- ./my-optimized-binary
 
 ### Limitations
 - Linux only
-- DWARF unwinding: single target process only (not system-wide), max 16 mappings / 500K entries / 32 frames
+- DWARF unwinding: max 16 mappings per process / 500K total entries / 32 frames
 - Interpreted / JIT stacktraces not yet supported
 - [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) `.eh_frame` parsed for DWARF unwinding; VDSO symbolization not yet supported
 
