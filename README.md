@@ -23,45 +23,44 @@ More documentation in [docs](docs) directory.
 
 Profile Bee supports two methods for stack unwinding:
 
-1. **Frame Pointer Unwinding** (eBPF kernel space): Fast and efficient, but requires binaries compiled with frame pointers enabled.
-2. **DWARF-based Unwinding** (userspace fallback): Infrastructure for parsing `.eh_frame` sections (algorithm not yet implemented).
+1. **Frame Pointer Unwinding** (eBPF): Fast, but requires binaries compiled with `-fno-omit-frame-pointer`.
+2. **DWARF-based Unwinding** (eBPF + userspace): Profiles binaries without frame pointers by using `.eh_frame` unwind tables.
 
-#### Where Does Unwinding Happen?
+Both methods run the actual stack walking in eBPF (kernel space) for performance. Symbolization always happens in userspace.
 
-**eBPF (Kernel Space)**: Frame pointer unwinding runs in the kernel for maximum performance
-- Directly reads CPU registers (RIP, RBP) during sampling
-- Walks frame pointer chain in kernel context
-- Can sample at high frequency (99-9999 Hz) with minimal overhead
-- **Limitation**: Only works with `-fno-omit-frame-pointer` binaries
+#### Frame Pointer Method
 
-**Userland (User Space)**: DWARF unwinding infrastructure exists for fallback
-- Parses process memory maps and ELF binaries
-- Extracts and caches `.eh_frame` sections
-- **Status**: Infrastructure complete, CFI evaluation algorithm not yet implemented
-- See `docs/dwarf_unwinding_design.md` for complete architecture details
+The default. The kernel's `bpf_get_stackid` walks the frame pointer chain. Works out of the box for binaries compiled with frame pointers:
+- Rust: `RUSTFLAGS="-Cforce-frame-pointers=yes"`
+- C/C++: `-fno-omit-frame-pointer` flag
 
-#### Frame Pointer Method (WORKS NOW)
+#### DWARF Method
 
-For best performance with frame pointer unwinding, compile your programs with:
-- Rust: `RUSTFLAGS="-Cforce-frame-pointers=yes"` (or modify `.cargo/config`)
-- C/C++: `-fno-omit-frame-pointer` flag with gcc/clang
+Enabled with `--dwarf`. Handles binaries compiled without frame pointers (the default for most `-O2`/`-O3` builds).
 
-#### DWARF Method (INFRASTRUCTURE ONLY)
+**How it works:**
+1. At startup, userspace parses `/proc/[pid]/maps` and `.eh_frame` sections from each executable mapping
+2. Pre-evaluates DWARF CFI rules into a flat `UnwindEntry` table (PC → CFA rule + RA rule)
+3. Loads the table into eBPF maps before profiling begins
+4. At sample time, the eBPF program binary-searches the table and walks the stack using CFA computation + `bpf_probe_read_user`
 
-**Current status**: The DWARF unwinding infrastructure is in place but the actual unwinding algorithm is not yet implemented.
+This is the same approach used by [parca-agent](https://github.com/parca-dev/parca-agent) and other production eBPF profilers.
 
-What works:
-- ✅ Process memory map reading
-- ✅ ELF binary parsing
-- ✅ `.eh_frame` section extraction and caching
-- ✅ Integration with TraceHandler
+```bash
+# Profile a no-frame-pointer binary with DWARF unwinding
+profile-bee --dwarf --cmd "./my-optimized-binary" --svg output.svg --time 5000
 
-What's missing:
-- ❌ DWARF CFI instruction evaluation
-- ❌ Canonical Frame Address computation
-- ❌ Stack walking using DWARF unwind rules
+# Without --dwarf, the same binary would produce shallow/incomplete stacks
+```
 
-The `--no-dwarf` flag exists but currently has no effect since the DWARF algorithm isn't implemented yet.
+See `docs/dwarf_unwinding_design.md` for architecture details.
+
+#### Current limitations
+
+- DWARF unwinding only works for the `--cmd`/`--pid` target process (not system-wide)
+- Max 8 executable mappings per process, 250K unwind table entries, 32 frame depth
+- No dynamic library hot-loading (dlopen after startup)
+- No signal trampoline unwinding
 
 **Note**: For symbol resolution, you still need debug information:
 - Rust: Add `-g` flag when compiling
@@ -125,6 +124,7 @@ profile-bee --pid <pid> ...
 
 ### Limitations
 - Linux only
+- DWARF unwinding: single target process only (not system-wide), max 8 mappings / 250K entries / 32 frames
 - Interpreted / JIT stacktraces not yet supported
 - [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) and binary offsets not calculated
 
