@@ -208,6 +208,16 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
         }
 
         if !found_mapping || table_count == 0 {
+            // No DWARF info — try FP-based step as fallback
+            if let Some((ra, nbp)) = try_fp_step(bp) {
+                pointers[i] = ra;
+                len = i + 1;
+                current_ip = ra;
+                sp = bp + 16;
+                bp = nbp;
+                i += 1;
+                continue;
+            }
             break;
         }
 
@@ -217,7 +227,19 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
         // Binary search for the unwind entry covering this PC
         let entry = match binary_search_unwind_entry(table_start, table_count, relative_pc) {
             Some(e) => e,
-            None => break,
+            None => {
+                // No unwind entry — try FP-based step as fallback
+                if let Some((ra, nbp)) = try_fp_step(bp) {
+                    pointers[i] = ra;
+                    len = i + 1;
+                    current_ip = ra;
+                    sp = bp + 16;
+                    bp = nbp;
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
         };
 
         // Compute CFA (Canonical Frame Address) based on rule type
@@ -284,6 +306,21 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
     }
 
     (ip, bp, len)
+}
+
+/// Try a single frame-pointer-based unwind step.
+/// Returns (return_address, new_bp) if successful.
+#[inline(always)]
+unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
+    if bp == 0 || invalid_userspace_pointer(bp) {
+        return None;
+    }
+    let new_bp = bpf_probe_read_user(bp as *const u64).ok()?;
+    let ra = bpf_probe_read_user((bp + 8) as *const u64).ok()?;
+    if ra == 0 || invalid_userspace_pointer(ra) {
+        return None;
+    }
+    Some((ra, new_bp))
 }
 
 /// Max binary search iterations (covers 2^16 = 65K entries per mapping)
