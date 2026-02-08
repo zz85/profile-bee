@@ -1,5 +1,7 @@
 # WIP Branches Comparison: dwarf_unwind_wip vs dwarf_unwind_wip2
 
+> **Note**: This is historical analysis. The wip2 code is now the active implementation in `profile-bee/src/unwinder/` (not `dwarf_unwind.rs`). References to `dwarf_unwind.rs` below are from the copilot branch and do not exist in the current codebase.
+
 ## Executive Summary
 
 Both `dwarf_unwind_wip` and `dwarf_unwind_wip2` branches contain **working implementations** of DWARF-based stack unwinding that are significantly more complete than the current infrastructure-only implementation. These branches provide valuable insights and code that can be incorporated into the main implementation.

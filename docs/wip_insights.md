@@ -1,5 +1,7 @@
 # Key Insights from WIP Branches Analysis
 
+> **Note**: This is historical analysis. The wip2 code is now the active implementation in `profile-bee/src/unwinder/`. References to `dwarf_unwind.rs` below are from the copilot branch and do not exist in the current codebase.
+
 ## Summary
 
 Analysis of `dwarf_unwind_wip` and `dwarf_unwind_wip2` branches reveals **working DWARF unwinding implementations** that are far more complete than the current infrastructure-only code. These branches provide a clear roadmap for completing the DWARF unwinding feature.

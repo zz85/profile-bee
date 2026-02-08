@@ -51,26 +51,6 @@ Profile-bee uses a **hybrid approach** for stack unwinding:
 - Stores instruction pointers in `FramePointers` array (up to 1024 addresses)
 - Fast and efficient, but **requires** binaries compiled with `-fno-omit-frame-pointer`
 
-**Code location**:
-```rust
-// profile-bee-ebpf/src/lib.rs
-unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize) {
-    let regs = ctx.as_ptr() as *const pt_regs;
-    let ip = regs.rip;          // Current instruction pointer
-    let mut bp = regs.rbp;       // Frame pointer (base pointer)
-    
-    pointers[0] = ip;
-    
-    // Walk frame pointer chain
-    for i in 1..pointers.len() {
-        let Some(ret_addr) = get_frame(&mut bp) else {
-            break;
-        };
-        pointers[i] = ret_addr;
-    }
-}
-```
-
 **Why in eBPF?**
 - Direct access to CPU registers via `pt_regs`
 - Minimal overhead (runs in kernel context)
@@ -84,43 +64,23 @@ unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64
 
 ### Userland (User Space)
 
-**File**: `profile-bee/src/dwarf_unwind.rs`
+**Module**: `profile-bee/src/unwinder/`
 
-**What it does** (or should do):
-- DWARF CFI (Call Frame Information) unwinding
-- Parses `.eh_frame` or `.debug_frame` sections from ELF binaries
-- Uses DWARF expressions to compute Canonical Frame Address (CFA)
-- Reconstructs stack frames for code without frame pointers
-- **Current status**: Infrastructure exists, algorithm NOT yet implemented
-
-**Code location**:
-```rust
-// profile-bee/src/dwarf_unwind.rs
-impl DwarfUnwinder {
-    pub fn unwind_stack(&mut self, pid: u32, initial_addresses: &[Addr]) 
-        -> Result<Option<Vec<Addr>>> 
-    {
-        // Called when FP unwinding produces < 10 frames
-        self.try_dwarf_unwind(pid, initial_addresses)
-    }
-    
-    fn try_dwarf_unwind(&mut self, pid: u32, _initial_addresses: &[Addr]) 
-        -> Result<Vec<Addr>> 
-    {
-        // Load .eh_frame sections from process binaries
-        let maps = get_process_maps(pid as i32)?;
-        for map in &maps {
-            if map.is_exec() {
-                self.load_unwind_info(path, base_addr)?;
-            }
-        }
-        
-        // TODO: Actually unwind using DWARF CFI (line 163)
-        // Currently returns empty vec!
-        Ok(vec![])
-    }
-}
 ```
+profile-bee/src/unwinder/
+├── mod.rs       - Main unwinding logic (get_mappings, find_instruction, execute_instruction)
+├── ehframe.rs   - DWARF .eh_frame parsing with gimli (UnwindTable, UnwindTableRow, Instruction, Op, Reg)
+└── maps.rs      - Process memory map handling (AddressMap, AddressEntry)
+```
+
+**What it does** (infrastructure complete, algorithm WIP):
+- DWARF CFI (Call Frame Information) unwinding
+- Parses `.eh_frame` sections from ELF binaries via gimli
+- Builds `UnwindTable` with simplified `Instruction` rules
+- Reads `/proc/[pid]/maps` to find process binaries
+- Caches parsed unwind tables per binary
+
+**Current status**: Infrastructure exists (parsing, caching, data structures). The core unwinding algorithm (CFI evaluation loop) is NOT yet implemented.
 
 **Why in Userland?**
 - Cannot parse complex ELF sections in eBPF (size/complexity limits)
@@ -128,19 +88,6 @@ impl DwarfUnwinder {
 - Need to read process `/proc/[pid]/maps` to find binaries
 - Need to read binary files from filesystem
 - Gimli library (DWARF parser) is userspace-only
-
-**Integration point**:
-```rust
-// profile-bee/src/trace_handler.rs
-fn format_stack_trace(&mut self, ...) -> Vec<StackFrameInfo> {
-    let addrs = user_stack.unwrap_or_default();
-    
-    // Try to enhance with DWARF unwinding if enabled
-    let enhanced_addrs = self.enhance_with_dwarf_unwinding(pid, &addrs);
-    
-    self.symbolize_user_stack(pid, &enhanced_addrs)
-}
-```
 
 ## Current Implementation Status
 
@@ -152,10 +99,9 @@ fn format_stack_trace(&mut self, ...) -> Vec<StackFrameInfo> {
    - Sends to userspace via BPF maps
 
 2. **DWARF Infrastructure** (COMPLETE)
-   - Can read `/proc/[pid]/maps`
-   - Can parse ELF binaries
-   - Can extract `.eh_frame` sections
-   - Caches parsed data per binary
+   - `unwinder/maps.rs`: Reads `/proc/[pid]/maps` via `AddressMap::load_pid()`
+   - `unwinder/ehframe.rs`: Parses ELF `.eh_frame` sections into `UnwindTable`
+   - `unwinder/mod.rs`: `get_unwind_table()` builds per-binary unwind tables
    - Integration hooks in TraceHandler
 
 3. **Symbolization** (COMPLETE)
@@ -166,30 +112,56 @@ fn format_stack_trace(&mut self, ...) -> Vec<StackFrameInfo> {
 
 **DWARF Unwinding Algorithm** (NOT IMPLEMENTED)
 
-The actual DWARF unwinding is **NOT** implemented. Line 163 in `dwarf_unwind.rs` has a TODO:
-
-```rust
-// TODO: Implement the actual DWARF unwinding algorithm
-// This would involve:
-// 1. Starting from the initial IP (instruction pointer)
-// 2. Finding the corresponding .eh_frame FDE (Frame Description Entry)
-// 3. Evaluating the DWARF expressions to compute CFA and return address
-// 4. Repeating for each frame until we reach the end
-```
+The `find_instruction()` and `execute_instruction()` functions in `unwinder/mod.rs` exist but the full unwinding loop that walks the stack using DWARF CFI rules is not complete.
 
 **What needs to be done**:
-1. Parse `.eh_frame` with gimli to find FDE for each IP
-2. Evaluate DWARF CFI instructions (DW_CFA_*)
-3. Compute CFA (Canonical Frame Address) for each frame
-4. Extract return address register from CFA
-5. Repeat until stack end
+1. Capture RSP from pt_regs in eBPF (add `sp` to `StackInfo`)
+2. Implement process memory reading (`process_vm_readv`)
+3. Implement the unwinding loop: for each frame, find the unwind row, compute CFA, read return address
+4. Integrate with TraceHandler to enhance short FP stacks
 
-**Why it's hard**:
-- DWARF CFI is a stack-based expression language
-- Need to track register state across frames
-- Different architectures have different register sets
-- Need to read process memory for some operations
-- Complex error handling for malformed unwind info
+## Simplified DWARF Model
+
+95% of real-world code follows simple patterns:
+```
+CFA = RSP + offset              // Canonical Frame Address
+ReturnAddress = [CFA - 8]       // Return address on stack
+```
+
+This is captured in the `Instruction` and `UnwindTableRow` types in `ehframe.rs`:
+
+```rust
+pub enum Op {
+    Unimplemented,
+    Undefined,
+    CfaOffset,    // Value at CFA + offset
+    Register,     // Register value + offset
+}
+
+pub struct UnwindTableRow {
+    pub start_address: usize,
+    pub end_address: usize,
+    pub rip: Instruction,  // How to recover return address
+    pub rsp: Instruction,  // How to compute CFA
+}
+```
+
+## DwarfDelta Innovation
+
+The `DwarfDelta` structure (in `profile-bee-common/src/lib.rs`) compresses unwind rules for potential eBPF-side unwinding:
+
+```rust
+struct DwarfDelta {
+    addr: u64,      // Instruction pointer to match
+    cfa_offset: i8, // RSP + this = CFA
+    rip_offset: i8, // CFA + this = return address location
+}
+```
+
+Benefits:
+- Small: 100K entries ≈ 2.4MB (fits in BPF map)
+- Fast: Binary searchable
+- Simple: No expression evaluation needed
 
 ## Flow Diagram
 
@@ -217,11 +189,9 @@ User runs: profile-bee --svg output.svg --time 5000
          │                          │
          │                          ▼
          │                     FramePointers[]
-         │                     [ip0, ip1, ip2, ...]
          │
          ▼
     Store in BPF map
-         │
          │
          ▼
     ┌─────────────────────┐
@@ -234,96 +204,44 @@ User runs: profile-bee --svg output.svg --time 5000
          │         ▼
          │    Got < 10 frames?
          │         │
-         │         ├─ NO ──▶ Use FP addresses
+         │         ├─ NO ──▶ Use FP addresses as-is
          │         │
          │         ▼ YES
-         │    enhance_with_dwarf_unwinding()
-         │         │
-         │         ▼
-         │    ┌──────────────────────┐
-         │    │  DwarfUnwinder       │
-         │    └──────────────────────┘
-         │         │
-         │         ├─▶ Read /proc/[pid]/maps
-         │         ├─▶ Parse binaries
-         │         ├─▶ Load .eh_frame sections
-         │         ├─▶ Cache unwind info
-         │         │
-         │         ▼
-         │    TODO: Actual DWARF unwinding
-         │    (Currently returns empty vec)
+         │    DWARF unwinding (TODO)
+         │    using unwinder/ module
          │         │
          │         ▼
          │    Enhanced addresses
-         │         │
-         ▼         ▼
-    symbolize_user_stack()
-         │
-         ├──▶ blazesym resolves addresses
          │
          ▼
-    StackFrameInfo[] with symbols
+    symbolize_user_stack()
          │
          ▼
     Generate flamegraph
 ```
 
-## Hybrid Strategy Rationale
-
-### Why Not DWARF in eBPF?
-
-**eBPF limitations**:
-- Maximum program size (~1 million instructions)
-- No dynamic memory allocation
-- Cannot read files from filesystem
-- Cannot parse complex data structures
-- Limited helper functions
-
-**DWARF complexity**:
-- `.eh_frame` can be megabytes per binary
-- Requires complex parsing (FDE, CIE, expressions)
-- Stack-based expression evaluation
-- Architecture-specific register sets
-
-### Why Not All Userland?
-
-**Performance**:
-- eBPF FP unwinding is 10-100x faster
-- Runs in kernel, no context switch
-- Can sample at high frequency (9999 Hz)
-
-**When FP works, use it**:
-- Most well-behaved code has FP
-- Debug builds always have FP
-- `-fno-omit-frame-pointer` is becoming common
-- Kernel code always has FP
-
-### Hybrid = Best of Both
-
-1. **First**: Try fast eBPF FP unwinding
-2. **Then**: If incomplete (<10 frames), enhance with DWARF in userspace
-3. **Result**: Fast common case, correct rare case
-
 ## Configuration
-
-**Enable DWARF** (default):
-```bash
-profile-bee --svg output.svg --time 5000
-```
 
 **Disable DWARF** (FP only):
 ```bash
 profile-bee --no-dwarf --svg output.svg --time 5000
 ```
 
-**In code**:
-```rust
-// DWARF enabled
-let profiler = TraceHandler::new();
+Note: `--no-dwarf` currently has no effect since the DWARF algorithm isn't implemented yet.
 
-// DWARF disabled
-let profiler = TraceHandler::with_dwarf(false);
-```
+## Future Work
+
+### Phase 1: Userspace DWARF Unwinding
+1. Add RSP to StackInfo, capture in eBPF
+2. Implement `process_vm_readv` memory reading
+3. Implement unwinding loop in `unwinder/mod.rs`
+4. Integrate with TraceHandler
+
+### Phase 2: eBPF DWARF Unwinding
+1. Pre-compute DwarfDelta tables in userspace
+2. Store in BPF maps (per-PID)
+3. Implement eBPF-side unwinding using delta lookups
+4. Fallback to userspace for complex cases
 
 ## References
 
@@ -331,16 +249,3 @@ let profiler = TraceHandler::with_dwarf(false);
 - [gimli DWARF parser](https://github.com/gimli-rs/gimli)
 - [nbdd0121 unwinding library](https://github.com/nbdd0121/unwinding)
 - [Parca Agent unwind implementation](https://github.com/parca-dev/parca-agent/blob/main/pkg/stack/unwind/)
-
-## Future Work
-
-To complete DWARF unwinding:
-
-1. **Implement CFI evaluation** in `try_dwarf_unwind()`
-2. **Use gimli** to parse `.eh_frame` FDEs
-3. **Evaluate DWARF expressions** to compute CFA
-4. **Track register state** across frames
-5. **Read process memory** for dereferencing
-6. **Test with optimized binaries** compiled without FP
-
-The infrastructure is 100% complete. Only the algorithm implementation remains.
