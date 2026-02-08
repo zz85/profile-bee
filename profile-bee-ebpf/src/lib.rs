@@ -230,6 +230,25 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
 const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
+/// Frame Pointer Stack Unwinding (eBPF / Kernel Space)
+///
+/// This is the FAST PATH for stack unwinding that runs directly in the kernel.
+///
+/// # What This Does
+/// - Reads CPU registers from pt_regs (RIP = instruction pointer, RBP = frame pointer)
+/// - Walks the frame pointer chain by following: [RBP] → next RBP, [RBP+8] → return address
+/// - Stores up to 1024 instruction pointers in the output array
+/// - Runs in eBPF context (can sample at 99-9999 Hz with minimal overhead)
+///
+/// # Limitations
+/// - ONLY works for binaries compiled with `-fno-omit-frame-pointer`
+/// - Optimized code (gcc/clang -O2/-O3) often omits frame pointers
+/// - Will produce incomplete stacks for code without FP
+///
+/// # DWARF Fallback
+/// When this produces <10 frames, userland DWARF unwinding (in `dwarf_unwind.rs`)
+/// can enhance the stack by parsing .eh_frame sections. See `docs/dwarf_unwinding_design.md`
+///
 /// puts the userspace stack in the target pointer slice
 #[inline(always)]
 unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
