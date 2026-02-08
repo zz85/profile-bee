@@ -154,8 +154,8 @@ for i in 1..32:
 
 The eBPF code is structured to pass the BPF verifier:
 - All loops use bounded `for _ in 0..CONST` ranges
-- Binary search uses `for _ in 0..16` (not `while`)
-- Mapping scan uses `for m in 0..8` with early break
+- Binary search uses `for _ in 0..19` (not `while`)
+- Mapping scan uses `for m in 0..16` with early break
 - `MAX_DWARF_STACK_DEPTH = 32` keeps the outer loop bounded
 - Functions are `#[inline(always)]` to avoid BPF function call overhead
 
@@ -167,7 +167,7 @@ The eBPF code is structured to pass the BPF verifier:
 - ProcInfo per process: ~200 bytes
 
 ### CPU (per sample, when DWARF enabled)
-- Mapping lookup: O(n) where n ≤ 8
+- Mapping lookup: O(n) where n ≤ 16
 - Binary search: O(log n) where n ≤ 500K, max 19 iterations
 - `bpf_probe_read_user`: 1-2 calls per frame (return address + optional RBP restore)
 - Compared to FP unwinding (1 `bpf_probe_read` per frame), DWARF is ~10-20x more instructions per frame
