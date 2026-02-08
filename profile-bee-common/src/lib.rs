@@ -94,7 +94,7 @@ impl UnwindEntry {
 }
 
 pub const MAX_DWARF_STACK_DEPTH: usize = 32;
-pub const MAX_UNWIND_TABLE_SIZE: u32 = 250_000;
+pub const MAX_UNWIND_TABLE_SIZE: u32 = 500_000;
 pub const MAX_PROC_MAPS: usize = 16;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]

@@ -105,7 +105,7 @@ pub struct ExecMapping {
 
 | Map | Type | Size | Purpose |
 |-----|------|------|---------|
-| `unwind_table` | Array | 250K entries × 12B = 2.9 MB max | Global unwind table |
+| `unwind_table` | Array | 500K entries × 12B = 5.7 MB max | Global unwind table |
 | `proc_info` | HashMap | 1024 entries | Per-process mapping info |
 | `stacked_pointers` | HashMap | 2048 entries | DWARF-unwound frame pointers per stack |
 
@@ -163,12 +163,12 @@ The eBPF code is structured to pass the BPF verifier:
 
 ### Memory
 - Typical process (binary + libc + ld): ~23K entries × 12B = **~270 KB**
-- Maximum (250K entries): **2.9 MB** pinned kernel memory
+- Maximum (500K entries): **5.7 MB** pinned kernel memory
 - ProcInfo per process: ~200 bytes
 
 ### CPU (per sample, when DWARF enabled)
 - Mapping lookup: O(n) where n ≤ 8
-- Binary search: O(log n) where n ≤ 250K, max 16 iterations
+- Binary search: O(log n) where n ≤ 500K, max 19 iterations
 - `bpf_probe_read_user`: 1-2 calls per frame (return address + optional RBP restore)
 - Compared to FP unwinding (1 `bpf_probe_read` per frame), DWARF is ~10-20x more instructions per frame
 - In practice, the overhead is negligible at typical sampling rates (99-999 Hz)
@@ -183,7 +183,7 @@ The eBPF code is structured to pass the BPF verifier:
 - **No hot-reload**: dlopen'd libraries after startup won't have unwind tables
 - **MAX_PROC_MAPS = 16**: processes with very many shared libraries may exceed this
 - **MAX_DWARF_STACK_DEPTH = 32**: stacks deeper than 32 frames are truncated
-- **MAX_UNWIND_TABLE_SIZE = 250K**: very large binaries (Chrome, Firefox) may exceed this
+- **MAX_UNWIND_TABLE_SIZE = 500K**: very large binaries (Chrome, Firefox) may exceed this
 - **No signal trampolines**: unwinding through signal handlers may stop early on kernels where the vDSO lacks `.eh_frame` entries for `__restore_rt` (libc's `__restore_rt` is handled)
 - **x86_64 only**: register rules are hardcoded for x86_64 (RSP, RBP, RA)
 
