@@ -63,11 +63,11 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 
 ## Data Structures
 
-### UnwindEntry (16 bytes, stored in BPF Array map)
+### UnwindEntry (12 bytes, stored in BPF Array map)
 
 ```rust
 pub struct UnwindEntry {
-    pub pc: u64,           // File-relative program counter
+    pub pc: u32,           // File-relative program counter (u32 sufficient for single-binary offsets)
     pub cfa_offset: i16,   // CFA = register + offset
     pub rbp_offset: i16,   // RBP restore offset from CFA
     pub cfa_type: u8,      // 0=RSP, 1=RBP
@@ -99,7 +99,7 @@ pub struct ExecMapping {
 
 | Map | Type | Size | Purpose |
 |-----|------|------|---------|
-| `unwind_table` | Array | 250K entries × 32B = 7.6 MB max | Global unwind table |
+| `unwind_table` | Array | 250K entries × 12B = 2.9 MB max | Global unwind table |
 | `proc_info` | HashMap | 1024 entries | Per-process mapping info |
 | `stacked_pointers` | HashMap | 2048 entries | DWARF-unwound frame pointers per stack |
 
@@ -156,8 +156,8 @@ The eBPF code is structured to pass the BPF verifier:
 ## Performance
 
 ### Memory
-- Typical process (binary + libc + ld): ~23K entries × 16B = **~360 KB**
-- Maximum (250K entries): **3.8 MB** pinned kernel memory
+- Typical process (binary + libc + ld): ~23K entries × 12B = **~270 KB**
+- Maximum (250K entries): **2.9 MB** pinned kernel memory
 - ProcInfo per process: ~200 bytes
 
 ### CPU (per sample, when DWARF enabled)

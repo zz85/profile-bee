@@ -212,7 +212,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
         }
 
         // Convert virtual address to file-relative address for table lookup
-        let relative_pc = current_ip - load_bias;
+        let relative_pc = (current_ip - load_bias) as u32;
 
         // Binary search for the unwind entry covering this PC
         let entry = match binary_search_unwind_entry(table_start, table_count, relative_pc) {
@@ -290,7 +290,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
 const MAX_BIN_SEARCH_DEPTH: u32 = 16;
 
 #[inline(always)]
-unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relative_pc: u64) -> Option<UnwindEntry> {
+unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relative_pc: u32) -> Option<UnwindEntry> {
     if table_count == 0 {
         return None;
     }

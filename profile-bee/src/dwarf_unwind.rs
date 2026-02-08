@@ -199,8 +199,15 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
                         _ => (REG_RULE_UNDEFINED, 0i16),
                     };
 
+                    let relative_pc = pc - base_vaddr;
+                    // Skip entries with PC > u32::MAX (shouldn't happen for
+                    // file-relative addresses, but be safe)
+                    let Ok(pc32) = u32::try_from(relative_pc) else {
+                        continue;
+                    };
+
                     entries.push(UnwindEntry {
-                        pc: pc - base_vaddr,
+                        pc: pc32,
                         cfa_offset: cfa_offset as i16,
                         rbp_offset,
                         cfa_type,
@@ -459,8 +466,8 @@ mod tests {
             std::mem::size_of::<UnwindEntry>(),
             UnwindEntry::STRUCT_SIZE
         );
-        // Should be 16 bytes (compact format)
-        assert_eq!(std::mem::size_of::<UnwindEntry>(), 16);
+        // Should be 12 bytes (compact format)
+        assert_eq!(std::mem::size_of::<UnwindEntry>(), 12);
     }
 
     #[test]

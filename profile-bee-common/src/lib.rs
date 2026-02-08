@@ -76,12 +76,12 @@ pub const REG_RULE_EXPRESSION: u8 = 4;
 /// Compact unwind table entry for eBPF-side stack unwinding.
 ///
 /// On x86_64, the return address is always at CFA-8, so we don't store RA
-/// rule/offset. Using i16 offsets (sufficient for real-world CFA/RBP offsets)
-/// reduces the entry from 32 bytes to 16 bytes — a 2x memory improvement.
+/// rule/offset. Using u32 for PC (file-relative addresses fit in 4GB) and
+/// i16 offsets gives us 12 bytes per entry.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct UnwindEntry {
-    pub pc: u64,
+    pub pc: u32,
     pub cfa_offset: i16,
     pub rbp_offset: i16,
     pub cfa_type: u8,

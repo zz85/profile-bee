@@ -61,8 +61,8 @@ fn test_unwind_entry_struct_size() {
     // eBPF requires predictable struct layout
     assert_eq!(
         std::mem::size_of::<UnwindEntry>(),
-        16,
-        "UnwindEntry must be 16 bytes for eBPF compatibility"
+        12,
+        "UnwindEntry must be 12 bytes for eBPF compatibility"
     );
 }
 
