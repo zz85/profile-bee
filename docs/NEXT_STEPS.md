@@ -18,9 +18,9 @@ Unwind tables are loaded at startup only. Monitoring `mmap` events (via tracepoi
 
 The vendored `cargo-trace` already has uprobe/USDT attachment code in `bpf-probes`. Wiring this into the main binary would enable function-level latency profiling and user-defined static tracepoints.
 
-## 5. Signal Trampoline / VDSO Unwinding
+## 5. ~~Signal Trampoline / VDSO Unwinding~~ ✅ Done
 
-VDSO frames show up frequently (e.g., `clock_gettime`) and signal trampolines break DWARF unwinding. Handling these would noticeably improve stack accuracy.
+Implemented: vDSO `.eh_frame` parsing from `/proc/[pid]/mem`, `CFA_REG_DEREF_RSP` for signal frames, `CFA_REG_PLT` for PLT stubs. Remaining gap: kernels where the vDSO lacks `.eh_frame` entries for `__restore_rt` may still stop unwinding at signal boundaries.
 
 ## 6. PID Nesting / cgroup-based Profiling
 

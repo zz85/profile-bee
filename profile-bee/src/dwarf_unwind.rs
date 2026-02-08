@@ -57,7 +57,7 @@ fn classify_cfa_expression(
 
     let mut ops = expr.operations(gimli::Encoding {
         address_size: 8,
-        format: gimli::Format::Dwarf64,
+        format: gimli::Format::Dwarf32,
         version: 4,
     });
 

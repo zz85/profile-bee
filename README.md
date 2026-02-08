@@ -125,7 +125,7 @@ profile-bee --pid <pid> ...
 - Linux only
 - DWARF unwinding: single target process only (not system-wide), max 16 mappings / 250K entries / 32 frames
 - Interpreted / JIT stacktraces not yet supported
-- [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) and binary offsets not calculated
+- [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) `.eh_frame` parsed for DWARF unwinding; VDSO symbolization not yet supported
 
 ### TODOs
 - Optimize CPU usage
