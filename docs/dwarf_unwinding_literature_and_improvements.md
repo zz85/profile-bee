@@ -104,38 +104,25 @@ An earlier, incomplete iteration that should be removed:
 
 ### High Impact, Lower Effort
 
-#### 1. Compact UnwindEntry to ~12 bytes
+#### 1. ~~Compact UnwindEntry~~ ✅ Done
 
-Parca uses `i16` offsets and packs to 8 bytes. Profile-bee's 32-byte entries waste 4x BPF map memory. Most real-world CFA/RA/RBP offsets fit in `i16`. Proposed layout:
+Implemented: 12-byte `UnwindEntry` with `u32` PC (file-relative), `i16` offsets, RA hardcoded as CFA-8. Down from the original 32 bytes (4x reduction). Further compaction to 8 bytes (Parca-style packed CFA register+offset) remains a future option.
 
-```rust
-#[repr(C, packed)]
-pub struct UnwindEntry {
-    pub pc: u64,        // 8 bytes
-    pub cfa_offset: i16, // 2 bytes
-    pub rbp_offset: i16, // 2 bytes
-    pub cfa_type: u8,    // 1 byte
-    pub rbp_type: u8,    // 1 byte
-}                        // 14 bytes (RA is always CFA-8 on x86_64)
-```
+#### 2. ~~Handle the 2 Most Common DWARF Expressions~~ ✅ Done
 
-This would fit 4x more entries in the same budget, or reduce memory from 7.6MB to ~2MB.
+Implemented: `CFA_REG_PLT` (PLT stubs) and `CFA_REG_DEREF_RSP` (signal frames) with `classify_cfa_expression()` parser.
 
-#### 2. Handle the 2 Most Common DWARF Expressions
+#### 3. ~~Remove Dead `unwinder/` Module~~ ✅ Done
 
-Currently all `CFA_REG_EXPRESSION` entries are skipped. Parca found two specific expressions cover >50% of expression-based rows (typically in glibc). Implementing these would improve coverage for system libraries.
+Removed in commit `b2ed9ae`.
 
-#### 3. Remove Dead `unwinder/` Module
+#### 4. ~~Handle Signal Trampolines (vDSO `__restore_rt`)~~ ✅ Done
 
-Remove `unwinder/ehframe.rs`, `unwinder/maps.rs`, `unwinder/mod.rs`, and the `DwarfDelta`/`DwarfUnwindInfo` types from `profile-bee-common`. They're unused dead code from an earlier iteration with `i8` offsets that can't represent real-world values.
+Implemented: `CFA_REG_DEREF_RSP` handles libc's `__restore_rt` signal frame expression. vDSO `.eh_frame` parsed from `/proc/[pid]/mem`. Remaining gap: kernels where vDSO lacks `.eh_frame` entries.
 
-#### 4. Handle Signal Trampolines (vDSO `__restore_rt`)
+#### 5. ~~Fix `copy_stack()` Early Return Bug~~ ✅ Done
 
-When a signal interrupts execution, the kernel pushes a signal frame. Without special handling, unwinding stops at the signal trampoline. Both Parca and OTel handle this by detecting the vDSO sigreturn address and manually stepping over the signal frame.
-
-#### 5. Fix `copy_stack()` Early Return Bug
-
-The FP-based `copy_stack()` in `profile-bee-ebpf/src/lib.rs` has a `return (ip, bp, 1, sp);` before the actual frame-walking loop (line ~186), making FP unwinding always return depth 1. This means non-DWARF mode is effectively broken.
+Fixed in commit `b2ed9ae`.
 
 ### Medium Impact, Medium Effort
 
@@ -151,9 +138,9 @@ Monitor `/proc/[pid]/maps` periodically or use `mmap`/`munmap` tracepoints to de
 
 Use ELF build IDs instead of file paths as cache keys. Handles container environments where the same binary appears at different paths, and avoids re-parsing when the same library is loaded by multiple processes.
 
-#### 9. Increase MAX_PROC_MAPS
+#### 9. ~~Increase MAX_PROC_MAPS~~ ✅ Done
 
-8 mappings is tight. A typical process has main binary + libc + ld-linux + libpthread + libm + libgcc_s + libstdc++ + more, easily exceeding 8. Bumping to 16-32 would cover most real-world cases.
+Bumped from 8 to 16.
 
 #### 10. Unwind Table Validation
 

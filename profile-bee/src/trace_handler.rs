@@ -126,7 +126,7 @@ impl TraceHandler {
         // Try to use DWARF-unwound frame pointers from eBPF
         let user_stack = if let Ok(pointers) = stacked_pointers.get(&key, 0) {
             let pointers = pointers.0;
-            let len = pointers.len as usize;
+            let len = (pointers.len as usize).min(pointers.pointers.len());
             let fp_len = fp_user_stack.as_ref().map_or(0, |v| v.len());
             if len > fp_len {
                 let addrs: Vec<u64> = pointers.pointers[..len].to_vec();
