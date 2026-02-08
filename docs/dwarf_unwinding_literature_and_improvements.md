@@ -191,3 +191,88 @@ The most impactful quick wins:
 6. [Ian Lance Taylor: .eh_frame](https://www.airs.com/blog/archives/460)
 7. [MaskRay: Stack unwinding](https://maskray.me/blog/2020-11-08-stack-unwinding)
 8. [corsix.org: ELF .eh_frame](https://www.corsix.org/content/elf-eh-frame)
+
+## Appendix: async-profiler Analysis
+
+### Overview
+
+[async-profiler](https://github.com/async-profiler/async-profiler) (8.8K stars) is a userspace sampling profiler for Java (C++, ~55% of codebase). Unlike profile-bee's eBPF approach, it runs inside the target process via a JVMTI agent and uses `SIGPROF` signal handlers to sample. This gives it direct memory access to the stack — no `bpf_probe_read_user` needed.
+
+It offers three stack walking modes:
+- **Frame Pointer (FP)**: traditional linked-list walk
+- **DWARF**: `.eh_frame`-based unwinding (enabled with `--cstack dwarf`)
+- **VM Structs**: JVM-internal structure walking (default since v4.2)
+
+Despite the different execution model, several design choices are directly applicable.
+
+### FrameDesc: 16-byte Compact Entry
+
+```c
+struct FrameDesc {
+    u32 loc;       // 4B — file-relative PC (32-bit, not 64!)
+    int cfa;       // 4B — packed: low byte = register, upper 24 bits = offset
+    int fp_off;    // 4B — FP restore offset (or DW_SAME_FP sentinel)
+    int pc_off;    // 4B — PC/RA offset from CFA
+};
+```
+
+Key differences from profile-bee's `UnwindEntry`:
+- **32-bit PC**: file-relative offsets within a single binary never exceed 4GB, so `u64` is wasteful. Profile-bee could save 4 bytes per entry by switching to `u32`.
+- **Packed CFA field**: register number in the low byte, offset in the upper 24 bits of a single `int`. Eliminates the need for separate `cfa_type` and `cfa_offset` fields.
+
+### PLT Stub Handling (`DW_REG_PLT`)
+
+PLT stubs have a peculiar stack layout where the CFA offset depends on the instruction's position within the PLT entry. DWARF encodes this as a `DW_CFA_def_cfa_expression`, which profile-bee currently skips entirely.
+
+async-profiler introduces a pseudo-register `DW_REG_PLT` and computes the actual offset at walk time:
+
+```c
+} else if (cfa_reg == DW_REG_PLT) {
+    sp += ((uintptr_t)pc & 15) >= 11 ? cfa_off * 2 : cfa_off;
+}
+```
+
+This is one of the "2 most common DWARF expressions" referenced in the Parca literature. Implementing it would improve unwinding through dynamically-linked function calls (e.g., calls into libc).
+
+### Deduplication of Consecutive Identical Entries
+
+In `addRecord()`, async-profiler skips adding a new entry if the CFA/FP/PC rules haven't changed from the previous entry:
+
+```c
+void DwarfParser::addRecord(...) {
+    int cfa = cfa_reg | cfa_off << 8;
+    if (_prev == NULL || (_prev->loc == loc && --_count >= 0) ||
+            _prev->cfa != cfa || _prev->fp_off != fp_off || _prev->pc_off != pc_off) {
+        _prev = addRecordRaw(loc, cfa, fp_off, pc_off);
+    }
+}
+```
+
+Profile-bee doesn't deduplicate — gimli's `rows()` iterator emits one entry per PC change, even if the rules are identical. Adding dedup could reduce table size by 20-40%.
+
+### Default Frame Fallback
+
+When no DWARF info is found for a PC, async-profiler falls back to `FrameDesc::default_frame` which assumes a standard frame-pointer-based layout (CFA = FP + 16, FP at CFA-16, RA at CFA-8 on x86_64). Profile-bee currently just stops unwinding when no entry is found. A FP-based fallback would recover additional frames in binaries with partial frame pointer coverage.
+
+### SafeAccess and Crash Protection
+
+async-profiler uses inline assembly for memory loads with a SIGSEGV handler that detects faults and returns a default value. The entire `walkVM` function is wrapped in `setjmp`/`longjmp` for crash recovery. Not directly applicable to eBPF (where `bpf_probe_read_user` handles faults), but the userspace symbolization path could benefit from similar protection.
+
+### DW_CFA_val_expression for PC-Relative Unwinding
+
+async-profiler parses a limited subset of DWARF expressions — specifically `DW_CFA_val_expression` for the PC register, encoding "previous PC = current PC + offset". This handles tail-call-optimized code where the return address isn't on the stack but can be computed from the current PC.
+
+### Custom DWARF Parser
+
+async-profiler implements its own DWARF CFI parser in ~300 lines of C++, directly consuming the `.eh_frame_hdr` binary search table for O(1) FDE lookup. This is faster than iterating all FDEs. They parse DWARF opcodes directly, only extracting the 3 registers they care about (SP, FP, PC).
+
+### Actionable Takeaways for Profile-Bee
+
+| # | Improvement | Estimated Impact |
+|---|------------|-----------------|
+| 1 | Deduplicate consecutive identical unwind entries | 20-40% table size reduction |
+| 2 | Use `u32` for PC in UnwindEntry (12 bytes total) | 25% memory reduction |
+| 3 | PLT stub handling (DW_REG_PLT trick) | Better unwinding through dynamic calls |
+| 4 | Default FP-based fallback when no entry found | Recover frames in partial-FP binaries |
+| 5 | Pack CFA register + offset into single field | Minor space optimization |
+| 6 | Parse `.eh_frame_hdr` for faster FDE lookup | Faster startup for large binaries |
