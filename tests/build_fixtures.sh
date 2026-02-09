@@ -37,6 +37,14 @@ gcc "$SRC_DIR/callstack.c" -g -fomit-frame-pointer -pie -fPIE -o "$FIXTURE_DIR/c
 gcc -shared -fPIC -g -fomit-frame-pointer "$SRC_DIR/libhotlib.c" -o "$FIXTURE_DIR/libhotlib.so"
 gcc "$SRC_DIR/sharedlib.c" -g -fomit-frame-pointer -L"$FIXTURE_DIR" -lhotlib -Wl,-rpath,'$ORIGIN' -o "$FIXTURE_DIR/sharedlib-no-fp"
 
+# ── Rust test programs ────────────────────────────────────────────────────────
+
+echo "Building Rust test fixtures..."
+
+# rust_callstack: main → rust_func_a → rust_func_b → rust_func_c → hot_loop
+rustc -C opt-level=2 -C force-frame-pointers=no -g "$SRC_DIR/rust_callstack.rs" -o "$FIXTURE_DIR/rust-no-fp"
+rustc -C opt-level=2 -C force-frame-pointers=yes -g "$SRC_DIR/rust_callstack.rs" -o "$FIXTURE_DIR/rust-fp"
+
 echo "Verifying .eh_frame sections exist..."
 for bin in "$FIXTURE_DIR"/*; do
     if ! readelf -S "$bin" 2>/dev/null | grep -q '.eh_frame'; then

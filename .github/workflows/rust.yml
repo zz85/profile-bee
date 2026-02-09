@@ -61,3 +61,27 @@ jobs:
           workspaces: profile-bee-ebpf
       - name: Build eBPF
         run: cargo +nightly build --verbose -Z build-std=core --target bpfel-unknown-none --manifest-path profile-bee-ebpf/Cargo.toml
+
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: [build, build-ebpf]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            profile-bee-ebpf
+      - name: Build eBPF
+        run: cargo +nightly build --release -Z build-std=core --target bpfel-unknown-none --manifest-path profile-bee-ebpf/Cargo.toml
+      - name: Build profile-bee
+        run: cargo build --release
+      - name: Build test fixtures
+        run: bash tests/build_fixtures.sh
+      - name: Run e2e tests
+        run: sudo tests/run_e2e.sh --verbose
