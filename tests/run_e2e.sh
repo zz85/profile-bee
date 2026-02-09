@@ -213,7 +213,7 @@ test_no_fp_without_dwarf() {
 
 test_dwarf_callstack() {
     local file
-    file=$(run_profiler "$FIXTURE_DIR/callstack-no-fp" "dwarf-callstack" --dwarf)
+    file=$(run_profiler "$FIXTURE_DIR/callstack-no-fp" "dwarf-callstack" --dwarf true)
     assert_stack_contains "$file" "hot" "hot() should appear"
     assert_stack_contains "$file" "function_a" "function_a() should appear with DWARF"
     assert_stack_contains "$file" "function_b" "function_b() should appear with DWARF"
@@ -224,7 +224,7 @@ test_dwarf_callstack() {
 
 test_dwarf_callstack_O2() {
     local file
-    file=$(run_profiler "$FIXTURE_DIR/callstack-O2-no-fp" "dwarf-callstack-O2" --dwarf)
+    file=$(run_profiler "$FIXTURE_DIR/callstack-O2-no-fp" "dwarf-callstack-O2" --dwarf true)
     assert_stack_contains "$file" "hot\|function_\|main" "Should resolve some symbols with DWARF on O2"
     # O2 may inline functions, so we check for at least hot + main
     assert_stack_contains "$file" "hot" "hot() should appear (busy loop not inlined)"
@@ -232,7 +232,7 @@ test_dwarf_callstack_O2() {
 
 test_dwarf_deep() {
     local file
-    file=$(run_profiler "$FIXTURE_DIR/deep-no-fp" "dwarf-deep" --dwarf)
+    file=$(run_profiler "$FIXTURE_DIR/deep-no-fp" "dwarf-deep" --dwarf true)
     assert_stack_contains "$file" "leaf" "leaf() should appear with DWARF"
     assert_stack_contains "$file" "recurse" "recurse() should appear with DWARF"
     assert_stack_contains "$file" "main" "main() should appear with DWARF"
@@ -247,7 +247,7 @@ test_dwarf_vs_fp_depth() {
     # DWARF should produce at least as many frames as FP
     local fp_file dwarf_file
     fp_file=$(run_profiler "$FIXTURE_DIR/callstack-fp" "cmp-fp")
-    dwarf_file=$(run_profiler "$FIXTURE_DIR/callstack-fp" "cmp-dwarf" --dwarf)
+    dwarf_file=$(run_profiler "$FIXTURE_DIR/callstack-fp" "cmp-dwarf" --dwarf true)
 
     local fp_depth dwarf_depth
     # Count only userspace frames (exclude kernel frames ending with _k)
@@ -267,7 +267,7 @@ test_dwarf_improves_no_fp() {
     # than profiling the same binary without DWARF
     local no_dwarf_file dwarf_file
     no_dwarf_file=$(run_profiler "$FIXTURE_DIR/callstack-no-fp" "improve-no-dwarf")
-    dwarf_file=$(run_profiler "$FIXTURE_DIR/callstack-no-fp" "improve-dwarf" --dwarf)
+    dwarf_file=$(run_profiler "$FIXTURE_DIR/callstack-no-fp" "improve-dwarf" --dwarf true)
 
     local no_dwarf_depth dwarf_depth
     no_dwarf_depth=$(awk -F';' '{print NF}' "$no_dwarf_file" | sort -rn | head -1)
@@ -287,7 +287,7 @@ test_dwarf_improves_no_fp() {
 test_dwarf_nonexistent_binary() {
     # --dwarf with a binary that doesn't exist should not crash
     local output
-    output=$(timeout "$TEST_TIMEOUT" "$PROFILER" --cmd "/nonexistent/binary" --dwarf --time 200 --collapse "$OUTPUT_DIR/bad-bin.collapse" 2>&1) || true
+    output=$(timeout "$TEST_TIMEOUT" "$PROFILER" --cmd "/nonexistent/binary" --dwarf true --time 200 --collapse "$OUTPUT_DIR/bad-bin.collapse" 2>&1) || true
     # Should exit without segfault — any output is fine
     return 0
 }
@@ -295,7 +295,7 @@ test_dwarf_nonexistent_binary() {
 test_dwarf_shared_library() {
     # DWARF unwinding across shared library boundary (no frame pointers)
     local file
-    file=$(run_profiler "$FIXTURE_DIR/sharedlib-no-fp" "dwarf-sharedlib" --dwarf)
+    file=$(run_profiler "$FIXTURE_DIR/sharedlib-no-fp" "dwarf-sharedlib" --dwarf true)
     assert_stack_contains "$file" "lib_hot"
     assert_stack_contains "$file" "caller_a"
     assert_stack_contains "$file" "caller_b"
@@ -306,7 +306,7 @@ test_dwarf_shared_library() {
 test_dwarf_pie_binary() {
     # DWARF unwinding on a PIE (position-independent) binary without frame pointers
     local file
-    file=$(run_profiler "$FIXTURE_DIR/callstack-pie-no-fp" "dwarf-pie" --dwarf)
+    file=$(run_profiler "$FIXTURE_DIR/callstack-pie-no-fp" "dwarf-pie" --dwarf true)
     assert_stack_contains "$file" "hot"
     assert_stack_contains "$file" "function_a"
     assert_stack_contains "$file" "function_b"
@@ -320,7 +320,7 @@ test_dwarf_rust_binary() {
     # At O2, tail calls eliminate intermediate functions, but we should still get
     # hot_loop and the Rust runtime frames (lang_start, etc.)
     local file
-    file=$(run_profiler "$FIXTURE_DIR/rust-no-fp" "dwarf-rust" --dwarf)
+    file=$(run_profiler "$FIXTURE_DIR/rust-no-fp" "dwarf-rust" --dwarf true)
     assert_stack_contains "$file" "hot_loop"
     assert_stack_contains "$file" "main"
     assert_min_depth "$file" 5

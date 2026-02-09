@@ -12,6 +12,53 @@ use thiserror::Error;
 
 use crate::cache::{AddrCache, ProcessCache};
 
+/// Build ID for uniquely identifying ELF binaries
+pub type BuildId = Vec<u8>;
+
+/// Extracts the GNU build ID from an ELF binary file
+fn extract_build_id_from_file(path: &Path) -> Option<BuildId> {
+    let data = std::fs::read(path).ok()?;
+    extract_build_id(&data)
+}
+
+/// Extracts the GNU build ID from an ELF binary in memory
+fn extract_build_id(data: &[u8]) -> Option<BuildId> {
+    use object::{Object, ObjectSection};
+
+    let obj = object::File::parse(data).ok()?;
+    let section = obj.section_by_name(".note.gnu.build-id")?;
+    let note_data = section.data().ok()?;
+
+    if note_data.len() < 16 {
+        return None;
+    }
+
+    let namesz =
+        u32::from_ne_bytes([note_data[0], note_data[1], note_data[2], note_data[3]]) as usize;
+    let descsz =
+        u32::from_ne_bytes([note_data[4], note_data[5], note_data[6], note_data[7]]) as usize;
+    let note_type = u32::from_ne_bytes([note_data[8], note_data[9], note_data[10], note_data[11]]);
+
+    // NT_GNU_BUILD_ID = 3
+    if note_type != 3 {
+        return None;
+    }
+
+    if namesz < 4 || note_data.len() < 12 + namesz {
+        return None;
+    }
+
+    let name_aligned = (namesz + 3) & !3;
+    let desc_offset = 12 + name_aligned;
+
+    if note_data.len() < desc_offset + descsz {
+        return None;
+    }
+
+    let build_id = note_data[desc_offset..desc_offset + descsz].to_vec();
+    Some(build_id)
+}
+
 #[derive(Debug, Error)]
 pub enum SymbolError {
     #[error("Failed to open proc maps")]
@@ -53,8 +100,10 @@ pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> core::result::Result<&str, std::
 pub struct SymbolFinder {
     // kernel symbols
     ksyms: BTreeMap<u64, String>,
-    // TODO we should store inode, exe and starttime as a way to check staleness
-    obj_cache: HashMap<(u64, PathBuf), Option<ObjItem>>,
+    // Build-ID based cache for object files (preferred)
+    obj_cache: HashMap<BuildId, Option<ObjItem>>,
+    // Fallback cache for binaries without build IDs (keyed by namespace + path)
+    obj_path_cache: HashMap<(u64, PathBuf), Option<ObjItem>>,
     pub addr_cache: AddrCache,
     pub process_cache: ProcessCache,
 }
@@ -267,62 +316,65 @@ impl StackFrameInfo {
         // println!("{:#x} -> obj physical address {:#x}", f.ip, info.address());
         let object_path = self.object_path().unwrap();
 
-        // optimized cache hit based on same namespace
-        let object_key = (self.ns.unwrap_or(self.pid as u64), object_path.into());
+        // Build the full target path first
+        let path = object_path.to_str().unwrap_or_default();
+        if path == "[vdso]" || path.starts_with('[') {
+            // Skip special mappings like vdso
+            return;
+        }
 
-        let obj_cache = finder.obj_cache.entry(object_key).or_insert_with(|| {
-            let path = object_path.to_str().unwrap_or_default();
-            if path == "[vdso]" || path.starts_with('[') {
-                // since this is a cache entry, should prevent much reloading
-                return None;
+        // try best if meet a deleted dso
+        let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+
+        let root_link = format!("/proc/{}/root", id);
+        let base = Path::new(&root_link);
+        let mut target = match read_link(&base) {
+            Ok(link) => link,
+            Err(_e) => {
+                // Best attempt, use root
+                PathBuf::new()
             }
-            // try best if meet a deleted dso
-            let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+        };
 
-            let root_link = format!("/proc/{}/root", id);
-            let base = Path::new(&root_link);
-            let mut target = match read_link(&base) {
-                Ok(link) => link,
-                Err(_e) => {
-                    // println!("Can't read link {root_link}. Process  {path:?} might have terminated. - {e:?}");
-                    // Best attempt, use root
-                    PathBuf::new()
-                }
-            };
+        target.push(path);
 
-            target.push(path);
+        // Try to get build ID and use it for caching
+        let build_id = extract_build_id_from_file(&target);
 
-            // let file = File::open(&target);
-            // TODO use mmap if dealing with large files eg. let mmapped_file = unsafe { Mmap::map(&file) };
+        // Look up in cache: prefer build-ID based cache, fall back to path-based
+        let obj_cache = if let Some(bid) = build_id {
+            finder.obj_cache.entry(bid).or_insert_with(|| {
+                let loader = match Loader::new(&target) {
+                    Err(e) => {
+                        println!("Error while loading target {target:?} : {e:?}");
+                        return None;
+                    }
+                    Ok(loader) => loader,
+                };
 
-            // if file.is_err() {
-            //     println!(
-            //         "Can't read {:?} {:?} {} {:#8x} {:#8x} - pid {}",
-            //         target,
-            //         file.err(),
-            //         self.cmd,
-            //         self.address,
-            //         virtual_address,
-            //         self.pid
-            //     );
-            //     return None;
-            // }
+                Some(ObjItem {
+                    ctx: Some(loader),
+                    symbols: vec![],
+                })
+            })
+        } else {
+            // Fall back to path-based cache for binaries without build IDs
+            let object_key = (self.ns.unwrap_or(self.pid as u64), object_path.into());
+            finder.obj_path_cache.entry(object_key).or_insert_with(|| {
+                let loader = match Loader::new(&target) {
+                    Err(e) => {
+                        println!("Error while loading target {target:?} : {e:?}");
+                        return None;
+                    }
+                    Ok(loader) => loader,
+                };
 
-            let loader = match Loader::new(&target) {
-                Err(e) => {
-                    println!("Error while loading target {target:?} : {e:?}");
-                    return None;
-                }
-                Ok(loader) => loader,
-            };
-
-            let item = ObjItem {
-                ctx: Some(loader),
-                symbols: vec![],
-            };
-
-            Some(item)
-        });
+                Some(ObjItem {
+                    ctx: Some(loader),
+                    symbols: vec![],
+                })
+            })
+        };
 
         let obj = match obj_cache {
             Some(obj) => obj,

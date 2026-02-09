@@ -13,11 +13,9 @@ use aya_ebpf::{
 
 // use aya_log_ebpf::info;
 use profile_bee_common::{
-    FramePointers, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW,
-    UnwindEntry, ProcInfo, ProcInfoKey,
-    CFA_REG_RSP, CFA_REG_RBP, CFA_REG_PLT, CFA_REG_DEREF_RSP,
-    REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
-    MAX_DWARF_STACK_DEPTH, MAX_UNWIND_TABLE_SIZE, MAX_PROC_MAPS,
+    FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_PLT,
+    CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS, MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS,
+    MAX_SHARD_ENTRIES, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -35,8 +33,9 @@ static NOTIFY_TYPE: u8 = EVENT_TRACE_ALWAYS;
 static DWARF_ENABLED: u8 = 0;
 
 /// Target PID to profile (0 = profile all processes)
-#[no_mangle]
-static TARGET_PID: u32 = 0;
+/// Stored in an Array map so userspace can update it after process spawn.
+#[map(name = "target_pid_map")]
+static TARGET_PID_MAP: Array<u32> = Array::with_max_entries(1, 0);
 
 #[inline]
 unsafe fn skip_idle() -> bool {
@@ -56,7 +55,10 @@ unsafe fn dwarf_enabled() -> bool {
 
 #[inline]
 unsafe fn target_pid() -> u32 {
-    core::ptr::read_volatile(&TARGET_PID)
+    match TARGET_PID_MAP.get(0) {
+        Some(&pid) => pid,
+        None => 0,
+    }
 }
 
 /* Setup maps */
@@ -76,11 +78,24 @@ static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
 #[map(name = "stack_traces")]
 pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
 
-// DWARF unwind maps
+// DWARF unwind maps — sharded per-binary Array tables
 
-/// Global unwind table: array of UnwindEntry indexed by position
-#[map(name = "unwind_table")]
-pub static UNWIND_TABLE: Array<UnwindEntry> = Array::with_max_entries(MAX_UNWIND_TABLE_SIZE, 0);
+#[map(name = "shard_0")]
+pub static SHARD_0: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_1")]
+pub static SHARD_1: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_2")]
+pub static SHARD_2: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_3")]
+pub static SHARD_3: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_4")]
+pub static SHARD_4: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_5")]
+pub static SHARD_5: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_6")]
+pub static SHARD_6: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_7")]
+pub static SHARD_7: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
 
 /// Per-process unwind info: maps tgid to ProcInfo (exec mappings)
 #[map(name = "proc_info")]
@@ -96,7 +111,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     }
 
     let tgid = ctx.tgid(); // thread group id
-    
+
     // Filter by target PID if specified
     let filter_pid = target_pid();
     if filter_pid != 0 && tgid != filter_pid {
@@ -169,7 +184,11 @@ const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
 /// DWARF-based stack unwinding using pre-loaded unwind tables
 #[inline(always)]
-unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: u32) -> (u64, u64, usize) {
+unsafe fn dwarf_copy_stack<C: EbpfContext>(
+    ctx: &C,
+    pointers: &mut [u64],
+    tgid: u32,
+) -> (u64, u64, usize) {
     let regs = ctx.as_ptr() as *const pt_regs;
     let regs = &*regs;
 
@@ -205,7 +224,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
 
         // Find the mapping that contains current_ip
         let mut found_mapping = false;
-        let mut table_start: u32 = 0;
+        let mut shard_id: u8 = SHARD_NONE;
         let mut table_count: u32 = 0;
         let mut load_bias: u64 = 0;
 
@@ -215,7 +234,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
             }
             let mapping = &proc_info.mappings[m];
             if current_ip >= mapping.begin && current_ip < mapping.end {
-                table_start = mapping.table_start;
+                shard_id = mapping.shard_id;
                 table_count = mapping.table_count;
                 load_bias = mapping.load_bias;
                 found_mapping = true;
@@ -223,7 +242,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
             }
         }
 
-        if !found_mapping || table_count == 0 {
+        if !found_mapping || table_count == 0 || shard_id == SHARD_NONE {
             // No DWARF info — try FP-based step as fallback
             if let Some((ra, nbp)) = try_fp_step(bp) {
                 pointers[i] = ra;
@@ -241,7 +260,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: 
         let relative_pc = (current_ip - load_bias) as u32;
 
         // Binary search for the unwind entry covering this PC
-        let entry = match binary_search_unwind_entry(table_start, table_count, relative_pc) {
+        let entry = match binary_search_unwind_entry(shard_id, table_count, relative_pc) {
             Some(e) => e,
             None => {
                 // No unwind entry — try FP-based step as fallback
@@ -340,11 +359,32 @@ unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
     Some((ra, new_bp))
 }
 
-/// Max binary search iterations (covers 2^19 = 512K entries per mapping)
-const MAX_BIN_SEARCH_DEPTH: u32 = 19;
+/// Dispatch to the correct shard Array by shard_id.
+/// This is an 8-way static match — the verifier sees constant branches, no loop.
+#[inline(always)]
+unsafe fn shard_lookup(shard_id: u8, idx: u32) -> Option<UnwindEntry> {
+    match shard_id {
+        0 => SHARD_0.get(idx).copied(),
+        1 => SHARD_1.get(idx).copied(),
+        2 => SHARD_2.get(idx).copied(),
+        3 => SHARD_3.get(idx).copied(),
+        4 => SHARD_4.get(idx).copied(),
+        5 => SHARD_5.get(idx).copied(),
+        6 => SHARD_6.get(idx).copied(),
+        7 => SHARD_7.get(idx).copied(),
+        _ => None,
+    }
+}
+
+/// Max binary search iterations (covers 2^16 = 65K entries = MAX_SHARD_ENTRIES)
+const MAX_BIN_SEARCH_DEPTH: u32 = 16;
 
 #[inline(always)]
-unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relative_pc: u32) -> Option<UnwindEntry> {
+unsafe fn binary_search_unwind_entry(
+    shard_id: u8,
+    table_count: u32,
+    relative_pc: u32,
+) -> Option<UnwindEntry> {
     if table_count == 0 {
         return None;
     }
@@ -357,9 +397,8 @@ unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relativ
             break;
         }
         let mid = lo + (hi - lo) / 2;
-        let idx = table_start + mid;
 
-        let entry = match UNWIND_TABLE.get(idx) {
+        let entry = match shard_lookup(shard_id, mid) {
             Some(e) => e,
             None => return None,
         };
@@ -375,8 +414,7 @@ unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relativ
         return None;
     }
 
-    let result_idx = table_start + lo - 1;
-    UNWIND_TABLE.get(result_idx).copied()
+    shard_lookup(shard_id, lo - 1)
 }
 
 /// puts the userspace stack in the target pointer slice

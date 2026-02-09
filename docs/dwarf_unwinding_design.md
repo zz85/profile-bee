@@ -63,7 +63,7 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 
 ## Data Structures
 
-### UnwindEntry (12 bytes, stored in BPF Array map)
+### UnwindEntry (12 bytes, stored in BPF HashMap map)
 
 ```rust
 pub struct UnwindEntry {
@@ -84,19 +84,28 @@ CFA types:
 
 Return address is always at CFA-8 on x86_64, so RA rule/offset are not stored.
 
+### UnwindTableKey (8 bytes, key for sharded tables)
+
+```rust
+pub struct UnwindTableKey {
+    pub table_id: u32,   // Unique ID for each binary
+    pub index: u32,      // Index within that binary's table
+}
+```
+
 ### ProcInfo (per-process, stored in BPF HashMap)
 
 ```rust
 pub struct ProcInfo {
     pub mapping_count: u32,
-    pub mappings: [ExecMapping; 16],  // MAX_PROC_MAPS
+    pub mappings: [ExecMapping; 8],  // MAX_PROC_MAPS
 }
 
 pub struct ExecMapping {
     pub begin: u64,        // Virtual address range start
     pub end: u64,          // Virtual address range end
     pub load_bias: u64,    // Subtract from IP to get file-relative PC
-    pub table_start: u32,  // Index into UNWIND_TABLE
+    pub table_id: u32,     // ID of the unwind table for this mapping
     pub table_count: u32,  // Number of entries for this mapping
 }
 ```
@@ -105,7 +114,7 @@ pub struct ExecMapping {
 
 | Map | Type | Size | Purpose |
 |-----|------|------|---------|
-| `unwind_table` | Array | 500K entries × 12B = 5.7 MB max | Global unwind table |
+| `unwind_tables` | HashMap | 500K entries × 20B = 10 MB max | Sharded per-binary unwind tables (table_id, index) → UnwindEntry |
 | `proc_info` | HashMap | 1024 entries | Per-process mapping info |
 | `stacked_pointers` | HashMap | 2048 entries | DWARF-unwound frame pointers per stack |
 
@@ -135,7 +144,7 @@ sp = RSP, bp = RBP, current_ip = RIP
 for i in 1..32:
     mapping = find_mapping(current_ip)        // linear scan, max 16
     relative_pc = current_ip - mapping.load_bias
-    entry = binary_search(relative_pc)        // max 19 iterations
+    entry = binary_search(mapping.table_id, relative_pc)  // max 19 iterations
 
     cfa = (entry.cfa_type == RSP) ? sp + entry.cfa_offset
                                   : bp + entry.cfa_offset
@@ -158,17 +167,20 @@ The eBPF code is structured to pass the BPF verifier:
 - Mapping scan uses `for m in 0..16` with early break
 - `MAX_DWARF_STACK_DEPTH = 32` keeps the outer loop bounded
 - Functions are `#[inline(always)]` to avoid BPF function call overhead
+- Sharded tables reduce verifier complexity by keeping per-binary tables smaller
 
 ## Performance
 
 ### Memory
 - Typical process (binary + libc + ld): ~23K entries × 12B = **~270 KB**
-- Maximum (500K entries): **5.7 MB** pinned kernel memory
+- **Sharded design**: Each binary gets its own table (max 500K entries per binary)
+- Maximum: 64 binaries × 500K entries × 20B (key + value) = **~600 MB** total capacity
+- Build-ID based deduplication: Same binary across multiple processes reuses the same table_id
 - ProcInfo per process: ~200 bytes
 
 ### CPU (per sample, when DWARF enabled)
 - Mapping lookup: O(n) where n ≤ 16
-- Binary search: O(log n) where n ≤ 500K, max 19 iterations
+- Binary search: O(log n) where n ≤ 500K per binary, max 19 iterations
 - `bpf_probe_read_user`: 1-2 calls per frame (return address + optional RBP restore)
 - Compared to FP unwinding (1 `bpf_probe_read` per frame), DWARF is ~10-20x more instructions per frame
 - In practice, the overhead is negligible at typical sampling rates (99-999 Hz)
@@ -179,11 +191,11 @@ The eBPF code is structured to pass the BPF verifier:
 
 ## Limitations
 
-- **Single process**: only loads tables for `--cmd`/`--pid` target
-- **No hot-reload**: dlopen'd libraries after startup won't have unwind tables
+- **No hot-reload**: dlopen'd libraries after startup won't have unwind tables (but periodic rescanning is supported)
 - **MAX_PROC_MAPS = 16**: processes with very many shared libraries may exceed this
 - **MAX_DWARF_STACK_DEPTH = 32**: stacks deeper than 32 frames are truncated
-- **MAX_UNWIND_TABLE_SIZE = 500K**: very large binaries (Chrome, Firefox) may exceed this
+- **MAX_UNWIND_TABLE_SIZE = 500K per binary**: very large binaries (Chrome, Firefox) with >500K unwind entries will be truncated
+- **MAX_UNWIND_TABLES = 64**: system-wide profiling limited to 64 unique binaries
 - **No signal trampolines**: unwinding through signal handlers may stop early on kernels where the vDSO lacks `.eh_frame` entries for `__restore_rt` (libc's `__restore_rt` is handled)
 - **x86_64 only**: register rules are hardcoded for x86_64 (RSP, RBP, RA)
 

@@ -1,14 +1,14 @@
-use aya::maps::{MapData, StackTraceMap};
+use aya::maps::{MapData, RingBuf, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
 use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod};
-use profile_bee::ebpf::FramePointersPod;
+use profile_bee::ebpf::{FramePointersPod};
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
-use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{StackInfo, UnwindEntry, ProcInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -22,7 +22,14 @@ use profile_bee::types::FrameCount;
 /// Message type for the profiler's communication channel
 enum PerfWork {
     StackInfo(StackInfo),
+    DwarfRefresh(DwarfRefreshUpdate),
     Stop,
+}
+
+/// Incremental DWARF unwind table update
+struct DwarfRefreshUpdate {
+    shard_updates: Vec<(u8, Vec<UnwindEntry>)>,  // (shard_id, entries)
+    proc_info: Vec<(u32, ProcInfo)>,
 }
 
 #[derive(Debug, Parser)]
@@ -75,11 +82,8 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     group_by_cpu: bool,
 
-    #[arg(long, default_value_t = false)]
-    no_dwarf: bool,
-
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_missing_value = "true")]
     dwarf: bool,
 
     /// PID to profile
@@ -137,6 +141,27 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // profile_bee::load(&opt.cmd.unwrap()).unwrap();
     // return Ok(());
 
+    // Create eBPF profiler configuration from command line options (without pid first)
+    let config = ProfilerConfig {
+        skip_idle: opt.skip_idle,
+        stream_mode: opt.stream_mode,
+        frequency: opt.frequency,
+        kprobe: opt.kprobe.clone(),
+        uprobe: opt.uprobe.clone(),
+        tracepoint: opt.tracepoint.clone(),
+        pid: opt.pid.clone(),
+        cpu: opt.cpu,
+        self_profile: opt.self_profile,
+        dwarf: opt.dwarf,
+    };
+
+    // Setup eBPF profiler first to ensure verification succeeds
+    let verification_start = std::time::Instant::now();
+    let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
+    let verification_time = verification_start.elapsed();
+    println!("eBPF verification completed in {:?}", verification_time);
+
+    // Only spawn process after eBPF verification succeeds
     let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
 
     let pid = if let Some(cmd) = &spawn {
@@ -145,33 +170,30 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         opt.pid.clone()
     };
 
-    // Create eBPF profiler configuration from command line options
-    let config = ProfilerConfig {
-        skip_idle: opt.skip_idle,
-        stream_mode: opt.stream_mode,
-        frequency: opt.frequency,
-        kprobe: opt.kprobe.clone(),
-        uprobe: opt.uprobe.clone(),
-        tracepoint: opt.tracepoint.clone(),
-        pid,
-        cpu: opt.cpu,
-        self_profile: opt.self_profile,
-        dwarf: opt.dwarf,
-    };
+    // Set target PID for eBPF filtering (after spawn so we have the actual PID)
+    if let Some(target_pid) = pid {
+        ebpf_profiler.set_target_pid(target_pid)?;
+        println!("Profiling PID {}..", target_pid);
+    }
 
-    // Setup eBPF profiler
-    let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
+    // Take ownership of ring buffer map before partial borrows
+    let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
 
-    // If DWARF unwinding is enabled, load unwind tables for the target process
-    if opt.dwarf {
+    // Set up communication channels (before DWARF block so refresh thread can use it)
+    let (perf_tx, perf_rx) = mpsc::channel();
+
+    // If DWARF unwinding is enabled, load unwind tables
+    let tgid_request_tx = if opt.dwarf {
+        let mut dwarf_manager = DwarfUnwindManager::new();
+
+        // Load initial process if specified
         if let Some(target_pid) = pid {
             println!("Loading DWARF unwind tables for pid {}...", target_pid);
-            let mut dwarf_manager = DwarfUnwindManager::new();
             match dwarf_manager.load_process(target_pid) {
                 Ok(()) => {
                     println!(
                         "Loaded {} unwind entries for pid {}",
-                        dwarf_manager.table_size(),
+                        dwarf_manager.total_entries(),
                         target_pid,
                     );
                     if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
@@ -182,10 +204,20 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                     eprintln!("Failed to load DWARF info for pid {}: {}", target_pid, e);
                 }
             }
-        } else {
-            eprintln!("DWARF unwinding requires a target PID (--pid or --cmd). Falling back to frame pointer unwinding.");
         }
-    }
+
+        // Channel for requesting new tgid loads (multi-process / dlopen support)
+        let (tgid_tx, tgid_rx) = mpsc::channel::<u32>();
+        let refresh_tx = perf_tx.clone();
+        let initial_pid = pid;
+        std::thread::spawn(move || {
+            dwarf_refresh_loop(dwarf_manager, initial_pid, tgid_rx, refresh_tx);
+        });
+
+        Some(tgid_tx)
+    } else {
+        None
+    };
 
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
@@ -193,17 +225,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let mut profiler = TraceHandler::new();
 
-    // Set up communication channels
-    let (perf_tx, perf_rx) = mpsc::channel();
-
     // Set up stopping mechanisms
     // Pass the external PID if we're monitoring one (not spawned)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
     setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn, external_pid);
 
     task::spawn(async move {
-        // Set up ring buffer to collect stack traces
-        if let Err(e) = setup_ring_buffer_task(&mut ebpf_profiler.bpf, perf_tx).await {
+        if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
             eprintln!("Failed to set up ring buffer: {:?}", e);
         }
     });
@@ -220,6 +248,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             opt.stream_mode,
             opt.group_by_cpu,
             stacked_pointers,
+            &mut ebpf_profiler.bpf,
+            &tgid_request_tx,
         );
 
         // Generate and save output files
@@ -322,9 +352,15 @@ fn setup_stopping_mechanisms(
     // - 4. target PID exits (when profiling with --pid)
 
     // Timer-based stopping
+    // Clone the stopping handler so that when the timer expires,
+    // it will signal the spawned process to be killed
     let time_stop_tx = perf_tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
+        // Send Stop message to exit the profiling loop
+        // NOTE: Don't kill the spawned process here — it must stay alive
+        // for symbolization (reading /proc/<pid>/maps) after profiling stops.
+        // The caller kills it after processing.
         time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
     });
 
@@ -363,12 +399,9 @@ fn setup_stopping_mechanisms(
 
 /// Sets up the ring buffer task to collect stack traces
 async fn setup_ring_buffer_task(
-    ebpf: &mut Ebpf,
+    ring_buf: RingBuf<MapData>,
     perf_tx: mpsc::Sender<PerfWork>,
 ) -> anyhow::Result<()> {
-    // Setup the ring buffer before spawning the task
-    let ring_buf = setup_ring_buffer(ebpf)?;
-
     use tokio::io::unix::AsyncFd;
     let mut fd = AsyncFd::new(ring_buf)?;
 
@@ -392,6 +425,100 @@ async fn setup_ring_buffer_task(
     Ok(())
 }
 
+/// Background thread: handles dlopen rescans and new process DWARF loading
+fn dwarf_refresh_loop(
+    mut manager: DwarfUnwindManager,
+    initial_pid: Option<u32>,
+    tgid_rx: mpsc::Receiver<u32>,
+    tx: mpsc::Sender<PerfWork>,
+) {
+    let mut tracked_pids: Vec<u32> = initial_pid.into_iter().collect();
+
+    loop {
+        // Drain all pending tgid requests (non-blocking)
+        while let Ok(new_tgid) = tgid_rx.try_recv() {
+            if !tracked_pids.contains(&new_tgid) {
+                tracked_pids.push(new_tgid);
+                // Immediately load the new process
+                if let Ok(new_shard_ids) = manager.refresh_process(new_tgid) {
+                    if !new_shard_ids.is_empty() {
+                        if send_refresh(&manager, &tx, new_shard_ids).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Periodic rescan of all tracked processes for dlopen'd libraries
+        for &pid in &tracked_pids {
+            if let Ok(new_shard_ids) = manager.refresh_process(pid) {
+                if !new_shard_ids.is_empty() {
+                    if send_refresh(&manager, &tx, new_shard_ids).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn send_refresh(
+    manager: &DwarfUnwindManager,
+    tx: &mpsc::Sender<PerfWork>,
+    new_shard_ids: Vec<u8>,
+) -> Result<(), ()> {
+    let mut shard_updates = Vec::new();
+    for &shard_id in &new_shard_ids {
+        if let Some(entries) = manager.binary_tables.get(&shard_id) {
+            shard_updates.push((shard_id, entries.clone()));
+        }
+    }
+    let proc_info: Vec<(u32, ProcInfo)> = manager
+        .proc_info
+        .iter()
+        .map(|(&t, &p)| (t, p))
+        .collect();
+    let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
+    println!(
+        "DWARF refresh: {} new shards with {} total entries",
+        new_shard_ids.len(), total_entries,
+    );
+    tx.send(PerfWork::DwarfRefresh(DwarfRefreshUpdate {
+        shard_updates,
+        proc_info,
+    })).map_err(|_| ())
+}
+
+/// Apply incremental DWARF unwind table updates to eBPF maps
+fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
+    use aya::maps::{Array, HashMap};
+    use profile_bee::ebpf::{UnwindEntryPod, ProcInfoKeyPod, ProcInfoPod};
+    use profile_bee_common::ProcInfoKey;
+
+    for (shard_id, entries) in &update.shard_updates {
+        let map_name = format!("shard_{}", shard_id);
+        if let Some(map) = bpf.map_mut(&map_name) {
+            if let Ok(mut arr) = Array::<&mut MapData, UnwindEntryPod>::try_from(map) {
+                for (idx, entry) in entries.iter().enumerate() {
+                    let _ = arr.set(idx as u32, UnwindEntryPod(*entry), 0);
+                }
+            }
+        }
+    }
+
+    if let Some(map) = bpf.map_mut("proc_info") {
+        if let Ok(mut hm) = HashMap::<&mut MapData, ProcInfoKeyPod, ProcInfoPod>::try_from(map) {
+            for (tgid, pi) in &update.proc_info {
+                let key = ProcInfoKeyPod(ProcInfoKey { tgid: *tgid, _pad: 0 });
+                let _ = hm.insert(key, ProcInfoPod(*pi), 0);
+            }
+        }
+    }
+}
+
 // Processes the profiling data collected from eBPF
 fn process_profiling_data(
     counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
@@ -401,11 +528,14 @@ fn process_profiling_data(
     stream_mode: u8,
     group_by_cpu: bool,
     stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
+    bpf: &mut Ebpf,
+    tgid_request_tx: &Option<mpsc::Sender<u32>>,
 ) -> Vec<String> {
     // Local counting
     let mut trace_count = HashMap::<StackInfo, usize>::new();
     let mut queue_processed = 0;
     let mut samples = 0;
+    let mut known_tgids = std::collections::HashSet::<u32>::new();
 
     // Clear counters
     trace_count.clear();
@@ -422,6 +552,13 @@ fn process_profiling_data(
             PerfWork::StackInfo(stack) => {
                 queue_processed += 1;
 
+                // Request DWARF loading for newly seen processes
+                if let Some(tx) = tgid_request_tx {
+                    if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
+                        let _ = tx.send(stack.tgid);
+                    }
+                }
+
                 // User space counting
                 let trace = trace_count.entry(stack).or_insert(0);
                 *trace += 1;
@@ -434,6 +571,9 @@ fn process_profiling_data(
                         stacked_pointers,
                     );
                 }
+            }
+            PerfWork::DwarfRefresh(update) => {
+                apply_dwarf_refresh(bpf, update);
             }
             PerfWork::Stop => break,
         }

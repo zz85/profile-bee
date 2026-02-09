@@ -6,13 +6,13 @@ Prioritized roadmap for profile-bee, roughly ordered by impact.
 
 On-CPU profiling only tells half the story. Off-CPU profiling (via `sched_switch` tracepoints or `finish_task_switch` kprobes) would show where time is spent blocked on I/O, locks, or sleep — making profile-bee a much more complete tool.
 
-## 2. System-wide DWARF Unwinding
+## ~~2. System-wide DWARF Unwinding~~ ✅ Done
 
-DWARF unwinding is currently limited to a single `--pid`/`--cmd` target. Extending to system-wide profiling requires dynamically tracking process exec/mmap events to load unwind tables on the fly.
+DWARF unwinding now works system-wide. A background thread loads unwind tables for all profiled processes, with Build-ID caching to avoid redundant parsing of shared libraries.
 
-## 3. Dynamic Library Hot-loading (`dlopen` support)
+## ~~3. Dynamic Library Hot-loading (`dlopen` support)~~ ✅ Done
 
-Unwind tables are loaded at startup only. Monitoring `mmap` events (via tracepoint or uprobes on `dlopen`) to update the unwind table at runtime would handle long-running services that load plugins or JIT code.
+A background thread polls `/proc/[pid]/maps` (~1s interval) to detect newly loaded libraries and incrementally updates the eBPF unwind tables at runtime.
 
 ## 4. uprobe / USDT Support
 

@@ -8,18 +8,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use gimli::{
-    BaseAddresses, CfaRule, EhFrame, NativeEndian, Register, RegisterRule,
-    UnwindSection,
-};
+use gimli::{BaseAddresses, CfaRule, EhFrame, NativeEndian, Register, RegisterRule, UnwindSection};
 use object::{Object, ObjectSection};
-use profile_bee_common::{
-    UnwindEntry, ExecMapping, ProcInfo,
-    CFA_REG_EXPRESSION, CFA_REG_RBP, CFA_REG_RSP, CFA_REG_PLT, CFA_REG_DEREF_RSP,
-    REG_RULE_OFFSET, REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED,
-    MAX_PROC_MAPS, MAX_UNWIND_TABLE_SIZE,
-};
 use procfs::process::{MMapPath, Process};
+use profile_bee_common::{
+    ExecMapping, ProcInfo, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_PLT,
+    CFA_REG_RBP, CFA_REG_RSP, MAX_PROC_MAPS, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET,
+    REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED, SHARD_NONE,
+};
+
+/// Build ID for uniquely identifying ELF binaries
+pub type BuildId = Vec<u8>;
 
 // x86_64 register numbers in DWARF
 const X86_64_RSP: Register = Register(7);
@@ -27,8 +26,11 @@ const X86_64_RBP: Register = Register(6);
 const X86_64_RA: Register = Register(16);
 
 /// Generates a compact unwind table from an ELF binary's .eh_frame section
-pub fn generate_unwind_table(elf_path: &Path) -> Result<Vec<UnwindEntry>, String> {
-    let data = fs::read(elf_path).map_err(|e| format!("Failed to read {}: {}", elf_path.display(), e))?;
+pub fn generate_unwind_table(
+    elf_path: &Path,
+) -> Result<(Vec<UnwindEntry>, Option<BuildId>), String> {
+    let data =
+        fs::read(elf_path).map_err(|e| format!("Failed to read {}: {}", elf_path.display(), e))?;
     generate_unwind_table_from_bytes(&data)
 }
 
@@ -62,7 +64,10 @@ fn classify_cfa_expression(
     });
 
     // First op should be RegisterOffset { register: RSP, offset: N } (DW_OP_breg7)
-    let Ok(Some(Operation::RegisterOffset { register, offset, .. })) = ops.next() else {
+    let Ok(Some(Operation::RegisterOffset {
+        register, offset, ..
+    })) = ops.next()
+    else {
         return (CFA_REG_EXPRESSION, 0);
     };
     if register != X86_64_RSP {
@@ -79,7 +84,11 @@ fn classify_cfa_expression(
             (CFA_REG_DEREF_RSP, off)
         }
         // PLT stub: breg7(rsp)+N; breg16(rip)+0; ... → CFA = RSP + N + ((RIP&15)>=11 ? 8 : 0)
-        Ok(Some(Operation::RegisterOffset { register: reg2, offset: 0, .. })) if reg2 == X86_64_RA => {
+        Ok(Some(Operation::RegisterOffset {
+            register: reg2,
+            offset: 0,
+            ..
+        })) if reg2 == X86_64_RA => {
             let Ok(off) = i16::try_from(base_offset) else {
                 return (CFA_REG_EXPRESSION, 0);
             };
@@ -105,16 +114,72 @@ fn read_vdso(tgid: u32, start: u64, end: u64) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>, String> {
+/// Extracts the GNU build ID from an ELF binary
+///
+/// The build ID is a unique identifier embedded in the `.note.gnu.build-id` section
+/// of ELF binaries. It's typically a 20-byte SHA1 hash but can be other lengths.
+/// Returns None if no build ID is found.
+fn extract_build_id(data: &[u8]) -> Option<BuildId> {
+    let obj = object::File::parse(data).ok()?;
+    let section = obj.section_by_name(".note.gnu.build-id")?;
+    let note_data = section.data().ok()?;
+
+    // Parse ELF note format:
+    // struct {
+    //     u32 namesz;  // length of name (including null terminator)
+    //     u32 descsz;  // length of descriptor (the actual build ID)
+    //     u32 type;    // note type (3 = NT_GNU_BUILD_ID)
+    //     char name[namesz];   // "GNU\0" (aligned to 4 bytes)
+    //     char desc[descsz];   // the build ID bytes (aligned to 4 bytes)
+    // }
+
+    if note_data.len() < 16 {
+        return None;
+    }
+
+    let namesz =
+        u32::from_ne_bytes([note_data[0], note_data[1], note_data[2], note_data[3]]) as usize;
+    let descsz =
+        u32::from_ne_bytes([note_data[4], note_data[5], note_data[6], note_data[7]]) as usize;
+    let note_type = u32::from_ne_bytes([note_data[8], note_data[9], note_data[10], note_data[11]]);
+
+    // NT_GNU_BUILD_ID = 3
+    if note_type != 3 {
+        return None;
+    }
+
+    // Verify we have "GNU\0" name
+    if namesz < 4 || note_data.len() < 12 + namesz {
+        return None;
+    }
+
+    // Name is aligned to 4 bytes
+    let name_aligned = (namesz + 3) & !3;
+    let desc_offset = 12 + name_aligned;
+
+    if note_data.len() < desc_offset + descsz {
+        return None;
+    }
+
+    let build_id = note_data[desc_offset..desc_offset + descsz].to_vec();
+    Some(build_id)
+}
+
+pub fn generate_unwind_table_from_bytes(
+    data: &[u8],
+) -> Result<(Vec<UnwindEntry>, Option<BuildId>), String> {
     use object::ObjectSegment;
 
-    let obj = object::File::parse(data)
-        .map_err(|e| format!("Failed to parse ELF: {}", e))?;
+    let obj = object::File::parse(data).map_err(|e| format!("Failed to parse ELF: {}", e))?;
+
+    // Extract build ID first
+    let build_id = extract_build_id(data);
 
     // Find the base virtual address (first PT_LOAD segment with file offset 0)
     // For non-PIE executables this is typically 0x400000, for PIE/shared libs it's 0.
     // We subtract this from .eh_frame PCs to make entries file-relative.
-    let base_vaddr = obj.segments()
+    let base_vaddr = obj
+        .segments()
         .find(|s| s.file_range().0 == 0)
         .map(|s| s.address())
         .unwrap_or(0);
@@ -131,8 +196,7 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
 
     let eh_frame = EhFrame::new(eh_frame_data, NativeEndian);
 
-    let bases = BaseAddresses::default()
-        .set_eh_frame(eh_frame_addr);
+    let bases = BaseAddresses::default().set_eh_frame(eh_frame_addr);
 
     let mut entries = Vec::new();
     let mut ctx = gimli::UnwindContext::new();
@@ -182,9 +246,7 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
                             };
                             (reg_type, offset_i16)
                         }
-                        CfaRule::Expression(expr) => {
-                            classify_cfa_expression(expr, eh_frame_data)
-                        }
+                        CfaRule::Expression(expr) => classify_cfa_expression(expr, eh_frame_data),
                     };
 
                     // Skip DWARF expression-based CFA (too complex for eBPF)
@@ -252,41 +314,65 @@ pub fn generate_unwind_table_from_bytes(data: &[u8]) -> Result<Vec<UnwindEntry>,
     if before != after {
         tracing::debug!(
             "Dedup: {} -> {} entries ({:.1}% reduction)",
-            before, after, (1.0 - after as f64 / before as f64) * 100.0
+            before,
+            after,
+            (1.0 - after as f64 / before as f64) * 100.0
         );
     }
 
-    Ok(entries)
+    Ok((entries, build_id))
 }
 
 /// Holds the unwind tables for all currently profiled processes
 pub struct DwarfUnwindManager {
-    /// Global unwind table (shared eBPF array)
-    pub global_table: Vec<UnwindEntry>,
+    /// Per-binary unwind tables: map from shard_id to the entries
+    pub binary_tables: HashMap<u8, Vec<UnwindEntry>>,
     /// Per-process mapping information
     pub proc_info: HashMap<u32, ProcInfo>,
-    /// Next free index in the global unwind table
-    next_table_index: u32,
-    /// Cache of parsed ELF binary unwind entries, keyed by resolved path
-    binary_cache: HashMap<std::path::PathBuf, (u32, u32)>, // (table_start, table_count)
+    /// Next shard_id to assign to a new binary
+    next_shard_id: u8,
+    /// Cache of parsed ELF binary shard IDs, keyed by build ID
+    /// Falls back to path-based caching for binaries without build IDs
+    binary_cache: HashMap<BuildId, u8>, // build_id -> shard_id
+    /// Fallback cache for binaries without build IDs (keyed by path)
+    path_cache: HashMap<std::path::PathBuf, u8>, // path -> shard_id
 }
 
 impl DwarfUnwindManager {
     pub fn new() -> Self {
         Self {
-            global_table: Vec::new(),
+            binary_tables: HashMap::new(),
             proc_info: HashMap::new(),
-            next_table_index: 0,
+            next_shard_id: 0,
             binary_cache: HashMap::new(),
+            path_cache: HashMap::new(),
         }
     }
 
-    /// Load unwind information for a process by scanning its memory mappings
+    /// Load unwind information for a process by scanning its memory mappings.
+    /// Returns Ok(()) if the process was loaded (or already loaded).
     pub fn load_process(&mut self, tgid: u32) -> Result<(), String> {
         if self.proc_info.contains_key(&tgid) {
             return Ok(());
         }
+        self.scan_and_update(tgid)
+    }
 
+    /// Rescan a process's memory mappings and load any new ones.
+    /// Returns the list of new shard IDs added (for incremental eBPF updates).
+    pub fn refresh_process(&mut self, tgid: u32) -> Result<Vec<u8>, String> {
+        let old_shard_ids: Vec<u8> = self.binary_tables.keys().copied().collect();
+        self.scan_and_update(tgid)?;
+        let new_shard_ids: Vec<u8> = self
+            .binary_tables
+            .keys()
+            .copied()
+            .filter(|id| !old_shard_ids.contains(id))
+            .collect();
+        Ok(new_shard_ids)
+    }
+
+    fn scan_and_update(&mut self, tgid: u32) -> Result<(), String> {
         let process = Process::new(tgid as i32)
             .map_err(|e| format!("Failed to open process {}: {}", tgid, e))?;
 
@@ -294,17 +380,28 @@ impl DwarfUnwindManager {
             .maps()
             .map_err(|e| format!("Failed to read maps for {}: {}", tgid, e))?;
 
-        let mut proc_info = ProcInfo {
+        // Collect existing mapping addresses so we can skip them
+        let existing = self.proc_info.get(&tgid);
+        let existing_ranges: Vec<(u64, u64)> = existing
+            .map(|pi| {
+                (0..pi.mapping_count as usize)
+                    .map(|i| (pi.mappings[i].begin, pi.mappings[i].end))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut proc_info = existing.copied().unwrap_or(ProcInfo {
             mapping_count: 0,
             _pad: 0,
             mappings: [ExecMapping {
                 begin: 0,
                 end: 0,
                 load_bias: 0,
-                table_start: 0,
+                shard_id: SHARD_NONE,
+                _pad1: [0; 3],
                 table_count: 0,
             }; MAX_PROC_MAPS],
-        };
+        });
 
         let root_path = format!("/proc/{}/root", tgid);
 
@@ -313,7 +410,6 @@ impl DwarfUnwindManager {
                 break;
             }
 
-            // Only process executable mappings that map to files
             let perms = &map.perms;
             use procfs::process::MMPermissions;
             if !perms.contains(MMPermissions::EXECUTE) || !perms.contains(MMPermissions::READ) {
@@ -331,7 +427,14 @@ impl DwarfUnwindManager {
             let file_offset = map.offset;
             let is_vdso = matches!(&map.pathname, MMapPath::Vdso);
 
-            // Construct the actual path (may be in a container namespace)
+            // Skip mappings we already have
+            if existing_ranges
+                .iter()
+                .any(|&(b, e)| b == start_addr && e == end_addr)
+            {
+                continue;
+            }
+
             let resolved_path = if is_vdso {
                 file_path.clone()
             } else {
@@ -348,75 +451,115 @@ impl DwarfUnwindManager {
                 continue;
             }
 
-            // Calculate load bias (use wrapping to handle edge cases)
             let load_bias = start_addr.wrapping_sub(file_offset);
 
-            // Check if we've already parsed this binary
-            let (table_start, table_count) = if let Some(&(ts, tc)) = self.binary_cache.get(&resolved_path) {
-                (ts, tc)
-            } else {
-                // Generate unwind table for this binary
-                let unwind_entries = if is_vdso {
-                    // Read vDSO from process memory
-                    match read_vdso(tgid, start_addr, end_addr) {
-                        Ok(data) => match generate_unwind_table_from_bytes(&data) {
-                            Ok(entries) => entries,
-                            Err(e) => {
-                                tracing::debug!("Skipping [vdso] for pid {}: {}", tgid, e);
-                                continue;
-                            }
-                        },
-                        Err(e) => {
-                            tracing::debug!("Skipping [vdso] for pid {}: {}", tgid, e);
-                            continue;
-                        }
+            // Try to get cached unwind table, preferring build-ID based lookup
+            let (shard_id, table_count) = {
+                // First, try to get the binary data to extract build ID
+                let binary_data = if is_vdso {
+                    read_vdso(tgid, start_addr, end_addr).ok()
+                } else {
+                    fs::read(&resolved_path).ok()
+                };
+
+                let cache_hit = if let Some(ref data) = binary_data {
+                    // Try build-ID based cache lookup
+                    if let Some(build_id) = extract_build_id(data) {
+                        self.binary_cache.get(&build_id).copied()
+                    } else {
+                        // Fall back to path-based cache for binaries without build ID
+                        self.path_cache.get(&resolved_path).copied()
                     }
                 } else {
-                    match generate_unwind_table(&resolved_path) {
-                        Ok(entries) => entries,
-                        Err(e) => {
-                            tracing::debug!(
-                                "Skipping {} for pid {}: {}",
-                                resolved_path.display(),
-                                tgid,
-                                e
+                    None
+                };
+
+                if let Some(sid) = cache_hit {
+                    // Get the table count from the cached shard
+                    let tc = self
+                        .binary_tables
+                        .get(&sid)
+                        .map(|t| t.len() as u32)
+                        .unwrap_or(0);
+                    (sid, tc)
+                } else {
+                    // Cache miss - need to parse the binary
+                    let (unwind_entries, build_id_opt) = if let Some(data) = binary_data {
+                        match generate_unwind_table_from_bytes(&data) {
+                            Ok(result) => result,
+                            Err(e) => {
+                                let name = if is_vdso {
+                                    "[vdso]".to_string()
+                                } else {
+                                    resolved_path.display().to_string()
+                                };
+                                tracing::debug!("Skipping {} for pid {}: {}", name, tgid, e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        let name = if is_vdso {
+                            "[vdso]".to_string()
+                        } else {
+                            resolved_path.display().to_string()
+                        };
+                        tracing::debug!("Failed to read binary {} for pid {}", name, tgid);
+                        continue;
+                    };
+
+                    if unwind_entries.is_empty() {
+                        continue;
+                    }
+
+                    let tc = match u32::try_from(unwind_entries.len()) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let name = if is_vdso {
+                                "[vdso]".to_string()
+                            } else {
+                                resolved_path.display().to_string()
+                            };
+                            tracing::warn!(
+                                "Unwind table too large for {}: {} entries",
+                                name,
+                                unwind_entries.len(),
                             );
                             continue;
                         }
-                    }
-                };
+                    };
 
-                if unwind_entries.is_empty() {
-                    continue;
-                }
-
-                let ts = self.next_table_index;
-                let tc = match u32::try_from(unwind_entries.len()) {
-                    Ok(v) => v,
-                    Err(_) => {
+                    if tc > MAX_SHARD_ENTRIES {
                         tracing::warn!(
-                            "Unwind table too large for {}: {} entries",
-                            resolved_path.display(),
-                            unwind_entries.len(),
+                            "Binary unwind table too large: {} entries (max {} per shard), skipping",
+                            tc,
+                            MAX_SHARD_ENTRIES,
                         );
                         continue;
                     }
-                };
 
-                if self.next_table_index + tc > MAX_UNWIND_TABLE_SIZE {
-                    tracing::warn!(
-                        "Global unwind table full ({}/{} entries used), skipping remaining mappings for pid {}",
-                        self.next_table_index, MAX_UNWIND_TABLE_SIZE, tgid,
-                    );
-                    break;
+                    if self.next_shard_id as usize >= MAX_UNWIND_SHARDS {
+                        tracing::warn!(
+                            "All {} shard slots used, skipping remaining binaries for pid {}",
+                            MAX_UNWIND_SHARDS,
+                            tgid,
+                        );
+                        break;
+                    }
+
+                    let sid = self.next_shard_id;
+                    self.next_shard_id += 1;
+
+                    self.binary_tables.insert(sid, unwind_entries);
+
+                    // Cache using build ID if available, otherwise use path
+                    if let Some(build_id) = build_id_opt {
+                        self.binary_cache.insert(build_id, sid);
+                    } else {
+                        self.path_cache.insert(resolved_path.clone(), sid);
+                    }
+
+                    (sid, tc)
                 }
-
-                self.global_table.extend_from_slice(&unwind_entries);
-                self.next_table_index += tc;
-
-                self.binary_cache.insert(resolved_path.clone(), (ts, tc));
-
-                (ts, tc)
             };
 
             let idx = proc_info.mapping_count as usize;
@@ -424,7 +567,8 @@ impl DwarfUnwindManager {
                 begin: start_addr,
                 end: end_addr,
                 load_bias,
-                table_start,
+                shard_id,
+                _pad1: [0; 3],
                 table_count,
             };
             proc_info.mapping_count += 1;
@@ -435,9 +579,9 @@ impl DwarfUnwindManager {
         Ok(())
     }
 
-    /// Returns the current total number of entries in the global table
-    pub fn table_size(&self) -> usize {
-        self.global_table.len()
+    /// Returns the total number of table entries across all binaries
+    pub fn total_entries(&self) -> usize {
+        self.binary_tables.values().map(|t| t.len()).sum()
     }
 }
 
@@ -449,11 +593,14 @@ mod tests {
     fn test_generate_unwind_table_self() {
         // Parse the current test binary's .eh_frame
         let exe = std::env::current_exe().unwrap();
-        let entries = generate_unwind_table(&exe).unwrap();
+        let (entries, build_id) = generate_unwind_table(&exe).unwrap();
         assert!(
             !entries.is_empty(),
             "Expected non-empty unwind table for test binary"
         );
+
+        // Check that build ID was extracted
+        assert!(build_id.is_some(), "Expected build ID for test binary");
 
         // Entries should be sorted by PC
         for w in entries.windows(2) {
@@ -468,7 +615,10 @@ mod tests {
         // All entries should have valid CFA types
         for entry in &entries {
             assert!(
-                matches!(entry.cfa_type, CFA_REG_RSP | CFA_REG_RBP | CFA_REG_PLT | CFA_REG_DEREF_RSP),
+                matches!(
+                    entry.cfa_type,
+                    CFA_REG_RSP | CFA_REG_RBP | CFA_REG_PLT | CFA_REG_DEREF_RSP
+                ),
                 "Unexpected CFA type: {}",
                 entry.cfa_type
             );
@@ -492,17 +642,14 @@ mod tests {
     #[test]
     fn test_dwarf_manager_new() {
         let manager = DwarfUnwindManager::new();
-        assert_eq!(manager.table_size(), 0);
+        assert_eq!(manager.total_entries(), 0);
         assert!(manager.proc_info.is_empty());
     }
 
     #[test]
     fn test_unwind_entry_sizes() {
         // Verify the struct sizes are what we expect for eBPF compatibility
-        assert_eq!(
-            std::mem::size_of::<UnwindEntry>(),
-            UnwindEntry::STRUCT_SIZE
-        );
+        assert_eq!(std::mem::size_of::<UnwindEntry>(), UnwindEntry::STRUCT_SIZE);
         // Should be 12 bytes (compact format)
         assert_eq!(std::mem::size_of::<UnwindEntry>(), 12);
     }
@@ -513,11 +660,8 @@ mod tests {
         // The compact format hardcodes this, so we just verify the entries
         // are generated (RA rule filtering happens during generation).
         let exe = std::env::current_exe().unwrap();
-        let entries = generate_unwind_table(&exe).unwrap();
-        assert!(
-            !entries.is_empty(),
-            "Expected non-empty unwind table"
-        );
+        let (entries, _) = generate_unwind_table(&exe).unwrap();
+        assert!(!entries.is_empty(), "Expected non-empty unwind table");
     }
 
     #[test]
@@ -531,7 +675,7 @@ mod tests {
             result
         );
         assert!(
-            manager.table_size() > 0,
+            manager.total_entries() > 0,
             "Expected non-empty unwind table for current process"
         );
         assert!(
@@ -556,7 +700,7 @@ mod tests {
 
         let libc_path = libc_paths.iter().find(|p| Path::new(p).exists());
         if let Some(path) = libc_path {
-            let entries = generate_unwind_table(Path::new(path)).unwrap();
+            let (entries, build_id) = generate_unwind_table(Path::new(path)).unwrap();
             assert!(
                 !entries.is_empty(),
                 "Expected non-empty unwind table for libc"
@@ -567,6 +711,43 @@ mod tests {
                 "Expected >100 entries for libc, got {}",
                 entries.len()
             );
+            // libc should have a build ID
+            assert!(build_id.is_some(), "Expected build ID for libc");
         }
+    }
+
+    #[test]
+    fn test_build_id_extraction() {
+        // Test that build ID extraction works on the test binary
+        let exe = std::env::current_exe().unwrap();
+        let data = fs::read(&exe).unwrap();
+        let build_id = extract_build_id(&data);
+        assert!(build_id.is_some(), "Expected build ID in test binary");
+
+        // Build IDs are typically 20 bytes (SHA1) but can vary
+        let id = build_id.unwrap();
+        assert!(!id.is_empty(), "Build ID should not be empty");
+        assert!(id.len() >= 8, "Build ID should be at least 8 bytes");
+    }
+
+    #[test]
+    fn test_build_id_caching() {
+        // Test that the same library loaded by multiple "processes" uses cached entries
+        let mut manager = DwarfUnwindManager::new();
+        let pid = std::process::id();
+
+        // Load current process
+        let result = manager.load_process(pid);
+        assert!(result.is_ok(), "Failed to load process: {:?}", result);
+
+        let initial_cache_size = manager.binary_cache.len() + manager.path_cache.len();
+        let initial_table_size = manager.total_entries();
+
+        assert!(initial_cache_size > 0, "Expected some cached binaries");
+        assert!(initial_table_size > 0, "Expected non-empty unwind table");
+
+        // In a real scenario with multiple processes sharing libraries,
+        // we would see cache hits here. For this test, we just verify
+        // the caching mechanism is set up correctly.
     }
 }

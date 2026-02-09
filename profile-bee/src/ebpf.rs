@@ -9,7 +9,7 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 
 use aya::Pod;
-use profile_bee_common::{UnwindEntry, ProcInfo, ProcInfoKey};
+use profile_bee_common::{ProcInfo, ProcInfoKey, UnwindEntry};
 
 // Create a newtype wrapper around StackInfo
 #[repr(transparent)]
@@ -74,13 +74,11 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
 
     let skip_idle = if config.skip_idle { 1u8 } else { 0u8 };
     let dwarf_enabled = if config.dwarf { 1u8 } else { 0u8 };
-    let target_pid = config.pid.unwrap_or(0);
 
     let bpf = EbpfLoader::new()
         .set_global("SKIP_IDLE", &skip_idle, true)
         .set_global("NOTIFY_TYPE", &config.stream_mode, true)
         .set_global("DWARF_ENABLED", &dwarf_enabled, true)
-        .set_global("TARGET_PID", &target_pid, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {
@@ -142,10 +140,13 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
             } else {
                 online_cpus().map_err(|(_, error)| error)?
             };
-            
+
             let nprocs = cpus.len();
             if let Some(pid) = config.pid {
-                eprintln!("Profiling PID {} and child processes across {} CPUs", pid, nprocs);
+                eprintln!(
+                    "Profiling PID {} and child processes across {} CPUs",
+                    pid, nprocs
+                );
             } else if let Some(cpu) = config.cpu {
                 eprintln!("Profiling CPU {}", cpu);
             }
@@ -199,9 +200,9 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
     })
 }
 
-pub fn setup_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<&mut MapData>, anyhow::Error> {
+pub fn setup_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<MapData>, anyhow::Error> {
     let ring_buf = RingBuf::try_from(
-        bpf.map_mut("RING_BUF_STACKS")
+        bpf.take_map("RING_BUF_STACKS")
             .ok_or(anyhow!("RING_BUF_STACKS not found"))?,
     )?;
 
@@ -209,30 +210,65 @@ pub fn setup_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<&mut MapData>, anyhow
 }
 
 impl EbpfProfiler {
+    /// Set the target PID for eBPF filtering (0 = profile all processes)
+    pub fn set_target_pid(&mut self, pid: u32) -> Result<(), anyhow::Error> {
+        let mut target_pid_map: Array<&mut MapData, u32> = Array::try_from(
+            self.bpf
+                .map_mut("target_pid_map")
+                .ok_or(anyhow!("target_pid_map not found"))?,
+        )?;
+        target_pid_map.set(0, pid, 0)?;
+        Ok(())
+    }
+
     /// Load DWARF unwind tables into eBPF maps for a process
     pub fn load_dwarf_unwind_tables(
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
     ) -> Result<(), anyhow::Error> {
-        // Get the unwind_table array map
-        let mut unwind_table: Array<&mut MapData, UnwindEntryPod> =
-            Array::try_from(
-                self.bpf
-                    .map_mut("unwind_table")
-                    .ok_or(anyhow!("unwind_table map not found"))?,
-            )?;
+        // Load all shards
+        let all_shard_ids: Vec<u8> = manager.binary_tables.keys().copied().collect();
+        self.update_dwarf_tables(manager, &all_shard_ids)
+    }
 
-        // Load all unwind entries into the global array
-        for (idx, entry) in manager.global_table.iter().enumerate() {
-            unwind_table.set(idx as u32, UnwindEntryPod(*entry), 0)?;
+    /// Load a single shard's unwind entries into its eBPF Array map.
+    fn load_shard(&mut self, shard_id: u8, entries: &[UnwindEntry]) -> Result<(), anyhow::Error> {
+        let map_name = format!("shard_{}", shard_id);
+        let mut arr: Array<&mut MapData, UnwindEntryPod> = Array::try_from(
+            self.bpf
+                .map_mut(&map_name)
+                .ok_or_else(|| anyhow!("{} map not found", map_name))?,
+        )?;
+        for (idx, entry) in entries.iter().enumerate() {
+            arr.set(idx as u32, UnwindEntryPod(*entry), 0)?;
+        }
+        Ok(())
+    }
+
+    /// Incrementally update eBPF maps with new unwind shard entries,
+    /// and refresh all proc_info entries.
+    pub fn update_dwarf_tables(
+        &mut self,
+        manager: &crate::dwarf_unwind::DwarfUnwindManager,
+        new_shard_ids: &[u8],
+    ) -> Result<(), anyhow::Error> {
+        if !new_shard_ids.is_empty() {
+            let mut total_entries = 0usize;
+            for &shard_id in new_shard_ids {
+                if let Some(entries) = manager.binary_tables.get(&shard_id) {
+                    self.load_shard(shard_id, entries)?;
+                    total_entries += entries.len();
+                    tracing::info!("Loaded shard {} with {} entries", shard_id, entries.len());
+                }
+            }
+
+            tracing::info!(
+                "Loaded {} total unwind entries across {} shards",
+                total_entries,
+                new_shard_ids.len()
+            );
         }
 
-        tracing::info!(
-            "Loaded {} unwind table entries into eBPF map",
-            manager.global_table.len()
-        );
-
-        // Get the proc_info hash map
         let mut proc_info_map: HashMap<&mut MapData, ProcInfoKeyPod, ProcInfoPod> =
             HashMap::try_from(
                 self.bpf
@@ -240,7 +276,6 @@ impl EbpfProfiler {
                     .ok_or(anyhow!("proc_info map not found"))?,
             )?;
 
-        // Load per-process mapping information
         for (&tgid, proc_info) in &manager.proc_info {
             let key = ProcInfoKeyPod(ProcInfoKey { tgid, _pad: 0 });
             let value = ProcInfoPod(*proc_info);
