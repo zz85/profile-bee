@@ -171,6 +171,12 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         opt.pid.clone()
     };
 
+    // Set target PID for eBPF filtering (after spawn so we have the actual PID)
+    if let Some(target_pid) = pid {
+        ebpf_profiler.set_target_pid(target_pid)?;
+        println!("Profiling PID {}..", target_pid);
+    }
+
     // Take ownership of ring buffer map before partial borrows
     let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
 
@@ -350,12 +356,12 @@ fn setup_stopping_mechanisms(
     // Clone the stopping handler so that when the timer expires,
     // it will signal the spawned process to be killed
     let time_stop_tx = perf_tx.clone();
-    let time_stopping = stopping.clone();
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
-        // Drop the stopping handler to send kill signal to spawned process
-        drop(time_stopping);
-        // Also send Stop message to exit the profiling loop
+        // Send Stop message to exit the profiling loop
+        // NOTE: Don't kill the spawned process here — it must stay alive
+        // for symbolization (reading /proc/<pid>/maps) after profiling stops.
+        // The caller kills it after processing.
         time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
     });
 

@@ -7,7 +7,7 @@ use aya_ebpf::{
     bindings::{pt_regs, BPF_F_USER_STACK},
     helpers::{bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_user},
     macros::map,
-    maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
+    maps::{Array, HashMap, PerCpuArray, RingBuf, StackTrace},
     EbpfContext,
 };
 
@@ -33,8 +33,9 @@ static NOTIFY_TYPE: u8 = EVENT_TRACE_ALWAYS;
 static DWARF_ENABLED: u8 = 0;
 
 /// Target PID to profile (0 = profile all processes)
-#[no_mangle]
-static TARGET_PID: u32 = 0;
+/// Stored in an Array map so userspace can update it after process spawn.
+#[map(name = "target_pid_map")]
+static TARGET_PID_MAP: Array<u32> = Array::with_max_entries(1, 0);
 
 #[inline]
 unsafe fn skip_idle() -> bool {
@@ -54,7 +55,10 @@ unsafe fn dwarf_enabled() -> bool {
 
 #[inline]
 unsafe fn target_pid() -> u32 {
-    core::ptr::read_volatile(&TARGET_PID)
+    match TARGET_PID_MAP.get(0) {
+        Some(&pid) => pid,
+        None => 0,
+    }
 }
 
 /* Setup maps */

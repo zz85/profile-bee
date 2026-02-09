@@ -211,12 +211,8 @@ impl TraceHandler {
                 let addrs: Vec<Addr> = stack
                     .frames()
                     .iter()
-                    .map(|frame| {
-                        let instruction_pointer = frame.ip;
-                        instruction_pointer
-                    })
+                    .map(|frame| frame.ip)
                     .collect();
-
                 addrs
             })
         } else {

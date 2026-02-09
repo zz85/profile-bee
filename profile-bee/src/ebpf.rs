@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use aya::maps::{HashMap, MapData, RingBuf, StackTraceMap};
+use aya::maps::{Array, HashMap, MapData, RingBuf, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
@@ -79,13 +79,11 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
 
     let skip_idle = if config.skip_idle { 1u8 } else { 0u8 };
     let dwarf_enabled = if config.dwarf { 1u8 } else { 0u8 };
-    let target_pid = config.pid.unwrap_or(0);
 
     let bpf = EbpfLoader::new()
         .set_global("SKIP_IDLE", &skip_idle, true)
         .set_global("NOTIFY_TYPE", &config.stream_mode, true)
         .set_global("DWARF_ENABLED", &dwarf_enabled, true)
-        .set_global("TARGET_PID", &target_pid, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {
@@ -217,6 +215,17 @@ pub fn setup_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<MapData>, anyhow::Err
 }
 
 impl EbpfProfiler {
+    /// Set the target PID for eBPF filtering (0 = profile all processes)
+    pub fn set_target_pid(&mut self, pid: u32) -> Result<(), anyhow::Error> {
+        let mut target_pid_map: Array<&mut MapData, u32> = Array::try_from(
+            self.bpf
+                .map_mut("target_pid_map")
+                .ok_or(anyhow!("target_pid_map not found"))?,
+        )?;
+        target_pid_map.set(0, pid, 0)?;
+        Ok(())
+    }
+
     /// Load DWARF unwind tables into eBPF maps for a process
     pub fn load_dwarf_unwind_tables(
         &mut self,
