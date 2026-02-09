@@ -73,10 +73,22 @@ The vendored `cargo-trace` already has some of this plumbing. The main work is w
 
 ## Integrations
 
-### flamelens
+### flamelens ✅ Integrated
 
-[flamelens](https://github.com/YS-L/flamelens) is an interactive TUI flamegraph viewer. Profile-bee's collapsed stack output is already compatible. Ideas:
+[flamelens](https://github.com/YS-L/flamelens) is now embedded as profile-bee's terminal UI viewer.
 
-- Pipe directly: `sudo profile-bee -p 1234 | flamelens`
-- Add a `--flamelens` flag that pipes output to flamelens automatically (if installed)
-- Explore embedding flamelens as an optional feature for an integrated TUI experience
+Usage:
+- **Static mode:** `profile-bee --tui --cmd "app" --time 5000`
+  - Profile runs, then shows interactive flamegraph in terminal
+- **Live mode:** `profile-bee --tui --stream-mode 1 --time 30000`
+  - Real-time flamegraph updates every 500ms
+  - Press `z` to freeze/unfreeze, `q` to exit
+- **Dual mode:** `profile-bee --tui --serve --stream-mode 1`
+  - TUI displays locally, web server at http://localhost:8000 for sharing
+
+Benefits:
+- No browser required for quick profiling sessions
+- All the power of interactive flamegraph navigation (zoom, search, filter)
+- Self-contained: single binary includes profiler + viewer
+- Can run both TUI and web server simultaneously
+

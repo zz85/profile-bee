@@ -113,11 +113,27 @@ struct Opt {
     /// Command and arguments to spawn and profile (use after `--`)
     #[arg(last = true)]
     command: Vec<String>,
+
+    /// Display interactive flamegraph in terminal (TUI mode).
+    /// Use with --stream-mode 1 for live updates.
+    /// Can be combined with --serve to run both TUI and web server.
+    #[arg(long)]
+    tui: bool,
 }
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
     let opt = Opt::parse();
+    
+    // Validate TUI mode requirements
+    if opt.tui {
+        use std::io::IsTerminal;
+        if !std::io::stderr().is_terminal() {
+            eprintln!("Warning: stderr is not a TTY. TUI mode may not work correctly.");
+            eprintln!("Hint: Redirect only stdout, not stderr: profile-bee --tui > output.log");
+        }
+    }
+    
     // Initialize the tracing subscriber with environment variables
     tracing_subscriber::fmt()
         // Use EnvFilter to read from RUST_LOG environment variable
@@ -238,34 +254,98 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let started = Instant::now();
 
-    loop {
-        // Process collected data
-        let stacks = process_profiling_data(
-            counts,
-            stack_traces,
-            &perf_rx,
-            &mut profiler,
-            opt.stream_mode,
-            opt.group_by_cpu,
-            stacked_pointers,
-            &mut ebpf_profiler.bpf,
-            &tgid_request_tx,
-        );
+    // Check if live TUI mode
+    let live_tui_mode = opt.tui && opt.stream_mode == EVENT_TRACE_ALWAYS;
 
-        // Generate and save output files
-        output_results(&opt, &stacks, &tx)?;
-
-        if !opt.serve {
-            // only loop with serve mode
-            break;
+    let final_stacks = if live_tui_mode {
+        // Live TUI mode - spawn flamelens in thread, feed it updates
+        let (flamegraph_tx, flamegraph_rx) = std::sync::mpsc::channel::<String>();
+        
+        // Spawn flamelens TUI in separate thread
+        let tui_handle = std::thread::spawn(move || {
+            if let Err(e) = flamelens::run_from_live_stream(
+                flamegraph_rx,
+                "profile-bee [live]",
+            ) {
+                eprintln!("TUI error: {:?}", e);
+            }
+        });
+        
+        loop {
+            // Process profiling data
+            let stacks = process_profiling_data(
+                counts,
+                stack_traces,
+                &perf_rx,
+                &mut profiler,
+                opt.stream_mode,
+                opt.group_by_cpu,
+                stacked_pointers,
+                &mut ebpf_profiler.bpf,
+                &tgid_request_tx,
+            );
+            
+            // Send to TUI thread (non-blocking)
+            let collapsed = stacks.join("\n");
+            if flamegraph_tx.send(collapsed.clone()).is_err() {
+                // TUI exited (user pressed 'q')
+                println!("TUI closed, stopping profiler");
+                drop(stopper);
+                drop(flamegraph_tx);
+                let _ = tui_handle.join();
+                break stacks;
+            }
+            
+            // Also output to other formats (web server, files)
+            output_results(&opt, &stacks, &tx)?;
+            
+            // Throttle updates (avoid overwhelming TUI)
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
-    }
+    } else {
+        // Normal mode (no live TUI)
+        let result = loop {
+            // Process collected data
+            let stacks = process_profiling_data(
+                counts,
+                stack_traces,
+                &perf_rx,
+                &mut profiler,
+                opt.stream_mode,
+                opt.group_by_cpu,
+                stacked_pointers,
+                &mut ebpf_profiler.bpf,
+                &tgid_request_tx,
+            );
 
-    drop(stopper);
+            // Generate and save output files
+            output_results(&opt, &stacks, &tx)?;
+
+            if !opt.serve {
+                // only loop with serve mode
+                break stacks;
+            }
+        };
+        
+        drop(stopper);
+        result
+    };
 
     println!("Profiler ran for {:?}", started.elapsed());
 
     profiler.print_stats();
+
+    // NEW: If TUI mode (static), show interactive flamegraph after profiling completes
+    if opt.tui && !live_tui_mode {
+        let collapsed_data = final_stacks.join("\n");
+        if let Err(e) = flamelens::run_from_collapsed_stacks(
+            collapsed_data,
+            "profile-bee",
+            false,
+        ) {
+            eprintln!("Failed to launch TUI: {:?}", e);
+        }
+    }
 
     Ok(())
 }

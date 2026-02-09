@@ -37,6 +37,7 @@ gimli = "0.31.1"
 object = "0.37.0"
 libc = "0.2.86"
 procmaps = "0.4.1"
+flamelens = { path = "../flamelens", default-features = false }
 
 [[bin]]
 name = "profile-bee"

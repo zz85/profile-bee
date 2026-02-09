@@ -17,7 +17,55 @@ More documentation in [docs](docs) directory.
 - A SVG flamegraph (generated with inferno) you can load in your browser
 - [Branden Gregg's](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html) Stack Collapsed [format](https://github.com/BrendanGregg/flamegraph#2-fold-stacks) that can be loaded up using [speedscope visualizer](https://www.speedscope.app/)
 - D3 flamegraph JSON and static HTML output
+- Interactive terminal UI (TUI) viewer powered by [flamelens](https://github.com/YS-L/flamelens)
 - Your own custom format
+
+### Viewing Options
+
+Profile-bee offers multiple ways to view profiling results:
+
+#### 1. Static Files
+Generate standard profiling output formats:
+```bash
+# SVG flamegraph (via inferno)
+profile-bee --svg profile.svg --cmd "my-app" --time 5000
+
+# Collapsed stacks (for speedscope.app)
+profile-bee --collapse profile.txt --time 5000
+
+# D3 flamegraph (HTML + JSON)
+profile-bee --html profile.html --json profile.json --time 5000
+```
+
+#### 2. Web Browser (Live Updates)
+Real-time flamegraph updates served via HTTP:
+```bash
+profile-bee --serve --stream-mode 1 --time 30000
+# Open http://localhost:8000 and click "realtime-updates"
+```
+
+#### 3. Terminal UI (Interactive)
+View flamegraph directly in your terminal:
+```bash
+# Static: View after profiling completes
+profile-bee --tui --cmd "my-app" --time 5000
+
+# Live: Watch flamegraph update in real-time
+profile-bee --tui --stream-mode 1 --time 30000
+
+# Combo: TUI + Web server (share with team while viewing locally)
+profile-bee --tui --serve --stream-mode 1 --time 30000
+```
+
+**TUI Controls:**
+- `hjkl` or arrow keys: Navigate flamegraph
+- `Enter`: Zoom into selected frame
+- `Esc`: Reset zoom to full view
+- `/regex`: Search and highlight matching frames
+- `#`: Highlight selected frame
+- `n` / `N`: Jump to next/previous match
+- `z`: Freeze/unfreeze updates (live mode)
+- `q`: Quit viewer
 
 ### Stack unwinding, Symbolization and Debug info
 
@@ -121,6 +169,7 @@ profile-bee --svg output.svg -- ./my-optimized-binary
 ### Features
 - **DWARF-based stack unwinding** (enabled by default) for profiling binaries without frame pointers
 - Frame pointer-based unwinding in eBPF for maximum performance
+- **Interactive terminal UI viewer** powered by flamelens - no browser required
 - Rust and C++ symbols demangling supported (via gimli/blazesym)
 - Some source mapping supported
 - Simple symbol lookup cache
@@ -131,7 +180,7 @@ profile-bee --svg output.svg -- ./my-optimized-binary
 - Profile target PIDs, CPU id, or itself
 - **Automatic termination** when target PID (via `--pid`) or spawned process (via `--cmd`) exits
 - Static d3 flamegraph JSON and/or HTML output
-- Real time flamegraphs served over integrated web server (using warp)
+- Real time flamegraphs (both terminal UI and web-based) with live updates
 
 ### Limitations
 - Linux only
