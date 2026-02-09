@@ -141,15 +141,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // profile_bee::load(&opt.cmd.unwrap()).unwrap();
     // return Ok(());
 
-    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
-
-    let pid = if let Some(cmd) = &spawn {
-        Some(cmd.pid())
-    } else {
-        opt.pid.clone()
-    };
-
-    // Create eBPF profiler configuration from command line options
+    // Create eBPF profiler configuration from command line options (without pid first)
     let config = ProfilerConfig {
         skip_idle: opt.skip_idle,
         stream_mode: opt.stream_mode,
@@ -157,14 +149,26 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         kprobe: opt.kprobe.clone(),
         uprobe: opt.uprobe.clone(),
         tracepoint: opt.tracepoint.clone(),
-        pid,
+        pid: opt.pid.clone(),
         cpu: opt.cpu,
         self_profile: opt.self_profile,
         dwarf: opt.dwarf,
     };
 
-    // Setup eBPF profiler
+    // Setup eBPF profiler first to ensure verification succeeds
+    let verification_start = std::time::Instant::now();
     let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
+    let verification_time = verification_start.elapsed();
+    println!("eBPF verification completed in {:?}", verification_time);
+
+    // Only spawn process after eBPF verification succeeds
+    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
+
+    let pid = if let Some(cmd) = &spawn {
+        Some(cmd.pid())
+    } else {
+        opt.pid.clone()
+    };
 
     // Take ownership of ring buffer map before partial borrows
     let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
