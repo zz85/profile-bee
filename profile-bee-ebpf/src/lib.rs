@@ -13,11 +13,9 @@ use aya_ebpf::{
 
 // use aya_log_ebpf::info;
 use profile_bee_common::{
-    FramePointers, StackInfo, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW,
-    UnwindEntry, ProcInfo, ProcInfoKey,
-    CFA_REG_RSP, CFA_REG_RBP, CFA_REG_PLT, CFA_REG_DEREF_RSP,
-    REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
-    MAX_DWARF_STACK_DEPTH, MAX_UNWIND_TABLE_SIZE, MAX_PROC_MAPS,
+    FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_PLT,
+    CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW, MAX_DWARF_STACK_DEPTH,
+    MAX_PROC_MAPS, MAX_UNWIND_TABLE_SIZE, REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -96,7 +94,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     }
 
     let tgid = ctx.tgid(); // thread group id
-    
+
     // Filter by target PID if specified
     let filter_pid = target_pid();
     if filter_pid != 0 && tgid != filter_pid {
@@ -169,7 +167,11 @@ const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
 /// DWARF-based stack unwinding using pre-loaded unwind tables
 #[inline(always)]
-unsafe fn dwarf_copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64], tgid: u32) -> (u64, u64, usize) {
+unsafe fn dwarf_copy_stack<C: EbpfContext>(
+    ctx: &C,
+    pointers: &mut [u64],
+    tgid: u32,
+) -> (u64, u64, usize) {
     let regs = ctx.as_ptr() as *const pt_regs;
     let regs = &*regs;
 
@@ -340,11 +342,15 @@ unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
     Some((ra, new_bp))
 }
 
-/// Max binary search iterations (covers 2^19 = 512K entries per mapping)
-const MAX_BIN_SEARCH_DEPTH: u32 = 19;
+/// Max binary search iterations (covers 2^16 = 65K entries per mapping)
+const MAX_BIN_SEARCH_DEPTH: u32 = 16;
 
 #[inline(always)]
-unsafe fn binary_search_unwind_entry(table_start: u32, table_count: u32, relative_pc: u32) -> Option<UnwindEntry> {
+unsafe fn binary_search_unwind_entry(
+    table_start: u32,
+    table_count: u32,
+    relative_pc: u32,
+) -> Option<UnwindEntry> {
     if table_count == 0 {
         return None;
     }
