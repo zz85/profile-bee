@@ -73,10 +73,29 @@ The vendored `cargo-trace` already has some of this plumbing. The main work is w
 
 ## Integrations
 
-### flamelens
+### flamelens ✅ IMPLEMENTED
 
-[flamelens](https://github.com/YS-L/flamelens) is an interactive TUI flamegraph viewer. Profile-bee's collapsed stack output is already compatible. Ideas:
+[flamelens](https://github.com/YS-L/flamelens) is an interactive TUI flamegraph viewer. Profile-bee now includes an embedded TUI viewer forked from flamelens.
 
-- Pipe directly: `sudo profile-bee -p 1234 | flamelens`
-- Add a `--flamelens` flag that pipes output to flamelens automatically (if installed)
-- Explore embedding flamelens as an optional feature for an integrated TUI experience
+**Implementation:**
+- Created `profile-bee-tui` workspace crate containing the forked flamelens code
+- Adapted to work with profile-bee's collapsed stack format
+- Removed Python-specific features, added support for live profiling updates
+- Integrated with `--tui` flag (requires `tui` feature)
+- Supports real-time flamegraph updates during profiling
+- Freeze/unfreeze capability with 'z' key
+
+**Usage:**
+```bash
+# Build with TUI support
+cargo build --release --features tui
+
+# Use the TUI viewer
+sudo ./target/release/profile-bee --tui --cmd "your-command"
+sudo ./target/release/profile-bee --tui --pid <pid> --time 30000
+```
+
+**Original ideas (archived):**
+- ~~Pipe directly: `sudo profile-bee -p 1234 | flamelens`~~
+- ~~Add a `--flamelens` flag that pipes output to flamelens automatically (if installed)~~
+- ~~Explore embedding flamelens as an optional feature for an integrated TUI experience~~
