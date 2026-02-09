@@ -83,7 +83,7 @@ struct Opt {
     group_by_cpu: bool,
 
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     dwarf: bool,
 
     /// PID to profile
