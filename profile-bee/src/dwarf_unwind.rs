@@ -13,8 +13,8 @@ use object::{Object, ObjectSection};
 use procfs::process::{MMapPath, Process};
 use profile_bee_common::{
     ExecMapping, ProcInfo, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_PLT,
-    CFA_REG_RBP, CFA_REG_RSP, MAX_PROC_MAPS, MAX_UNWIND_TABLES, MAX_UNWIND_TABLE_SIZE,
-    REG_RULE_OFFSET, REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED,
+    CFA_REG_RBP, CFA_REG_RSP, MAX_PROC_MAPS, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET,
+    REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED, SHARD_NONE,
 };
 
 /// Build ID for uniquely identifying ELF binaries
@@ -325,17 +325,17 @@ pub fn generate_unwind_table_from_bytes(
 
 /// Holds the unwind tables for all currently profiled processes
 pub struct DwarfUnwindManager {
-    /// Per-binary unwind tables: map from table_id to the entries
-    pub binary_tables: HashMap<u32, Vec<UnwindEntry>>,
+    /// Per-binary unwind tables: map from shard_id to the entries
+    pub binary_tables: HashMap<u8, Vec<UnwindEntry>>,
     /// Per-process mapping information
     pub proc_info: HashMap<u32, ProcInfo>,
-    /// Next table_id to assign to a new binary
-    next_table_id: u32,
-    /// Cache of parsed ELF binary unwind table IDs, keyed by build ID
+    /// Next shard_id to assign to a new binary
+    next_shard_id: u8,
+    /// Cache of parsed ELF binary shard IDs, keyed by build ID
     /// Falls back to path-based caching for binaries without build IDs
-    binary_cache: HashMap<BuildId, u32>, // build_id -> table_id
+    binary_cache: HashMap<BuildId, u8>, // build_id -> shard_id
     /// Fallback cache for binaries without build IDs (keyed by path)
-    path_cache: HashMap<std::path::PathBuf, u32>, // path -> table_id
+    path_cache: HashMap<std::path::PathBuf, u8>, // path -> shard_id
 }
 
 impl DwarfUnwindManager {
@@ -343,7 +343,7 @@ impl DwarfUnwindManager {
         Self {
             binary_tables: HashMap::new(),
             proc_info: HashMap::new(),
-            next_table_id: 0,
+            next_shard_id: 0,
             binary_cache: HashMap::new(),
             path_cache: HashMap::new(),
         }
@@ -359,17 +359,17 @@ impl DwarfUnwindManager {
     }
 
     /// Rescan a process's memory mappings and load any new ones.
-    /// Returns the list of new table IDs added (for incremental eBPF updates).
-    pub fn refresh_process(&mut self, tgid: u32) -> Result<Vec<u32>, String> {
-        let old_table_ids: Vec<u32> = self.binary_tables.keys().copied().collect();
+    /// Returns the list of new shard IDs added (for incremental eBPF updates).
+    pub fn refresh_process(&mut self, tgid: u32) -> Result<Vec<u8>, String> {
+        let old_shard_ids: Vec<u8> = self.binary_tables.keys().copied().collect();
         self.scan_and_update(tgid)?;
-        let new_table_ids: Vec<u32> = self
+        let new_shard_ids: Vec<u8> = self
             .binary_tables
             .keys()
             .copied()
-            .filter(|id| !old_table_ids.contains(id))
+            .filter(|id| !old_shard_ids.contains(id))
             .collect();
-        Ok(new_table_ids)
+        Ok(new_shard_ids)
     }
 
     fn scan_and_update(&mut self, tgid: u32) -> Result<(), String> {
@@ -397,7 +397,8 @@ impl DwarfUnwindManager {
                 begin: 0,
                 end: 0,
                 load_bias: 0,
-                table_id: 0,
+                shard_id: SHARD_NONE,
+                _pad1: [0; 3],
                 table_count: 0,
             }; MAX_PROC_MAPS],
         });
@@ -453,7 +454,7 @@ impl DwarfUnwindManager {
             let load_bias = start_addr.wrapping_sub(file_offset);
 
             // Try to get cached unwind table, preferring build-ID based lookup
-            let (table_id, table_count) = {
+            let (shard_id, table_count) = {
                 // First, try to get the binary data to extract build ID
                 let binary_data = if is_vdso {
                     read_vdso(tgid, start_addr, end_addr).ok()
@@ -473,14 +474,14 @@ impl DwarfUnwindManager {
                     None
                 };
 
-                if let Some(tid) = cache_hit {
-                    // Get the table count from the cached table
+                if let Some(sid) = cache_hit {
+                    // Get the table count from the cached shard
                     let tc = self
                         .binary_tables
-                        .get(&tid)
+                        .get(&sid)
                         .map(|t| t.len() as u32)
                         .unwrap_or(0);
-                    (tid, tc)
+                    (sid, tc)
                 } else {
                     // Cache miss - need to parse the binary
                     let (unwind_entries, build_id_opt) = if let Some(data) = binary_data {
@@ -527,36 +528,37 @@ impl DwarfUnwindManager {
                         }
                     };
 
-                    if tc > MAX_UNWIND_TABLE_SIZE {
+                    if tc > MAX_SHARD_ENTRIES {
                         tracing::warn!(
-                            "Binary unwind table too large: {} entries (max {}), skipping",
+                            "Binary unwind table too large: {} entries (max {} per shard), skipping",
                             tc,
-                            MAX_UNWIND_TABLE_SIZE,
+                            MAX_SHARD_ENTRIES,
                         );
                         continue;
                     }
 
-                    if self.next_table_id >= MAX_UNWIND_TABLES {
+                    if self.next_shard_id as usize >= MAX_UNWIND_SHARDS {
                         tracing::warn!(
-                            "Maximum number of unwind tables reached ({}/{}), skipping remaining binaries for pid {}",
-                            self.next_table_id, MAX_UNWIND_TABLES, tgid,
+                            "All {} shard slots used, skipping remaining binaries for pid {}",
+                            MAX_UNWIND_SHARDS,
+                            tgid,
                         );
                         break;
                     }
 
-                    let tid = self.next_table_id;
-                    self.next_table_id += 1;
+                    let sid = self.next_shard_id;
+                    self.next_shard_id += 1;
 
-                    self.binary_tables.insert(tid, unwind_entries);
+                    self.binary_tables.insert(sid, unwind_entries);
 
                     // Cache using build ID if available, otherwise use path
                     if let Some(build_id) = build_id_opt {
-                        self.binary_cache.insert(build_id, tid);
+                        self.binary_cache.insert(build_id, sid);
                     } else {
-                        self.path_cache.insert(resolved_path.clone(), tid);
+                        self.path_cache.insert(resolved_path.clone(), sid);
                     }
 
-                    (tid, tc)
+                    (sid, tc)
                 }
             };
 
@@ -565,7 +567,8 @@ impl DwarfUnwindManager {
                 begin: start_addr,
                 end: end_addr,
                 load_bias,
-                table_id,
+                shard_id,
+                _pad1: [0; 3],
                 table_count,
             };
             proc_info.mapping_count += 1;
@@ -739,8 +742,8 @@ mod tests {
 
         let initial_cache_size = manager.binary_cache.len() + manager.path_cache.len();
         let initial_table_size = manager.total_entries();
-        let initial_cache_size = manager.binary_cache.len() + manager.path_cache.len();
 
+        assert!(initial_cache_size > 0, "Expected some cached binaries");
         assert!(initial_table_size > 0, "Expected non-empty unwind table");
 
         // In a real scenario with multiple processes sharing libraries,

@@ -9,7 +9,7 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 
 use aya::Pod;
-use profile_bee_common::{ProcInfo, ProcInfoKey, UnwindEntry, UnwindTableKey};
+use profile_bee_common::{ProcInfo, ProcInfoKey, UnwindEntry};
 
 // Create a newtype wrapper around StackInfo
 #[repr(transparent)]
@@ -26,11 +26,6 @@ unsafe impl Pod for FramePointersPod {}
 #[derive(Debug, Clone, Copy)]
 pub struct UnwindEntryPod(pub UnwindEntry);
 unsafe impl Pod for UnwindEntryPod {}
-
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
-pub struct UnwindTableKeyPod(pub UnwindTableKey);
-unsafe impl Pod for UnwindTableKeyPod {}
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
@@ -231,49 +226,46 @@ impl EbpfProfiler {
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
     ) -> Result<(), anyhow::Error> {
-        // Load all tables
-        let all_table_ids: Vec<u32> = manager.binary_tables.keys().copied().collect();
-        self.update_dwarf_tables(manager, &all_table_ids)
+        // Load all shards
+        let all_shard_ids: Vec<u8> = manager.binary_tables.keys().copied().collect();
+        self.update_dwarf_tables(manager, &all_shard_ids)
     }
 
-    /// Incrementally update eBPF maps with new unwind table entries for the given table IDs,
+    /// Load a single shard's unwind entries into its eBPF Array map.
+    fn load_shard(&mut self, shard_id: u8, entries: &[UnwindEntry]) -> Result<(), anyhow::Error> {
+        let map_name = format!("shard_{}", shard_id);
+        let mut arr: Array<&mut MapData, UnwindEntryPod> = Array::try_from(
+            self.bpf
+                .map_mut(&map_name)
+                .ok_or_else(|| anyhow!("{} map not found", map_name))?,
+        )?;
+        for (idx, entry) in entries.iter().enumerate() {
+            arr.set(idx as u32, UnwindEntryPod(*entry), 0)?;
+        }
+        Ok(())
+    }
+
+    /// Incrementally update eBPF maps with new unwind shard entries,
     /// and refresh all proc_info entries.
     pub fn update_dwarf_tables(
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
-        new_table_ids: &[u32],
+        new_shard_ids: &[u8],
     ) -> Result<(), anyhow::Error> {
-        if !new_table_ids.is_empty() {
-            let mut unwind_tables: HashMap<&mut MapData, UnwindTableKeyPod, UnwindEntryPod> =
-                HashMap::try_from(
-                    self.bpf
-                        .map_mut("unwind_tables")
-                        .ok_or(anyhow!("unwind_tables map not found"))?,
-                )?;
-
-            let mut total_entries = 0;
-            for &table_id in new_table_ids {
-                if let Some(entries) = manager.binary_tables.get(&table_id) {
-                    for (index, entry) in entries.iter().enumerate() {
-                        let key = UnwindTableKeyPod(UnwindTableKey {
-                            table_id,
-                            index: index as u32,
-                        });
-                        unwind_tables.insert(key, UnwindEntryPod(*entry), 0)?;
-                        total_entries += 1;
-                    }
-                    tracing::info!(
-                        "Loaded unwind table {} with {} entries",
-                        table_id,
-                        entries.len()
-                    );
+        if !new_shard_ids.is_empty() {
+            let mut total_entries = 0usize;
+            for &shard_id in new_shard_ids {
+                if let Some(entries) = manager.binary_tables.get(&shard_id) {
+                    self.load_shard(shard_id, entries)?;
+                    total_entries += entries.len();
+                    tracing::info!("Loaded shard {} with {} entries", shard_id, entries.len());
                 }
             }
 
             tracing::info!(
-                "Loaded {} total unwind table entries across {} tables",
+                "Loaded {} total unwind entries across {} shards",
                 total_entries,
-                new_table_ids.len()
+                new_shard_ids.len()
             );
         }
 

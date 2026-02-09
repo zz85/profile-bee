@@ -13,9 +13,9 @@ use aya_ebpf::{
 
 // use aya_log_ebpf::info;
 use profile_bee_common::{
-    FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry, UnwindTableKey,
-    CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
-    MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
+    FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_PLT,
+    CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS, MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS,
+    MAX_SHARD_ENTRIES, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -78,13 +78,24 @@ static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
 #[map(name = "stack_traces")]
 pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
 
-// DWARF unwind maps
+// DWARF unwind maps — sharded per-binary Array tables
 
-/// Sharded unwind tables: HashMap mapping (table_id, index) to UnwindEntry
-/// Each binary gets its own table_id, removing the global 500K limit
-#[map(name = "unwind_tables")]
-pub static UNWIND_TABLES: HashMap<UnwindTableKey, UnwindEntry> =
-    HashMap::with_max_entries(500_000, 0);
+#[map(name = "shard_0")]
+pub static SHARD_0: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_1")]
+pub static SHARD_1: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_2")]
+pub static SHARD_2: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_3")]
+pub static SHARD_3: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_4")]
+pub static SHARD_4: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_5")]
+pub static SHARD_5: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_6")]
+pub static SHARD_6: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_7")]
+pub static SHARD_7: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
 
 /// Per-process unwind info: maps tgid to ProcInfo (exec mappings)
 #[map(name = "proc_info")]
@@ -213,7 +224,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
 
         // Find the mapping that contains current_ip
         let mut found_mapping = false;
-        let mut table_id: u32 = 0;
+        let mut shard_id: u8 = SHARD_NONE;
         let mut table_count: u32 = 0;
         let mut load_bias: u64 = 0;
 
@@ -223,7 +234,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
             }
             let mapping = &proc_info.mappings[m];
             if current_ip >= mapping.begin && current_ip < mapping.end {
-                table_id = mapping.table_id;
+                shard_id = mapping.shard_id;
                 table_count = mapping.table_count;
                 load_bias = mapping.load_bias;
                 found_mapping = true;
@@ -231,7 +242,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
             }
         }
 
-        if !found_mapping || table_count == 0 {
+        if !found_mapping || table_count == 0 || shard_id == SHARD_NONE {
             // No DWARF info — try FP-based step as fallback
             if let Some((ra, nbp)) = try_fp_step(bp) {
                 pointers[i] = ra;
@@ -249,7 +260,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
         let relative_pc = (current_ip - load_bias) as u32;
 
         // Binary search for the unwind entry covering this PC
-        let entry = match binary_search_unwind_entry(table_id, table_count, relative_pc) {
+        let entry = match binary_search_unwind_entry(shard_id, table_count, relative_pc) {
             Some(e) => e,
             None => {
                 // No unwind entry — try FP-based step as fallback
@@ -348,12 +359,29 @@ unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
     Some((ra, new_bp))
 }
 
-/// Max binary search iterations (covers 2^19 = 524K entries per binary)
-const MAX_BIN_SEARCH_DEPTH: u32 = 19;
+/// Dispatch to the correct shard Array by shard_id.
+/// This is an 8-way static match — the verifier sees constant branches, no loop.
+#[inline(always)]
+unsafe fn shard_lookup(shard_id: u8, idx: u32) -> Option<UnwindEntry> {
+    match shard_id {
+        0 => SHARD_0.get(idx).copied(),
+        1 => SHARD_1.get(idx).copied(),
+        2 => SHARD_2.get(idx).copied(),
+        3 => SHARD_3.get(idx).copied(),
+        4 => SHARD_4.get(idx).copied(),
+        5 => SHARD_5.get(idx).copied(),
+        6 => SHARD_6.get(idx).copied(),
+        7 => SHARD_7.get(idx).copied(),
+        _ => None,
+    }
+}
+
+/// Max binary search iterations (covers 2^16 = 65K entries = MAX_SHARD_ENTRIES)
+const MAX_BIN_SEARCH_DEPTH: u32 = 16;
 
 #[inline(always)]
 unsafe fn binary_search_unwind_entry(
-    table_id: u32,
+    shard_id: u8,
     table_count: u32,
     relative_pc: u32,
 ) -> Option<UnwindEntry> {
@@ -369,12 +397,8 @@ unsafe fn binary_search_unwind_entry(
             break;
         }
         let mid = lo + (hi - lo) / 2;
-        let key = UnwindTableKey {
-            table_id,
-            index: mid,
-        };
 
-        let entry = match UNWIND_TABLES.get(&key) {
+        let entry = match shard_lookup(shard_id, mid) {
             Some(e) => e,
             None => return None,
         };
@@ -390,11 +414,7 @@ unsafe fn binary_search_unwind_entry(
         return None;
     }
 
-    let result_key = UnwindTableKey {
-        table_id,
-        index: lo - 1,
-    };
-    UNWIND_TABLES.get(&result_key).copied()
+    shard_lookup(shard_id, lo - 1)
 }
 
 /// puts the userspace stack in the target pointer slice

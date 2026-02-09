@@ -12,7 +12,7 @@ fn test_both_parsers_handle_self_binary() {
     let exe = std::env::current_exe().unwrap();
 
     // dwarf_unwind.rs parser (for eBPF)
-    let entries = generate_unwind_table(&exe).unwrap();
+    let (entries, _build_id) = generate_unwind_table(&exe).unwrap();
     assert!(!entries.is_empty(), "dwarf_unwind should produce entries");
 
     // Entries should be sorted by PC
@@ -36,7 +36,7 @@ fn test_dwarf_manager_loads_current_process() {
     let mut manager = DwarfUnwindManager::new();
     manager.load_process(pid).unwrap();
 
-    assert!(manager.table_size() > 0, "Should have unwind entries");
+    assert!(manager.total_entries() > 0, "Should have unwind entries");
     assert!(
         manager.proc_info.contains_key(&pid),
         "Should have proc_info for current PID"
@@ -79,7 +79,7 @@ fn test_libc_has_unwind_info() {
         return;
     };
 
-    let entries = generate_unwind_table(Path::new(path)).unwrap();
+    let (entries, _build_id) = generate_unwind_table(Path::new(path)).unwrap();
     assert!(
         entries.len() > 100,
         "libc should have many unwind entries, got {}",
@@ -92,16 +92,24 @@ fn dump_callstack_no_fp_entries() {
     use profile_bee::dwarf_unwind::generate_unwind_table;
     use std::path::Path;
     // Try both relative paths (depends on cargo test working dir)
-    let candidates = ["tests/fixtures/bin/callstack-no-fp", "../tests/fixtures/bin/callstack-no-fp"];
+    let candidates = [
+        "tests/fixtures/bin/callstack-no-fp",
+        "../tests/fixtures/bin/callstack-no-fp",
+    ];
     let p = candidates.iter().map(Path::new).find(|p| p.exists());
-    let Some(p) = p else { eprintln!("callstack-no-fp not found, skipping"); return; };
-    let entries = generate_unwind_table(p).unwrap();
+    let Some(p) = p else {
+        eprintln!("callstack-no-fp not found, skipping");
+        return;
+    };
+    let (entries, _build_id) = generate_unwind_table(p).unwrap();
     eprintln!("Total entries: {}", entries.len());
     // hot=0x400527, function_c=0x400534, function_b=0x40053b, function_a=0x400542, main=0x400549
     for e in &entries {
         if e.pc >= 0x500 && e.pc <= 0x700 {
-            eprintln!("pc={:#010x} cfa_type={} cfa_off={:4} rbp_type={} rbp_off={:4}",
-                e.pc, e.cfa_type, e.cfa_offset, e.rbp_type, e.rbp_offset);
+            eprintln!(
+                "pc={:#010x} cfa_type={} cfa_off={:4} rbp_type={} rbp_off={:4}",
+                e.pc, e.cfa_type, e.cfa_offset, e.rbp_type, e.rbp_offset
+            );
         }
     }
 }

@@ -93,18 +93,15 @@ impl UnwindEntry {
     pub const STRUCT_SIZE: usize = size_of::<UnwindEntry>();
 }
 
-pub const MAX_DWARF_STACK_DEPTH: usize = 32;
-pub const MAX_UNWIND_TABLE_SIZE: u32 = 500_000; // Per-binary table size (was global limit)
-pub const MAX_PROC_MAPS: usize = 16;
-pub const MAX_UNWIND_TABLES: u32 = 64; // Maximum number of unique binaries
+pub const MAX_DWARF_STACK_DEPTH: usize = 12;
+pub const MAX_PROC_MAPS: usize = 8;
 
-/// Key for sharded unwind table lookups
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-#[repr(C)]
-pub struct UnwindTableKey {
-    pub table_id: u32,
-    pub index: u32,
-}
+/// Number of per-binary Array shard maps in eBPF (shard_0 .. shard_7)
+pub const MAX_UNWIND_SHARDS: usize = 8;
+/// Maximum unwind entries per shard (2^16, covered by 16 binary search iterations)
+pub const MAX_SHARD_ENTRIES: u32 = 65_536;
+/// Sentinel value: no shard assigned to this mapping
+pub const SHARD_NONE: u8 = 0xFF;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(C)]
@@ -119,8 +116,9 @@ pub struct ExecMapping {
     pub begin: u64,
     pub end: u64,
     pub load_bias: u64,
-    pub table_id: u32, // ID of the unwind table for this mapping
-    pub table_count: u32,
+    pub shard_id: u8, // Which shard Array to search (0..MAX_UNWIND_SHARDS-1, or SHARD_NONE)
+    pub _pad1: [u8; 3],
+    pub table_count: u32, // Number of entries in this shard for this binary
 }
 
 #[derive(Copy, Clone, Debug)]
