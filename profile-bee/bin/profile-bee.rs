@@ -342,9 +342,15 @@ fn setup_stopping_mechanisms(
     // - 4. target PID exits (when profiling with --pid)
 
     // Timer-based stopping
+    // Clone the stopping handler so that when the timer expires,
+    // it will signal the spawned process to be killed
     let time_stop_tx = perf_tx.clone();
+    let time_stopping = stopping.clone();
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
+        // Drop the stopping handler to send kill signal to spawned process
+        drop(time_stopping);
+        // Also send Stop message to exit the profiling loop
         time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
     });
 
