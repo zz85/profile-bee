@@ -74,11 +74,13 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
 
     let skip_idle = if config.skip_idle { 1u8 } else { 0u8 };
     let dwarf_enabled = if config.dwarf { 1u8 } else { 0u8 };
+    let target_pid = config.pid.unwrap_or(0);
 
     let bpf = EbpfLoader::new()
         .set_global("SKIP_IDLE", &skip_idle, true)
         .set_global("NOTIFY_TYPE", &config.stream_mode, true)
         .set_global("DWARF_ENABLED", &dwarf_enabled, true)
+        .set_global("TARGET_PID", &target_pid, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {
@@ -132,22 +134,31 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
                 SamplePolicy::Frequency(config.frequency),
                 true,
             )?;
-        } else if let Some(pid) = config.pid {
-            program.attach(
-                perf_type,
-                PERF_COUNT_SW_CPU_CLOCK,
-                PerfEventScope::OneProcessAnyCpu { pid },
-                SamplePolicy::Frequency(config.frequency),
-                true,
-            )?;
-        } else if let Some(cpu) = config.cpu {
-            program.attach(
-                perf_type,
-                PERF_COUNT_SW_CPU_CLOCK,
-                PerfEventScope::AllProcessesOneCpu { cpu },
-                SamplePolicy::Frequency(config.frequency),
-                true,
-            )?;
+        } else if config.pid.is_some() || config.cpu.is_some() {
+            // When filtering by PID or CPU, attach to all/specific CPUs
+            // and let eBPF filter by tgid. This allows profiling child processes.
+            let cpus = if let Some(cpu) = config.cpu {
+                vec![cpu]
+            } else {
+                online_cpus().map_err(|(_, error)| error)?
+            };
+            
+            let nprocs = cpus.len();
+            if let Some(pid) = config.pid {
+                eprintln!("Profiling PID {} and child processes across {} CPUs", pid, nprocs);
+            } else if let Some(cpu) = config.cpu {
+                eprintln!("Profiling CPU {}", cpu);
+            }
+
+            for cpu in cpus {
+                program.attach(
+                    perf_type.clone(),
+                    PERF_COUNT_SW_CPU_CLOCK,
+                    PerfEventScope::AllProcessesOneCpu { cpu },
+                    SamplePolicy::Frequency(config.frequency),
+                    true,
+                )?;
+            }
         } else {
             let cpus = online_cpus().map_err(|(_, error)| error)?;
             let nprocs = cpus.len();

@@ -34,6 +34,10 @@ static NOTIFY_TYPE: u8 = EVENT_TRACE_ALWAYS;
 #[no_mangle]
 static DWARF_ENABLED: u8 = 0;
 
+/// Target PID to profile (0 = profile all processes)
+#[no_mangle]
+static TARGET_PID: u32 = 0;
+
 #[inline]
 unsafe fn skip_idle() -> bool {
     let skip = core::ptr::read_volatile(&SKIP_IDLE);
@@ -48,6 +52,11 @@ unsafe fn notify_type() -> u8 {
 unsafe fn dwarf_enabled() -> bool {
     let enabled = core::ptr::read_volatile(&DWARF_ENABLED);
     enabled > 0
+}
+
+#[inline]
+unsafe fn target_pid() -> u32 {
+    core::ptr::read_volatile(&TARGET_PID)
 }
 
 /* Setup maps */
@@ -86,8 +95,14 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         return;
     }
 
-    let cmd = ctx.command().unwrap_or_default();
     let tgid = ctx.tgid(); // thread group id
+    
+    // Filter by target PID if specified
+    let filter_pid = target_pid();
+    if filter_pid != 0 && tgid != filter_pid {
+        return;
+    }
+
     let cpu = bpf_get_smp_processor_id();
     let user_stack_id = STACK_TRACES
         .get_stackid(&ctx, BPF_F_USER_STACK.into())
@@ -112,6 +127,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     };
     pointer.len = len;
 
+    let cmd = ctx.command().unwrap_or_default();
     let stack_info = StackInfo {
         tgid,
         user_stack_id,

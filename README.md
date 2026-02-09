@@ -48,7 +48,7 @@ This is the same approach used by [parca-agent](https://github.com/parca-dev/par
 
 ```bash
 # Profile a no-frame-pointer binary with DWARF unwinding
-profile-bee --dwarf --cmd "./my-optimized-binary" --svg output.svg --time 5000
+profile-bee --dwarf --svg output.svg --time 5000 -- ./my-optimized-binary
 
 # Without --dwarf, the same binary would produce shallow/incomplete stacks
 ```
@@ -71,9 +71,12 @@ For more information on DWARF-based profiling, see:
 
 ### Usage
 
-```
+```bash
 # Profile a command (runs top for 5 seconds), writing flamegraph to test.svg
-profile-bee --svg test.svg --cmd "top -b -n 5 -d 1"
+profile-bee --svg test.svg -- top -b -n 5 -d 1
+
+# Profile a command with multiple arguments
+profile-bee --svg test.svg -- ls -la /tmp
 
 # Profile system wide for 5s, generating a html flamegraph
 profile-bee --time 5000 --html flamegraphs.html
@@ -82,7 +85,8 @@ profile-bee --time 5000 --html flamegraphs.html
 profile-bee --svg profile.svg --frequency 9999 --time 2000
 
 # Realtime flamegraphs
-profile-bee --time 5000 --serve --skip-idle --stream-mode 1 # Goto http://localhost:8000/ and click "realtime-updates"
+profile-bee --time 5000 --serve --skip-idle --stream-mode 1
+# Then goto http://localhost:8000/ and click "realtime-updates"
 
 # Same as above, grouped by CPU ids
 profile-bee --svg profile.svg --frequency 9999 --time 2000 --group-by-cpu
@@ -102,11 +106,14 @@ profile-bee --kprobe vfs_write --time 200 --svg kprobe.svg
 # Profile using a tracepoint over a interval of 200ms
 profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 
-# Profile specific pid (automatically stops when the process exits)
+# Profile specific pid (includes child processes, automatically stops when process exits)
 profile-bee --pid <pid> --svg output.svg --time 10000
 
 # Profile specific cpu
 profile-bee --cpu 0 --svg output.svg --time 5000
+
+# Profile a command with DWARF unwinding (for binaries without frame pointers)
+profile-bee --dwarf --svg output.svg -- ./my-optimized-binary
 
 ```
 
