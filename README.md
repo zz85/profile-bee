@@ -30,27 +30,29 @@ Both methods run the actual stack walking in eBPF (kernel space) for performance
 
 #### Frame Pointer Method
 
-The default. The kernel's `bpf_get_stackid` walks the frame pointer chain. Works out of the box for binaries compiled with frame pointers:
+Uses the kernel's `bpf_get_stackid` to walk the frame pointer chain. Works out of the box for binaries compiled with frame pointers:
 - Rust: `RUSTFLAGS="-Cforce-frame-pointers=yes"`
 - C/C++: `-fno-omit-frame-pointer` flag
 
-#### DWARF Method
+#### DWARF Method (default)
 
-Enabled with `--dwarf`. Handles binaries compiled without frame pointers (the default for most `-O2`/`-O3` builds).
+Enabled by default. Handles binaries compiled without frame pointers (the default for most `-O2`/`-O3` builds). Use `--dwarf=false` to disable and fall back to frame pointer unwinding.
 
 **How it works:**
 1. At startup, userspace parses `/proc/[pid]/maps` and `.eh_frame` sections from each executable mapping
 2. Pre-evaluates DWARF CFI rules into a flat `UnwindEntry` table (PC → CFA rule + RA rule)
 3. Loads the table into eBPF maps before profiling begins
 4. At sample time, the eBPF program binary-searches the table and walks the stack using CFA computation + `bpf_probe_read_user`
+5. A background thread polls for newly loaded libraries (e.g. via `dlopen`) and updates the unwind tables at runtime
 
 This is the same approach used by [parca-agent](https://github.com/parca-dev/parca-agent) and other production eBPF profilers.
 
 ```bash
-# Profile a no-frame-pointer binary with DWARF unwinding
-profile-bee --dwarf --svg output.svg --time 5000 -- ./my-optimized-binary
+# Profile a no-frame-pointer binary (DWARF unwinding is on by default)
+profile-bee --svg output.svg --time 5000 -- ./my-optimized-binary
 
-# Without --dwarf, the same binary would produce shallow/incomplete stacks
+# Disable DWARF unwinding to use frame pointers only
+profile-bee --dwarf=false --svg output.svg --time 5000 -- ./my-fp-binary
 ```
 
 See `docs/dwarf_unwinding_design.md` for architecture details.
@@ -112,12 +114,12 @@ profile-bee --pid <pid> --svg output.svg --time 10000
 profile-bee --cpu 0 --svg output.svg --time 5000
 
 # Profile a command with DWARF unwinding (for binaries without frame pointers)
-profile-bee --dwarf --svg output.svg -- ./my-optimized-binary
+profile-bee --svg output.svg -- ./my-optimized-binary
 
 ```
 
 ### Features
-- **DWARF-based stack unwinding** for profiling binaries without frame pointers
+- **DWARF-based stack unwinding** (enabled by default) for profiling binaries without frame pointers
 - Frame pointer-based unwinding in eBPF for maximum performance
 - Rust and C++ symbols demangling supported (via gimli/blazesym)
 - Some source mapping supported
@@ -134,6 +136,7 @@ profile-bee --dwarf --svg output.svg -- ./my-optimized-binary
 ### Limitations
 - Linux only
 - DWARF unwinding: max 16 mappings per process / 500K total entries / 32 frames
+- Libraries loaded via dlopen are detected within ~1 second
 - Interpreted / JIT stacktraces not yet supported
 - [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) `.eh_frame` parsed for DWARF unwinding; VDSO symbolization not yet supported
 
