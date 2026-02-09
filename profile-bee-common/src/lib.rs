@@ -93,9 +93,18 @@ impl UnwindEntry {
     pub const STRUCT_SIZE: usize = size_of::<UnwindEntry>();
 }
 
-pub const MAX_DWARF_STACK_DEPTH: usize = 4;
-pub const MAX_UNWIND_TABLE_SIZE: u32 = 500_000;
-pub const MAX_PROC_MAPS: usize = 8;
+pub const MAX_DWARF_STACK_DEPTH: usize = 32;
+pub const MAX_UNWIND_TABLE_SIZE: u32 = 500_000; // Per-binary table size (was global limit)
+pub const MAX_PROC_MAPS: usize = 16;
+pub const MAX_UNWIND_TABLES: u32 = 64; // Maximum number of unique binaries
+
+/// Key for sharded unwind table lookups
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[repr(C)]
+pub struct UnwindTableKey {
+    pub table_id: u32,
+    pub index: u32,
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(C)]
@@ -110,7 +119,7 @@ pub struct ExecMapping {
     pub begin: u64,
     pub end: u64,
     pub load_bias: u64,
-    pub table_start: u32,
+    pub table_id: u32, // ID of the unwind table for this mapping
     pub table_count: u32,
 }
 

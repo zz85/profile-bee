@@ -7,15 +7,15 @@ use aya_ebpf::{
     bindings::{pt_regs, BPF_F_USER_STACK},
     helpers::{bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_user},
     macros::map,
-    maps::{Array, HashMap, PerCpuArray, RingBuf, StackTrace},
+    maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
     EbpfContext,
 };
 
 // use aya_log_ebpf::info;
 use profile_bee_common::{
-    FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_PLT,
-    CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS, EVENT_TRACE_NEW, MAX_DWARF_STACK_DEPTH,
-    MAX_PROC_MAPS, MAX_UNWIND_TABLE_SIZE, REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
+    FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry, UnwindTableKey,
+    CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
+    MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -76,9 +76,11 @@ pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0
 
 // DWARF unwind maps
 
-/// Global unwind table: array of UnwindEntry indexed by position
-#[map(name = "unwind_table")]
-pub static UNWIND_TABLE: Array<UnwindEntry> = Array::with_max_entries(MAX_UNWIND_TABLE_SIZE, 0);
+/// Sharded unwind tables: HashMap mapping (table_id, index) to UnwindEntry
+/// Each binary gets its own table_id, removing the global 500K limit
+#[map(name = "unwind_tables")]
+pub static UNWIND_TABLES: HashMap<UnwindTableKey, UnwindEntry> =
+    HashMap::with_max_entries(500_000, 0);
 
 /// Per-process unwind info: maps tgid to ProcInfo (exec mappings)
 #[map(name = "proc_info")]
@@ -207,7 +209,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
 
         // Find the mapping that contains current_ip
         let mut found_mapping = false;
-        let mut table_start: u32 = 0;
+        let mut table_id: u32 = 0;
         let mut table_count: u32 = 0;
         let mut load_bias: u64 = 0;
 
@@ -217,7 +219,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
             }
             let mapping = &proc_info.mappings[m];
             if current_ip >= mapping.begin && current_ip < mapping.end {
-                table_start = mapping.table_start;
+                table_id = mapping.table_id;
                 table_count = mapping.table_count;
                 load_bias = mapping.load_bias;
                 found_mapping = true;
@@ -243,7 +245,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
         let relative_pc = (current_ip - load_bias) as u32;
 
         // Binary search for the unwind entry covering this PC
-        let entry = match binary_search_unwind_entry(table_start, table_count, relative_pc) {
+        let entry = match binary_search_unwind_entry(table_id, table_count, relative_pc) {
             Some(e) => e,
             None => {
                 // No unwind entry — try FP-based step as fallback
@@ -342,12 +344,12 @@ unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
     Some((ra, new_bp))
 }
 
-/// Max binary search iterations (covers 2^16 = 65K entries per mapping)
-const MAX_BIN_SEARCH_DEPTH: u32 = 16;
+/// Max binary search iterations (covers 2^19 = 524K entries per binary)
+const MAX_BIN_SEARCH_DEPTH: u32 = 19;
 
 #[inline(always)]
 unsafe fn binary_search_unwind_entry(
-    table_start: u32,
+    table_id: u32,
     table_count: u32,
     relative_pc: u32,
 ) -> Option<UnwindEntry> {
@@ -363,9 +365,12 @@ unsafe fn binary_search_unwind_entry(
             break;
         }
         let mid = lo + (hi - lo) / 2;
-        let idx = table_start + mid;
+        let key = UnwindTableKey {
+            table_id,
+            index: mid,
+        };
 
-        let entry = match UNWIND_TABLE.get(idx) {
+        let entry = match UNWIND_TABLES.get(&key) {
             Some(e) => e,
             None => return None,
         };
@@ -381,8 +386,11 @@ unsafe fn binary_search_unwind_entry(
         return None;
     }
 
-    let result_idx = table_start + lo - 1;
-    UNWIND_TABLE.get(result_idx).copied()
+    let result_key = UnwindTableKey {
+        table_id,
+        index: lo - 1,
+    };
+    UNWIND_TABLES.get(&result_key).copied()
 }
 
 /// puts the userspace stack in the target pointer slice

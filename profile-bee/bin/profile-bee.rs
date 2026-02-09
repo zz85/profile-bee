@@ -28,7 +28,8 @@ enum PerfWork {
 
 /// Incremental DWARF unwind table update
 struct DwarfRefreshUpdate {
-    new_entries: Vec<(u32, UnwindEntry)>,
+    new_table_ids: Vec<u32>,
+    binary_tables: std::collections::HashMap<u32, Vec<UnwindEntry>>,
     proc_info: Vec<(u32, ProcInfo)>,
 }
 
@@ -83,7 +84,7 @@ struct Opt {
     group_by_cpu: bool,
 
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = true, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_missing_value = "true")]
     dwarf: bool,
 
     /// PID to profile
@@ -187,7 +188,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 Ok(()) => {
                     println!(
                         "Loaded {} unwind entries for pid {}",
-                        dwarf_manager.table_size(),
+                        dwarf_manager.total_entries(),
                         target_pid,
                     );
                     if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
@@ -434,9 +435,9 @@ fn dwarf_refresh_loop(
             if !tracked_pids.contains(&new_tgid) {
                 tracked_pids.push(new_tgid);
                 // Immediately load the new process
-                if let Ok(range) = manager.refresh_process(new_tgid) {
-                    if !range.is_empty() {
-                        if send_refresh(&manager, &tx, range).is_err() {
+                if let Ok(new_table_ids) = manager.refresh_process(new_tgid) {
+                    if !new_table_ids.is_empty() {
+                        if send_refresh(&manager, &tx, new_table_ids).is_err() {
                             return;
                         }
                     }
@@ -448,9 +449,9 @@ fn dwarf_refresh_loop(
 
         // Periodic rescan of all tracked processes for dlopen'd libraries
         for &pid in &tracked_pids {
-            if let Ok(range) = manager.refresh_process(pid) {
-                if !range.is_empty() {
-                    if send_refresh(&manager, &tx, range).is_err() {
+            if let Ok(new_table_ids) = manager.refresh_process(pid) {
+                if !new_table_ids.is_empty() {
+                    if send_refresh(&manager, &tx, new_table_ids).is_err() {
                         return;
                     }
                 }
@@ -462,34 +463,47 @@ fn dwarf_refresh_loop(
 fn send_refresh(
     manager: &DwarfUnwindManager,
     tx: &mpsc::Sender<PerfWork>,
-    range: std::ops::Range<u32>,
+    new_table_ids: Vec<u32>,
 ) -> Result<(), ()> {
-    let new_entries: Vec<(u32, UnwindEntry)> = (range.start..range.end)
-        .map(|i| (i, manager.global_table[i as usize]))
-        .collect();
+    let mut binary_tables = std::collections::HashMap::new();
+    for &table_id in &new_table_ids {
+        if let Some(entries) = manager.binary_tables.get(&table_id) {
+            binary_tables.insert(table_id, entries.clone());
+        }
+    }
     let proc_info: Vec<(u32, ProcInfo)> = manager
         .proc_info
         .iter()
         .map(|(&t, &p)| (t, p))
         .collect();
+    let total_entries: usize = binary_tables.values().map(|v| v.len()).sum();
     println!(
-        "DWARF refresh: {} new entries (total {})",
-        range.len(), range.end,
+        "DWARF refresh: {} new tables with {} total entries",
+        new_table_ids.len(), total_entries,
     );
     tx.send(PerfWork::DwarfRefresh(DwarfRefreshUpdate {
-        new_entries,
+        new_table_ids,
+        binary_tables,
         proc_info,
     })).map_err(|_| ())
 }
 
 /// Apply incremental DWARF unwind table updates to eBPF maps
 fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
-    use aya::maps::{Array, HashMap};
+    use aya::maps::HashMap;
+    use profile_bee::ebpf::{UnwindTableKeyPod, UnwindEntryPod, ProcInfoKeyPod, ProcInfoPod};
+    use profile_bee_common::{UnwindTableKey, ProcInfoKey};
 
-    if let Some(map) = bpf.map_mut("unwind_table") {
-        if let Ok(mut arr) = Array::<&mut MapData, UnwindEntryPod>::try_from(map) {
-            for (idx, entry) in &update.new_entries {
-                let _ = arr.set(*idx, UnwindEntryPod(*entry), 0);
+    if let Some(map) = bpf.map_mut("unwind_tables") {
+        if let Ok(mut hm) = HashMap::<&mut MapData, UnwindTableKeyPod, UnwindEntryPod>::try_from(map) {
+            for (&table_id, entries) in &update.binary_tables {
+                for (index, entry) in entries.iter().enumerate() {
+                    let key = UnwindTableKeyPod(UnwindTableKey {
+                        table_id,
+                        index: index as u32,
+                    });
+                    let _ = hm.insert(key, UnwindEntryPod(*entry), 0);
+                }
             }
         }
     }

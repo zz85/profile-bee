@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use aya::maps::{Array, HashMap, MapData, RingBuf, StackTraceMap};
+use aya::maps::{HashMap, MapData, RingBuf, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
@@ -9,7 +9,7 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 
 use aya::Pod;
-use profile_bee_common::{UnwindEntry, ProcInfo, ProcInfoKey};
+use profile_bee_common::{ProcInfo, ProcInfoKey, UnwindEntry, UnwindTableKey};
 
 // Create a newtype wrapper around StackInfo
 #[repr(transparent)]
@@ -26,6 +26,11 @@ unsafe impl Pod for FramePointersPod {}
 #[derive(Debug, Clone, Copy)]
 pub struct UnwindEntryPod(pub UnwindEntry);
 unsafe impl Pod for UnwindEntryPod {}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct UnwindTableKeyPod(pub UnwindTableKey);
+unsafe impl Pod for UnwindTableKeyPod {}
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
@@ -142,10 +147,13 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
             } else {
                 online_cpus().map_err(|(_, error)| error)?
             };
-            
+
             let nprocs = cpus.len();
             if let Some(pid) = config.pid {
-                eprintln!("Profiling PID {} and child processes across {} CPUs", pid, nprocs);
+                eprintln!(
+                    "Profiling PID {} and child processes across {} CPUs",
+                    pid, nprocs
+                );
             } else if let Some(cpu) = config.cpu {
                 eprintln!("Profiling CPU {}", cpu);
             }
@@ -214,33 +222,49 @@ impl EbpfProfiler {
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
     ) -> Result<(), anyhow::Error> {
-        self.update_dwarf_tables(manager, 0..manager.table_size() as u32)
+        // Load all tables
+        let all_table_ids: Vec<u32> = manager.binary_tables.keys().copied().collect();
+        self.update_dwarf_tables(manager, &all_table_ids)
     }
 
-    /// Incrementally update eBPF maps with new unwind entries in the given range,
+    /// Incrementally update eBPF maps with new unwind table entries for the given table IDs,
     /// and refresh all proc_info entries.
     pub fn update_dwarf_tables(
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
-        new_entries: std::ops::Range<u32>,
+        new_table_ids: &[u32],
     ) -> Result<(), anyhow::Error> {
-        if !new_entries.is_empty() {
-            let mut unwind_table: Array<&mut MapData, UnwindEntryPod> =
-                Array::try_from(
+        if !new_table_ids.is_empty() {
+            let mut unwind_tables: HashMap<&mut MapData, UnwindTableKeyPod, UnwindEntryPod> =
+                HashMap::try_from(
                     self.bpf
-                        .map_mut("unwind_table")
-                        .ok_or(anyhow!("unwind_table map not found"))?,
+                        .map_mut("unwind_tables")
+                        .ok_or(anyhow!("unwind_tables map not found"))?,
                 )?;
 
-            for idx in new_entries.clone() {
-                unwind_table.set(idx, UnwindEntryPod(manager.global_table[idx as usize]), 0)?;
+            let mut total_entries = 0;
+            for &table_id in new_table_ids {
+                if let Some(entries) = manager.binary_tables.get(&table_id) {
+                    for (index, entry) in entries.iter().enumerate() {
+                        let key = UnwindTableKeyPod(UnwindTableKey {
+                            table_id,
+                            index: index as u32,
+                        });
+                        unwind_tables.insert(key, UnwindEntryPod(*entry), 0)?;
+                        total_entries += 1;
+                    }
+                    tracing::info!(
+                        "Loaded unwind table {} with {} entries",
+                        table_id,
+                        entries.len()
+                    );
+                }
             }
 
             tracing::info!(
-                "Loaded {} new unwind table entries (indices {}..{})",
-                new_entries.len(),
-                new_entries.start,
-                new_entries.end,
+                "Loaded {} total unwind table entries across {} tables",
+                total_entries,
+                new_table_ids.len()
             );
         }
 
