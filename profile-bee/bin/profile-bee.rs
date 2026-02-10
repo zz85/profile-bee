@@ -588,7 +588,7 @@ fn process_profiling_data(
                         &stack,
                         &stack_traces,
                         group_by_cpu,
-                        stacked_pointers,
+                        &stacked_pointers,
                     );
                 }
             }
@@ -763,7 +763,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
 
     println!("Starting TUI mode...");
 
-    let (stopper, spawn) = setup_process_to_profile(&opt.cmd)?;
+    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
 
     let pid = if let Some(cmd) = &spawn {
         Some(cmd.pid())
@@ -799,7 +799,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                 Ok(()) => {
                     println!(
                         "Loaded {} unwind entries for pid {}",
-                        dwarf_manager.table_size(),
+                        dwarf_manager.total_entries(),
                         target_pid,
                     );
                     if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
@@ -823,17 +823,13 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         None
     };
 
-    let counts = &mut ebpf_profiler.counts;
-    let stack_traces = &ebpf_profiler.stack_traces;
-    let stacked_pointers = &ebpf_profiler.stacked_pointers;
-    let mut profiler = TraceHandler::new();
-
     // Create TUI app
     let mut app = App::with_live();
     let update_handle = app.get_update_handle();
 
     // Setup stopping mechanisms
-    setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn);
+    let external_pid = if spawn.is_none() { opt.pid } else { None };
+    setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn, external_pid);
 
     // Ring buffer collection task
     task::spawn(async move {
@@ -843,9 +839,15 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     });
 
     // Background task to collect and process profiling data
+    // Move ebpf_profiler into thread (TraceHandler contains !Send Symbolizer)
     let stream_mode = opt.stream_mode;
     let group_by_cpu = opt.group_by_cpu;
-    task::spawn_blocking(move || {
+    std::thread::spawn(move || {
+        let mut profiler = TraceHandler::new();
+        let mut counts = ebpf_profiler.counts;
+        let stack_traces = ebpf_profiler.stack_traces;
+        let stacked_pointers = ebpf_profiler.stacked_pointers;
+        let mut bpf = ebpf_profiler.bpf;
         let mut trace_count = HashMap::<StackInfo, usize>::new();
         let mut known_tgids = std::collections::HashSet::<u32>::new();
 
@@ -874,12 +876,12 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                                 &stack,
                                 &stack_traces,
                                 group_by_cpu,
-                                stacked_pointers,
+                                &stacked_pointers,
                             );
                         }
                     }
                     Ok(PerfWork::DwarfRefresh(update)) => {
-                        apply_dwarf_refresh(&mut ebpf_profiler.bpf, update);
+                        apply_dwarf_refresh(&mut bpf, update);
                     }
                     Ok(PerfWork::Stop) => return,
                     Err(_) => break, // Timeout, generate flamegraph
@@ -896,7 +898,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                         stack,
                         &stack_traces,
                         group_by_cpu,
-                        stacked_pointers,
+                        &stacked_pointers,
                     );
                     stacks.push(FrameCount {
                         frames: combined,
@@ -910,7 +912,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                         &stack,
                         &stack_traces,
                         group_by_cpu,
-                        stacked_pointers,
+                        &stacked_pointers,
                     );
                     stacks.push(FrameCount {
                         frames: combined,
@@ -947,29 +949,28 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     });
 
     // Initialize TUI
-    let backend = ratatui::backend::CrosstermBackend::new(io::stderr());
-    let terminal = ratatui::Terminal::new(backend)?;
+    let backend = profile_bee_tui::ratatui::backend::CrosstermBackend::new(io::stderr());
+    let terminal = profile_bee_tui::ratatui::Terminal::new(backend)?;
     let events = EventHandler::new(250);
     let mut tui = Tui::new(terminal, events);
-    tui.init()?;
+    tui.init().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Main event loop
     while app.running {
-        tui.draw(&mut app)?;
+        tui.draw(&mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        match tui.events.next().await? {
+        match tui.events.next().map_err(|e| anyhow::anyhow!("{e}"))? {
             Event::Tick => app.tick(),
-            Event::Key(key_event) => handle_key_events(key_event, &mut app)?,
+            Event::Key(key_event) => handle_key_events(key_event, &mut app).map_err(|e| anyhow::anyhow!("{e}"))?,
             Event::Mouse(_) => {}
             Event::Resize(_, _) => {}
         }
     }
 
-    tui.exit()?;
+    tui.exit().map_err(|e| anyhow::anyhow!("{e}"))?;
     drop(stopper);
 
     println!("\nExiting TUI mode");
-    profiler.print_stats();
 
     Ok(())
 }

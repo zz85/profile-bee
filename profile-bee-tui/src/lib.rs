@@ -4,6 +4,8 @@
 //! Original repository: https://github.com/YS-L/flamelens
 //! License: MIT License - Copyright (c) 2024 Yung Siang Liau
 
+pub use ratatui;
+
 /// Application.
 pub mod app;
 
