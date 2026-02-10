@@ -60,6 +60,11 @@ struct Opt {
     #[arg(long)]
     tui: bool,
 
+    /// How often (in ms) to accumulate samples before refreshing the TUI flamegraph
+    #[cfg(feature = "tui")]
+    #[arg(long, default_value_t = 2000)]
+    tui_refresh_ms: u64,
+
     /// Avoid profiling idle cpu cycles
     #[arg(long)]
     skip_idle: bool,
@@ -842,6 +847,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     // Move ebpf_profiler into thread (TraceHandler contains !Send Symbolizer)
     let stream_mode = opt.stream_mode;
     let group_by_cpu = opt.group_by_cpu;
+    let tui_refresh_ms = opt.tui_refresh_ms;
     std::thread::spawn(move || {
         let mut profiler = TraceHandler::new();
         let mut counts = ebpf_profiler.counts;
@@ -859,7 +865,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
             }
 
             // Process incoming events with timeout to update periodically
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(tui_refresh_ms);
             while std::time::Instant::now() < deadline {
                 match perf_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(PerfWork::StackInfo(stack)) => {
@@ -957,13 +963,21 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
 
     // Main event loop
     while app.running {
-        tui.draw(&mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if app.dirty {
+            tui.draw(&mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
+            app.dirty = false;
+        }
 
         match tui.events.next().map_err(|e| anyhow::anyhow!("{e}"))? {
             Event::Tick => app.tick(),
-            Event::Key(key_event) => handle_key_events(key_event, &mut app).map_err(|e| anyhow::anyhow!("{e}"))?,
+            Event::Key(key_event) => {
+                handle_key_events(key_event, &mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
+                app.dirty = true;
+            }
             Event::Mouse(_) => {}
-            Event::Resize(_, _) => {}
+            Event::Resize(_, _) => {
+                app.dirty = true;
+            }
         }
     }
 

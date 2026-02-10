@@ -44,6 +44,8 @@ pub struct App {
     pub transient_message: Option<String>,
     /// Debug mode
     pub debug: bool,
+    /// Whether the UI needs to be redrawn
+    pub dirty: bool,
     /// Next flamegraph to swap in
     next_flamegraph: Arc<Mutex<Option<ParsedFlameGraph>>>,
 }
@@ -59,6 +61,7 @@ impl App {
             elapsed: HashMap::new(),
             transient_message: None,
             debug: false,
+            dirty: true,
             next_flamegraph: Arc::new(Mutex::new(None)),
         }
     }
@@ -75,6 +78,7 @@ impl App {
             elapsed: HashMap::new(),
             transient_message: None,
             debug: false,
+            dirty: true,
         }
     }
 
@@ -105,6 +109,7 @@ impl App {
                 self.flamegraph_view.replace_flamegraph(parsed.flamegraph);
                 self.elapsed
                     .insert("replacement".to_string(), tic.elapsed());
+                self.dirty = true;
             }
         }
     }
