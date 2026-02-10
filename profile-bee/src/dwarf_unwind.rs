@@ -20,6 +20,33 @@ use profile_bee_common::{
 /// Build ID for uniquely identifying ELF binaries
 pub type BuildId = Vec<u8>;
 
+/// File metadata for cache lookups (avoids reading full binary)
+/// Uses (dev, ino, size, mtime) as composite key for identifying binaries
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileMetadata {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+}
+
+impl FileMetadata {
+    /// Extract metadata from a file path using stat()
+    fn from_path(path: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)
+            .map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.len(),
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+        })
+    }
+}
+
 // x86_64 register numbers in DWARF
 const X86_64_RSP: Register = Register(7);
 const X86_64_RBP: Register = Register(6);
@@ -331,6 +358,8 @@ pub struct DwarfUnwindManager {
     pub proc_info: HashMap<u32, ProcInfo>,
     /// Next shard_id to assign to a new binary
     next_shard_id: u8,
+    /// Fast metadata-based cache for hot path lookups (stat-based)
+    metadata_cache: HashMap<FileMetadata, u8>, // metadata -> shard_id
     /// Cache of parsed ELF binary shard IDs, keyed by build ID
     /// Falls back to path-based caching for binaries without build IDs
     binary_cache: HashMap<BuildId, u8>, // build_id -> shard_id
@@ -344,6 +373,7 @@ impl DwarfUnwindManager {
             binary_tables: HashMap::new(),
             proc_info: HashMap::new(),
             next_shard_id: 0,
+            metadata_cache: HashMap::new(),
             binary_cache: HashMap::new(),
             path_cache: HashMap::new(),
         }
@@ -453,29 +483,21 @@ impl DwarfUnwindManager {
 
             let load_bias = start_addr.wrapping_sub(file_offset);
 
-            // Try to get cached unwind table, preferring build-ID based lookup
+            // Two-tier cache lookup:
+            // 1. Hot path: stat-based metadata lookup (single syscall, no file read)
+            // 2. Cold path: full file read + build-ID extraction (cache miss only)
             let (shard_id, table_count) = {
-                // First, try to get the binary data to extract build ID
-                let binary_data = if is_vdso {
-                    read_vdso(tgid, start_addr, end_addr).ok()
-                } else {
-                    fs::read(&resolved_path).ok()
-                };
-
-                let cache_hit = if let Some(ref data) = binary_data {
-                    // Try build-ID based cache lookup
-                    if let Some(build_id) = extract_build_id(data) {
-                        self.binary_cache.get(&build_id).copied()
-                    } else {
-                        // Fall back to path-based cache for binaries without build ID
-                        self.path_cache.get(&resolved_path).copied()
-                    }
+                // Try fast metadata-based cache lookup first (for non-vdso files)
+                let metadata_cache_hit = if !is_vdso {
+                    FileMetadata::from_path(&resolved_path)
+                        .ok()
+                        .and_then(|meta| self.metadata_cache.get(&meta).copied())
                 } else {
                     None
                 };
 
-                if let Some(sid) = cache_hit {
-                    // Get the table count from the cached shard
+                if let Some(sid) = metadata_cache_hit {
+                    // Hot path: metadata cache hit - no file read needed!
                     let tc = self
                         .binary_tables
                         .get(&sid)
@@ -483,82 +505,123 @@ impl DwarfUnwindManager {
                         .unwrap_or(0);
                     (sid, tc)
                 } else {
-                    // Cache miss - need to parse the binary
-                    let (unwind_entries, build_id_opt) = if let Some(data) = binary_data {
-                        match generate_unwind_table_from_bytes(&data) {
-                            Ok(result) => result,
-                            Err(e) => {
-                                let name = if is_vdso {
-                                    "[vdso]".to_string()
-                                } else {
-                                    resolved_path.display().to_string()
-                                };
-                                tracing::debug!("Skipping {} for pid {}: {}", name, tgid, e);
-                                continue;
-                            }
-                        }
+                    // Cold path: metadata cache miss - need to read binary
+                    let binary_data = if is_vdso {
+                        read_vdso(tgid, start_addr, end_addr).ok()
                     } else {
-                        let name = if is_vdso {
-                            "[vdso]".to_string()
-                        } else {
-                            resolved_path.display().to_string()
-                        };
-                        tracing::debug!("Failed to read binary {} for pid {}", name, tgid);
-                        continue;
+                        fs::read(&resolved_path).ok()
                     };
 
-                    if unwind_entries.is_empty() {
-                        continue;
-                    }
+                    let cache_hit = if let Some(ref data) = binary_data {
+                        // Try build-ID based cache lookup
+                        if let Some(build_id) = extract_build_id(data) {
+                            self.binary_cache.get(&build_id).copied()
+                        } else {
+                            // Fall back to path-based cache for binaries without build ID
+                            self.path_cache.get(&resolved_path).copied()
+                        }
+                    } else {
+                        None
+                    };
 
-                    let tc = match u32::try_from(unwind_entries.len()) {
-                        Ok(v) => v,
-                        Err(_) => {
+                    if let Some(sid) = cache_hit {
+                        // Build-ID or path cache hit - store metadata mapping for next time
+                        if !is_vdso {
+                            if let Ok(meta) = FileMetadata::from_path(&resolved_path) {
+                                self.metadata_cache.insert(meta, sid);
+                            }
+                        }
+                        let tc = self
+                            .binary_tables
+                            .get(&sid)
+                            .map(|t| t.len() as u32)
+                            .unwrap_or(0);
+                        (sid, tc)
+                    } else {
+                        // Cache miss - need to parse the binary
+                        let (unwind_entries, build_id_opt) = if let Some(data) = binary_data {
+                            match generate_unwind_table_from_bytes(&data) {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    let name = if is_vdso {
+                                        "[vdso]".to_string()
+                                    } else {
+                                        resolved_path.display().to_string()
+                                    };
+                                    tracing::debug!("Skipping {} for pid {}: {}", name, tgid, e);
+                                    continue;
+                                }
+                            }
+                        } else {
                             let name = if is_vdso {
                                 "[vdso]".to_string()
                             } else {
                                 resolved_path.display().to_string()
                             };
+                            tracing::debug!("Failed to read binary {} for pid {}", name, tgid);
+                            continue;
+                        };
+
+                        if unwind_entries.is_empty() {
+                            continue;
+                        }
+
+                        let tc = match u32::try_from(unwind_entries.len()) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                let name = if is_vdso {
+                                    "[vdso]".to_string()
+                                } else {
+                                    resolved_path.display().to_string()
+                                };
+                                tracing::warn!(
+                                    "Unwind table too large for {}: {} entries",
+                                    name,
+                                    unwind_entries.len(),
+                                );
+                                continue;
+                            }
+                        };
+
+                        if tc > MAX_SHARD_ENTRIES {
                             tracing::warn!(
-                                "Unwind table too large for {}: {} entries",
-                                name,
-                                unwind_entries.len(),
+                                "Binary unwind table too large: {} entries (max {} per shard), skipping",
+                                tc,
+                                MAX_SHARD_ENTRIES,
                             );
                             continue;
                         }
-                    };
 
-                    if tc > MAX_SHARD_ENTRIES {
-                        tracing::warn!(
-                            "Binary unwind table too large: {} entries (max {} per shard), skipping",
-                            tc,
-                            MAX_SHARD_ENTRIES,
-                        );
-                        continue;
+                        if self.next_shard_id as usize >= MAX_UNWIND_SHARDS {
+                            tracing::warn!(
+                                "All {} shard slots used, skipping remaining binaries for pid {}",
+                                MAX_UNWIND_SHARDS,
+                                tgid,
+                            );
+                            break;
+                        }
+
+                        let sid = self.next_shard_id;
+                        self.next_shard_id += 1;
+
+                        self.binary_tables.insert(sid, unwind_entries);
+
+                        // Cache using build ID if available, otherwise use path
+                        if let Some(build_id) = build_id_opt {
+                            self.binary_cache.insert(build_id, sid);
+                        } else {
+                            self.path_cache.insert(resolved_path.clone(), sid);
+                        }
+
+                        // Also cache by metadata for fast future lookups
+                        if !is_vdso {
+                            if let Ok(meta) = FileMetadata::from_path(&resolved_path) {
+                                self.metadata_cache.insert(meta, sid);
+                            }
+                        }
+
+                        (sid, tc)
                     }
-
-                    if self.next_shard_id as usize >= MAX_UNWIND_SHARDS {
-                        tracing::warn!(
-                            "All {} shard slots used, skipping remaining binaries for pid {}",
-                            MAX_UNWIND_SHARDS,
-                            tgid,
-                        );
-                        break;
-                    }
-
-                    let sid = self.next_shard_id;
-                    self.next_shard_id += 1;
-
-                    self.binary_tables.insert(sid, unwind_entries);
-
-                    // Cache using build ID if available, otherwise use path
-                    if let Some(build_id) = build_id_opt {
-                        self.binary_cache.insert(build_id, sid);
-                    } else {
-                        self.path_cache.insert(resolved_path.clone(), sid);
-                    }
-
-                    (sid, tc)
                 }
             };
 
@@ -749,5 +812,35 @@ mod tests {
         // In a real scenario with multiple processes sharing libraries,
         // we would see cache hits here. For this test, we just verify
         // the caching mechanism is set up correctly.
+    }
+
+    #[test]
+    fn test_metadata_based_caching() {
+        // Test that metadata cache is used for fast lookups
+        let mut manager = DwarfUnwindManager::new();
+        let pid = std::process::id();
+
+        // Load current process - this should populate metadata cache
+        let result = manager.load_process(pid);
+        assert!(result.is_ok(), "Failed to load process: {:?}", result);
+
+        let metadata_cache_size = manager.metadata_cache.len();
+        assert!(
+            metadata_cache_size > 0,
+            "Expected metadata cache to be populated"
+        );
+
+        // Refresh the same process - should use metadata cache for fast lookups
+        let new_shards = manager.refresh_process(pid).unwrap();
+
+        // Since the binaries haven't changed, we shouldn't have new shards
+        assert_eq!(new_shards.len(), 0, "Expected no new shards on refresh");
+
+        // Metadata cache size should remain the same or grow slightly
+        let new_metadata_cache_size = manager.metadata_cache.len();
+        assert!(
+            new_metadata_cache_size >= metadata_cache_size,
+            "Metadata cache should not shrink"
+        );
     }
 }
