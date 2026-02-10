@@ -858,7 +858,9 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         let mut known_tgids = std::collections::HashSet::<u32>::new();
 
         loop {
-            trace_count.clear();
+            // Drain the eBPF counts map (to prevent it from filling up) but
+            // keep trace_count accumulating across cycles so the flamegraph
+            // shows the full profile history, not just the latest window.
             let keys = counts.keys().flatten().collect::<Vec<_>>();
             for k in keys {
                 let _ = counts.remove(&k);
@@ -898,33 +900,35 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
             let mut stacks = Vec::new();
             let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
-            if local_counting {
-                for (stack, value) in trace_count.iter() {
-                    let combined = profiler.get_exp_stacked_frames(
-                        stack,
-                        &stack_traces,
-                        group_by_cpu,
-                        &stacked_pointers,
-                    );
-                    stacks.push(FrameCount {
-                        frames: combined,
-                        count: *value as u64,
-                    });
-                }
-            } else {
+            if !local_counting {
+                // Merge eBPF-side counts into trace_count so we accumulate
+                // across refresh cycles instead of showing only the latest window.
                 for (key, value) in counts.iter().flatten() {
                     let stack: StackInfo = key.0;
-                    let combined = profiler.get_exp_stacked_frames(
-                        &stack,
-                        &stack_traces,
-                        group_by_cpu,
-                        &stacked_pointers,
-                    );
-                    stacks.push(FrameCount {
-                        frames: combined,
-                        count: value,
-                    });
+                    // Prime the symbol cache for new stacks
+                    if !trace_count.contains_key(&stack) {
+                        let _combined = profiler.get_exp_stacked_frames(
+                            &stack,
+                            &stack_traces,
+                            group_by_cpu,
+                            &stacked_pointers,
+                        );
+                    }
+                    *trace_count.entry(stack).or_insert(0) += value as usize;
                 }
+            }
+
+            for (stack, value) in trace_count.iter() {
+                let combined = profiler.get_exp_stacked_frames(
+                    stack,
+                    &stack_traces,
+                    group_by_cpu,
+                    &stacked_pointers,
+                );
+                stacks.push(FrameCount {
+                    frames: combined,
+                    count: *value as u64,
+                });
             }
 
             let mut out = stacks
