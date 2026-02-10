@@ -170,19 +170,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         opt.pid.clone()
     };
 
-    // Set target PID for eBPF filtering (after spawn so we have the actual PID)
-    if let Some(target_pid) = pid {
-        ebpf_profiler.set_target_pid(target_pid)?;
-        println!("Profiling PID {}..", target_pid);
-    }
-
-    // Take ownership of ring buffer map before partial borrows
-    let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
-
     // Set up communication channels (before DWARF block so refresh thread can use it)
     let (perf_tx, perf_rx) = mpsc::channel();
 
-    // If DWARF unwinding is enabled, load unwind tables
+    // If DWARF unwinding is enabled, load unwind tables BEFORE setting TARGET_PID
+    // This ensures unwind information is available from the first sample
     let tgid_request_tx = if opt.dwarf {
         let mut dwarf_manager = DwarfUnwindManager::new();
 
@@ -218,6 +210,16 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     } else {
         None
     };
+
+    // Set target PID for eBPF filtering AFTER DWARF tables are loaded
+    // This ensures the eBPF program has unwind information before filtering samples
+    if let Some(target_pid) = pid {
+        ebpf_profiler.set_target_pid(target_pid)?;
+        println!("Profiling PID {}..", target_pid);
+    }
+
+    // Take ownership of ring buffer map after DWARF loading
+    let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
 
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
