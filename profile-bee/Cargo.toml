@@ -16,6 +16,7 @@ include = [
 aya = { version = ">=0.11", features=["async_tokio"] }
 aya-log = "0.2.1"
 profile-bee-common = { path = "../profile-bee-common", features=["user"] }
+profile-bee-tui = { path = "../profile-bee-tui", optional = true }
 anyhow = "1.0.42"
 clap = { version = "4.0", features = ["derive"] }
 tokio = { version = "1.18", features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time", "process"] }
@@ -37,6 +38,10 @@ gimli = "0.31.1"
 object = "0.37.0"
 libc = "0.2.86"
 procmaps = "0.4.1"
+
+[features]
+default = []
+tui = ["dep:profile-bee-tui"]
 
 [[bin]]
 name = "profile-bee"

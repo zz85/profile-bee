@@ -55,6 +55,16 @@ struct Opt {
     #[arg(long)]
     serve: bool,
 
+    /// Display results in an interactive TUI flamegraph viewer
+    #[cfg(feature = "tui")]
+    #[arg(long)]
+    tui: bool,
+
+    /// How often (in ms) to accumulate samples before refreshing the TUI flamegraph
+    #[cfg(feature = "tui")]
+    #[arg(long, default_value_t = 2000)]
+    tui_refresh_ms: u64,
+
     /// Avoid profiling idle cpu cycles
     #[arg(long)]
     skip_idle: bool,
@@ -118,6 +128,14 @@ struct Opt {
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
     let opt = Opt::parse();
+
+    // Validate mutually exclusive options
+    #[cfg(feature = "tui")]
+    if opt.tui && opt.serve {
+        eprintln!("Error: --tui and --serve flags cannot be used together");
+        std::process::exit(1);
+    }
+
     // Initialize the tracing subscriber with environment variables
     tracing_subscriber::fmt()
         // Use EnvFilter to read from RUST_LOG environment variable
@@ -129,6 +147,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     use tokio::sync::broadcast;
     let (tx, rx) = broadcast::channel(16);
+
+    #[cfg(feature = "tui")]
+    if opt.tui {
+        return run_tui_mode(opt).await;
+    }
 
     if opt.serve {
         tokio::spawn(async {
@@ -570,7 +593,7 @@ fn process_profiling_data(
                         &stack,
                         &stack_traces,
                         group_by_cpu,
-                        stacked_pointers,
+                        &stacked_pointers,
                     );
                 }
             }
@@ -733,6 +756,262 @@ fn output_svg(path: &PathBuf, str: &[String], title: String) -> anyhow::Result<(
     svg_opts.title = title;
     let mut svg_file = std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(path)?);
     flamegraph::from_lines(&mut svg_opts, str.iter().map(|v| v.as_str()), &mut svg_file)?;
+
+    Ok(())
+}
+
+/// Runs the interactive TUI flamegraph viewer mode
+#[cfg(feature = "tui")]
+async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
+    use profile_bee_tui::{app::App, event::{Event, EventHandler}, handler::handle_key_events, tui::Tui};
+    use std::io;
+
+    println!("Starting TUI mode...");
+
+    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
+
+    let pid = if let Some(cmd) = &spawn {
+        Some(cmd.pid())
+    } else {
+        opt.pid.clone()
+    };
+
+    // Create eBPF profiler configuration
+    let config = ProfilerConfig {
+        skip_idle: opt.skip_idle,
+        stream_mode: opt.stream_mode,
+        frequency: opt.frequency,
+        kprobe: opt.kprobe.clone(),
+        uprobe: opt.uprobe.clone(),
+        tracepoint: opt.tracepoint.clone(),
+        pid,
+        cpu: opt.cpu,
+        self_profile: opt.self_profile,
+        dwarf: opt.dwarf,
+    };
+
+    // Setup eBPF profiler
+    let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
+    let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
+    let (perf_tx, perf_rx) = mpsc::channel();
+
+    // Load DWARF if enabled
+    let tgid_request_tx = if opt.dwarf {
+        let mut dwarf_manager = DwarfUnwindManager::new();
+        if let Some(target_pid) = pid {
+            println!("Loading DWARF unwind tables for pid {}...", target_pid);
+            match dwarf_manager.load_process(target_pid) {
+                Ok(()) => {
+                    println!(
+                        "Loaded {} unwind entries for pid {}",
+                        dwarf_manager.total_entries(),
+                        target_pid,
+                    );
+                    if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
+                        eprintln!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to load DWARF info for pid {}: {}", target_pid, e);
+                }
+            }
+        }
+
+        let (tgid_tx, tgid_rx) = mpsc::channel::<u32>();
+        let refresh_tx = perf_tx.clone();
+        let initial_pid = pid;
+        std::thread::spawn(move || {
+            dwarf_refresh_loop(dwarf_manager, initial_pid, tgid_rx, refresh_tx);
+        });
+        Some(tgid_tx)
+    } else {
+        None
+    };
+
+    // Set target PID for eBPF filtering AFTER DWARF tables are loaded
+    if let Some(target_pid) = pid {
+        ebpf_profiler.set_target_pid(target_pid)?;
+        println!("Profiling PID {}..", target_pid);
+    }
+
+    // Create TUI app
+    let mut app = App::with_live();
+    let update_handle = app.get_update_handle();
+
+    // Setup stopping mechanisms
+    let external_pid = if spawn.is_none() { opt.pid } else { None };
+    setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn, external_pid);
+
+    // Ring buffer collection task
+    task::spawn(async move {
+        if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
+            eprintln!("Failed to set up ring buffer: {:?}", e);
+        }
+    });
+
+    // Background task to collect and process profiling data
+    // Move ebpf_profiler into thread (TraceHandler contains !Send Symbolizer)
+    let stream_mode = opt.stream_mode;
+    let group_by_cpu = opt.group_by_cpu;
+    let tui_refresh_ms = opt.tui_refresh_ms;
+    std::thread::spawn(move || {
+        let mut profiler = TraceHandler::new();
+        let mut counts = ebpf_profiler.counts;
+        let stack_traces = ebpf_profiler.stack_traces;
+        let stacked_pointers = ebpf_profiler.stacked_pointers;
+        let mut bpf = ebpf_profiler.bpf;
+        let mut trace_count = HashMap::<StackInfo, usize>::new();
+        let mut known_tgids = std::collections::HashSet::<u32>::new();
+
+        loop {
+            // Drain the eBPF counts map (to prevent it from filling up) but
+            // keep trace_count accumulating across cycles so the flamegraph
+            // shows the full profile history, not just the latest window.
+            let keys = counts.keys().flatten().collect::<Vec<_>>();
+            for k in keys {
+                let _ = counts.remove(&k);
+            }
+
+            // Compute local_counting before the loop to avoid double-counting
+            let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
+
+            // Process incoming events with timeout to update periodically
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(tui_refresh_ms);
+            while std::time::Instant::now() < deadline {
+                match perf_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(PerfWork::StackInfo(stack)) => {
+                        if let Some(tx) = &tgid_request_tx {
+                            if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
+                                let _ = tx.send(stack.tgid);
+                            }
+                        }
+                        
+                        if local_counting {
+                            let trace = trace_count.entry(stack).or_insert(0);
+                            *trace += 1;
+
+                            if *trace == 1 {
+                                let _combined = profiler.get_exp_stacked_frames(
+                                    &stack,
+                                    &stack_traces,
+                                    group_by_cpu,
+                                    &stacked_pointers,
+                                );
+                            }
+                        } else {
+                            // Only prime symbol cache for non-local counting
+                            let _combined = profiler.get_exp_stacked_frames(
+                                &stack,
+                                &stack_traces,
+                                group_by_cpu,
+                                &stacked_pointers,
+                            );
+                        }
+                    }
+                    Ok(PerfWork::DwarfRefresh(update)) => {
+                        apply_dwarf_refresh(&mut bpf, update);
+                    }
+                    Ok(PerfWork::Stop) => return,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+
+            // Generate flamegraph data
+            let mut stacks = Vec::new();
+
+            if !local_counting {
+                // Merge eBPF-side counts into trace_count so we accumulate
+                // across refresh cycles instead of showing only the latest window.
+                for (key, value) in counts.iter().flatten() {
+                    let stack: StackInfo = key.0;
+                    // Prime the symbol cache for new stacks
+                    if !trace_count.contains_key(&stack) {
+                        let _combined = profiler.get_exp_stacked_frames(
+                            &stack,
+                            &stack_traces,
+                            group_by_cpu,
+                            &stacked_pointers,
+                        );
+                    }
+                    *trace_count.entry(stack).or_insert(0) += value as usize;
+                }
+            }
+
+            for (stack, value) in trace_count.iter() {
+                let combined = profiler.get_exp_stacked_frames(
+                    stack,
+                    &stack_traces,
+                    group_by_cpu,
+                    &stacked_pointers,
+                );
+                stacks.push(FrameCount {
+                    frames: combined,
+                    count: *value as u64,
+                });
+            }
+
+            let mut out = stacks
+                .into_iter()
+                .map(|frames| {
+                    let key = frames
+                        .frames
+                        .iter()
+                        .map(|s| s.fmt_symbol())
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    let count = frames.count;
+                    format!("{} {}", &key, count)
+                })
+                .collect::<Vec<_>>();
+            out.sort();
+
+            // Update TUI app with new flamegraph data
+            let data = out.join("\n");
+            let tic = std::time::Instant::now();
+            let flamegraph = profile_bee_tui::flame::FlameGraph::from_string(data, true);
+            let parsed = profile_bee_tui::app::ParsedFlameGraph {
+                flamegraph,
+                elapsed: tic.elapsed(),
+            };
+            *update_handle.lock().unwrap_or_else(|e| {
+                eprintln!("Mutex poisoned: {}", e);
+                e.into_inner()
+            }) = Some(parsed);
+        }
+    });
+
+    // Initialize TUI
+    let backend = profile_bee_tui::ratatui::backend::CrosstermBackend::new(io::stderr());
+    let terminal = profile_bee_tui::ratatui::Terminal::new(backend)?;
+    let events = EventHandler::new(250);
+    let mut tui = Tui::new(terminal, events);
+    tui.init().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Main event loop
+    while app.running {
+        if app.dirty {
+            tui.draw(&mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
+            app.dirty = false;
+        }
+
+        match tui.events.next().map_err(|e| anyhow::anyhow!("{e}"))? {
+            Event::Tick => app.tick(),
+            Event::Key(key_event) => {
+                handle_key_events(key_event, &mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
+                app.dirty = true;
+            }
+            Event::Mouse(_) => {}
+            Event::Resize(_, _) => {
+                app.dirty = true;
+            }
+        }
+    }
+
+    tui.exit().map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(stopper);
+
+    println!("\nExiting TUI mode");
 
     Ok(())
 }

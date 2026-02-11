@@ -14,6 +14,7 @@ Stacks can be counted in kernel or sent via events in raw form.
 More documentation in [docs](docs) directory.
 
 ### Supported output formats
+- **TUI (Terminal User Interface)**: Interactive flamegraph viewer directly in your terminal (requires `tui` feature)
 - A SVG flamegraph (generated with inferno) you can load in your browser
 - [Branden Gregg's](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html) Stack Collapsed [format](https://github.com/BrendanGregg/flamegraph#2-fold-stacks) that can be loaded up using [speedscope visualizer](https://www.speedscope.app/)
 - D3 flamegraph JSON and static HTML output
@@ -73,6 +74,12 @@ For more information on DWARF-based profiling, see:
 ### Usage
 
 ```bash
+# Interactive TUI flamegraph viewer (requires tui feature)
+profile-bee --tui --cmd "top -b -n 5 -d 1"
+
+# TUI with live profiling updates
+profile-bee --tui --pid 1234 --time 30000
+
 # Profile a command (runs top for 5 seconds), writing flamegraph to test.svg
 profile-bee --svg test.svg -- top -b -n 5 -d 1
 
@@ -117,6 +124,44 @@ profile-bee --cpu 0 --svg output.svg --time 5000
 profile-bee --svg output.svg -- ./my-optimized-binary
 
 ```
+
+### TUI (Terminal User Interface)
+
+Profile-bee includes an interactive terminal-based flamegraph viewer, forked and adapted from [flamelens](https://github.com/YS-L/flamelens). The TUI mode provides a rich interactive experience directly in your terminal without needing a browser.
+
+**Key Features:**
+- Real-time flamegraph updates during profiling
+- Navigate and zoom into specific stack frames
+- Search and highlight frames using regex patterns
+- Freeze/unfreeze live updates with 'z' key
+- Keyboard-driven interface (vim-style navigation)
+
+**Usage:**
+```bash
+# Build with TUI support
+cargo build --release --features tui
+
+# Interactive TUI with a command
+sudo ./target/release/profile-bee --tui --cmd "your-command"
+
+# Live profiling of a running process
+sudo ./target/release/profile-bee --tui --pid <pid> --time 30000
+
+# With DWARF unwinding for optimized binaries (enabled by default)
+sudo ./target/release/profile-bee --tui --cmd "./optimized-binary"
+```
+
+**Key Bindings:**
+- `hjkl` or arrow keys: Navigate cursor
+- `Enter`: Zoom into selected frame
+- `Esc`: Reset zoom
+- `/`: Search frames with regex
+- `#`: Highlight selected frame
+- `n/N`: Next/previous match
+- `z`: Freeze/unfreeze live updates
+- `q` or `Ctrl+C`: Quit
+
+The TUI viewer is optional and can be enabled with the `tui` feature flag. See [profile-bee-tui/](profile-bee-tui/) for implementation details.
 
 ### Features
 - **DWARF-based stack unwinding** (enabled by default) for profiling binaries without frame pointers
