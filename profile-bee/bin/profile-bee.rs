@@ -872,6 +872,9 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                 let _ = counts.remove(&k);
             }
 
+            // Compute local_counting before the loop to avoid double-counting
+            let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
+
             // Process incoming events with timeout to update periodically
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(tui_refresh_ms);
             while std::time::Instant::now() < deadline {
@@ -882,10 +885,21 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                                 let _ = tx.send(stack.tgid);
                             }
                         }
-                        let trace = trace_count.entry(stack).or_insert(0);
-                        *trace += 1;
+                        
+                        if local_counting {
+                            let trace = trace_count.entry(stack).or_insert(0);
+                            *trace += 1;
 
-                        if *trace == 1 {
+                            if *trace == 1 {
+                                let _combined = profiler.get_exp_stacked_frames(
+                                    &stack,
+                                    &stack_traces,
+                                    group_by_cpu,
+                                    &stacked_pointers,
+                                );
+                            }
+                        } else {
+                            // Only prime symbol cache for non-local counting
                             let _combined = profiler.get_exp_stacked_frames(
                                 &stack,
                                 &stack_traces,
@@ -905,7 +919,6 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
 
             // Generate flamegraph data
             let mut stacks = Vec::new();
-            let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
             if !local_counting {
                 // Merge eBPF-side counts into trace_count so we accumulate
@@ -961,7 +974,10 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                 flamegraph,
                 elapsed: tic.elapsed(),
             };
-            *update_handle.lock().unwrap() = Some(parsed);
+            *update_handle.lock().unwrap_or_else(|e| {
+                eprintln!("Mutex poisoned: {}", e);
+                e.into_inner()
+            }) = Some(parsed);
         }
     });
 

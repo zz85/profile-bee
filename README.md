@@ -147,8 +147,8 @@ sudo ./target/release/profile-bee --tui --cmd "your-command"
 # Live profiling of a running process
 sudo ./target/release/profile-bee --tui --pid <pid> --time 30000
 
-# With DWARF unwinding for optimized binaries
-sudo ./target/release/profile-bee --tui --dwarf --cmd "./optimized-binary"
+# With DWARF unwinding for optimized binaries (enabled by default)
+sudo ./target/release/profile-bee --tui --cmd "./optimized-binary"
 ```
 
 **Key Bindings:**

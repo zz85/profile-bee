@@ -444,7 +444,7 @@ impl<'a> FlamelensWidget<'a> {
         }
         let full_name = self.app.flamegraph().get_stack_full_name_from_info(stack);
         let v1 = hash_name(full_name);
-        let v2 = hash_name(full_name);
+        let v2 = hash_name(&format!("{}#2", full_name));
         let mut r;
         let mut g;
         let mut b;
@@ -515,7 +515,7 @@ impl<'a> FlamelensWidget<'a> {
     }
 
     fn get_version_indicator(&self) -> Line {
-        Line::from(format!("flamelens v{}", env!("CARGO_PKG_VERSION")))
+        Line::from(format!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .style(Style::default().bold())
     }
 

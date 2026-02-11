@@ -105,7 +105,7 @@ impl FlameGraphView {
             if let Some(parent) = parent {
                 if let Some(parent_stack) = self.flamegraph.get_stack(&parent) {
                     if !self.is_stack_in_view_port(parent_stack) {
-                        self.state.level_offset -= 1;
+                        self.state.level_offset = self.state.level_offset.saturating_sub(1);
                     }
                 }
                 self.select_id(&parent);
