@@ -53,7 +53,7 @@ struct Opt {
     #[arg(long)]
     json: Option<PathBuf>,
 
-    /// Starts a http server to serve the html flamegraph result
+    /// Starts a http server to serve the html flamegraph result. Can be combined with --tui for dual interface access.
     #[arg(long)]
     serve: bool,
 
@@ -150,12 +150,7 @@ struct Opt {
 async fn main() -> std::result::Result<(), anyhow::Error> {
     let opt = Opt::parse();
 
-    // Validate mutually exclusive options
-    #[cfg(feature = "tui")]
-    if opt.tui && opt.serve {
-        eprintln!("Error: --tui and --serve flags cannot be used together");
-        std::process::exit(1);
-    }
+    // TUI and serve modes can now run together
 
     // Initialize the tracing subscriber with environment variables
     tracing_subscriber::fmt()
@@ -171,7 +166,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     #[cfg(feature = "tui")]
     if opt.tui {
-        return run_tui_mode(opt).await;
+        if opt.serve {
+            // Combined TUI + serve mode
+            return run_combined_mode(opt, tx).await;
+        } else {
+            // TUI only mode
+            return run_tui_mode(opt).await;
+        }
     }
 
     if opt.serve {
@@ -874,6 +875,202 @@ fn output_svg(path: &PathBuf, str: &[String], title: String) -> anyhow::Result<(
     let mut svg_file = std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(path)?);
     flamegraph::from_lines(&mut svg_opts, str.iter().map(|v| v.as_str()), &mut svg_file)?;
 
+    Ok(())
+}
+
+/// Runs combined TUI + serve mode with shared profiling pipeline
+#[cfg(feature = "tui")]
+async fn run_combined_mode(opt: Opt, web_tx: tokio::sync::broadcast::Sender<String>) -> std::result::Result<(), anyhow::Error> {
+    use profile_bee_tui::{app::App, event::{Event, EventHandler}, handler::handle_key_events, tui::Tui};
+    use std::io;
+
+    println!("Starting combined TUI + serve mode...");
+
+    // Start web server
+    let web_rx = web_tx.subscribe();
+    tokio::spawn(async move {
+        profile_bee::html::start_server(web_rx).await;
+    });
+
+    // Setup shared profiling infrastructure
+    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
+    let pid = if let Some(cmd) = &spawn {
+        Some(cmd.pid())
+    } else {
+        opt.pid.clone()
+    };
+
+    let config = ProfilerConfig {
+        skip_idle: opt.skip_idle,
+        stream_mode: opt.stream_mode,
+        frequency: opt.frequency,
+        kprobe: opt.kprobe.clone(),
+        uprobe: opt.uprobe.clone(),
+        tracepoint: opt.tracepoint.clone(),
+        pid,
+        cpu: opt.cpu,
+        self_profile: opt.self_profile,
+        dwarf: opt.dwarf,
+    };
+
+    let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
+    let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
+    let (perf_tx, perf_rx) = mpsc::channel();
+
+    // DWARF setup
+    let tgid_request_tx = if opt.dwarf {
+        let mut dwarf_manager = DwarfUnwindManager::new();
+        if let Some(target_pid) = pid {
+            println!("Loading DWARF unwind tables for pid {}...", target_pid);
+            match dwarf_manager.load_process(target_pid) {
+                Ok(()) => {
+                    println!("Loaded {} unwind entries for pid {}", dwarf_manager.total_entries(), target_pid);
+                    if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
+                        eprintln!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to load DWARF info for pid {}: {}", target_pid, e);
+                }
+            }
+        }
+
+        let (tgid_tx, tgid_rx) = mpsc::channel::<u32>();
+        let refresh_tx = perf_tx.clone();
+        let initial_pid = pid;
+        std::thread::spawn(move || {
+            dwarf_refresh_loop(dwarf_manager, initial_pid, tgid_rx, refresh_tx);
+        });
+        Some(tgid_tx)
+    } else {
+        None
+    };
+
+    // Set target PID for eBPF filtering AFTER DWARF tables are loaded
+    if let Some(target_pid) = pid {
+        ebpf_profiler.set_target_pid(target_pid)?;
+        println!("Profiling PID {}..", target_pid);
+    }
+
+    // Setup TUI
+    let mut app = App::with_live();
+    let update_handle = app.get_update_handle();
+
+    // Shared profiling thread that feeds both TUI and web server
+    let web_tx_clone = web_tx.clone();
+    let stream_mode = opt.stream_mode;
+    let group_by_cpu = opt.group_by_cpu;
+    let tui_refresh_ms = opt.tui_refresh_ms;
+    std::thread::spawn(move || {
+        let mut profiler = TraceHandler::new();
+        let mut counts = ebpf_profiler.counts;
+        let stack_traces = ebpf_profiler.stack_traces;
+        let stacked_pointers = ebpf_profiler.stacked_pointers;
+        let mut bpf = ebpf_profiler.bpf;
+        let mut trace_count = HashMap::<StackInfo, usize>::new();
+        let mut known_tgids = std::collections::HashSet::<u32>::new();
+
+        loop {
+            let keys = counts.keys().flatten().collect::<Vec<_>>();
+            for k in keys {
+                let _ = counts.remove(&k);
+            }
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(tui_refresh_ms);
+            while std::time::Instant::now() < deadline {
+                match perf_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(PerfWork::StackInfo(stack)) => {
+                        if let Some(tx) = &tgid_request_tx {
+                            if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
+                                let _ = tx.send(stack.tgid);
+                            }
+                        }
+                        let trace = trace_count.entry(stack).or_insert(0);
+                        *trace += 1;
+                        if *trace == 1 {
+                            let _combined = profiler.get_exp_stacked_frames(&stack, &stack_traces, group_by_cpu, &stacked_pointers);
+                        }
+                    }
+                    Ok(PerfWork::DwarfRefresh(update)) => {
+                        apply_dwarf_refresh(&mut bpf, update);
+                    }
+                    Ok(PerfWork::Stop) => return,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+
+            // Generate data for both TUI and web
+            let mut stacks = Vec::new();
+            let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
+
+            if !local_counting {
+                for (key, value) in counts.iter().flatten() {
+                    let stack: StackInfo = key.0;
+                    if !trace_count.contains_key(&stack) {
+                        let _combined = profiler.get_exp_stacked_frames(&stack, &stack_traces, group_by_cpu, &stacked_pointers);
+                    }
+                    *trace_count.entry(stack).or_insert(0) += value as usize;
+                }
+            }
+
+            for (stack, value) in trace_count.iter() {
+                let combined = profiler.get_exp_stacked_frames(stack, &stack_traces, group_by_cpu, &stacked_pointers);
+                stacks.push(FrameCount { frames: combined, count: *value as u64 });
+            }
+
+            let mut out = stacks.into_iter().map(|frames| {
+                let key = frames.frames.iter().map(|s| s.fmt_symbol()).collect::<Vec<_>>().join(";");
+                format!("{} {}", &key, frames.count)
+            }).collect::<Vec<_>>();
+            out.sort();
+
+            // Update TUI
+            let data = out.join("\n");
+            let tic = std::time::Instant::now();
+            let flamegraph = profile_bee_tui::flame::FlameGraph::from_string(data.clone(), true);
+            let parsed = profile_bee_tui::app::ParsedFlameGraph { flamegraph, elapsed: tic.elapsed() };
+            *update_handle.lock().unwrap() = Some(parsed);
+
+            // Send to web server
+            let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
+            let _ = web_tx_clone.send(json);
+        }
+    });
+
+    // Start ring buffer processing
+    tokio::spawn(async move {
+        if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
+            eprintln!("Failed to set up ring buffer: {:?}", e);
+        }
+    });
+
+    // TUI event loop
+    let backend = profile_bee_tui::ratatui::backend::CrosstermBackend::new(io::stderr());
+    let terminal = profile_bee_tui::ratatui::Terminal::new(backend)?;
+    let events = EventHandler::new(250);
+    let mut tui = Tui::new(terminal, events);
+    tui.init().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    while app.running {
+        if app.dirty {
+            tui.draw(&mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
+            app.dirty = false;
+        }
+        match tui.events.next().map_err(|e| anyhow::anyhow!("{e}"))? {
+            Event::Tick => app.tick(),
+            Event::Key(key_event) => {
+                handle_key_events(key_event, &mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
+                app.dirty = true;
+            }
+            Event::Mouse(_) => {}
+            Event::Resize(_, _) => { app.dirty = true; }
+        }
+    }
+
+    tui.exit().map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(stopper);
+    println!("\nExiting combined mode");
     Ok(())
 }
 
