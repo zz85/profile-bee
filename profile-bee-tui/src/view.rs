@@ -374,21 +374,21 @@ impl FlameGraphView {
 
     pub fn set_zoom_for_id(&mut self, stack_id: StackIdentifier) {
         if let Some(selected_stack) = self.flamegraph.get_stack(&stack_id) {
+            if stack_id == ROOT_ID || selected_stack.total_count == 0 {
+                self.unset_zoom();
+                return;
+            }
             let zoom_factor =
                 self.flamegraph.total_count() as f64 / selected_stack.total_count as f64;
             let ancestors = self.flamegraph.get_ancestors(&stack_id);
             let descendants = self.flamegraph.get_descendants(&stack_id);
-            if stack_id == ROOT_ID {
-                self.unset_zoom();
-            } else {
-                let zoom = ZoomState {
-                    stack_id,
-                    zoom_factor,
-                    ancestors,
-                    descendants,
-                };
-                self.state.set_zoom(zoom);
-            }
+            let zoom = ZoomState {
+                stack_id,
+                zoom_factor,
+                ancestors,
+                descendants,
+            };
+            self.state.set_zoom(zoom);
         }
     }
 

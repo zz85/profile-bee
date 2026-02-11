@@ -828,6 +828,12 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         None
     };
 
+    // Set target PID for eBPF filtering AFTER DWARF tables are loaded
+    if let Some(target_pid) = pid {
+        ebpf_profiler.set_target_pid(target_pid)?;
+        println!("Profiling PID {}..", target_pid);
+    }
+
     // Create TUI app
     let mut app = App::with_live();
     let update_handle = app.get_update_handle();
@@ -892,7 +898,8 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                         apply_dwarf_refresh(&mut bpf, update);
                     }
                     Ok(PerfWork::Stop) => return,
-                    Err(_) => break, // Timeout, generate flamegraph
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             }
 
