@@ -85,6 +85,10 @@ pub struct ProfilerConfig {
     /// Raw tracepoint name for syscall raw_tp (e.g., "sys_enter").
     /// Uses collect_trace_raw_syscall which reads pt_regs from args[0].
     pub raw_tracepoint: Option<String>,
+    /// Raw tracepoint name for generic raw_tp with task pt_regs (e.g., "sched_switch").
+    /// Uses bpf_get_current_task_btf() + bpf_task_pt_regs() for full FP/DWARF unwinding.
+    /// Requires kernel >= 5.15; falls back to raw_tracepoint_generic on older kernels.
+    pub raw_tracepoint_task_regs: Option<String>,
     /// Raw tracepoint name for generic raw_tp (e.g., "sched_switch").
     /// Uses collect_trace_raw_tp_generic which relies on bpf_get_stackid only.
     pub raw_tracepoint_generic: Option<String>,
@@ -222,6 +226,11 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
     } else if let Some(raw_tp) = &config.raw_tracepoint {
         let program: &mut RawTracePoint =
             bpf.program_mut("raw_tp_sys_enter").unwrap().try_into()?;
+        program.load()?;
+        program.attach(raw_tp)?;
+    } else if let Some(raw_tp) = &config.raw_tracepoint_task_regs {
+        let program: &mut RawTracePoint =
+            bpf.program_mut("raw_tp_with_regs").unwrap().try_into()?;
         program.load()?;
         program.attach(raw_tp)?;
     } else if let Some(raw_tp) = &config.raw_tracepoint_generic {

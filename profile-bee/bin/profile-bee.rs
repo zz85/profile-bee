@@ -278,18 +278,22 @@ fn syscall_name_to_nr(name: &str) -> Option<i64> {
 
 /// Set up eBPF profiler with automatic raw tracepoint fallback.
 ///
-/// For ALL tracepoints, this first tries attaching via `RawTracePoint`
+/// For ALL tracepoints, this tries attaching via `RawTracePoint`
 /// (which uses `bpf_raw_tracepoint_open` and bypasses BPF LSM restrictions
 /// on `PERF_EVENT_IOC_SET_BPF`). If that fails, it falls back to the
 /// regular `TracePoint` attachment.
 ///
-/// For syscall tracepoints (syscalls:sys_enter_*), uses the syscall-specific
-/// raw_tp program with pt_regs access and syscall NR filtering.
-/// For all other tracepoints, uses the generic raw_tp program with
-/// bpf_get_stackid()-only stack traces.
+/// Fallback chain for non-syscall tracepoints:
+///   1. raw_tp with task pt_regs (kernel >= 5.15, full FP/DWARF unwinding)
+///   2. raw_tp generic (bpf_get_stackid only)
+///   3. perf TracePoint (legacy, may be blocked by BPF LSM)
+///
+/// For syscall tracepoints (syscalls:sys_enter_*):
+///   1. raw_tp syscall (pt_regs from args[0], syscall NR filtering)
+///   2-3. same as above
 fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfiler, anyhow::Error> {
     if let Some(tp) = config.tracepoint.clone() {
-        // First, try syscall-specific raw tracepoint (has pt_regs for full unwinding)
+        // For syscall tracepoints, try syscall-specific raw_tp first (has pt_regs in args)
         if let Some((raw_tp, syscall_nr)) = parse_syscall_tracepoint(&tp) {
             let raw_tp = raw_tp.to_string();
             let tp_saved = config.tracepoint.take();
@@ -306,7 +310,7 @@ fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfil
                 }
                 Err(e) => {
                     eprintln!(
-                        "Raw tracepoint (syscall) failed ({}), trying generic raw_tp...",
+                        "Raw tracepoint (syscall) failed ({}), trying task_pt_regs...",
                         e
                     );
                     config.raw_tracepoint = None;
@@ -316,16 +320,38 @@ fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfil
             }
         }
 
-        // Second, try generic raw tracepoint (bpf_get_stackid only, no custom unwinding)
-        let raw_tp_name = parse_tracepoint_name(&tp);
-        if let Some(name) = raw_tp_name {
+        // Try raw_tp with task pt_regs (kernel >= 5.15, full unwinding)
+        if let Some(name) = parse_tracepoint_name(&tp) {
+            let name = name.to_string();
             let tp_saved = config.tracepoint.take();
-            config.raw_tracepoint_generic = Some(name.to_string());
+            config.raw_tracepoint_task_regs = Some(name.clone());
 
             match setup_ebpf_profiler(config) {
                 Ok(profiler) => {
                     eprintln!(
-                        "Attached via generic raw tracepoint '{}'",
+                        "Attached via raw tracepoint '{}' (task pt_regs, full unwinding)",
+                        name
+                    );
+                    return Ok(profiler);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Raw tracepoint with task_pt_regs failed ({}), trying generic...",
+                        e
+                    );
+                    config.raw_tracepoint_task_regs = None;
+                    config.tracepoint = tp_saved;
+                }
+            }
+
+            // Try generic raw_tp (bpf_get_stackid only, no custom unwinding)
+            let tp_saved = config.tracepoint.take();
+            config.raw_tracepoint_generic = Some(name.clone());
+
+            match setup_ebpf_profiler(config) {
+                Ok(profiler) => {
+                    eprintln!(
+                        "Attached via generic raw tracepoint '{}' (stackid only)",
                         name
                     );
                     return Ok(profiler);
@@ -414,6 +440,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         smart_uprobe,
         tracepoint: opt.tracepoint.clone(),
         raw_tracepoint: None,
+        raw_tracepoint_task_regs: None,
         raw_tracepoint_generic: None,
         target_syscall_nr: -1,
         pid: opt.pid.clone(),
@@ -1123,6 +1150,7 @@ fn build_profiler_config(
         smart_uprobe,
         tracepoint: opt.tracepoint.clone(),
         raw_tracepoint: None,
+        raw_tracepoint_task_regs: None,
         raw_tracepoint_generic: None,
         target_syscall_nr: -1,
         pid,

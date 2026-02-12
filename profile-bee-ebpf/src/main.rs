@@ -7,7 +7,10 @@ use aya_ebpf::{
     programs::{PerfEventContext, RawTracePointContext, TracePointContext},
     programs::{ProbeContext, RetProbeContext},
 };
-use profile_bee_ebpf::{collect_trace, collect_trace_raw_syscall, collect_trace_raw_tp_generic};
+use profile_bee_ebpf::{
+    collect_trace, collect_trace_raw_syscall, collect_trace_raw_tp_generic,
+    collect_trace_raw_tp_with_task_regs,
+};
 
 #[perf_event]
 pub fn profile_cpu(ctx: PerfEventContext) -> u32 {
@@ -54,6 +57,16 @@ pub fn raw_tp_sys_enter(ctx: RawTracePointContext) -> u32 {
 #[raw_tracepoint]
 pub fn raw_tp_generic(ctx: RawTracePointContext) -> u32 {
     unsafe { collect_trace_raw_tp_generic(ctx) }
+    0
+}
+
+/// Raw tracepoint with task pt_regs for non-syscall events.
+/// Uses bpf_get_current_task_btf() + bpf_task_pt_regs() for full
+/// FP/DWARF unwinding. Requires kernel >= 5.15; will fail to load
+/// on older kernels, falling back to raw_tp_generic.
+#[raw_tracepoint]
+pub fn raw_tp_with_regs(ctx: RawTracePointContext) -> u32 {
+    unsafe { collect_trace_raw_tp_with_task_regs(ctx) }
     0
 }
 

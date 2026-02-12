@@ -6,7 +6,8 @@
 use aya_ebpf::{
     bindings::{bpf_raw_tracepoint_args, pt_regs, BPF_F_USER_STACK},
     helpers::{
-        bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_kernel, bpf_probe_read_user,
+        bpf_get_current_task_btf, bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_kernel,
+        bpf_probe_read_user, bpf_task_pt_regs,
     },
     macros::map,
     maps::{Array, HashMap, PerCpuArray, RingBuf, StackTrace},
@@ -338,6 +339,123 @@ pub unsafe fn collect_trace_raw_tp_generic(ctx: RawTracePointContext) {
         ip: 0,
         bp: 0,
         sp: 0,
+    };
+
+    let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
+
+    let notify_code = notify_type();
+    let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+
+    if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
+        *count += 1;
+    } else {
+        let _ = COUNTS.insert(&stack_info, &1, 0);
+        notify = true;
+    }
+
+    if notify {
+        if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+            let _writable = entry.write(stack_info);
+            entry.submit(0);
+        }
+    }
+}
+
+/// Collect trace for generic raw tracepoint programs using task pt_regs.
+///
+/// Uses bpf_get_current_task_btf() + bpf_task_pt_regs() to obtain the
+/// interrupted userspace registers, enabling full frame-pointer/DWARF
+/// unwinding even for non-syscall tracepoints (sched, block, net, tcp, etc.).
+///
+/// Requires kernel >= 5.15 for bpf_task_pt_regs(). Programs using this
+/// function will fail to load on older kernels, falling back to
+/// collect_trace_raw_tp_generic (bpf_get_stackid only).
+#[inline(always)]
+pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
+    let pid = ctx.pid();
+
+    if pid == 0 && skip_idle() {
+        return;
+    }
+
+    let tgid = ctx.tgid();
+
+    let filter_pid = target_pid();
+    if filter_pid != 0 && tgid != filter_pid {
+        return;
+    }
+
+    // Get pt_regs from current task (kernel >= 5.15)
+    let task = bpf_get_current_task_btf();
+    let regs_ptr = bpf_task_pt_regs(task) as *const pt_regs;
+    if regs_ptr.is_null() {
+        return;
+    }
+
+    let cpu = bpf_get_smp_processor_id();
+    let user_stack_id = STACK_TRACES
+        .get_stackid(&ctx, BPF_F_USER_STACK.into())
+        .map_or(-1, |stack_id| stack_id as i32);
+    let kernel_stack_id = STACK_TRACES
+        .get_stackid(&ctx, 0)
+        .map_or(-1, |stack_id| stack_id as i32);
+
+    let Some(pointer) = STORAGE.get_ptr_mut(0) else {
+        return;
+    };
+    let pointer = &mut *pointer;
+
+    // bpf_task_pt_regs returns a kernel pointer — read with bpf_probe_read_kernel
+    let Ok(regs) = bpf_probe_read_kernel(regs_ptr) else {
+        // Fallback: no custom unwinding, just use stack IDs
+        pointer.len = 0;
+        let cmd = ctx.command().unwrap_or_default();
+        let stack_info = StackInfo {
+            tgid,
+            user_stack_id,
+            kernel_stack_id,
+            cmd,
+            cpu,
+            ip: 0,
+            bp: 0,
+            sp: 0,
+        };
+        let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
+        let notify_code = notify_type();
+        let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+        if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
+            *count += 1;
+        } else {
+            let _ = COUNTS.insert(&stack_info, &1, 0);
+            notify = true;
+        }
+        if notify {
+            if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+                let _writable = entry.write(stack_info);
+                entry.submit(0);
+            }
+        }
+        return;
+    };
+
+    let (ip, bp, len, sp) = if dwarf_enabled() {
+        let (ip, bp, len) = dwarf_copy_stack_regs(&regs, &mut pointer.pointers, tgid);
+        (ip, bp, len, regs.rsp)
+    } else {
+        copy_stack_regs(&regs, &mut pointer.pointers)
+    };
+    pointer.len = len;
+
+    let cmd = ctx.command().unwrap_or_default();
+    let stack_info = StackInfo {
+        tgid,
+        user_stack_id,
+        kernel_stack_id,
+        cmd,
+        cpu,
+        ip,
+        bp,
+        sp,
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
