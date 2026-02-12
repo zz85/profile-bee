@@ -28,7 +28,7 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 │       │                              │                              │
 │       │                              ├─ Read RIP, RSP, RBP          │
 │       │                              ├─ Lookup PROC_INFO by tgid    │
-│       │                              ├─ For each frame (max 22):    │
+│       │                              ├─ For each frame (max 21):    │
 │       │                              │   ├─ Find mapping for IP     │
 │       │                              │   ├─ relative_pc = IP - bias │
 │       │                              │   ├─ Binary search table     │
