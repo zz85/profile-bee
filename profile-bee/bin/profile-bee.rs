@@ -3,7 +3,7 @@ use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
-use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod};
+use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod, UProbeConfig};
 use profile_bee::ebpf::{FramePointersPod};
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::spawn::{SpawnProcess, StopHandler};
@@ -81,9 +81,22 @@ struct Opt {
     #[arg(long)]
     kprobe: Option<String>,
 
-    /// function name to attached uprobe
+    /// Function name to attach uprobe. Format: function_name or function_name+offset
     #[arg(long)]
     uprobe: Option<String>,
+
+    /// Path to binary/library for uprobe. Can be absolute path or library name (e.g., "libc").
+    /// If not specified, defaults to "libc"
+    #[arg(long)]
+    uprobe_path: Option<String>,
+
+    /// Use uretprobe instead of uprobe (attaches to function return)
+    #[arg(long)]
+    uretprobe: bool,
+
+    /// PID to attach uprobe to (if not specified, attaches to all processes)
+    #[arg(long)]
+    uprobe_pid: Option<i32>,
 
     /// function name to attached tracepoint eg.
     #[arg(long)]
@@ -170,7 +183,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         stream_mode: opt.stream_mode,
         frequency: opt.frequency,
         kprobe: opt.kprobe.clone(),
-        uprobe: opt.uprobe.clone(),
+        uprobe: opt.uprobe.as_ref().map(|fn_name| {
+            UProbeConfig {
+                function: fn_name.clone(),
+                path: opt.uprobe_path.clone().unwrap_or_else(|| "libc".to_string()),
+                is_retprobe: opt.uretprobe,
+                pid: opt.uprobe_pid,
+            }
+        }),
         tracepoint: opt.tracepoint.clone(),
         pid: opt.pid.clone(),
         cpu: opt.cpu,
@@ -777,12 +797,19 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     };
 
     // Create eBPF profiler configuration
+    let uprobe_config = opt.uprobe.as_ref().map(|function| UProbeConfig {
+        function: function.clone(),
+        path: opt.uprobe_path.clone().unwrap_or_else(|| "libc".to_string()),
+        is_retprobe: opt.uretprobe,
+        pid: opt.uprobe_pid,
+    });
+
     let config = ProfilerConfig {
         skip_idle: opt.skip_idle,
         stream_mode: opt.stream_mode,
         frequency: opt.frequency,
         kprobe: opt.kprobe.clone(),
-        uprobe: opt.uprobe.clone(),
+        uprobe: uprobe_config,
         tracepoint: opt.tracepoint.clone(),
         pid,
         cpu: opt.cpu,

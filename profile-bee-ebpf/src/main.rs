@@ -2,10 +2,10 @@
 #![no_main]
 
 use aya_ebpf::{
-    macros::{kprobe, uprobe},
+    macros::{kprobe, uprobe, uretprobe},
     macros::{perf_event, tracepoint},
-    programs::ProbeContext,
     programs::{PerfEventContext, TracePointContext},
+    programs::{ProbeContext, RetProbeContext},
 };
 use profile_bee_ebpf::collect_trace;
 
@@ -26,6 +26,12 @@ pub fn kprobe_profile(ctx: ProbeContext) -> u32 {
 
 #[uprobe]
 pub fn uprobe_profile(ctx: ProbeContext) -> u32 {
+    unsafe { collect_trace(ctx) }
+    0
+}
+
+#[uretprobe]
+pub fn uretprobe_profile(ctx: RetProbeContext) -> u32 {
     unsafe { collect_trace(ctx) }
     0
 }

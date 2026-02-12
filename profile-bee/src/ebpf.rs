@@ -48,12 +48,25 @@ pub struct EbpfProfiler {
     /// Custom storage of StackTrace IPs
     pub stacked_pointers: HashMap<MapData, StackInfoPod, FramePointersPod>,
 }
+/// Configuration for uprobe attachment
+#[derive(Debug, Clone)]
+pub struct UProbeConfig {
+    /// Function name (with optional +offset)
+    pub function: String,
+    /// Path to binary/library (absolute or library name)
+    pub path: String,
+    /// Whether this is a return probe
+    pub is_retprobe: bool,
+    /// Optional PID to attach to (None = all processes)
+    pub pid: Option<i32>,
+}
+
 pub struct ProfilerConfig {
     pub skip_idle: bool,
     pub stream_mode: u8,
     pub frequency: u64,
     pub kprobe: Option<String>,
-    pub uprobe: Option<String>,
+    pub uprobe: Option<UProbeConfig>,
     pub tracepoint: Option<String>,
     pub pid: Option<u32>,
     pub cpu: Option<u32>,
@@ -99,10 +112,34 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         let program: &mut KProbe = bpf.program_mut("kprobe_profile").unwrap().try_into()?;
         program.load()?;
         program.attach(kprobe, 0)?;
-    } else if let Some(uprobe) = &config.uprobe {
-        let program: &mut UProbe = bpf.program_mut("uprobe_profile").unwrap().try_into()?;
+    } else if let Some(uprobe_config) = &config.uprobe {
+        // Choose the right program based on is_retprobe flag
+        let program_name = if uprobe_config.is_retprobe {
+            "uretprobe_profile"
+        } else {
+            "uprobe_profile"
+        };
+
+        let program: &mut UProbe = bpf.program_mut(program_name).unwrap().try_into()?;
         program.load()?;
-        program.attach(Some(uprobe), 0, "libc", None)?;
+
+        // Parse function name and offset (format: "function_name" or "function_name+offset")
+        let (fn_name, offset) = if let Some(plus_pos) = uprobe_config.function.find('+') {
+            let (name, offset_str) = uprobe_config.function.split_at(plus_pos);
+            let offset = offset_str[1..]
+                .parse::<u64>()
+                .map_err(|e| anyhow::anyhow!("Invalid offset in uprobe function: {}", e))?;
+            (Some(name), offset)
+        } else {
+            (Some(uprobe_config.function.as_str()), 0)
+        };
+
+        program.attach(
+            fn_name,
+            offset,
+            uprobe_config.path.as_str(),
+            uprobe_config.pid,
+        )?;
     } else if let Some(tracepoint) = &config.tracepoint {
         let program: &mut TracePoint = bpf.program_mut("tracepoint_profile").unwrap().try_into()?;
         program.load()?;

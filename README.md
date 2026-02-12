@@ -114,6 +114,24 @@ profile-bee --kprobe vfs_write --time 200 --svg kprobe.svg
 # Profile using a tracepoint over a interval of 200ms
 profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 
+# Profile using uprobe on malloc in libc
+profile-bee --uprobe malloc --time 1000 --svg malloc.svg
+
+# Profile uprobe on a specific binary with custom path
+profile-bee --uprobe my_function --uprobe-path /path/to/binary --time 1000 --svg uprobe.svg
+
+# Profile using uprobe on a library name (e.g., libpthread)
+profile-bee --uprobe pthread_create --uprobe-path libpthread --time 1000 --svg thread.svg
+
+# Profile uprobe with function offset
+profile-bee --uprobe my_function+16 --uprobe-path /path/to/binary --time 1000 --svg uprobe_offset.svg
+
+# Profile using uretprobe (return probe) on malloc
+profile-bee --uprobe malloc --uretprobe --time 1000 --svg malloc_ret.svg
+
+# Profile uprobe for a specific PID only
+profile-bee --uprobe malloc --uprobe-pid 12345 --time 1000 --svg malloc_pid.svg
+
 # Profile specific pid (includes child processes, automatically stops when process exits)
 profile-bee --pid <pid> --svg output.svg --time 10000
 
@@ -171,7 +189,8 @@ The TUI viewer is optional and can be enabled with the `tui` feature flag. See [
 - Simple symbol lookup cache
 - SVG Flamegraph generation (via inferno)
 - BPF based stacktrace aggregation for reducing kernel <-> userspace transfers
-- Basic Kernel and tracepoint probing
+- **User space probing (uprobe/uretprobe)** - trace any userspace function
+- Basic Kernel probing (kprobe) and tracepoint support
 - Group by CPUs
 - Profile target PIDs, CPU id, or itself
 - **Automatic termination** when target PID (via `--pid`) or spawned process (via `--cmd`) exits
@@ -188,10 +207,11 @@ The TUI viewer is optional and can be enabled with the `tui` feature flag. See [
 ### TODOs
 - Optimize CPU usage
 - Check stack correctness (compare with perf, pprof etc)
-- implement uprobing/USDT
+- Implement USDT (User Statically-Defined Tracing) support
 - pid nesting
 - Off CPU profiling
 - Publish to crates.io
+- ~~Implement uprobing (uprobe/uretprobe)~~
 - ~~Optimize symbol lookup via binary search~~
 - ~~Measure cache hit ratio~~
 - ~~Missing symbols~~
