@@ -130,27 +130,27 @@ signal_work → handler → __restore_rt → compute → main → __libc_start_m
 
 **Tradeoff:** The extra `bpf_probe_read_user` calls for signal frame handling consume verifier budget, reducing `MAX_DWARF_STACK_DEPTH` from 22 to 21 (one fewer frame in the deepest stacks).
 
-## Issue 3: Partial shared library unwinding failures (~51% of samples)
+## Issue 3: Partial shared library unwinding failures (~51% of samples) — FIXED
 
 **Severity:** Medium  
-**File:** `profile-bee/src/dwarf_unwind.rs`, `profile-bee-ebpf/src/lib.rs`
+**File:** `profile-bee/src/dwarf_unwind.rs`
 
-For the shared library test, only ~49% of samples get the full call chain. The rest show only `[unknown];lib_hot`.
+For the shared library test, previously only ~49% of samples got the full call chain. The rest showed only `[unknown];lib_hot`.
 
-**profile-bee:**
+**Before:**
 ```
 sharedlib-no-fp;[unknown];_start;__libc_start_main;main;caller_a;caller_b;lib_entry;lib_inner;lib_hot  47
 sharedlib-no-fp;[unknown];lib_hot                                                                     101
 ```
 
-**perf:** 100% of samples get the full stack.
+**After:**
+```
+sharedlib-no-fp;[unknown];_start;__libc_start_main;main;caller_a;caller_b;lib_entry;lib_inner;lib_hot  298
+```
 
-**Possible causes:**
-1. The FP-based fallback (`try_fp_step`) in the eBPF code may be kicking in when the DWARF lookup fails at a library boundary, and the FP step produces a bad frame that terminates unwinding
-2. The mapping lookup may not find the correct mapping when the return address crosses from `libhotlib.so` back to the main binary, if the main binary's mapping range doesn't cover the PLT/GOT region
-3. Race between process startup and mapping scan — some samples may be collected before all mappings are loaded
+**Root cause:** Race condition between process spawn and initial DWARF table load. When using `--cmd`, the process is spawned and `load_process` reads `/proc/PID/maps` immediately. But the dynamic linker hasn't finished mapping shared libraries yet, so the initial load captures only the main binary's unwind table (~1412 entries). The shared library and libc tables (~19000 entries) are only picked up by the background refresh thread 1 second later.
 
-**Investigation needed:** Add per-sample debug counters in eBPF to track where unwinding stops.
+**Fix:** Poll `/proc/PID/maps` until the executable mapping count stabilizes before loading unwind tables. This waits for the dynamic linker to finish (typically <50ms) without using a fragile fixed delay.
 
 ## Issue 4: Persistent `[unknown]` frame at stack bottom
 
@@ -161,25 +161,25 @@ Every stack has an `[unknown]` frame between the process name and `_start`. This
 
 Cosmetic issue but adds noise to flamegraphs.
 
-## Issue 5: Design doc vs implementation mismatch
+## Issue 5: Design doc vs implementation mismatch — FIXED
 
 **Severity:** Low
 
 | Constant | Design doc | Code (before) | Code (after fix) |
 |----------|-----------|---------------|-------------------|
-| MAX_DWARF_STACK_DEPTH | 32 | 12 | 22 |
+| MAX_DWARF_STACK_DEPTH | 32 | 12 | 21 |
 | MAX_PROC_MAPS | 16 | 8 | 8 (can't increase — BPF verifier) |
 
-The design doc should be updated to reflect the actual BPF verifier limits.
+The design doc has been updated to reflect the actual BPF verifier limits.
 
 ## Test Results Summary
 
-### Before fix (MAX_DWARF_STACK_DEPTH=12)
+### Before fixes
 
 | Test | pb depth | perf depth | Match? |
 |------|----------|------------|--------|
 | Basic callstack | 9 | 8 | ✅ |
-| Deep recursion (20 levels) | 13 | 24 | ❌ Truncated |
+| Deep recursion (20 levels) | 13 | 24 | ❌ Truncated at 12 |
 | Shared library | 10 | 8 | ⚠️ 51% fail |
 | PIE binary | 9 | 8 | ✅ |
 | Indirect calls | 11 | 10 | ✅ |
@@ -187,8 +187,15 @@ The design doc should be updated to reflect the actual BPF verifier limits.
 | Signal handler | 6 | 7 | ❌ Stops at trampoline |
 | Rust binary (O2) | 8 | 9 | ✅ |
 
-### After fix (MAX_DWARF_STACK_DEPTH=22)
+### After all fixes (depth=21, signal trampoline, shared lib race)
 
 | Test | pb depth | perf depth | Match? |
 |------|----------|------------|--------|
-| Deep recursion (20 levels) | 23 | 24 | ✅ (within 1 frame) |
+| Basic callstack | 9 | 8 | ✅ |
+| Deep recursion (20 levels) | 22 | 24 | ✅ (within 2 frames) |
+| Shared library | 10 | 8 | ✅ 100% success |
+| Signal handler | 9 | 7 | ✅ Crosses trampoline |
+| PIE binary | 9 | 8 | ✅ |
+| Indirect calls | 11 | 10 | ✅ |
+| Multi-threaded | 8 | 8 | ✅ |
+| Rust binary (O2) | 8 | 9 | ✅ |

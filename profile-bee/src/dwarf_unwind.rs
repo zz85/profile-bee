@@ -390,6 +390,18 @@ impl DwarfUnwindManager {
         if self.proc_info.contains_key(&tgid) {
             return Ok(());
         }
+        // Wait for the dynamic linker to finish mapping shared libraries.
+        // After fork+exec, /proc/PID/maps may not yet reflect all mappings.
+        // Poll until the mapping count stabilizes (typically <100ms).
+        let mut prev_count = 0usize;
+        for _ in 0..20 {
+            let count = Self::count_exec_maps(tgid);
+            if count > 0 && count == prev_count {
+                break;
+            }
+            prev_count = count;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         self.scan_and_update(tgid)
     }
 
@@ -405,6 +417,24 @@ impl DwarfUnwindManager {
             .filter(|id| !old_shard_ids.contains(id))
             .collect();
         Ok(new_shard_ids)
+    }
+
+    /// Count executable memory mappings for a process (fast, no file I/O).
+    fn count_exec_maps(tgid: u32) -> usize {
+        let Ok(process) = Process::new(tgid as i32) else {
+            return 0;
+        };
+        let Ok(maps) = process.maps() else {
+            return 0;
+        };
+        use procfs::process::MMPermissions;
+        maps.iter()
+            .filter(|m| {
+                m.perms.contains(MMPermissions::EXECUTE)
+                    && m.perms.contains(MMPermissions::READ)
+                    && matches!(m.pathname, MMapPath::Path(_) | MMapPath::Vdso)
+            })
+            .count()
     }
 
     fn scan_and_update(&mut self, tgid: u32) -> Result<(), String> {
