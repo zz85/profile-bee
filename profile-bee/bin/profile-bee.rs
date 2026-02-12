@@ -329,6 +329,15 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Convert an optional i32 PID to u32, rejecting negative values.
+fn uprobe_pid_as_u32(uprobe_pid: Option<i32>) -> Result<Option<u32>, anyhow::Error> {
+    uprobe_pid
+        .map(|p| {
+            u32::try_from(p).map_err(|_| anyhow::anyhow!("--uprobe-pid must be non-negative, got {}", p))
+        })
+        .transpose()
+}
+
 /// Handle --list-probes: resolve and display matching symbols, then exit.
 fn handle_list_probes(
     probe_str: &str,
@@ -342,7 +351,7 @@ fn handle_list_probes(
 
     let resolver = ProbeResolver::new();
 
-    let effective_pid = pid.or(uprobe_pid.map(|p| p as u32));
+    let effective_pid = pid.or(uprobe_pid_as_u32(uprobe_pid)?);
 
     let probes = if let Some(target_pid) = effective_pid {
         eprintln!("Scanning /proc/{}/maps...", target_pid);
@@ -364,7 +373,7 @@ fn resolve_uprobe_specs(
     uprobe_pid: Option<i32>,
 ) -> Result<SmartUProbeConfig, anyhow::Error> {
     let resolver = ProbeResolver::new();
-    let effective_pid = pid.or(uprobe_pid.map(|p| p as u32));
+    let effective_pid = pid.or(uprobe_pid_as_u32(uprobe_pid)?);
     let mut all_probes: Vec<ResolvedProbe> = Vec::new();
 
     for spec_str in specs {
