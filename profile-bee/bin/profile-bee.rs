@@ -680,8 +680,10 @@ fn process_profiling_data(
     let mut samples = 0;
     let mut known_tgids = std::collections::HashSet::<u32>::new();
 
-    // Clear counters
-    trace_count.clear();
+    // Determine counting strategy before the recv loop so the StackInfo
+    // handler knows whether to accumulate into trace_count (local counting)
+    // or only prime the symbol cache (kernel counting).
+    let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
     // Clear "counts" hashmap
     let keys = counts.keys().flatten().collect::<Vec<_>>();
@@ -702,11 +704,21 @@ fn process_profiling_data(
                     }
                 }
 
-                // User space counting
-                let trace = trace_count.entry(stack).or_insert(0);
-                *trace += 1;
+                if local_counting {
+                    // User space counting — accumulate into trace_count
+                    let trace = trace_count.entry(stack).or_insert(0);
+                    *trace += 1;
 
-                if *trace == 1 {
+                    if *trace == 1 {
+                        let _combined = profiler.get_exp_stacked_frames(
+                            &stack,
+                            &stack_traces,
+                            group_by_cpu,
+                            &stacked_pointers,
+                        );
+                    }
+                } else {
+                    // Kernel counts are authoritative; only prime symbol cache
                     let _combined = profiler.get_exp_stacked_frames(
                         &stack,
                         &stack_traces,
@@ -726,7 +738,6 @@ fn process_profiling_data(
     println!("Processing stacks...");
 
     let mut stacks = Vec::new();
-    let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
     if local_counting {
         process_local_counting(
