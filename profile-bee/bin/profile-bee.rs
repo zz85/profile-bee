@@ -3,7 +3,7 @@ use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
-use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod, SmartUProbeConfig};
+use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig, StackInfoPod, SmartUProbeConfig};
 use profile_bee::ebpf::{FramePointersPod};
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::probe_spec::parse_probe_spec;
@@ -53,7 +53,7 @@ struct Opt {
     #[arg(long)]
     json: Option<PathBuf>,
 
-    /// Starts a http server to serve the html flamegraph result
+    /// Starts a http server to serve the html flamegraph result. Can be combined with --tui for dual interface access.
     #[arg(long)]
     serve: bool,
 
@@ -150,12 +150,7 @@ struct Opt {
 async fn main() -> std::result::Result<(), anyhow::Error> {
     let opt = Opt::parse();
 
-    // Validate mutually exclusive options
-    #[cfg(feature = "tui")]
-    if opt.tui && opt.serve {
-        eprintln!("Error: --tui and --serve flags cannot be used together");
-        std::process::exit(1);
-    }
+    // TUI and serve modes can now run together
 
     // Initialize the tracing subscriber with environment variables
     tracing_subscriber::fmt()
@@ -171,7 +166,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     #[cfg(feature = "tui")]
     if opt.tui {
-        return run_tui_mode(opt).await;
+        if opt.serve {
+            // Combined TUI + serve mode
+            return run_combined_mode(opt, tx).await;
+        } else {
+            // TUI only mode
+            return run_tui_mode(opt).await;
+        }
     }
 
     if opt.serve {
@@ -679,8 +680,10 @@ fn process_profiling_data(
     let mut samples = 0;
     let mut known_tgids = std::collections::HashSet::<u32>::new();
 
-    // Clear counters
-    trace_count.clear();
+    // Determine counting strategy before the recv loop so the StackInfo
+    // handler knows whether to accumulate into trace_count (local counting)
+    // or only prime the symbol cache (kernel counting).
+    let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
     // Clear "counts" hashmap
     let keys = counts.keys().flatten().collect::<Vec<_>>();
@@ -701,11 +704,21 @@ fn process_profiling_data(
                     }
                 }
 
-                // User space counting
-                let trace = trace_count.entry(stack).or_insert(0);
-                *trace += 1;
+                if local_counting {
+                    // User space counting — accumulate into trace_count
+                    let trace = trace_count.entry(stack).or_insert(0);
+                    *trace += 1;
 
-                if *trace == 1 {
+                    if *trace == 1 {
+                        let _combined = profiler.get_exp_stacked_frames(
+                            &stack,
+                            &stack_traces,
+                            group_by_cpu,
+                            &stacked_pointers,
+                        );
+                    }
+                } else {
+                    // Kernel counts are authoritative; only prime symbol cache
                     let _combined = profiler.get_exp_stacked_frames(
                         &stack,
                         &stack_traces,
@@ -725,7 +738,6 @@ fn process_profiling_data(
     println!("Processing stacks...");
 
     let mut stacks = Vec::new();
-    let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
     if local_counting {
         process_local_counting(
@@ -877,30 +889,23 @@ fn output_svg(path: &PathBuf, str: &[String], title: String) -> anyhow::Result<(
     Ok(())
 }
 
-/// Runs the interactive TUI flamegraph viewer mode
+// ---------------------------------------------------------------------------
+// Shared helpers for TUI and combined (TUI + serve) modes
+// ---------------------------------------------------------------------------
+
+/// Builds a `ProfilerConfig` from CLI options, resolving smart uprobe specs.
 #[cfg(feature = "tui")]
-async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
-    use profile_bee_tui::{app::App, event::{Event, EventHandler}, handler::handle_key_events, tui::Tui};
-    use std::io;
-
-    println!("Starting TUI mode...");
-
-    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
-
-    let pid = if let Some(cmd) = &spawn {
-        Some(cmd.pid())
-    } else {
-        opt.pid.clone()
-    };
-
-    // Resolve smart uprobe specs for TUI mode
+fn build_profiler_config(
+    opt: &Opt,
+    pid: Option<u32>,
+) -> Result<ProfilerConfig, anyhow::Error> {
     let smart_uprobe = if !opt.uprobe.is_empty() {
         Some(resolve_uprobe_specs(&opt.uprobe, pid, opt.uprobe_pid)?)
     } else {
         None
     };
 
-    let config = ProfilerConfig {
+    Ok(ProfilerConfig {
         skip_idle: opt.skip_idle,
         stream_mode: opt.stream_mode,
         frequency: opt.frequency,
@@ -912,15 +917,30 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         cpu: opt.cpu,
         self_profile: opt.self_profile,
         dwarf: opt.dwarf,
-    };
+    })
+}
 
-    // Setup eBPF profiler
-    let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
+/// Sets up the eBPF profiler, ring buffer, DWARF unwinding (if enabled),
+/// and target-PID filtering.  Returns everything the profiling thread needs.
+#[cfg(feature = "tui")]
+fn setup_ebpf_and_dwarf(
+    config: &ProfilerConfig,
+    perf_tx: &mpsc::Sender<PerfWork>,
+    pid: Option<u32>,
+    dwarf: bool,
+) -> Result<
+    (
+        EbpfProfiler,
+        aya::maps::RingBuf<aya::maps::MapData>,
+        Option<mpsc::Sender<u32>>,
+    ),
+    anyhow::Error,
+> {
+    let mut ebpf_profiler = setup_ebpf_profiler(config)?;
     let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
-    let (perf_tx, perf_rx) = mpsc::channel();
 
-    // Load DWARF if enabled
-    let tgid_request_tx = if opt.dwarf {
+    // Load DWARF unwind tables and start the background refresh thread
+    let tgid_request_tx = if dwarf {
         let mut dwarf_manager = DwarfUnwindManager::new();
         if let Some(target_pid) = pid {
             println!("Loading DWARF unwind tables for pid {}...", target_pid);
@@ -958,26 +978,25 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         println!("Profiling PID {}..", target_pid);
     }
 
-    // Create TUI app
-    let mut app = App::with_live();
-    let update_handle = app.get_update_handle();
+    Ok((ebpf_profiler, ring_buf, tgid_request_tx))
+}
 
-    // Setup stopping mechanisms
-    let external_pid = if spawn.is_none() { opt.pid } else { None };
-    setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn, external_pid);
-
-    // Ring buffer collection task
-    task::spawn(async move {
-        if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
-            eprintln!("Failed to set up ring buffer: {:?}", e);
-        }
-    });
-
-    // Background task to collect and process profiling data
-    // Move ebpf_profiler into thread (TraceHandler contains !Send Symbolizer)
-    let stream_mode = opt.stream_mode;
-    let group_by_cpu = opt.group_by_cpu;
-    let tui_refresh_ms = opt.tui_refresh_ms;
+/// Spawns the background profiling thread that collects eBPF data,
+/// builds collapsed stacks, updates the TUI, and optionally feeds
+/// a web-server broadcast channel.
+///
+/// `web_tx` — pass `Some(sender)` for combined mode, `None` for TUI-only.
+#[cfg(feature = "tui")]
+fn spawn_profiling_thread(
+    ebpf_profiler: EbpfProfiler,
+    perf_rx: mpsc::Receiver<PerfWork>,
+    tgid_request_tx: Option<mpsc::Sender<u32>>,
+    update_handle: std::sync::Arc<std::sync::Mutex<Option<profile_bee_tui::app::ParsedFlameGraph>>>,
+    web_tx: Option<tokio::sync::broadcast::Sender<String>>,
+    stream_mode: u8,
+    group_by_cpu: bool,
+    tui_refresh_ms: u64,
+) {
     std::thread::spawn(move || {
         let mut profiler = TraceHandler::new();
         let mut counts = ebpf_profiler.counts;
@@ -1000,7 +1019,8 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
             let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
             // Process incoming events with timeout to update periodically
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(tui_refresh_ms);
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(tui_refresh_ms);
             while std::time::Instant::now() < deadline {
                 match perf_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(PerfWork::StackInfo(stack)) => {
@@ -1009,7 +1029,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                                 let _ = tx.send(stack.tgid);
                             }
                         }
-                        
+
                         if local_counting {
                             let trace = trace_count.entry(stack).or_insert(0);
                             *trace += 1;
@@ -1093,7 +1113,8 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
             // Update TUI app with new flamegraph data
             let data = out.join("\n");
             let tic = std::time::Instant::now();
-            let flamegraph = profile_bee_tui::flame::FlameGraph::from_string(data, true);
+            let flamegraph =
+                profile_bee_tui::flame::FlameGraph::from_string(data, true);
             let parsed = profile_bee_tui::app::ParsedFlameGraph {
                 flamegraph,
                 elapsed: tic.elapsed(),
@@ -1102,27 +1123,48 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
                 eprintln!("Mutex poisoned: {}", e);
                 e.into_inner()
             }) = Some(parsed);
+
+            // Optionally feed the web server
+            if let Some(ref tx) = web_tx {
+                let json = collapse_to_json(
+                    &out.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
+                );
+                let _ = tx.send(json);
+            }
         }
     });
+}
 
-    // Initialize TUI
-    let backend = profile_bee_tui::ratatui::backend::CrosstermBackend::new(io::stderr());
+/// Runs the TUI event loop until the user quits.
+#[cfg(feature = "tui")]
+fn run_tui_event_loop(
+    app: &mut profile_bee_tui::app::App,
+) -> Result<(), anyhow::Error> {
+    use profile_bee_tui::{
+        event::{Event, EventHandler},
+        handler::handle_key_events,
+        tui::Tui,
+    };
+    use std::io;
+
+    let backend =
+        profile_bee_tui::ratatui::backend::CrosstermBackend::new(io::stderr());
     let terminal = profile_bee_tui::ratatui::Terminal::new(backend)?;
     let events = EventHandler::new(250);
     let mut tui = Tui::new(terminal, events);
     tui.init().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Main event loop
     while app.running {
         if app.dirty {
-            tui.draw(&mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
+            tui.draw(app).map_err(|e| anyhow::anyhow!("{e}"))?;
             app.dirty = false;
         }
 
         match tui.events.next().map_err(|e| anyhow::anyhow!("{e}"))? {
             Event::Tick => app.tick(),
             Event::Key(key_event) => {
-                handle_key_events(key_event, &mut app).map_err(|e| anyhow::anyhow!("{e}"))?;
+                handle_key_events(key_event, app)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 app.dirty = true;
             }
             Event::Mouse(_) => {}
@@ -1133,9 +1175,142 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     }
 
     tui.exit().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+/// Runs combined TUI + serve mode with shared profiling pipeline
+#[cfg(feature = "tui")]
+async fn run_combined_mode(
+    opt: Opt,
+    web_tx: tokio::sync::broadcast::Sender<String>,
+) -> std::result::Result<(), anyhow::Error> {
+    use profile_bee_tui::app::App;
+
+    println!("Starting combined TUI + serve mode...");
+
+    // Start web server
+    let web_rx = web_tx.subscribe();
+    tokio::spawn(async move {
+        profile_bee::html::start_server(web_rx).await;
+    });
+
+    // Process / PID setup
+    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
+    let pid = if let Some(cmd) = &spawn {
+        Some(cmd.pid())
+    } else {
+        opt.pid.clone()
+    };
+
+    // Shared infrastructure
+    let config = build_profiler_config(&opt, pid)?;
+    let (perf_tx, perf_rx) = mpsc::channel();
+    let (ebpf_profiler, ring_buf, tgid_request_tx) =
+        setup_ebpf_and_dwarf(&config, &perf_tx, pid, opt.dwarf)?;
+
+    // TUI app + update handle
+    let mut app = App::with_live();
+    let update_handle = app.get_update_handle();
+
+    // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
+    let external_pid = if spawn.is_none() { opt.pid.clone() } else { None };
+    setup_stopping_mechanisms(
+        opt.time,
+        perf_tx.clone(),
+        stopper.clone(),
+        spawn,
+        external_pid,
+    );
+
+    // Ring buffer collection task
+    task::spawn(async move {
+        if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
+            eprintln!("Failed to set up ring buffer: {:?}", e);
+        }
+    });
+
+    // Profiling thread (feeds both TUI and web server)
+    spawn_profiling_thread(
+        ebpf_profiler,
+        perf_rx,
+        tgid_request_tx,
+        update_handle,
+        Some(web_tx),
+        opt.stream_mode,
+        opt.group_by_cpu,
+        opt.tui_refresh_ms,
+    );
+
+    // TUI event loop
+    run_tui_event_loop(&mut app)?;
+
     drop(stopper);
+    println!("\nExiting combined mode");
+    Ok(())
+}
 
+/// Runs the interactive TUI flamegraph viewer mode
+#[cfg(feature = "tui")]
+async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
+    use profile_bee_tui::app::App;
+
+    println!("Starting TUI mode...");
+
+    // Process / PID setup
+    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
+    let pid = if let Some(cmd) = &spawn {
+        Some(cmd.pid())
+    } else {
+        opt.pid.clone()
+    };
+
+    // Shared infrastructure
+    let config = build_profiler_config(&opt, pid)?;
+    let (perf_tx, perf_rx) = mpsc::channel();
+    let (ebpf_profiler, ring_buf, tgid_request_tx) =
+        setup_ebpf_and_dwarf(&config, &perf_tx, pid, opt.dwarf)?;
+
+    // TUI app + update handle
+    let mut app = App::with_live();
+    let update_handle = app.get_update_handle();
+
+    // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
+    let external_pid = if spawn.is_none() { opt.pid } else { None };
+    setup_stopping_mechanisms(
+        opt.time,
+        perf_tx.clone(),
+        stopper.clone(),
+        spawn,
+        external_pid,
+    );
+
+    // Ring buffer collection task
+    task::spawn(async move {
+        if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
+            eprintln!("Failed to set up ring buffer: {:?}", e);
+        }
+    });
+
+    // Profiling thread (TUI only, no web feed)
+    spawn_profiling_thread(
+        ebpf_profiler,
+        perf_rx,
+        tgid_request_tx,
+        update_handle,
+        None,
+        opt.stream_mode,
+        opt.group_by_cpu,
+        opt.tui_refresh_ms,
+    );
+
+    // TUI event loop
+    run_tui_event_loop(&mut app)?;
+
+    drop(stopper);
     println!("\nExiting TUI mode");
-
     Ok(())
 }
