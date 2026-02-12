@@ -7,7 +7,7 @@ use aya_ebpf::{
     programs::{PerfEventContext, RawTracePointContext, TracePointContext},
     programs::{ProbeContext, RetProbeContext},
 };
-use profile_bee_ebpf::{collect_trace, collect_trace_raw_syscall};
+use profile_bee_ebpf::{collect_trace, collect_trace_raw_syscall, collect_trace_raw_tp_generic};
 
 #[perf_event]
 pub fn profile_cpu(ctx: PerfEventContext) -> u32 {
@@ -45,6 +45,15 @@ pub fn tracepoint_profile(ctx: TracePointContext) -> u32 {
 #[raw_tracepoint(tracepoint = "sys_enter")]
 pub fn raw_tp_sys_enter(ctx: RawTracePointContext) -> u32 {
     unsafe { collect_trace_raw_syscall(ctx) }
+    0
+}
+
+/// Generic raw tracepoint for non-syscall events (sched, block, net, tcp, etc.).
+/// No hardcoded tracepoint name — userspace picks it at attach time.
+/// Uses bpf_get_stackid() only (no custom FP/DWARF unwinding).
+#[raw_tracepoint]
+pub fn raw_tp_generic(ctx: RawTracePointContext) -> u32 {
+    unsafe { collect_trace_raw_tp_generic(ctx) }
     0
 }
 

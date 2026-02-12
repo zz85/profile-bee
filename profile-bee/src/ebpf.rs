@@ -82,9 +82,12 @@ pub struct ProfilerConfig {
     /// New smart uprobe config with multi-attach support.
     pub smart_uprobe: Option<SmartUProbeConfig>,
     pub tracepoint: Option<String>,
-    /// Raw tracepoint name for raw_tp attachment (e.g., "sys_enter").
-    /// Used as a fallback when regular tracepoint attachment fails due to BPF LSM.
+    /// Raw tracepoint name for syscall raw_tp (e.g., "sys_enter").
+    /// Uses collect_trace_raw_syscall which reads pt_regs from args[0].
     pub raw_tracepoint: Option<String>,
+    /// Raw tracepoint name for generic raw_tp (e.g., "sched_switch").
+    /// Uses collect_trace_raw_tp_generic which relies on bpf_get_stackid only.
+    pub raw_tracepoint_generic: Option<String>,
     /// Target syscall number for raw tracepoint filtering (-1 = all).
     pub target_syscall_nr: i64,
     pub pid: Option<u32>,
@@ -219,6 +222,10 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
     } else if let Some(raw_tp) = &config.raw_tracepoint {
         let program: &mut RawTracePoint =
             bpf.program_mut("raw_tp_sys_enter").unwrap().try_into()?;
+        program.load()?;
+        program.attach(raw_tp)?;
+    } else if let Some(raw_tp) = &config.raw_tracepoint_generic {
+        let program: &mut RawTracePoint = bpf.program_mut("raw_tp_generic").unwrap().try_into()?;
         program.load()?;
         program.attach(raw_tp)?;
     } else if let Some(tracepoint) = &config.tracepoint {
