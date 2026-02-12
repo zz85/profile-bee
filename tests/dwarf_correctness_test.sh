@@ -148,7 +148,7 @@ test_depth_vs_perf() {
 }
 
 test_dwarf_improves_nofp() {
-    local nofp dwarf
+    local dwarf
     # Profile without DWARF
     local nofp_out="$OUTPUT_DIR/t-improve-nofp.collapse"
     timeout "$TEST_TIMEOUT" "$PROFILER" --cmd "$FIXTURE_DIR/callstack-no-fp" --time "$PROFILE_TIME_MS" \
