@@ -1038,12 +1038,21 @@ async fn run_combined_mode(opt: Opt, web_tx: tokio::sync::broadcast::Sender<Stri
         }
     });
 
+    // Clone perf_tx before it's moved into the ring-buffer task so we can
+    // wire up timer, Ctrl-C, child-exit, and PID-exit stopping mechanisms
+    // that send PerfWork::Stop into the same channel the profiling thread reads.
+    let perf_tx_clone = perf_tx.clone();
+
     // Start ring buffer processing
     tokio::spawn(async move {
         if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
             eprintln!("Failed to set up ring buffer: {:?}", e);
         }
     });
+
+    // Setup stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
+    let external_pid = if spawn.is_none() { opt.pid.clone() } else { None };
+    setup_stopping_mechanisms(opt.time, perf_tx_clone, stopper.clone(), spawn, external_pid);
 
     // TUI event loop
     let backend = profile_bee_tui::ratatui::backend::CrosstermBackend::new(io::stderr());
