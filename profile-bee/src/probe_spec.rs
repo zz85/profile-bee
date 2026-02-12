@@ -144,38 +144,20 @@ pub fn parse_probe_spec(input: &str) -> Result<ProbeSpec, String> {
         (false, input)
     };
 
-    // Step 2: Check for regex pattern /pattern/
-    // Must start with '/' and end with '/' (plus optional +offset).
-    // We distinguish from absolute paths by requiring that the closing '/'
-    // is the LAST '/' in the string (absolute paths like /usr/lib/... have
-    // multiple slashes).
-    if rest.starts_with('/') && rest.len() > 2 {
-        // Find the LAST '/' — if it's not the first one, we might have a regex
-        let last_slash = rest.rfind('/').unwrap(); // we know there's at least one
-        if last_slash > 0 {
-            let regex_str = &rest[1..last_slash];
-            let after_regex = &rest[last_slash + 1..];
-
-            // Only treat as regex if the content between slashes doesn't look
-            // like a file path (no more slashes in regex_str)
-            if !regex_str.contains('/') && !regex_str.is_empty() {
-                let offset = parse_trailing_offset(after_regex)?;
-
-                let regex = Regex::new(regex_str)
-                    .map_err(|e| format!("invalid regex '{}': {}", regex_str, e))?;
-
-                return Ok(ProbeSpec::Symbol {
-                    library: None,
-                    pattern: SymbolPattern::Regex(RegexWrapper {
-                        regex,
-                        source: regex_str.to_string(),
-                    }),
-                    offset,
-                    is_ret,
-                });
-            }
+    // Step 2: Check for bare regex pattern /pattern/ (no library prefix).
+    // We distinguish from absolute paths: absolute paths like /usr/lib/...
+    // contain slashes within the regex_str portion, so try_parse_regex_symbol
+    // will return None for those.
+    if rest.starts_with('/') && !rest.contains(':') {
+        if let Some((regex_wrapper, offset)) = try_parse_regex_symbol(rest)? {
+            return Ok(ProbeSpec::Symbol {
+                library: None,
+                pattern: SymbolPattern::Regex(regex_wrapper),
+                offset,
+                is_ret,
+            });
         }
-        // If no valid regex found, fall through — it's an absolute path
+        // If not a valid regex, fall through — it's an absolute path
     }
 
     // Step 3: Split on colon to detect library:symbol or file:line
@@ -200,10 +182,21 @@ pub fn parse_probe_spec(input: &str) -> Result<ProbeSpec, String> {
         }
     }
 
-    // Step 5: Parse offset from symbol part
+    // Step 5: Check if symbol part is a regex /pattern/ (handles library:/regex/ case)
+    if let Some(regex_result) = try_parse_regex_symbol(&symbol_part)? {
+        let (regex_wrapper, offset) = regex_result;
+        return Ok(ProbeSpec::Symbol {
+            library,
+            pattern: SymbolPattern::Regex(regex_wrapper),
+            offset,
+            is_ret,
+        });
+    }
+
+    // Step 6: Parse offset from symbol part
     let (symbol_name, offset) = split_symbol_and_offset(&symbol_part)?;
 
-    // Step 6: Determine pattern type
+    // Step 7: Determine pattern type
     let pattern = classify_pattern(&symbol_name);
 
     Ok(ProbeSpec::Symbol {
@@ -313,6 +306,44 @@ fn parse_trailing_offset(s: &str) -> Result<u64, String> {
     } else {
         Err(format!("unexpected trailing text: '{}'", s))
     }
+}
+
+/// Try to parse a symbol string as a `/regex/` pattern (with optional trailing +offset).
+/// Returns `Some((RegexWrapper, offset))` if it matches, `None` if not regex syntax.
+fn try_parse_regex_symbol(s: &str) -> Result<Option<(RegexWrapper, u64)>, String> {
+    if !s.starts_with('/') || s.len() < 3 {
+        return Ok(None);
+    }
+
+    // Find the closing '/' — must not be the first character
+    let last_slash = match s[1..].rfind('/') {
+        Some(pos) => pos + 1, // offset back into full string
+        None => return Ok(None),
+    };
+
+    if last_slash == 0 {
+        return Ok(None);
+    }
+
+    let regex_str = &s[1..last_slash];
+    let after_regex = &s[last_slash + 1..];
+
+    if regex_str.is_empty() {
+        return Ok(None);
+    }
+
+    let offset = parse_trailing_offset(after_regex)?;
+
+    let regex =
+        Regex::new(regex_str).map_err(|e| format!("invalid regex '{}': {}", regex_str, e))?;
+
+    Ok(Some((
+        RegexWrapper {
+            regex,
+            source: regex_str.to_string(),
+        },
+        offset,
+    )))
 }
 
 /// Classify a symbol name string into the appropriate SymbolPattern variant.
@@ -675,5 +706,75 @@ mod tests {
             parse_probe_spec("main.c:42").unwrap().to_string(),
             "main.c:42"
         );
+    }
+
+    #[test]
+    fn test_regex_with_library_prefix() {
+        let spec = parse_probe_spec("libc:/malloc.*/").unwrap();
+        match spec {
+            ProbeSpec::Symbol {
+                library,
+                pattern,
+                offset,
+                is_ret,
+            } => {
+                assert_eq!(library, Some("libc".to_string()));
+                assert!(matches!(pattern, SymbolPattern::Regex(ref rw) if rw.source == "malloc.*"));
+                assert_eq!(offset, 0);
+                assert!(!is_ret);
+            }
+            _ => panic!("expected Symbol with Regex pattern"),
+        }
+    }
+
+    #[test]
+    fn test_regex_with_library_prefix_and_offset() {
+        let spec = parse_probe_spec("libc:/^mem.*/+0x10").unwrap();
+        match spec {
+            ProbeSpec::Symbol {
+                library,
+                pattern,
+                offset,
+                ..
+            } => {
+                assert_eq!(library, Some("libc".to_string()));
+                assert!(matches!(pattern, SymbolPattern::Regex(ref rw) if rw.source == "^mem.*"));
+                assert_eq!(offset, 0x10);
+            }
+            _ => panic!("expected Symbol with Regex pattern"),
+        }
+    }
+
+    #[test]
+    fn test_regex_with_ret_and_library() {
+        let spec = parse_probe_spec("ret:libpthread:/pthread_.*/").unwrap();
+        match spec {
+            ProbeSpec::Symbol {
+                library,
+                pattern,
+                is_ret,
+                ..
+            } => {
+                assert_eq!(library, Some("libpthread".to_string()));
+                assert!(matches!(pattern, SymbolPattern::Regex(_)));
+                assert!(is_ret);
+            }
+            _ => panic!("expected Symbol with Regex pattern"),
+        }
+    }
+
+    #[test]
+    fn test_absolute_path_not_confused_with_regex() {
+        // /usr/lib/libc.so.6:malloc should NOT be parsed as regex
+        let spec = parse_probe_spec("/usr/lib/libc.so.6:malloc").unwrap();
+        match spec {
+            ProbeSpec::Symbol {
+                library, pattern, ..
+            } => {
+                assert_eq!(library, Some("/usr/lib/libc.so.6".to_string()));
+                assert!(matches!(pattern, SymbolPattern::Exact(ref s) if s == "malloc"));
+            }
+            _ => panic!("expected Symbol with Exact pattern"),
+        }
     }
 }
