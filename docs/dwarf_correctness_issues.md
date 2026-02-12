@@ -8,7 +8,7 @@ Findings from comparing profile-bee DWARF unwinding against `perf --call-graph d
 
 **Severity:** High  
 **File:** `profile-bee-common/src/lib.rs`  
-**Status:** Fixed — increased to 22
+**Status:** Fixed — increased to 21 (was 22 before signal frame support; see Issue 2)
 
 The constant `MAX_DWARF_STACK_DEPTH` was set to 12, truncating stacks for any moderately deep call chain. The design doc and README both claimed 32 frames, but the BPF verifier rejects values above 22 on kernel 5.10 (the nested loops in `dwarf_copy_stack` — 8 mapping iterations × N depth iterations × 16 binary search iterations — exceed the verifier's instruction limit).
 
