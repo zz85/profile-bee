@@ -48,7 +48,8 @@ pub struct EbpfProfiler {
     /// Custom storage of StackTrace IPs
     pub stacked_pointers: HashMap<MapData, StackInfoPod, FramePointersPod>,
 }
-/// Configuration for uprobe attachment
+/// Legacy configuration for uprobe attachment (single target).
+/// Kept for backward compatibility; prefer `ResolvedProbe` for new code.
 #[derive(Debug, Clone)]
 pub struct UProbeConfig {
     /// Function name (with optional +offset)
@@ -61,12 +62,25 @@ pub struct UProbeConfig {
     pub pid: Option<i32>,
 }
 
+/// Configuration for the new smart uprobe system.
+/// Holds one or more resolved probe targets for multi-attach.
+#[derive(Debug, Clone)]
+pub struct SmartUProbeConfig {
+    /// Resolved probe targets to attach to.
+    pub probes: Vec<crate::probe_resolver::ResolvedProbe>,
+    /// Optional PID to attach to (None = all processes).
+    pub pid: Option<i32>,
+}
+
 pub struct ProfilerConfig {
     pub skip_idle: bool,
     pub stream_mode: u8,
     pub frequency: u64,
     pub kprobe: Option<String>,
+    /// Legacy single-target uprobe config (backward compat).
     pub uprobe: Option<UProbeConfig>,
+    /// New smart uprobe config with multi-attach support.
+    pub smart_uprobe: Option<SmartUProbeConfig>,
     pub tracepoint: Option<String>,
     pub pid: Option<u32>,
     pub cpu: Option<u32>,
@@ -112,6 +126,61 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         let program: &mut KProbe = bpf.program_mut("kprobe_profile").unwrap().try_into()?;
         program.load()?;
         program.attach(kprobe, 0)?;
+    } else if let Some(smart) = &config.smart_uprobe {
+        // New smart uprobe path: attach to all resolved probe targets
+        if smart.probes.is_empty() {
+            return Err(anyhow!("no probe targets resolved — nothing to attach"));
+        }
+
+        // Separate probes by type (uprobe vs uretprobe)
+        let has_uprobe = smart.probes.iter().any(|p| !p.is_ret);
+        let has_uretprobe = smart.probes.iter().any(|p| p.is_ret);
+
+        if has_uprobe {
+            let program: &mut UProbe = bpf.program_mut("uprobe_profile").unwrap().try_into()?;
+            program.load()?;
+
+            for probe in smart.probes.iter().filter(|p| !p.is_ret) {
+                let display_name = probe.demangled.as_deref().unwrap_or(&probe.symbol_name);
+                eprintln!(
+                    "  attaching uprobe: {}:{} (0x{:x})",
+                    probe.library_path.display(),
+                    display_name,
+                    probe.address,
+                );
+                program.attach(
+                    Some(probe.symbol_name.as_str()),
+                    probe.offset,
+                    probe.library_path.to_str().ok_or_else(|| {
+                        anyhow!("non-UTF8 library path: {}", probe.library_path.display())
+                    })?,
+                    smart.pid,
+                )?;
+            }
+        }
+
+        if has_uretprobe {
+            let program: &mut UProbe = bpf.program_mut("uretprobe_profile").unwrap().try_into()?;
+            program.load()?;
+
+            for probe in smart.probes.iter().filter(|p| p.is_ret) {
+                let display_name = probe.demangled.as_deref().unwrap_or(&probe.symbol_name);
+                eprintln!(
+                    "  attaching uretprobe: {}:{} (0x{:x})",
+                    probe.library_path.display(),
+                    display_name,
+                    probe.address,
+                );
+                program.attach(
+                    Some(probe.symbol_name.as_str()),
+                    probe.offset,
+                    probe.library_path.to_str().ok_or_else(|| {
+                        anyhow!("non-UTF8 library path: {}", probe.library_path.display())
+                    })?,
+                    smart.pid,
+                )?;
+            }
+        }
     } else if let Some(uprobe_config) = &config.uprobe {
         // Choose the right program based on is_retprobe flag
         let program_name = if uprobe_config.is_retprobe {
