@@ -29,7 +29,76 @@ leaf → recurse ×20 → main → __libc_start_main → _start
 
 The fix captures the full 20-level recursion. The remaining 2-frame gap vs perf is because perf unwinds in userspace with no depth limit.
 
-**Future improvement:** To reach 32 frames, the eBPF code would need restructuring to reduce verifier complexity — e.g., splitting the unwind loop into a tail-call chain across multiple eBPF programs.
+**Future improvement: tail-call chaining to reach 128+ frames**
+
+To reach 32+ frames, the eBPF unwind loop needs to be split into a tail-call chain. This is the approach used by production profilers like [opentelemetry-ebpf-profiler](https://github.com/open-telemetry/opentelemetry-ebpf-profiler) (formerly Elastic/Prodfiler) and parca-agent.
+
+The idea: instead of one big loop that the BPF verifier rejects, unwind a small fixed number of frames per eBPF program invocation, then `bpf_tail_call()` back into the same program. Each tail call resets the verifier's instruction budget, so the total depth is limited only by the tail-call limit (33 on most kernels).
+
+**How opentelemetry-ebpf-profiler does it:**
+
+```
+// Only unwind 5 frames per program invocation
+#define NATIVE_FRAMES_PER_PROGRAM  5
+
+static int unwind_native(struct pt_regs *ctx) {
+    PerCPURecord *record = get_per_cpu_record();  // state persisted in per-CPU map
+    Trace *trace = &record->trace;
+
+    for (int i = 0; i < NATIVE_FRAMES_PER_PROGRAM; i++) {
+        push_native(&record->state, trace, ...);
+        error = unwind_one_frame(&record->state, &stop);
+        if (error || stop) break;
+        error = get_next_unwinder(&record, &unwinder);
+        if (error || unwinder != PROG_UNWIND_NATIVE) break;
+    }
+
+    // Tail-call back into ourselves (or into interpreter unwinder, or stop)
+    // This resets the BPF verifier instruction count
+    tail_call(ctx, unwinder);
+}
+```
+
+Key design points:
+- **Per-CPU state map:** Unwind state (SP, BP, IP, frame array, frame count) is stored in a `BPF_MAP_TYPE_PERCPU_ARRAY`, not on the eBPF stack. This persists across tail calls.
+- **Small inner loop:** 4-5 frames per invocation keeps the verifier happy even with complex per-frame logic (mapping lookup + binary search + CFA computation).
+- **Tail-call limit = depth limit:** With 5 frames/call × 33 tail calls = 165 max frames. More than enough.
+- **Program array map:** Uses `BPF_MAP_TYPE_PROG_ARRAY` to dispatch tail calls. The same program index can tail-call to itself.
+
+**What this would look like for profile-bee (aya-rs):**
+
+```rust
+// In eBPF code:
+#[map]
+static PROG_ARRAY: ProgramArray = ProgramArray::with_max_entries(4, 0);
+
+#[map]
+static UNWIND_STATE: PerCpuArray<DwarfUnwindState> = PerCpuArray::with_max_entries(1, 0);
+
+const FRAMES_PER_CALL: usize = 5;
+
+fn dwarf_unwind_step(ctx: &PerfEventContext) {
+    let state = UNWIND_STATE.get_ptr_mut(0).unwrap();
+    for _ in 0..FRAMES_PER_CALL {
+        // ... unwind one frame, store in state.pointers[state.len] ...
+        if done { break; }
+    }
+    if !done {
+        // Tail-call back into ourselves
+        unsafe { PROG_ARRAY.tail_call(ctx, 0); }
+    }
+}
+```
+
+This would require:
+1. Moving the `FramePointers` and unwind registers (SP, BP, IP) into a per-CPU map
+2. Splitting `dwarf_copy_stack()` into an init function (called from `collect_trace`) and a step function (the tail-call target)
+3. Registering the step function in a `ProgramArray` map from userspace
+
+References:
+- [opentelemetry-ebpf-profiler native_stack_trace.ebpf.c](https://github.com/open-telemetry/opentelemetry-ebpf-profiler/blob/main/support/ebpf/native_stack_trace.ebpf.c) — `NATIVE_FRAMES_PER_PROGRAM = 5`, `tail_call()` pattern
+- [Elastic blog: profiling without frame pointers](https://www.elastic.co/blog/universal-profiling-frame-pointers-symbols-ebpf) — architecture overview
+- [Polar Signals: DWARF-based stack walking using eBPF](https://www.polarsignals.com/blog/posts/2022/11/29/dwarf-based-stack-walking-using-ebpf/) — parca-agent's approach
 
 ## Issue 2: Signal trampoline unwinding stops at `__restore_rt`
 
