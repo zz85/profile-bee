@@ -281,11 +281,16 @@ pub fn generate_unwind_table_from_bytes(
                         continue;
                     }
 
-                    // Get return address rule — on x86_64 it's always CFA-8.
-                    // Skip entries where RA is not a simple CFA offset of -8.
+                    // Get return address rule — on x86_64 it's always CFA-8 for
+                    // normal frames. Signal frames use expression-based rules
+                    // (DW_OP_breg7+offset) which we handle specially.
                     let ra_rule = row.register(X86_64_RA);
+                    let is_signal_frame = cfa_type == CFA_REG_DEREF_RSP;
                     match ra_rule {
                         RegisterRule::Offset(offset) if offset == -8 => {}
+                        // Signal frames: RA is an expression (breg7+168).
+                        // We hardcode the ucontext_t offsets in eBPF.
+                        RegisterRule::Expression(_) if is_signal_frame => {}
                         RegisterRule::Undefined => continue,
                         _ => continue,
                     };
@@ -385,6 +390,18 @@ impl DwarfUnwindManager {
         if self.proc_info.contains_key(&tgid) {
             return Ok(());
         }
+        // Wait for the dynamic linker to finish mapping shared libraries.
+        // After fork+exec, /proc/PID/maps may not yet reflect all mappings.
+        // Poll until the mapping count stabilizes (typically <100ms).
+        let mut prev_count = 0usize;
+        for _ in 0..20 {
+            let count = Self::count_exec_maps(tgid);
+            if count > 0 && count == prev_count {
+                break;
+            }
+            prev_count = count;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         self.scan_and_update(tgid)
     }
 
@@ -400,6 +417,24 @@ impl DwarfUnwindManager {
             .filter(|id| !old_shard_ids.contains(id))
             .collect();
         Ok(new_shard_ids)
+    }
+
+    /// Count executable memory mappings for a process (fast, no file I/O).
+    fn count_exec_maps(tgid: u32) -> usize {
+        let Ok(process) = Process::new(tgid as i32) else {
+            return 0;
+        };
+        let Ok(maps) = process.maps() else {
+            return 0;
+        };
+        use procfs::process::MMPermissions;
+        maps.iter()
+            .filter(|m| {
+                m.perms.contains(MMPermissions::EXECUTE)
+                    && m.perms.contains(MMPermissions::READ)
+                    && matches!(m.pathname, MMapPath::Path(_) | MMapPath::Vdso)
+            })
+            .count()
     }
 
     fn scan_and_update(&mut self, tgid: u32) -> Result<(), String> {
