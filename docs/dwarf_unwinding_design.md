@@ -165,7 +165,7 @@ The eBPF code is structured to pass the BPF verifier:
 - All loops use bounded `for _ in 0..CONST` ranges
 - Binary search uses `for _ in 0..19` (not `while`)
 - Mapping scan uses `for m in 0..16` with early break
-- `MAX_DWARF_STACK_DEPTH = 22` keeps the outer loop bounded (BPF verifier rejects >22 on kernel 5.10 due to nested loop complexity)
+- `MAX_DWARF_STACK_DEPTH = 21` keeps the outer loop bounded (BPF verifier rejects >21 (with signal frame support) on kernel 5.10 due to nested loop complexity)
 - Functions are `#[inline(always)]` to avoid BPF function call overhead
 - Sharded tables reduce verifier complexity by keeping per-binary tables smaller
 
@@ -193,7 +193,7 @@ The eBPF code is structured to pass the BPF verifier:
 
 - **No hot-reload**: dlopen'd libraries after startup won't have unwind tables (but periodic rescanning is supported)
 - **MAX_PROC_MAPS = 16**: processes with very many shared libraries may exceed this
-- **MAX_DWARF_STACK_DEPTH = 22**: stacks deeper than 22 frames are truncated (BPF verifier limit; to reach 32, the unwind loop would need to be split across tail-called eBPF programs)
+- **MAX_DWARF_STACK_DEPTH = 21**: stacks deeper than 21 frames are truncated (BPF verifier limit; to reach 32, the unwind loop would need to be split across tail-called eBPF programs)
 - **MAX_UNWIND_TABLE_SIZE = 500K per binary**: very large binaries (Chrome, Firefox) with >500K unwind entries will be truncated
 - **MAX_UNWIND_TABLES = 64**: system-wide profiling limited to 64 unique binaries
 - **No signal trampolines**: unwinding through signal handlers may stop early on kernels where the vDSO lacks `.eh_frame` entries for `__restore_rt` (libc's `__restore_rt` is handled)

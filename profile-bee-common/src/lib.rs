@@ -93,7 +93,7 @@ impl UnwindEntry {
     pub const STRUCT_SIZE: usize = size_of::<UnwindEntry>();
 }
 
-pub const MAX_DWARF_STACK_DEPTH: usize = 22;
+pub const MAX_DWARF_STACK_DEPTH: usize = 21;
 pub const MAX_PROC_MAPS: usize = 8;
 
 /// Number of per-binary Array shard maps in eBPF (shard_0 .. shard_7)

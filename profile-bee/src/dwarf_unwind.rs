@@ -281,11 +281,16 @@ pub fn generate_unwind_table_from_bytes(
                         continue;
                     }
 
-                    // Get return address rule — on x86_64 it's always CFA-8.
-                    // Skip entries where RA is not a simple CFA offset of -8.
+                    // Get return address rule — on x86_64 it's always CFA-8 for
+                    // normal frames. Signal frames use expression-based rules
+                    // (DW_OP_breg7+offset) which we handle specially.
                     let ra_rule = row.register(X86_64_RA);
+                    let is_signal_frame = cfa_type == CFA_REG_DEREF_RSP;
                     match ra_rule {
                         RegisterRule::Offset(offset) if offset == -8 => {}
+                        // Signal frames: RA is an expression (breg7+168).
+                        // We hardcode the ucontext_t offsets in eBPF.
+                        RegisterRule::Expression(_) if is_signal_frame => {}
                         RegisterRule::Undefined => continue,
                         _ => continue,
                     };

@@ -278,12 +278,19 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
         };
 
         // Compute CFA (Canonical Frame Address) based on rule type
+        //
+        // Signal frames (CFA_REG_DEREF_RSP) are handled specially: we read
+        // RIP/RSP/RBP directly from the ucontext_t on the stack at fixed
+        // offsets, then continue unwinding from the interrupted frame.
+        //
+        // x86_64 Linux signal frame layout (from __restore_rt DWARF):
+        //   RBP at *(RSP + 120), RSP at *(RSP + 160), RIP at *(RSP + 168)
+        let is_signal = entry.cfa_type == CFA_REG_DEREF_RSP;
+
         let cfa = match entry.cfa_type {
             CFA_REG_RSP => sp.wrapping_add(entry.cfa_offset as i64 as u64),
             CFA_REG_RBP => bp.wrapping_add(entry.cfa_offset as i64 as u64),
             CFA_REG_PLT => {
-                // PLT stub: CFA = RSP + offset + ((RIP & 15) >= 11 ? 8 : 0)
-                // The 8 comes from the DWARF expression `lit3; shl` (1 << 3 = 8)
                 let base = sp.wrapping_add(entry.cfa_offset as i64 as u64);
                 if (current_ip & 15) >= 11 {
                     base.wrapping_add(8)
@@ -291,10 +298,9 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
                     base
                 }
             }
+            // Signal frame: CFA = saved RSP = *(RSP + 160)
             CFA_REG_DEREF_RSP => {
-                // Signal frame: CFA = *(RSP + offset)
-                let addr = sp.wrapping_add(entry.cfa_offset as i64 as u64);
-                match bpf_probe_read_user(addr as *const u64) {
+                match bpf_probe_read_user((sp + 160) as *const u64) {
                     Ok(val) => val,
                     Err(_) => break,
                 }
@@ -306,8 +312,8 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
             break;
         }
 
-        // Return address is always at CFA-8 on x86_64
-        let ra_addr = cfa.wrapping_sub(8);
+        // Return address: CFA-8 for normal frames, *(RSP+168) for signal frames
+        let ra_addr = if is_signal { sp + 168 } else { cfa.wrapping_sub(8) };
         let return_addr = match bpf_probe_read_user(ra_addr as *const u64) {
             Ok(val) => val,
             Err(_) => break,
@@ -317,17 +323,25 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
             break;
         }
 
-        // Restore RBP if needed
-        let new_bp = match entry.rbp_type {
-            REG_RULE_OFFSET => {
-                let bp_addr = (cfa as i64 + entry.rbp_offset as i64) as u64;
-                match bpf_probe_read_user(bp_addr as *const u64) {
-                    Ok(val) => val,
-                    Err(_) => bp,
-                }
+        // Restore RBP: for signal frames read from *(RSP+120),
+        // otherwise use normal CFA-relative offset rule
+        let new_bp = if is_signal {
+            match bpf_probe_read_user((sp + 120) as *const u64) {
+                Ok(val) => val,
+                Err(_) => bp,
             }
-            REG_RULE_SAME_VALUE => bp,
-            _ => bp,
+        } else {
+            match entry.rbp_type {
+                REG_RULE_OFFSET => {
+                    let bp_addr = (cfa as i64 + entry.rbp_offset as i64) as u64;
+                    match bpf_probe_read_user(bp_addr as *const u64) {
+                        Ok(val) => val,
+                        Err(_) => bp,
+                    }
+                }
+                REG_RULE_SAME_VALUE => bp,
+                _ => bp,
+            }
         };
 
         pointers[i] = return_addr;

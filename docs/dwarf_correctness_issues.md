@@ -100,26 +100,35 @@ References:
 - [Elastic blog: profiling without frame pointers](https://www.elastic.co/blog/universal-profiling-frame-pointers-symbols-ebpf) — architecture overview
 - [Polar Signals: DWARF-based stack walking using eBPF](https://www.polarsignals.com/blog/posts/2022/11/29/dwarf-based-stack-walking-using-ebpf/) — parca-agent's approach
 
-## Issue 2: Signal trampoline unwinding stops at `__restore_rt`
+## Issue 2: Signal trampoline unwinding stops at `__restore_rt` — FIXED
 
 **Severity:** Medium  
-**File:** `profile-bee-ebpf/src/lib.rs` (dwarf_copy_stack)
+**File:** `profile-bee-ebpf/src/lib.rs` (dwarf_copy_stack), `profile-bee/src/dwarf_unwind.rs`
 
-When a signal handler is active, profile-bee unwinds through the handler but stops at `__restore_rt`. It does not continue into the interrupted frame.
+When a signal handler is active, profile-bee now unwinds through the signal trampoline into the interrupted frame.
 
-**profile-bee:**
+**Before:**
 ```
-[unknown] → __restore_rt → handler → signal_work     (stops here)
+[unknown] → __restore_rt → handler → signal_work     (stopped here)
 ```
 
-**perf:**
+**After:**
+```
+[unknown] → _start → __libc_start_main → main → compute → __restore_rt → handler → signal_work
+```
+
+**perf reference:**
 ```
 signal_work → handler → __restore_rt → compute → main → __libc_start_main → _start
 ```
 
-**Root cause:** After the `CFA_REG_DEREF_RSP` entry (signal frame), the unwinder needs to extract the saved registers (RIP, RSP, RBP) from the `ucontext_t` structure on the stack. Currently it treats the signal trampoline like a normal frame, which doesn't work because `__restore_rt` uses a DWARF expression to locate the saved context.
+**Root cause:** The `__restore_rt` FDE uses `DW_CFA_expression` rules for all registers (not the standard `Offset(-8)` for RA). The userspace DWARF parser was skipping entries where RA wasn't `Offset(-8)`, so the signal frame entry never made it into the unwind table.
 
-**Potential fix:** After detecting a signal frame (CFA_REG_DEREF_RSP), read the saved RIP/RSP/RBP from the `ucontext_t` at known offsets from the signal frame's stack pointer. On x86_64 Linux, the `mcontext_t` within `ucontext_t` has RIP at offset 168, RSP at offset 160, and RBP at offset 120 from the `ucontext_t` base.
+**Fix:** Two changes:
+1. **Userspace** (`dwarf_unwind.rs`): Allow signal frame entries through even when RA is an expression rule, since the eBPF code handles them specially.
+2. **eBPF** (`lib.rs`): When `CFA_REG_DEREF_RSP` is detected, read RIP/RSP/RBP directly from the `ucontext_t` at fixed x86_64 Linux offsets (`RSP+168`, `RSP+160`, `RSP+120`) instead of using the standard `CFA-8` return address convention.
+
+**Tradeoff:** The extra `bpf_probe_read_user` calls for signal frame handling consume verifier budget, reducing `MAX_DWARF_STACK_DEPTH` from 22 to 21 (one fewer frame in the deepest stacks).
 
 ## Issue 3: Partial shared library unwinding failures (~51% of samples)
 
