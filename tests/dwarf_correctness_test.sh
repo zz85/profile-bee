@@ -163,12 +163,9 @@ test_dwarf_improves_nofp() {
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 echo ""
-echo "╔═══════════════════════════════════════════════════════════╗"
-echo "║       DWARF Correctness Regression Tests                  ║"
-echo "╠═══════════════════════════════════════════════════════════╣"
-echo "║  Profiler: $PROFILER"
-echo "║  Time: ${PROFILE_TIME_MS}ms @ ${FREQUENCY}Hz"
-echo "╚═══════════════════════════════════════════════════════════╝"
+echo "═══ DWARF Correctness Regression Tests ═══"
+echo "  Profiler: $PROFILER"
+echo "  Time: ${PROFILE_TIME_MS}ms @ ${FREQUENCY}Hz"
 echo ""
 
 echo "── Symbol Correctness ──"
