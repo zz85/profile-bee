@@ -114,23 +114,41 @@ profile-bee --kprobe vfs_write --time 200 --svg kprobe.svg
 # Profile using a tracepoint over a interval of 200ms
 profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 
-# Profile using uprobe on malloc in libc
+# Profile using uprobe on malloc in libc (auto-discovered)
 profile-bee --uprobe malloc --time 1000 --svg malloc.svg
 
-# Profile uprobe on a specific binary with custom path
-profile-bee --uprobe my_function --uprobe-path /path/to/binary --time 1000 --svg uprobe.svg
+# Profile multiple functions at once
+profile-bee --uprobe malloc --uprobe 'ret:free' --time 1000 --svg alloc.svg
 
-# Profile using uprobe on a library name (e.g., libpthread)
-profile-bee --uprobe pthread_create --uprobe-path libpthread --time 1000 --svg thread.svg
+# Glob matching — trace all pthread functions
+profile-bee --uprobe 'pthread_*' --time 1000 --svg pthread.svg
 
-# Profile uprobe with function offset
-profile-bee --uprobe my_function+16 --uprobe-path /path/to/binary --time 1000 --svg uprobe_offset.svg
+# Regex matching
+profile-bee --uprobe '/^sql_.*query/' --pid 1234 --time 2000 --svg sql.svg
 
-# Profile using uretprobe (return probe) on malloc
-profile-bee --uprobe malloc --uretprobe --time 1000 --svg malloc_ret.svg
+# Demangled C++/Rust name matching
+profile-bee --uprobe 'std::vector::push_back' --pid 1234 --time 1000 --svg vec.svg
 
-# Profile uprobe for a specific PID only
+# Source file and line number (requires DWARF debug info)
+profile-bee --uprobe 'main.c:42' --pid 1234 --time 1000 --svg source.svg
+
+# Explicit library prefix
+profile-bee --uprobe libc:malloc --time 1000 --svg malloc.svg
+
+# Absolute path to binary
+profile-bee --uprobe '/usr/lib/libc.so.6:malloc' --time 1000 --svg malloc.svg
+
+# Return probe (uretprobe)
+profile-bee --uprobe ret:malloc --time 1000 --svg malloc_ret.svg
+
+# Function with offset
+profile-bee --uprobe malloc+0x10 --time 1000 --svg malloc_offset.svg
+
+# Scope to a specific PID
 profile-bee --uprobe malloc --uprobe-pid 12345 --time 1000 --svg malloc_pid.svg
+
+# Discovery mode — list matching symbols without attaching
+profile-bee --list-probes 'pthread_*' --pid 1234
 
 # Profile specific pid (includes child processes, automatically stops when process exits)
 profile-bee --pid <pid> --svg output.svg --time 10000
@@ -141,6 +159,47 @@ profile-bee --cpu 0 --svg output.svg --time 5000
 # Profile a command with DWARF unwinding (for binaries without frame pointers)
 profile-bee --svg output.svg -- ./my-optimized-binary
 
+```
+
+### Smart Uprobe Targeting
+
+Profile-bee supports GDB-style symbol resolution for uprobes. Instead of manually specifying which library a function lives in, you provide a probe spec and the tool auto-discovers matching symbols across all loaded ELF binaries.
+
+**Probe spec syntax:**
+
+| Syntax | Example | Description |
+|--------|---------|-------------|
+| `function` | `malloc` | Exact match, auto-discover library |
+| `lib:function` | `libc:malloc` | Explicit library name prefix |
+| `/path:function` | `/usr/lib/libc.so.6:malloc` | Absolute path prefix |
+| `ret:function` | `ret:malloc` | Return probe (uretprobe) |
+| `function+offset` | `malloc+0x10` | Function with byte offset |
+| `glob_pattern` | `pthread_*` | Glob matching (`*`, `?`, `[...]`) |
+| `/regex/` | `/^sql_.*query/` | Regex matching |
+| `Namespace::func` | `std::vector::push_back` | Demangled C++/Rust name match |
+| `file.c:line` | `main.c:42` | Source location (requires DWARF) |
+
+**Resolution order:**
+1. If `--pid` or `--uprobe-pid` is set, scans `/proc/<pid>/maps` for all mapped executables
+2. Otherwise, scans system libraries via `ldconfig` cache and standard paths
+3. For each candidate ELF, reads `.symtab` and `.dynsym` symbol tables
+4. Demangled matching uses both Rust and C++ demanglers
+5. Source locations are resolved via gimli `.debug_line` parsing
+
+**Multi-attach:** If a spec matches multiple symbols (e.g. `pthread_*` matching 20 functions), uprobes are attached to all of them.
+
+**Discovery mode:** Use `--list-probes` to search without attaching:
+
+```bash
+$ sudo profile-bee --list-probes 'pthread_*' --pid 1234
+
+/usr/lib/x86_64-linux-gnu/libc.so.6:
+  pthread_create                                     0x0008fe30  (456 bytes)
+  pthread_join                                       0x00090a10  (312 bytes)
+  pthread_mutex_lock                                 0x00094230  (128 bytes)
+  ...
+
+Total: 20 matches across 1 library
 ```
 
 ### TUI (Terminal User Interface)
@@ -189,7 +248,12 @@ The TUI viewer is optional and can be enabled with the `tui` feature flag. See [
 - Simple symbol lookup cache
 - SVG Flamegraph generation (via inferno)
 - BPF based stacktrace aggregation for reducing kernel <-> userspace transfers
-- **User space probing (uprobe/uretprobe)** - trace any userspace function
+- **Smart uprobe/uretprobe** with GDB-style symbol resolution:
+  - Auto-discovers which library a function lives in (no `--uprobe-path` needed)
+  - Glob (`pthread_*`), regex (`/pattern/`), and demangled name matching
+  - Source file:line targeting via DWARF debug info
+  - Multi-attach: one spec can match multiple symbols across libraries
+  - Discovery mode (`--list-probes`) to inspect available symbols
 - Basic Kernel probing (kprobe) and tracepoint support
 - Group by CPUs
 - Profile target PIDs, CPU id, or itself
@@ -212,6 +276,7 @@ The TUI viewer is optional and can be enabled with the `tui` feature flag. See [
 - Off CPU profiling
 - Publish to crates.io
 - ~~Implement uprobing (uprobe/uretprobe)~~
+- ~~Smart uprobe symbol resolution (GDB-style auto-discovery)~~
 - ~~Optimize symbol lookup via binary search~~
 - ~~Measure cache hit ratio~~
 - ~~Missing symbols~~

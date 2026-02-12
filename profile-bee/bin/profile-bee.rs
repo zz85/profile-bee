@@ -3,9 +3,11 @@ use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
-use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod, UProbeConfig};
+use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, ProfilerConfig, StackInfoPod, SmartUProbeConfig};
 use profile_bee::ebpf::{FramePointersPod};
 use profile_bee::html::{collapse_to_json, generate_html_file};
+use profile_bee::probe_spec::parse_probe_spec;
+use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, ResolvedProbe};
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
 use profile_bee_common::{StackInfo, UnwindEntry, ProcInfo, EVENT_TRACE_ALWAYS};
@@ -81,22 +83,28 @@ struct Opt {
     #[arg(long)]
     kprobe: Option<String>,
 
-    /// Function name to attach uprobe. Format: function_name or function_name+offset
+    /// Uprobe specification. GDB-style smart matching:
+    ///   malloc                        - auto-discover library
+    ///   libc:malloc                   - explicit library
+    ///   /usr/lib/libc.so.6:malloc     - absolute path
+    ///   ret:malloc                    - return probe
+    ///   malloc+0x10                   - function + offset
+    ///   pthread_*                     - glob pattern
+    ///   /regex_pattern/               - regex matching
+    ///   std::vector::push_back        - demangled name match
+    ///   main.c:42                     - source file:line (DWARF)
+    /// Can be specified multiple times to attach multiple probes.
     #[arg(long)]
-    uprobe: Option<String>,
-
-    /// Path to binary/library for uprobe. Can be absolute path or library name (e.g., "libc").
-    /// If not specified, defaults to "libc"
-    #[arg(long)]
-    uprobe_path: Option<String>,
-
-    /// Use uretprobe instead of uprobe (attaches to function return)
-    #[arg(long)]
-    uretprobe: bool,
+    uprobe: Vec<String>,
 
     /// PID to attach uprobe to (if not specified, attaches to all processes)
     #[arg(long)]
     uprobe_pid: Option<i32>,
+
+    /// List matching probe targets without attaching (discovery mode).
+    /// Pass a probe spec like --list-probes 'pthread_*'
+    #[arg(long)]
+    list_probes: Option<String>,
 
     /// function name to attached tracepoint eg.
     #[arg(long)]
@@ -174,8 +182,20 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     println!("Starting {:?}", opt);
 
+    // Handle --list-probes discovery mode (print and exit)
+    if let Some(ref probe_str) = opt.list_probes {
+        return handle_list_probes(probe_str, opt.pid, opt.uprobe_pid);
+    }
+
     // profile_bee::load(&opt.cmd.unwrap()).unwrap();
     // return Ok(());
+
+    // Resolve smart uprobe specs (if any)
+    let smart_uprobe = if !opt.uprobe.is_empty() {
+        Some(resolve_uprobe_specs(&opt.uprobe, opt.pid, opt.uprobe_pid)?)
+    } else {
+        None
+    };
 
     // Create eBPF profiler configuration from command line options (without pid first)
     let config = ProfilerConfig {
@@ -183,14 +203,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         stream_mode: opt.stream_mode,
         frequency: opt.frequency,
         kprobe: opt.kprobe.clone(),
-        uprobe: opt.uprobe.as_ref().map(|fn_name| {
-            UProbeConfig {
-                function: fn_name.clone(),
-                path: opt.uprobe_path.clone().unwrap_or_else(|| "libc".to_string()),
-                is_retprobe: opt.uretprobe,
-                pid: opt.uprobe_pid,
-            }
-        }),
+        uprobe: None,
+        smart_uprobe,
         tracepoint: opt.tracepoint.clone(),
         pid: opt.pid.clone(),
         cpu: opt.cpu,
@@ -313,6 +327,89 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     profiler.print_stats();
 
     Ok(())
+}
+
+/// Convert an optional i32 PID to u32, rejecting negative values.
+fn uprobe_pid_as_u32(uprobe_pid: Option<i32>) -> Result<Option<u32>, anyhow::Error> {
+    uprobe_pid
+        .map(|p| {
+            u32::try_from(p).map_err(|_| anyhow::anyhow!("--uprobe-pid must be non-negative, got {}", p))
+        })
+        .transpose()
+}
+
+/// Handle --list-probes: resolve and display matching symbols, then exit.
+fn handle_list_probes(
+    probe_str: &str,
+    pid: Option<u32>,
+    uprobe_pid: Option<i32>,
+) -> Result<(), anyhow::Error> {
+    let spec = parse_probe_spec(probe_str)
+        .map_err(|e| anyhow::anyhow!("invalid probe spec '{}': {}", probe_str, e))?;
+
+    eprintln!("Searching for: {}", spec);
+
+    let resolver = ProbeResolver::new();
+
+    let effective_pid = pid.or(uprobe_pid_as_u32(uprobe_pid)?);
+
+    let probes = if let Some(target_pid) = effective_pid {
+        eprintln!("Scanning /proc/{}/maps...", target_pid);
+        resolver.resolve_for_pid(&spec, target_pid)
+    } else {
+        eprintln!("Scanning system libraries (no --pid specified)...");
+        resolver.resolve_system_wide(&spec)
+    }
+    .map_err(|e| anyhow::anyhow!("probe resolution failed: {}", e))?;
+
+    println!("{}", format_resolved_probes(&probes));
+    Ok(())
+}
+
+/// Resolve uprobe spec strings into a SmartUProbeConfig ready for eBPF attachment.
+fn resolve_uprobe_specs(
+    specs: &[String],
+    pid: Option<u32>,
+    uprobe_pid: Option<i32>,
+) -> Result<SmartUProbeConfig, anyhow::Error> {
+    let resolver = ProbeResolver::new();
+    let effective_pid = pid.or(uprobe_pid_as_u32(uprobe_pid)?);
+    let mut all_probes: Vec<ResolvedProbe> = Vec::new();
+
+    for spec_str in specs {
+        let spec = parse_probe_spec(spec_str)
+            .map_err(|e| anyhow::anyhow!("invalid probe spec '{}': {}", spec_str, e))?;
+
+        eprintln!("Resolving uprobe: {}", spec);
+
+        let probes = if let Some(target_pid) = effective_pid {
+            resolver.resolve_for_pid(&spec, target_pid)
+        } else {
+            resolver.resolve_system_wide(&spec)
+        }
+        .map_err(|e| anyhow::anyhow!("failed to resolve '{}': {}", spec_str, e))?;
+
+        if probes.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no symbols found matching '{}'. Use --list-probes to search.",
+                spec_str,
+            ));
+        }
+
+        eprintln!(
+            "  resolved {} match{} for '{}'",
+            probes.len(),
+            if probes.len() == 1 { "" } else { "es" },
+            spec_str,
+        );
+
+        all_probes.extend(probes);
+    }
+
+    Ok(SmartUProbeConfig {
+        probes: all_probes,
+        pid: uprobe_pid,
+    })
 }
 
 /// Sets up the process to profile if a command is provided
@@ -796,20 +893,20 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         opt.pid.clone()
     };
 
-    // Create eBPF profiler configuration
-    let uprobe_config = opt.uprobe.as_ref().map(|function| UProbeConfig {
-        function: function.clone(),
-        path: opt.uprobe_path.clone().unwrap_or_else(|| "libc".to_string()),
-        is_retprobe: opt.uretprobe,
-        pid: opt.uprobe_pid,
-    });
+    // Resolve smart uprobe specs for TUI mode
+    let smart_uprobe = if !opt.uprobe.is_empty() {
+        Some(resolve_uprobe_specs(&opt.uprobe, pid, opt.uprobe_pid)?)
+    } else {
+        None
+    };
 
     let config = ProfilerConfig {
         skip_idle: opt.skip_idle,
         stream_mode: opt.stream_mode,
         frequency: opt.frequency,
         kprobe: opt.kprobe.clone(),
-        uprobe: uprobe_config,
+        uprobe: None,
+        smart_uprobe,
         tracepoint: opt.tracepoint.clone(),
         pid,
         cpu: opt.cpu,
