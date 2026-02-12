@@ -1,5 +1,5 @@
-// Test: C++ with exceptions and virtual dispatch (complex unwind tables).
-// Tests DWARF unwinding through vtable calls and exception-heavy code paths.
+// Test: C indirect calls via function pointers.
+// Tests DWARF unwinding through indirect (function-pointer) call chains.
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
