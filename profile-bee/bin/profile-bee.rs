@@ -4,13 +4,13 @@ use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
 use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig, StackInfoPod, SmartUProbeConfig};
-use profile_bee::ebpf::{FramePointersPod};
+use profile_bee::ebpf::{FramePointersPod, attach_process_exit_tracepoint, setup_process_exit_ring_buffer};
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::probe_spec::parse_probe_spec;
 use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, ResolvedProbe};
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
-use profile_bee_common::{StackInfo, UnwindEntry, ProcInfo, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{StackInfo, UnwindEntry, ProcInfo, EVENT_TRACE_ALWAYS, ProcessExitEvent};
 use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -25,6 +25,7 @@ use profile_bee::types::FrameCount;
 enum PerfWork {
     StackInfo(StackInfo),
     DwarfRefresh(DwarfRefreshUpdate),
+    ProcessExit(ProcessExitEvent),
     Stop,
 }
 
@@ -623,6 +624,27 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // Take ownership of ring buffer map after DWARF loading
     let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
 
+    // Set up process exit monitoring for external PIDs (--pid, not spawned)
+    let external_pid = if spawn.is_none() { opt.pid } else { None };
+    if let Some(pid_to_monitor) = external_pid {
+        // Attach the sched_process_exit tracepoint
+        attach_process_exit_tracepoint(&mut ebpf_profiler.bpf)?;
+
+        // Set the PID to monitor in the eBPF map
+        ebpf_profiler.set_monitor_exit_pid(pid_to_monitor)?;
+
+        // Set up the ring buffer for process exit events
+        let exit_ring_buf = setup_process_exit_ring_buffer(&mut ebpf_profiler.bpf)?;
+        let exit_perf_tx = perf_tx.clone();
+        task::spawn(async move {
+            if let Err(e) = setup_process_exit_ring_buffer_task(exit_ring_buf, exit_perf_tx).await {
+                eprintln!("Failed to set up process exit ring buffer: {:?}", e);
+            }
+        });
+
+        println!("eBPF-based exit monitoring enabled for PID {}", pid_to_monitor);
+    }
+
     let counts = &mut ebpf_profiler.counts;
     let stack_traces = &ebpf_profiler.stack_traces;
     let stacked_pointers = &ebpf_profiler.stacked_pointers;
@@ -630,8 +652,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let mut profiler = TraceHandler::new();
 
     // Set up stopping mechanisms
-    // Pass the external PID if we're monitoring one (not spawned)
-    let external_pid = if spawn.is_none() { opt.pid } else { None };
     // CLI defaults to 10s profiling windows;
     // serve mode defaults to unlimited (like TUI modes).
     let duration = opt.time.unwrap_or(if opt.serve { 0 } else { 10000 });
@@ -795,38 +815,6 @@ fn setup_process_to_profile(
     }
 }
 
-/// Monitor a PID and return when it exits
-async fn monitor_pid_exit(pid: u32) {
-    use tokio::time::{sleep, Duration};
-    
-    // Check if the PID exists initially
-    if !pid_exists(pid) {
-        eprintln!("Warning: PID {} does not exist or is not accessible", pid);
-        return;
-    }
-    
-    println!("Monitoring PID {} for exit...", pid);
-    
-    // Poll every 100ms to check if the process is still alive
-    loop {
-        sleep(Duration::from_millis(100)).await;
-        
-        if !pid_exists(pid) {
-            println!("Target PID {} has exited", pid);
-            break;
-        }
-    }
-}
-
-/// Check if a PID exists and is accessible
-fn pid_exists(pid: u32) -> bool {
-    use std::fs;
-    
-    // Check if /proc/[pid] exists
-    let proc_path = format!("/proc/{}", pid);
-    fs::metadata(&proc_path).is_ok()
-}
-
 /// Sets up the mechanisms that can stop the profiling
 fn setup_stopping_mechanisms(
     duration: usize,
@@ -839,7 +827,7 @@ fn setup_stopping_mechanisms(
     // - 1. user defined duration
     // - 2. ctrl-c received
     // - 3. child process stops (when spawned with -- or --cmd)
-    // - 4. target PID exits (when profiling with --pid)
+    // - 4. target PID exits (when profiling with --pid) - now handled by eBPF tracepoint
 
     // Timer-based stopping (duration == 0 means run indefinitely)
     if duration > 0 {
@@ -862,18 +850,10 @@ fn setup_stopping_mechanisms(
             child_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
         });
     }
-    
-    // Target PID monitoring (for --pid option)
-    // Only monitor if we have a target PID and didn't spawn the process ourselves
-    if let Some(pid) = target_pid {
-        // Only set up PID monitoring if we're not already monitoring a spawned process
-        // (i.e., the PID came from --pid, not from a spawned command)
-        let pid_stop_tx = perf_tx.clone();
-        tokio::spawn(async move {
-            monitor_pid_exit(pid).await;
-            pid_stop_tx.send(PerfWork::Stop).unwrap_or_default();
-        });
-    }
+
+    // Note: Process exit monitoring for --pid is now handled by eBPF tracepoint
+    // (sched_process_exit) instead of polling /proc. Events are delivered
+    // through the process_exit_events ring buffer.
 
     // Ctrl-C stopping
     let stop_tx = perf_tx.clone();
@@ -901,6 +881,35 @@ async fn setup_ring_buffer_task(
             while let Some(item) = ring_buf.next() {
                 let stack: StackInfo = unsafe { *item.as_ptr().cast() };
                 let _ = perf_tx.send(PerfWork::StackInfo(stack));
+            }
+            Ok(())
+        }) {
+            Ok(_) => {
+                guard.clear_ready();
+                continue;
+            }
+            Err(_would_block) => continue,
+        }
+    }
+
+    Ok(())
+}
+
+/// Sets up the ring buffer task to collect process exit events
+async fn setup_process_exit_ring_buffer_task(
+    ring_buf: RingBuf<MapData>,
+    perf_tx: mpsc::Sender<PerfWork>,
+) -> anyhow::Result<()> {
+    use tokio::io::unix::AsyncFd;
+    let mut fd = AsyncFd::new(ring_buf)?;
+
+    while let Ok(mut guard) = fd.readable_mut().await {
+        match guard.try_io(|inner| {
+            let ring_buf = inner.get_mut();
+            while let Some(item) = ring_buf.next() {
+                let exit_event: ProcessExitEvent = unsafe { *item.as_ptr().cast() };
+                println!("eBPF detected: PID {} has exited", exit_event.pid);
+                let _ = perf_tx.send(PerfWork::ProcessExit(exit_event));
             }
             Ok(())
         }) {
@@ -1076,6 +1085,10 @@ fn process_profiling_data(
             }
             PerfWork::DwarfRefresh(update) => {
                 apply_dwarf_refresh(bpf, update);
+            }
+            PerfWork::ProcessExit(_exit_event) => {
+                // Process exit detected by eBPF - stop profiling
+                break;
             }
             PerfWork::Stop => break,
         }

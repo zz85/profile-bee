@@ -55,6 +55,18 @@ impl ProbeEvent {
     pub const STRUCT_SIZE: usize = size_of::<ProbeEvent>();
 }
 
+/// Process exit notification sent from eBPF to userspace
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(C)]
+pub struct ProcessExitEvent {
+    pub pid: u32,
+    pub exit_code: i32,
+}
+
+impl ProcessExitEvent {
+    pub const STRUCT_SIZE: usize = size_of::<ProcessExitEvent>();
+}
+
 // --- DWARF Unwind Table Types (used by eBPF-side unwinding) ---
 
 /// How to compute the CFA (Canonical Frame Address)

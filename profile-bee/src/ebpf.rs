@@ -9,7 +9,7 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 
 use aya::Pod;
-use profile_bee_common::{ProcInfo, ProcInfoKey, UnwindEntry};
+use profile_bee_common::{ProcInfo, ProcInfoKey, UnwindEntry, ProcessExitEvent};
 
 // Create a newtype wrapper around StackInfo
 #[repr(transparent)]
@@ -36,6 +36,11 @@ unsafe impl Pod for ProcInfoKeyPod {}
 #[derive(Clone, Copy)]
 pub struct ProcInfoPod(pub ProcInfo);
 unsafe impl Pod for ProcInfoPod {}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessExitEventPod(pub ProcessExitEvent);
+unsafe impl Pod for ProcessExitEventPod {}
 
 /// Wrapper for eBPF stuff
 #[derive(Debug)]
@@ -344,6 +349,26 @@ pub fn setup_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<MapData>, anyhow::Err
     Ok(ring_buf)
 }
 
+pub fn setup_process_exit_ring_buffer(bpf: &mut Ebpf) -> Result<RingBuf<MapData>, anyhow::Error> {
+    let ring_buf = RingBuf::try_from(
+        bpf.take_map("process_exit_events")
+            .ok_or(anyhow!("process_exit_events not found"))?,
+    )?;
+
+    Ok(ring_buf)
+}
+
+/// Attach the sched_process_exit tracepoint for monitoring process exits
+pub fn attach_process_exit_tracepoint(bpf: &mut Ebpf) -> Result<(), anyhow::Error> {
+    let program: &mut TracePoint = bpf
+        .program_mut("tracepoint_process_exit")
+        .ok_or(anyhow!("tracepoint_process_exit not found"))?
+        .try_into()?;
+    program.load()?;
+    program.attach("sched", "sched_process_exit")?;
+    Ok(())
+}
+
 impl EbpfProfiler {
     /// Set the target PID for eBPF filtering (0 = profile all processes)
     pub fn set_target_pid(&mut self, pid: u32) -> Result<(), anyhow::Error> {
@@ -353,6 +378,17 @@ impl EbpfProfiler {
                 .ok_or(anyhow!("target_pid_map not found"))?,
         )?;
         target_pid_map.set(0, pid, 0)?;
+        Ok(())
+    }
+
+    /// Set the PID to monitor for exit events (0 = don't monitor)
+    pub fn set_monitor_exit_pid(&mut self, pid: u32) -> Result<(), anyhow::Error> {
+        let mut monitor_exit_pid_map: Array<&mut MapData, u32> = Array::try_from(
+            self.bpf
+                .map_mut("monitor_exit_pid_map")
+                .ok_or(anyhow!("monitor_exit_pid_map not found"))?,
+        )?;
+        monitor_exit_pid_map.set(0, pid, 0)?;
         Ok(())
     }
 

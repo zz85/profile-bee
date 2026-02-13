@@ -9,7 +9,7 @@ use aya_ebpf::{
 };
 use profile_bee_ebpf::{
     collect_trace, collect_trace_raw_syscall, collect_trace_raw_syscall_exit,
-    collect_trace_raw_tp_with_task_regs, collect_trace_stackid_only,
+    collect_trace_raw_tp_with_task_regs, collect_trace_stackid_only, handle_process_exit,
 };
 
 #[perf_event]
@@ -75,6 +75,14 @@ pub fn raw_tp_generic(ctx: RawTracePointContext) -> u32 {
 #[raw_tracepoint]
 pub fn raw_tp_with_regs(ctx: RawTracePointContext) -> u32 {
     unsafe { collect_trace_raw_tp_with_task_regs(ctx) }
+    0
+}
+
+/// Tracepoint for monitoring process exit events.
+/// This allows us to detect when a monitored PID exits without polling.
+#[tracepoint(tracepoint = "sched:sched_process_exit")]
+pub fn tracepoint_process_exit(ctx: TracePointContext) -> u32 {
+    unsafe { handle_process_exit(ctx) }
     0
 }
 
