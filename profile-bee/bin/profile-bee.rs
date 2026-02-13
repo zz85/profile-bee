@@ -821,7 +821,7 @@ fn setup_stopping_mechanisms(
     perf_tx: mpsc::Sender<PerfWork>,
     stopping: Option<StopHandler>,
     spawn: Option<SpawnProcess>,
-    target_pid: Option<u32>,
+    _target_pid: Option<u32>,
 ) {
     // 4 ways to stop
     // - 1. user defined duration
@@ -1431,6 +1431,10 @@ fn spawn_profiling_thread(
                     }
                     Ok(PerfWork::DwarfRefresh(update)) => {
                         apply_dwarf_refresh(&mut bpf, update);
+                    }
+                    Ok(PerfWork::ProcessExit(_exit_event)) => {
+                        // Process exit detected by eBPF - stop profiling
+                        return;
                     }
                     Ok(PerfWork::Stop) => return,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
