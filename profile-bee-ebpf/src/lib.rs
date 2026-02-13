@@ -10,16 +10,17 @@ use aya_ebpf::{
         bpf_probe_read_user, bpf_task_pt_regs,
     },
     macros::map,
-    maps::{Array, HashMap, PerCpuArray, RingBuf, StackTrace},
+    maps::{Array, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
     programs::RawTracePointContext,
     EbpfContext,
 };
 
 // use aya_log_ebpf::info;
 use profile_bee_common::{
-    FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_PLT,
-    CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS, MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS,
-    MAX_SHARD_ENTRIES, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
+    DwarfUnwindState, FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry,
+    CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
+    FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS, MAX_SHARD_ENTRIES,
+    REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -130,6 +131,14 @@ pub static SHARD_7: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRI
 /// Per-process unwind info: maps tgid to ProcInfo (exec mappings)
 #[map(name = "proc_info")]
 pub static PROC_INFO: HashMap<ProcInfoKey, ProcInfo> = HashMap::with_max_entries(1024, 0);
+
+/// Per-CPU state for DWARF tail-call unwinding
+#[map(name = "unwind_state")]
+pub static UNWIND_STATE: PerCpuArray<DwarfUnwindState> = PerCpuArray::with_max_entries(1, 0);
+
+/// Program array for tail-call chaining during DWARF unwinding
+#[map(name = "prog_array")]
+pub static PROG_ARRAY: ProgramArray = ProgramArray::with_max_entries(4, 0);
 
 /// Collect trace with custom FP/DWARF stack unwinding via pt_regs.
 ///
@@ -531,6 +540,146 @@ pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
 
 const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
+/// Perform one frame of DWARF unwinding, updating state in place.
+/// Returns true if unwinding should continue, false if done.
+#[inline(always)]
+unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState, proc_info: &ProcInfo) -> bool {
+    let current_ip = state.current_ip;
+    let sp = state.sp;
+    let bp = state.bp;
+    let frame_idx = state.frame_count;
+
+    if frame_idx >= state.pointers.len() {
+        return false;
+    }
+    if invalid_userspace_pointer(current_ip) {
+        return false;
+    }
+
+    // Find the mapping that contains current_ip
+    let mut found_mapping = false;
+    let mut shard_id: u8 = SHARD_NONE;
+    let mut table_count: u32 = 0;
+    let mut load_bias: u64 = 0;
+
+    for m in 0..MAX_PROC_MAPS {
+        if m >= state.mapping_count as usize {
+            break;
+        }
+        let mapping = &proc_info.mappings[m];
+        if current_ip >= mapping.begin && current_ip < mapping.end {
+            shard_id = mapping.shard_id;
+            table_count = mapping.table_count;
+            load_bias = mapping.load_bias;
+            found_mapping = true;
+            break;
+        }
+    }
+
+    if !found_mapping || table_count == 0 || shard_id == SHARD_NONE {
+        // No DWARF info — try FP-based step as fallback
+        if let Some((ra, nbp)) = try_fp_step(bp) {
+            state.pointers[frame_idx] = ra;
+            state.frame_count = frame_idx + 1;
+            state.current_ip = ra;
+            state.sp = bp + 16;
+            state.bp = nbp;
+            return true;
+        }
+        return false;
+    }
+
+    // Convert virtual address to file-relative address for table lookup
+    let relative_pc = (current_ip - load_bias) as u32;
+
+    // Binary search for the unwind entry covering this PC
+    let entry = match binary_search_unwind_entry(shard_id, table_count, relative_pc) {
+        Some(e) => e,
+        None => {
+            // No unwind entry — try FP-based step as fallback
+            if let Some((ra, nbp)) = try_fp_step(bp) {
+                state.pointers[frame_idx] = ra;
+                state.frame_count = frame_idx + 1;
+                state.current_ip = ra;
+                state.sp = bp + 16;
+                state.bp = nbp;
+                return true;
+            }
+            return false;
+        }
+    };
+
+    // Compute CFA (Canonical Frame Address) based on rule type
+    let is_signal = entry.cfa_type == CFA_REG_DEREF_RSP;
+
+    let cfa = match entry.cfa_type {
+        CFA_REG_RSP => sp.wrapping_add(entry.cfa_offset as i64 as u64),
+        CFA_REG_RBP => bp.wrapping_add(entry.cfa_offset as i64 as u64),
+        CFA_REG_PLT => {
+            let base = sp.wrapping_add(entry.cfa_offset as i64 as u64);
+            if (current_ip & 15) >= 11 {
+                base.wrapping_add(8)
+            } else {
+                base
+            }
+        }
+        // Signal frame: CFA = saved RSP = *(RSP + 160)
+        CFA_REG_DEREF_RSP => match bpf_probe_read_user((sp + 160) as *const u64) {
+            Ok(val) => val,
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+
+    if cfa == 0 {
+        return false;
+    }
+
+    // Return address: CFA-8 for normal frames, *(RSP+168) for signal frames
+    let ra_addr = if is_signal {
+        sp + 168
+    } else {
+        cfa.wrapping_sub(8)
+    };
+    let return_addr = match bpf_probe_read_user(ra_addr as *const u64) {
+        Ok(val) => val,
+        Err(_) => return false,
+    };
+
+    if return_addr == 0 {
+        return false;
+    }
+
+    // Restore RBP: for signal frames read from *(RSP+120),
+    // otherwise use normal CFA-relative offset rule
+    let new_bp = if is_signal {
+        match bpf_probe_read_user((sp + 120) as *const u64) {
+            Ok(val) => val,
+            Err(_) => bp,
+        }
+    } else {
+        match entry.rbp_type {
+            REG_RULE_OFFSET => {
+                let bp_addr = (cfa as i64 + entry.rbp_offset as i64) as u64;
+                match bpf_probe_read_user(bp_addr as *const u64) {
+                    Ok(val) => val,
+                    Err(_) => bp,
+                }
+            }
+            REG_RULE_SAME_VALUE => bp,
+            _ => bp,
+        }
+    };
+
+    state.pointers[frame_idx] = return_addr;
+    state.frame_count = frame_idx + 1;
+    state.current_ip = return_addr;
+    state.sp = cfa;
+    state.bp = new_bp;
+
+    true
+}
+
 /// DWARF-based stack unwinding using pre-loaded unwind tables (from pt_regs directly)
 #[inline(always)]
 unsafe fn dwarf_copy_stack_regs(
@@ -560,7 +709,7 @@ unsafe fn dwarf_copy_stack_regs(
     let mapping_count = proc_info.mapping_count as usize;
 
     let mut i = 1usize;
-    for _ in 1..MAX_DWARF_STACK_DEPTH {
+    for _ in 1..LEGACY_MAX_DWARF_STACK_DEPTH {
         if i >= pointers.len() {
             break;
         }
@@ -704,6 +853,103 @@ unsafe fn dwarf_copy_stack_regs(
     }
 
     (ip, bp, len)
+}
+
+/// Initialize DWARF unwinding state and start tail-call chain.
+/// This is called from collect_trace when tail-call unwinding is enabled.
+#[inline(always)]
+unsafe fn dwarf_copy_stack_with_tail_calls<C: EbpfContext>(
+    ctx: &C,
+    pointers: &mut [u64],
+    tgid: u32,
+) -> (u64, u64, usize) {
+    let regs = ctx.as_ptr() as *const pt_regs;
+    let regs = &*regs;
+
+    let ip = regs.rip;
+    let sp = regs.rsp;
+    let bp = regs.rbp;
+
+    // Store first frame
+    pointers[0] = ip;
+
+    // Look up the process's unwind information
+    let proc_key = ProcInfoKey { tgid, _pad: 0 };
+    let proc_info = match PROC_INFO.get(&proc_key) {
+        Some(info) => info,
+        None => {
+            // No DWARF info - fall back to frame pointer unwinding
+            let (ip, bp, len, _sp) = copy_stack_regs(regs, pointers);
+            return (ip, bp, len);
+        }
+    };
+
+    // Initialize state in per-CPU map
+    let Some(state) = UNWIND_STATE.get_ptr_mut(0) else {
+        return (ip, bp, 1);
+    };
+
+    // Copy frame pointers array to state
+    for i in 0..pointers.len() {
+        (*state).pointers[i] = pointers[i];
+    }
+
+    (*state).frame_count = 1;
+    (*state).current_ip = ip;
+    (*state).sp = sp;
+    (*state).bp = bp;
+    (*state).tgid = tgid;
+    (*state).mapping_count = proc_info.mapping_count;
+
+    // Perform unwinding in a loop (simulating tail calls for now)
+    // In a real tail-call implementation, this would call PROG_ARRAY.tail_call()
+    let max_iterations = 33; // Max tail calls
+    for _ in 0..max_iterations {
+        let mut unwound_frames = 0;
+
+        // Unwind up to FRAMES_PER_TAIL_CALL frames
+        for _ in 0..FRAMES_PER_TAIL_CALL {
+            if (*state).frame_count >= (*state).pointers.len() {
+                break;
+            }
+
+            if !dwarf_unwind_one_frame(&mut *state, proc_info) {
+                // Unwinding complete or failed
+                unwound_frames = 0;
+                break;
+            }
+            unwound_frames += 1;
+        }
+
+        // If we didn't unwind any frames, we're done
+        if unwound_frames == 0 {
+            break;
+        }
+
+        // In real tail-call implementation: PROG_ARRAY.tail_call(ctx, 0)
+        // For now, we continue in the loop
+    }
+
+    // Copy results back to output array
+    let final_len = (*state).frame_count;
+    for i in 0..final_len.min(pointers.len()) {
+        pointers[i] = (*state).pointers[i];
+    }
+
+    (ip, bp, final_len)
+}
+
+/// DWARF-based stack unwinding using tail-call chaining.
+/// This is the entry point called from collect_trace.
+#[inline(always)]
+unsafe fn dwarf_copy_stack<C: EbpfContext>(
+    ctx: &C,
+    pointers: &mut [u64],
+    tgid: u32,
+) -> (u64, u64, usize) {
+    // Use tail-call version (currently implemented as a loop)
+    // TODO: Enable true tail-call when ProgramArray is properly initialized from userspace
+    dwarf_copy_stack_with_tail_calls(ctx, pointers, tgid)
 }
 
 /// Try a single frame-pointer-based unwind step.
