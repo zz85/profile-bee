@@ -2,9 +2,9 @@
 
 An eBPF-based CPU profiler for Linux, written in Rust. Single binary, no BCC/libbpf dependencies.
 
-![Architecture](docs/architecture-sketch.png)
+![Architecture](https://raw.githubusercontent.com/zz85/profile-bee/main/docs/architecture-sketch.png)
 
-![TUI Screenshot](docs/tui-self-profile-screenshot.png)
+![TUI Screenshot](https://raw.githubusercontent.com/zz85/profile-bee/main/docs/tui-self-profile-screenshot.png)
 
 ## About
 

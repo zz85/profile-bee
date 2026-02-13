@@ -5,10 +5,12 @@ edition = "2021"
 license = "MIT"
 description = "eBPF-based CPU profiler with flamegraph generation, DWARF unwinding, and interactive TUI"
 repository = "https://github.com/zz85/profile-bee"
+readme = "../README.md"
 
 include = [
   "build.rs",
   "Cargo.toml",
+  "../README.md",
   "src/**/*.rs",
   "bin/**/*.rs",
   "assets/**",
