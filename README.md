@@ -50,10 +50,10 @@ This is the same approach used by [parca-agent](https://github.com/parca-dev/par
 
 ```bash
 # Enable DWARF unwinding for a no-frame-pointer binary
-profile-bee --dwarf --svg output.svg --time 5000 -- ./my-optimized-binary
+probee --dwarf --svg output.svg --time 5000 -- ./my-optimized-binary
 
 # Frame pointer unwinding (the default)
-profile-bee --svg output.svg --time 5000 -- ./my-fp-binary
+probee --svg output.svg --time 5000 -- ./my-fp-binary
 ```
 
 See `docs/dwarf_unwinding_design.md` for architecture details.
@@ -71,93 +71,101 @@ For more information on DWARF-based profiling, see:
 - [Polar Signals' article on profiling without frame pointers](https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers)
 - `docs/dwarf_unwinding_design.md` for architecture details
 
+### Installation
+
+```bash
+cargo install profile-bee
+```
+
+This installs two binaries: `probee` (primary) and `pbee` (short alias). No nightly Rust required — a prebuilt eBPF binary is bundled.
+
 ### Usage
 
 ```bash
-# Interactive TUI flamegraph viewer (requires tui feature)
-profile-bee --tui --cmd "top -b -n 5 -d 1"
+# Interactive TUI flamegraph viewer
+probee --tui --cmd "top -b -n 5 -d 1"
 
 # TUI with live profiling updates
-profile-bee --tui --pid 1234 --time 30000
+probee --tui --pid 1234 --time 30000
 
 # Profile a command (runs top for 5 seconds), writing flamegraph to test.svg
-profile-bee --svg test.svg -- top -b -n 5 -d 1
+probee --svg test.svg -- top -b -n 5 -d 1
 
 # Profile a command with multiple arguments
-profile-bee --svg test.svg -- ls -la /tmp
+probee --svg test.svg -- ls -la /tmp
 
 # Profile system wide for 5s, generating a html flamegraph
-profile-bee --time 5000 --html flamegraphs.html
+probee --time 5000 --html flamegraphs.html
 
 # Profile at 9999hz for 2s, writing output to profile.svg
-profile-bee --svg profile.svg --frequency 9999 --time 2000
+probee --svg profile.svg --frequency 9999 --time 2000
 
 # Realtime flamegraphs
-profile-bee --time 5000 --serve --skip-idle --stream-mode 1
+probee --time 5000 --serve --skip-idle --stream-mode 1
 # Then goto http://localhost:8000/ and click "realtime-updates"
 
 # Same as above, grouped by CPU ids
-profile-bee --svg profile.svg --frequency 9999 --time 2000 --group-by-cpu
+probee --svg profile.svg --frequency 9999 --time 2000 --group-by-cpu
 
 # Profile at 999hz for 10s, writing output to profile.txt
-profile-bee --collapse profile.txt --frequency 999 --time 10000
+probee --collapse profile.txt --frequency 999 --time 10000
 
 # Kitchen sink of all output formats
-profile-bee --time 5000 --html flamegraphs.html --json profile.json --collapse profile.txt --svg profile.svg
+probee --time 5000 --html flamegraphs.html --json profile.json --collapse profile.txt --svg profile.svg
 
 # Profile at 99hz for 5s, writing output to screen, idle CPU cycles not counted
 cargo xtask run --release -- --collapse profile.txt --frequency 99 --time 5000 --skip-idle
 
 # Profile using kprobe over a short interval of 200ms
-profile-bee --kprobe vfs_write --time 200 --svg kprobe.svg
+probee --kprobe vfs_write --time 200 --svg kprobe.svg
 
 # Profile using a tracepoint over a interval of 200ms
-profile-bee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
+probee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
 
 # Profile using uprobe on malloc in libc (auto-discovered)
-profile-bee --uprobe malloc --time 1000 --svg malloc.svg
+probee --uprobe malloc --time 1000 --svg malloc.svg
 
 # Profile multiple functions at once
-profile-bee --uprobe malloc --uprobe 'ret:free' --time 1000 --svg alloc.svg
+probee --uprobe malloc --uprobe 'ret:free' --time 1000 --svg alloc.svg
 
 # Glob matching — trace all pthread functions
-profile-bee --uprobe 'pthread_*' --time 1000 --svg pthread.svg
+probee --uprobe 'pthread_*' --time 1000 --svg pthread.svg
 
 # Regex matching
-profile-bee --uprobe '/^sql_.*query/' --pid 1234 --time 2000 --svg sql.svg
+probee --uprobe '/^sql_.*query/' --pid 1234 --time 2000 --svg sql.svg
 
 # Demangled C++/Rust name matching
-profile-bee --uprobe 'std::vector::push_back' --pid 1234 --time 1000 --svg vec.svg
+probee --uprobe 'std::vector::push_back' --pid 1234 --time 1000 --svg vec.svg
 
 # Source file and line number (requires DWARF debug info)
-profile-bee --uprobe 'main.c:42' --pid 1234 --time 1000 --svg source.svg
+probee --uprobe 'main.c:42' --pid 1234 --time 1000 --svg source.svg
 
 # Explicit library prefix
-profile-bee --uprobe libc:malloc --time 1000 --svg malloc.svg
+probee --uprobe libc:malloc --time 1000 --svg malloc.svg
 
 # Absolute path to binary
-profile-bee --uprobe '/usr/lib/libc.so.6:malloc' --time 1000 --svg malloc.svg
+probee --uprobe '/usr/lib/libc.so.6:malloc' --time 1000 --svg malloc.svg
 
 # Return probe (uretprobe)
-profile-bee --uprobe ret:malloc --time 1000 --svg malloc_ret.svg
+probee --uprobe ret:malloc --time 1000 --svg malloc_ret.svg
 
 # Function with offset
-profile-bee --uprobe malloc+0x10 --time 1000 --svg malloc_offset.svg
+probee --uprobe malloc+0x10 --time 1000 --svg malloc_offset.svg
 
 # Scope to a specific PID
-profile-bee --uprobe malloc --uprobe-pid 12345 --time 1000 --svg malloc_pid.svg
+probee --uprobe malloc --uprobe-pid 12345 --time 1000 --svg malloc_pid.svg
 
 # Discovery mode — list matching symbols without attaching
-profile-bee --list-probes 'pthread_*' --pid 1234
+probee --list-probes 'pthread_*' --pid 1234
 
 # Profile specific pid (includes child processes, automatically stops when process exits)
-profile-bee --pid <pid> --svg output.svg --time 10000
+probee --pid <pid> --svg output.svg --time 10000
 
 # Profile specific cpu
-profile-bee --cpu 0 --svg output.svg --time 5000
+probee --cpu 0 --svg output.svg --time 5000
 
 # Profile a command with DWARF unwinding (for binaries without frame pointers)
-profile-bee --svg output.svg -- ./my-optimized-binary
+probee --svg output.svg -- ./my-optimized-binary
 
 ```
 
@@ -191,7 +199,7 @@ Profile-bee supports GDB-style symbol resolution for uprobes. Instead of manuall
 **Discovery mode:** Use `--list-probes` to search without attaching:
 
 ```bash
-$ sudo profile-bee --list-probes 'pthread_*' --pid 1234
+$ sudo probee --list-probes 'pthread_*' --pid 1234
 
 /usr/lib/x86_64-linux-gnu/libc.so.6:
   pthread_create                                     0x0008fe30  (456 bytes)
@@ -216,13 +224,13 @@ Profile-bee includes an interactive terminal-based flamegraph viewer, forked and
 **Usage:**
 ```bash
 # Interactive TUI with a command
-sudo ./target/release/profile-bee --tui --cmd "your-command"
+sudo probee --tui --cmd "your-command"
 
 # Live profiling of a running process
-sudo ./target/release/profile-bee --tui --pid <pid> --time 30000
+sudo probee --tui --pid <pid> --time 30000
 
 # With DWARF unwinding for optimized binaries
-sudo ./target/release/profile-bee --tui --dwarf --cmd "./optimized-binary"
+sudo probee --tui --dwarf --cmd "./optimized-binary"
 
 # Build without TUI support
 cargo build --release --no-default-features

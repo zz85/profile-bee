@@ -47,6 +47,10 @@ default = ["tui"]
 tui = ["dep:profile-bee-tui"]
 
 [[bin]]
-name = "profile-bee"
+name = "probee"
+path = "bin/profile-bee.rs"
+
+[[bin]]
+name = "pbee"
 path = "bin/profile-bee.rs"
 
