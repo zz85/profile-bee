@@ -35,9 +35,9 @@ Uses the kernel's `bpf_get_stackid` to walk the frame pointer chain. Works out o
 - Rust: `RUSTFLAGS="-Cforce-frame-pointers=yes"`
 - C/C++: `-fno-omit-frame-pointer` flag
 
-#### DWARF Method (default)
+#### DWARF Method
 
-Enabled by default. Handles binaries compiled without frame pointers (the default for most `-O2`/`-O3` builds). Use `--dwarf=false` to disable and fall back to frame pointer unwinding.
+Disabled by default. Handles binaries compiled without frame pointers (the default for most `-O2`/`-O3` builds). Use `--dwarf` to enable DWARF-based stack unwinding.
 
 **How it works:**
 1. At startup, userspace parses `/proc/[pid]/maps` and `.eh_frame` sections from each executable mapping
@@ -49,11 +49,11 @@ Enabled by default. Handles binaries compiled without frame pointers (the defaul
 This is the same approach used by [parca-agent](https://github.com/parca-dev/parca-agent) and other production eBPF profilers.
 
 ```bash
-# Profile a no-frame-pointer binary (DWARF unwinding is on by default)
-profile-bee --svg output.svg --time 5000 -- ./my-optimized-binary
+# Enable DWARF unwinding for a no-frame-pointer binary
+profile-bee --dwarf --svg output.svg --time 5000 -- ./my-optimized-binary
 
-# Disable DWARF unwinding to use frame pointers only
-profile-bee --dwarf=false --svg output.svg --time 5000 -- ./my-fp-binary
+# Frame pointer unwinding (the default)
+profile-bee --svg output.svg --time 5000 -- ./my-fp-binary
 ```
 
 See `docs/dwarf_unwinding_design.md` for architecture details.
@@ -215,17 +215,17 @@ Profile-bee includes an interactive terminal-based flamegraph viewer, forked and
 
 **Usage:**
 ```bash
-# Build with TUI support
-cargo build --release --features tui
-
 # Interactive TUI with a command
 sudo ./target/release/profile-bee --tui --cmd "your-command"
 
 # Live profiling of a running process
 sudo ./target/release/profile-bee --tui --pid <pid> --time 30000
 
-# With DWARF unwinding for optimized binaries (enabled by default)
-sudo ./target/release/profile-bee --tui --cmd "./optimized-binary"
+# With DWARF unwinding for optimized binaries
+sudo ./target/release/profile-bee --tui --dwarf --cmd "./optimized-binary"
+
+# Build without TUI support
+cargo build --release --no-default-features
 ```
 
 **Key Bindings:**
@@ -238,10 +238,10 @@ sudo ./target/release/profile-bee --tui --cmd "./optimized-binary"
 - `z`: Freeze/unfreeze live updates
 - `q` or `Ctrl+C`: Quit
 
-The TUI viewer is optional and can be enabled with the `tui` feature flag. See [profile-bee-tui/](profile-bee-tui/) for implementation details.
+The TUI viewer is included by default. Use `--no-default-features` to build without it. See [profile-bee-tui/](profile-bee-tui/) for implementation details.
 
 ### Features
-- **DWARF-based stack unwinding** (enabled by default) for profiling binaries without frame pointers
+- **DWARF-based stack unwinding** (opt-in with `--dwarf`) for profiling binaries without frame pointers
 - Frame pointer-based unwinding in eBPF for maximum performance
 - Rust and C++ symbols demangling supported (via gimli/blazesym)
 - Some source mapping supported

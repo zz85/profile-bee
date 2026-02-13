@@ -2,7 +2,9 @@
 name = "profile-bee"
 version = "0.3.0"
 edition = "2021"
-publish = false
+license = "MIT"
+description = "eBPF-based CPU profiler with flamegraph generation, DWARF unwinding, and interactive TUI"
+repository = "https://github.com/zz85/profile-bee"
 
 include = [
   "build.rs",
@@ -41,7 +43,7 @@ procmaps = "0.4.1"
 regex = "1"
 
 [features]
-default = []
+default = ["tui"]
 tui = ["dep:profile-bee-tui"]
 
 [[bin]]
