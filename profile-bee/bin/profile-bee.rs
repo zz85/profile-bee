@@ -295,24 +295,43 @@ fn syscall_name_to_nr(name: &str) -> Option<i64> {
 ///   3. perf TracePoint (legacy, may be blocked by BPF LSM)
 ///
 /// For syscall tracepoints (syscalls:sys_enter_* only):
-///   1. raw_tp sys_enter (pt_regs from args[0], syscall NR filtering via args[1])
-///   2-3. same as above
-/// Note: sys_exit_* is NOT routed here because its args[1] is the return
-/// value, not the syscall NR — it falls through to the generic path.
+///   1. raw_tp sys_enter with NR filtering (pt_regs from args[0], syscall NR via args[1])
+///   2. raw_tp sys_enter with task pt_regs (no per-syscall filtering, full unwinding)
+///   3. raw_tp sys_enter generic (bpf_get_stackid only)
+///   4. perf TracePoint (legacy)
+///
+/// Note: the aggregate raw tracepoint name ("sys_enter") is used for ALL
+/// raw_tp fallback attempts, since per-syscall names like "sys_enter_write"
+/// don't exist as raw tracepoints.
+/// sys_exit_* is NOT routed here — see parse_syscall_tracepoint.
 fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfiler, anyhow::Error> {
     if let Some(tp) = config.tracepoint.clone() {
-        // For syscall tracepoints, try syscall-specific raw_tp first (has pt_regs in args)
-        if let Some((raw_tp, syscall_nr)) = parse_syscall_tracepoint(&tp) {
-            let raw_tp = raw_tp.to_string();
+        // Determine the raw tracepoint name to use for fallback attempts.
+        // For syscall tracepoints (e.g. "syscalls:sys_enter_write") we must
+        // use the aggregate name ("sys_enter") — per-syscall names like
+        // "sys_enter_write" don't exist as raw tracepoints.
+        // For non-syscall tracepoints we use the event name after the colon.
+        let (raw_tp_name, syscall_info) = if let Some((raw_tp, syscall_nr)) = parse_syscall_tracepoint(&tp) {
+            (raw_tp.to_string(), Some(syscall_nr))
+        } else if let Some(name) = parse_tracepoint_name(&tp) {
+            (name.to_string(), None)
+        } else {
+            // No parseable tracepoint name — skip raw_tp attempts entirely
+            return setup_ebpf_profiler(config);
+        };
+
+        // For syscall tracepoints, first try the syscall-specific raw_tp
+        // (has pt_regs in args[0], syscall NR filtering via args[1])
+        if let Some(syscall_nr) = syscall_info {
             let tp_saved = config.tracepoint.take();
-            config.raw_tracepoint = Some(raw_tp.clone());
+            config.raw_tracepoint = Some(raw_tp_name.clone());
             config.target_syscall_nr = syscall_nr;
 
             match setup_ebpf_profiler(config) {
                 Ok(profiler) => {
                     eprintln!(
                         "Attached via raw tracepoint '{}' (syscall nr={})",
-                        raw_tp, syscall_nr
+                        raw_tp_name, syscall_nr
                     );
                     return Ok(profiler);
                 }
@@ -329,16 +348,15 @@ fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfil
         }
 
         // Try raw_tp with task pt_regs (kernel >= 5.15, full unwinding)
-        if let Some(name) = parse_tracepoint_name(&tp) {
-            let name = name.to_string();
+        {
             let tp_saved = config.tracepoint.take();
-            config.raw_tracepoint_task_regs = Some(name.clone());
+            config.raw_tracepoint_task_regs = Some(raw_tp_name.clone());
 
             match setup_ebpf_profiler(config) {
                 Ok(profiler) => {
                     eprintln!(
                         "Attached via raw tracepoint '{}' (task pt_regs, full unwinding)",
-                        name
+                        raw_tp_name
                     );
                     return Ok(profiler);
                 }
@@ -351,16 +369,18 @@ fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfil
                     config.tracepoint = tp_saved;
                 }
             }
+        }
 
-            // Try generic raw_tp (bpf_get_stackid only, no custom unwinding)
+        // Try generic raw_tp (bpf_get_stackid only, no custom unwinding)
+        {
             let tp_saved = config.tracepoint.take();
-            config.raw_tracepoint_generic = Some(name.clone());
+            config.raw_tracepoint_generic = Some(raw_tp_name.clone());
 
             match setup_ebpf_profiler(config) {
                 Ok(profiler) => {
                     eprintln!(
                         "Attached via generic raw tracepoint '{}' (stackid only)",
-                        name
+                        raw_tp_name
                     );
                     return Ok(profiler);
                 }
