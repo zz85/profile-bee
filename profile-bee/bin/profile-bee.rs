@@ -35,7 +35,46 @@ struct DwarfRefreshUpdate {
 }
 
 #[derive(Debug, Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "eBPF-based CPU profiler with flamegraph generation and interactive TUI.\n\
+             Supports kprobe, uprobe (with glob/regex matching), and tracepoint probes.\n\
+             Renders TUI, SVG, JSON, stackcollapse, HTML. Run --help for examples.",
+    long_about = None,
+    override_usage = "(sudo) probee [OPTIONS] [-- <COMMAND>...]",
+    after_long_help = "\x1b[1mExamples:\x1b[0m
+  # Interactive TUI flamegraph (live profiling)
+  sudo probee --tui
+
+  # TUI with a specific command
+  sudo probee --tui --cmd \"my-application\"
+
+  # Profile system-wide for 5s, generate SVG flamegraph
+  sudo probee --svg flamegraph.svg --time 5000
+
+  # Profile a command, writing output to SVG
+  sudo probee --svg output.svg -- ./my-binary arg1 arg2
+
+  # DWARF unwinding for binaries without frame pointers
+  sudo probee --tui --dwarf --cmd \"./optimized-binary\"
+
+  # Profile at high frequency, multiple output formats
+  sudo probee --frequency 999 --time 5000 --svg out.svg --html out.html
+
+  # Real-time flamegraphs via web server
+  sudo probee --serve --skip-idle
+
+  # Trace specific syscalls via kprobe/tracepoint/uprobe
+  sudo probee --kprobe vfs_write --time 200 --svg kprobe.svg
+  sudo probee --uprobe malloc --time 1000 --svg malloc.svg
+  sudo probee --uprobe 'pthread_*' --time 1000 --svg pthread.svg
+
+  # Discovery mode — list matching probe targets
+  sudo probee --list-probes 'pthread_*'
+
+\x1b[1mShort alias:\x1b[0m pbee (e.g., sudo pbee --tui)"
+)]
 struct Opt {
     /// Filename to write in stackcollapse format
     #[arg(short, long)]
@@ -76,9 +115,10 @@ struct Opt {
     #[arg(long)]
     skip_idle: bool,
 
-    /// Time to run CPU profiling in milliseconds,
-    #[arg(short, long, default_value_t = 10000)]
-    time: usize,
+    /// Time to run CPU profiling in milliseconds (0 = run until Ctrl-C).
+    /// Defaults to 10000 in CLI mode; defaults to 0 (unlimited) in --tui / --serve modes.
+    #[arg(short, long)]
+    time: Option<usize>,
 
     /// Frequency for sampling,
     #[arg(short, long, default_value_t = 99)]
@@ -119,7 +159,7 @@ struct Opt {
     group_by_cpu: bool,
 
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
-    #[arg(long, default_value_t = true, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, default_value_t = false, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_missing_value = "true")]
     dwarf: bool,
 
     /// PID to profile
@@ -149,6 +189,33 @@ struct Opt {
     /// Command and arguments to spawn and profile (use after `--`)
     #[arg(last = true)]
     command: Vec<String>,
+}
+
+impl Opt {
+    /// Returns true if the user expressed any profiling intent via flags.
+    /// When false, we show help instead of silently starting a system-wide profile.
+    fn has_user_intent(&self) -> bool {
+        // Any output format requested
+        self.collapse.is_some()
+            || self.svg.is_some()
+            || self.html.is_some()
+            || self.json.is_some()
+            // Interactive modes
+            || self.serve
+            || { #[cfg(feature = "tui")] { self.tui } #[cfg(not(feature = "tui"))] { false } }
+            // Target selection
+            || self.pid.is_some()
+            || self.cmd.is_some()
+            || !self.command.is_empty()
+            || self.self_profile
+            // Probe types
+            || self.kprobe.is_some()
+            || !self.uprobe.is_empty()
+            || self.tracepoint.is_some()
+            || self.list_probes.is_some()
+            // Explicit time means the user wants to profile
+            || self.time.is_some()
+    }
 }
 
 /// Parse a syscall tracepoint name like "syscalls:sys_enter_write" into
@@ -415,6 +482,14 @@ fn parse_tracepoint_name(tp: &str) -> Option<&str> {
 async fn main() -> std::result::Result<(), anyhow::Error> {
     let opt = Opt::parse();
 
+    // If no meaningful flags were provided, show help with examples and exit.
+    if !opt.has_user_intent() {
+        use clap::CommandFactory;
+        let bin_name = std::env::args().next().unwrap_or_else(|| "probee".to_string());
+        Opt::command().bin_name(bin_name).print_long_help()?;
+        std::process::exit(0);
+    }
+
     // TUI and serve modes can now run together
 
     // Initialize the tracing subscriber with environment variables
@@ -557,7 +632,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // Set up stopping mechanisms
     // Pass the external PID if we're monitoring one (not spawned)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
-    setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn, external_pid);
+    // CLI defaults to 10s profiling windows;
+    // serve mode defaults to unlimited (like TUI modes).
+    let duration = opt.time.unwrap_or(if opt.serve { 0 } else { 10000 });
+    setup_stopping_mechanisms(duration, perf_tx.clone(), stopper.clone(), spawn, external_pid);
 
     task::spawn(async move {
         if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
@@ -763,18 +841,18 @@ fn setup_stopping_mechanisms(
     // - 3. child process stops (when spawned with -- or --cmd)
     // - 4. target PID exits (when profiling with --pid)
 
-    // Timer-based stopping
-    // Clone the stopping handler so that when the timer expires,
-    // it will signal the spawned process to be killed
-    let time_stop_tx = perf_tx.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
-        // Send Stop message to exit the profiling loop
-        // NOTE: Don't kill the spawned process here — it must stay alive
-        // for symbolization (reading /proc/<pid>/maps) after profiling stops.
-        // The caller kills it after processing.
-        time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
-    });
+    // Timer-based stopping (duration == 0 means run indefinitely)
+    if duration > 0 {
+        let time_stop_tx = perf_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
+            // Send Stop message to exit the profiling loop
+            // NOTE: Don't kill the spawned process here — it must stay alive
+            // for symbolization (reading /proc/<pid>/maps) after profiling stops.
+            // The caller kills it after processing.
+            time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
+        });
+    }
 
     // Child process completion stopping (for spawned processes)
     if let Some(mut child) = spawn {
@@ -1123,7 +1201,7 @@ fn output_results(
             stacks,
             format!(
                 "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
-                opt.time, opt.frequency
+                opt.time.unwrap_or(10000), opt.frequency
             ),
         )
         .map_err(|e| {
@@ -1529,7 +1607,7 @@ async fn run_combined_mode(
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid.clone() } else { None };
     setup_stopping_mechanisms(
-        opt.time,
+        opt.time.unwrap_or(0),
         perf_tx.clone(),
         stopper.clone(),
         spawn,
@@ -1594,7 +1672,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
     setup_stopping_mechanisms(
-        opt.time,
+        opt.time.unwrap_or(0),
         perf_tx.clone(),
         stopper.clone(),
         spawn,

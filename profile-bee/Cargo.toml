@@ -2,21 +2,23 @@
 name = "profile-bee"
 version = "0.3.0"
 edition = "2021"
-publish = false
+license = "MIT"
+description = "eBPF-based CPU profiler with flamegraph generation, DWARF unwinding, and interactive TUI"
+repository = "https://github.com/zz85/profile-bee"
 
 include = [
   "build.rs",
   "Cargo.toml",
-  "files.rs",
   "src/**/*.rs",
   "bin/**/*.rs",
+  "ebpf-bin/profile-bee.bpf.o",
 ]
 
 [dependencies]
 aya = { version = ">=0.11", features=["async_tokio"] }
 aya-log = "0.2.1"
-profile-bee-common = { path = "../profile-bee-common", features=["user"] }
-profile-bee-tui = { path = "../profile-bee-tui", optional = true }
+profile-bee-common = { version = "0.1.0", path = "../profile-bee-common", features=["user"] }
+profile-bee-tui = { version = "0.1.0", path = "../profile-bee-tui", optional = true }
 anyhow = "1.0.42"
 clap = { version = "4.0", features = ["derive"] }
 tokio = { version = "1.18", features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time", "process"] }
@@ -41,10 +43,14 @@ procmaps = "0.4.1"
 regex = "1"
 
 [features]
-default = []
+default = ["tui"]
 tui = ["dep:profile-bee-tui"]
 
 [[bin]]
-name = "profile-bee"
+name = "probee"
+path = "bin/profile-bee.rs"
+
+[[bin]]
+name = "pbee"
 path = "bin/profile-bee.rs"
 

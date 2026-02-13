@@ -2,6 +2,9 @@
 name = "profile-bee-common"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Shared types between profile-bee userspace and eBPF programs"
+repository = "https://github.com/zz85/profile-bee"
 
 [features]
 default = []
