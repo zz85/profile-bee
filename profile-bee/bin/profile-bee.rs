@@ -149,6 +149,14 @@ struct Opt {
 /// Parse a syscall tracepoint name like "syscalls:sys_enter_write" into
 /// a raw tracepoint name ("sys_enter") and syscall NR.
 /// Returns None if this is not a syscall tracepoint.
+///
+/// Only `sys_enter_*` tracepoints are handled here because the raw
+/// tracepoint args layout exposes the syscall NR in `args[1]`, which
+/// the eBPF program uses for filtering.  `sys_exit_*` raw tracepoints
+/// put the *return value* in `args[1]` (not the NR), so routing them
+/// through the raw-tp + NR-filter path would silently break filtering.
+/// Returning None for sys_exit lets the caller fall through to the
+/// generic tracepoint / perf-event attachment path instead.
 fn parse_syscall_tracepoint(tp: &str) -> Option<(&str, i64)> {
     let mut parts = tp.splitn(2, ':');
     let category = parts.next()?;
@@ -159,17 +167,15 @@ fn parse_syscall_tracepoint(tp: &str) -> Option<(&str, i64)> {
     }
 
     // sys_enter_write -> raw_tp="sys_enter", syscall="write"
-    // sys_exit_read   -> raw_tp="sys_exit",  syscall="read"
-    let (raw_tp, syscall_name) = if let Some(s) = name.strip_prefix("sys_enter_") {
-        ("sys_enter", s)
-    } else if let Some(s) = name.strip_prefix("sys_exit_") {
-        ("sys_exit", s)
+    // sys_exit_* is intentionally NOT matched — see doc comment above.
+    let syscall_name = if let Some(s) = name.strip_prefix("sys_enter_") {
+        s
     } else {
         return None;
     };
 
     let nr = syscall_name_to_nr(syscall_name)?;
-    Some((raw_tp, nr))
+    Some(("sys_enter", nr))
 }
 
 /// Map x86_64 syscall name to its number.
@@ -288,9 +294,11 @@ fn syscall_name_to_nr(name: &str) -> Option<i64> {
 ///   2. raw_tp generic (bpf_get_stackid only)
 ///   3. perf TracePoint (legacy, may be blocked by BPF LSM)
 ///
-/// For syscall tracepoints (syscalls:sys_enter_*):
-///   1. raw_tp syscall (pt_regs from args[0], syscall NR filtering)
+/// For syscall tracepoints (syscalls:sys_enter_* only):
+///   1. raw_tp sys_enter (pt_regs from args[0], syscall NR filtering via args[1])
 ///   2-3. same as above
+/// Note: sys_exit_* is NOT routed here because its args[1] is the return
+/// value, not the syscall NR — it falls through to the generic path.
 fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfiler, anyhow::Error> {
     if let Some(tp) = config.tracepoint.clone() {
         // For syscall tracepoints, try syscall-specific raw_tp first (has pt_regs in args)
