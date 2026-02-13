@@ -115,6 +115,14 @@ pub static SHARD_7: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRI
 #[map(name = "proc_info")]
 pub static PROC_INFO: HashMap<ProcInfoKey, ProcInfo> = HashMap::with_max_entries(1024, 0);
 
+/// Collect trace with custom FP/DWARF stack unwinding via pt_regs.
+///
+/// SAFETY: ctx.as_ptr() MUST point to a valid pt_regs struct. This is true for:
+/// - PerfEventContext (bpf_perf_event_data, kernel rewrites field access to pt_regs)
+/// - ProbeContext / RetProbeContext (context IS pt_regs)
+///
+/// NOT valid for TracePointContext or RawTracePointContext — use
+/// collect_trace_stackid_only for those.
 #[inline(always)]
 pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     let pid = ctx.pid();
@@ -319,15 +327,16 @@ unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &pt_r
     }
 }
 
-/// Collect trace for generic raw tracepoint programs (non-syscall).
+/// Collect trace using bpf_get_stackid() only — no custom FP/DWARF unwinding.
 ///
-/// For tracepoints like sched_switch, block_rq_issue, net_dev_xmit, etc.,
-/// the raw tracepoint args do NOT contain pt_regs. We rely solely on
-/// bpf_get_stackid() for stack traces (the kernel synthesizes pt_regs
-/// internally via perf_fetch_caller_regs). Custom frame-pointer/DWARF
-/// unwinding is not available — ip/bp/sp are set to 0.
+/// Used for contexts where ctx.as_ptr() does NOT point to pt_regs:
+/// - TracePointContext (points to tracepoint-specific data struct)
+/// - RawTracePointContext (points to bpf_raw_tracepoint_args)
+///
+/// bpf_get_stackid() still works because the kernel internally synthesizes
+/// pt_regs from the current call stack. ip/bp/sp are set to 0.
 #[inline(always)]
-pub unsafe fn collect_trace_raw_tp_generic(ctx: RawTracePointContext) {
+pub unsafe fn collect_trace_stackid_only<C: EbpfContext>(ctx: C) {
     let pid = ctx.pid();
 
     if pid == 0 && skip_idle() {
@@ -349,8 +358,6 @@ pub unsafe fn collect_trace_raw_tp_generic(ctx: RawTracePointContext) {
         .get_stackid(&ctx, 0)
         .map_or(-1, |stack_id| stack_id as i32);
 
-    // No pt_regs available — skip custom frame-pointer/DWARF unwinding.
-    // Stack traces come entirely from bpf_get_stackid().
     let Some(pointer) = STORAGE.get_ptr_mut(0) else {
         return;
     };

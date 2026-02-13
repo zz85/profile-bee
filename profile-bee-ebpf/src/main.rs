@@ -9,7 +9,7 @@ use aya_ebpf::{
 };
 use profile_bee_ebpf::{
     collect_trace, collect_trace_raw_syscall, collect_trace_raw_syscall_exit,
-    collect_trace_raw_tp_generic, collect_trace_raw_tp_with_task_regs,
+    collect_trace_raw_tp_with_task_regs, collect_trace_stackid_only,
 };
 
 #[perf_event]
@@ -41,7 +41,9 @@ pub fn uretprobe_profile(ctx: RetProbeContext) -> u32 {
 
 #[tracepoint]
 pub fn tracepoint_profile(ctx: TracePointContext) -> u32 {
-    unsafe { collect_trace(ctx) }
+    // TracePointContext.as_ptr() points to a tracepoint-specific data struct,
+    // NOT pt_regs. Must use stackid-only path to avoid reading garbage registers.
+    unsafe { collect_trace_stackid_only(ctx) }
     0
 }
 
@@ -62,7 +64,7 @@ pub fn raw_tp_sys_exit(ctx: RawTracePointContext) -> u32 {
 /// Uses bpf_get_stackid() only (no custom FP/DWARF unwinding).
 #[raw_tracepoint]
 pub fn raw_tp_generic(ctx: RawTracePointContext) -> u32 {
-    unsafe { collect_trace_raw_tp_generic(ctx) }
+    unsafe { collect_trace_stackid_only(ctx) }
     0
 }
 
