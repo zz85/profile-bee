@@ -1,5 +1,5 @@
 use crate::flame::{FlameGraph, SearchPattern};
-use crate::state::FlameGraphState;
+use crate::state::{FlameGraphState, UpdateMode};
 use crate::view::FlameGraphView;
 use std::collections::HashMap;
 use std::error;
@@ -48,6 +48,8 @@ pub struct App {
     pub dirty: bool,
     /// Next flamegraph to swap in
     next_flamegraph: Arc<Mutex<Option<ParsedFlameGraph>>>,
+    /// Shared update mode for the profiling thread
+    update_mode_handle: Arc<Mutex<UpdateMode>>,
 }
 
 impl App {
@@ -63,15 +65,24 @@ impl App {
             debug: false,
             dirty: true,
             next_flamegraph: Arc::new(Mutex::new(None)),
+            update_mode_handle: Arc::new(Mutex::new(UpdateMode::default())),
         }
     }
 
     /// Constructs a new instance for live profiling mode
     pub fn with_live() -> Self {
+        Self::with_live_and_mode(UpdateMode::default())
+    }
+
+    /// Constructs a new instance for live profiling mode with specified update mode
+    pub fn with_live_and_mode(update_mode: UpdateMode) -> Self {
         let flamegraph = FlameGraph::from_string("".to_string(), true);
+        let mut state = FlameGraphState::default();
+        state.update_mode = update_mode;
+        let update_mode_handle = Arc::new(Mutex::new(update_mode));
         Self {
             running: true,
-            flamegraph_view: FlameGraphView::new(flamegraph),
+            flamegraph_view: FlameGraphView::new_with_state(flamegraph, state),
             flamegraph_input: FlameGraphInput::Live,
             next_flamegraph: Arc::new(Mutex::new(None)),
             input_buffer: None,
@@ -79,12 +90,23 @@ impl App {
             transient_message: None,
             debug: false,
             dirty: true,
+            update_mode_handle,
         }
     }
 
     /// Get a handle to update the flamegraph from another thread
     pub fn get_update_handle(&self) -> Arc<Mutex<Option<ParsedFlameGraph>>> {
         self.next_flamegraph.clone()
+    }
+
+    /// Get the current update mode
+    pub fn get_update_mode(&self) -> UpdateMode {
+        self.flamegraph_view.state.update_mode
+    }
+
+    /// Get a handle to the update mode for sharing with the profiling thread
+    pub fn get_update_mode_handle(&self) -> Arc<Mutex<UpdateMode>> {
+        self.update_mode_handle.clone()
     }
 
     /// Update flamegraph with new data
@@ -100,6 +122,13 @@ impl App {
 
     /// Handles the tick event of the terminal.
     pub fn tick(&mut self) {
+        // Sync update mode from the shared handle (in case it was changed by user)
+        if let Ok(mode) = self.update_mode_handle.lock() {
+            if self.flamegraph_view.state.update_mode != *mode {
+                self.flamegraph_view.state.update_mode = *mode;
+            }
+        }
+
         // Replace flamegraph
         if !self.flamegraph_view.state.freeze {
             if let Some(parsed) = self.next_flamegraph.lock().unwrap().take() {

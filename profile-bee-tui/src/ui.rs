@@ -180,6 +180,7 @@ impl<'a> FlamelensWidget<'a> {
                 } else {
                     help_tags.add("z", "freeze");
                 }
+                help_tags.add("m", "update mode");
             }
         } else {
             help_tags.add("j/k", "move cursor");
@@ -524,6 +525,7 @@ impl<'a> FlamelensWidget<'a> {
             FlameGraphInput::File(filename) => filename.clone(),
             FlameGraphInput::Live => {
                 let mut out = "Live profiling".to_string();
+                out += &format!(" [{}]", self.app.flamegraph_state().update_mode.as_str());
                 if self.app.flamegraph_state().freeze {
                     out += " [Frozen; press 'z' again to unfreeze]";
                 }
