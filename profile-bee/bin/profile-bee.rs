@@ -38,7 +38,9 @@ struct DwarfRefreshUpdate {
 #[command(
     author,
     version,
-    about = "eBPF-based CPU profiler with flamegraph generation and interactive TUI",
+    about = "eBPF-based CPU profiler with flamegraph generation and interactive TUI.\n\
+             Supports kprobe, uprobe (with glob/regex matching), and tracepoint probes.\n\
+             Requires root (sudo). Run --help for examples.",
     long_about = None,
     after_long_help = "\x1b[1mNote:\x1b[0m probee requires root privileges (sudo) to load eBPF programs.
 
