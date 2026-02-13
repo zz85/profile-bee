@@ -21,6 +21,14 @@ impl FlameGraphView {
         }
     }
 
+    pub fn new_with_state(flamegraph: FlameGraph, state: FlameGraphState) -> Self {
+        Self {
+            flamegraph,
+            state,
+            updated_at: std::time::Instant::now(),
+        }
+    }
+
     pub fn select_id(&mut self, stack_id: &StackIdentifier) {
         self.state.select_id(stack_id);
         if let Some(p) = self.state.search_pattern.as_ref() {

@@ -67,6 +67,11 @@ struct Opt {
     #[arg(long, default_value_t = 2000)]
     tui_refresh_ms: u64,
 
+    /// Update mode for real-time flamegraph: reset (clear each interval), accumulate (sum over time), decay (moving average)
+    #[cfg(feature = "tui")]
+    #[arg(long, default_value = "accumulate", value_parser = ["reset", "accumulate", "decay"])]
+    update_mode: String,
+
     /// Avoid profiling idle cpu cycles
     #[arg(long)]
     skip_idle: bool,
@@ -829,6 +834,18 @@ fn process_kernel_counting(
     }
 }
 
+/// Parse update mode from string
+#[cfg(feature = "tui")]
+fn parse_update_mode(mode: &str) -> profile_bee_tui::state::UpdateMode {
+    use profile_bee_tui::state::UpdateMode;
+    match mode.to_lowercase().as_str() {
+        "reset" => UpdateMode::Reset,
+        "accumulate" => UpdateMode::Accumulate,
+        "decay" => UpdateMode::Decay,
+        _ => UpdateMode::Accumulate, // default
+    }
+}
+
 /// Outputs the results in the requested formats
 fn output_results(
     opt: &Opt,
@@ -992,6 +1009,7 @@ fn spawn_profiling_thread(
     perf_rx: mpsc::Receiver<PerfWork>,
     tgid_request_tx: Option<mpsc::Sender<u32>>,
     update_handle: std::sync::Arc<std::sync::Mutex<Option<profile_bee_tui::app::ParsedFlameGraph>>>,
+    update_mode_handle: std::sync::Arc<std::sync::Mutex<profile_bee_tui::state::UpdateMode>>,
     web_tx: Option<tokio::sync::broadcast::Sender<String>>,
     stream_mode: u8,
     group_by_cpu: bool,
@@ -1063,6 +1081,28 @@ fn spawn_profiling_thread(
 
             // Generate flamegraph data
             let mut stacks = Vec::new();
+
+            // Apply update mode logic
+            let current_mode = update_mode_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            match current_mode {
+                profile_bee_tui::state::UpdateMode::Reset => {
+                    // Reset mode: clear trace_count each interval
+                    trace_count.clear();
+                }
+                profile_bee_tui::state::UpdateMode::Accumulate => {
+                    // Accumulate mode: keep accumulating (existing behavior)
+                    // No action needed
+                }
+                profile_bee_tui::state::UpdateMode::Decay => {
+                    // Decay mode: apply decay factor to existing counts
+                    const DECAY_FACTOR: f64 = 0.75; // Decay to 75% each interval
+                    for count in trace_count.values_mut() {
+                        *count = (*count as f64 * DECAY_FACTOR) as usize;
+                    }
+                    // Remove entries that have decayed to near zero
+                    trace_count.retain(|_, &mut count| count > 0);
+                }
+            }
 
             if !local_counting {
                 // Merge eBPF-side counts into trace_count so we accumulate
@@ -1213,8 +1253,10 @@ async fn run_combined_mode(
         setup_ebpf_and_dwarf(&config, &perf_tx, pid, opt.dwarf)?;
 
     // TUI app + update handle
-    let mut app = App::with_live();
+    let update_mode = parse_update_mode(&opt.update_mode);
+    let mut app = App::with_live_and_mode(update_mode);
     let update_handle = app.get_update_handle();
+    let update_mode_handle = app.get_update_mode_handle();
 
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid.clone() } else { None };
@@ -1239,6 +1281,7 @@ async fn run_combined_mode(
         perf_rx,
         tgid_request_tx,
         update_handle,
+        update_mode_handle,
         Some(web_tx),
         opt.stream_mode,
         opt.group_by_cpu,
@@ -1275,8 +1318,10 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         setup_ebpf_and_dwarf(&config, &perf_tx, pid, opt.dwarf)?;
 
     // TUI app + update handle
-    let mut app = App::with_live();
+    let update_mode = parse_update_mode(&opt.update_mode);
+    let mut app = App::with_live_and_mode(update_mode);
     let update_handle = app.get_update_handle();
+    let update_mode_handle = app.get_update_mode_handle();
 
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
@@ -1301,6 +1346,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         perf_rx,
         tgid_request_tx,
         update_handle,
+        update_mode_handle,
         None,
         opt.stream_mode,
         opt.group_by_cpu,

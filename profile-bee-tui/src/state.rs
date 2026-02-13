@@ -1,5 +1,36 @@
 use crate::flame::{FlameGraph, SearchPattern, StackIdentifier, ROOT_ID};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateMode {
+    Reset,
+    Accumulate,
+    Decay,
+}
+
+impl UpdateMode {
+    pub fn next(&self) -> Self {
+        match self {
+            UpdateMode::Reset => UpdateMode::Accumulate,
+            UpdateMode::Accumulate => UpdateMode::Decay,
+            UpdateMode::Decay => UpdateMode::Reset,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UpdateMode::Reset => "Reset",
+            UpdateMode::Accumulate => "Accumulate",
+            UpdateMode::Decay => "Decay",
+        }
+    }
+}
+
+impl Default for UpdateMode {
+    fn default() -> Self {
+        UpdateMode::Accumulate
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ZoomState {
     pub stack_id: StackIdentifier,
@@ -44,6 +75,7 @@ pub struct FlameGraphState {
     pub freeze: bool,
     pub view_kind: ViewKind,
     pub table_state: TableState,
+    pub update_mode: UpdateMode,
 }
 
 impl Default for FlameGraphState {
@@ -58,6 +90,7 @@ impl Default for FlameGraphState {
             freeze: false,
             view_kind: ViewKind::FlameGraph,
             table_state: TableState::default(),
+            update_mode: UpdateMode::default(),
         }
     }
 }
@@ -96,6 +129,10 @@ impl FlameGraphState {
             ViewKind::FlameGraph => ViewKind::Table,
             ViewKind::Table => ViewKind::FlameGraph,
         };
+    }
+
+    pub fn cycle_update_mode(&mut self) {
+        self.update_mode = self.update_mode.next();
     }
 
     /// Update StackIdentifiers to point to the correct ones in the new flamegraph
