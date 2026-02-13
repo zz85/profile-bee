@@ -224,8 +224,13 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
             uprobe_config.pid,
         )?;
     } else if let Some(raw_tp) = &config.raw_tracepoint {
-        let program: &mut RawTracePoint =
-            bpf.program_mut("raw_tp_sys_enter").unwrap().try_into()?;
+        // Pick the correct syscall raw_tp program based on enter vs exit
+        let prog_name = if raw_tp == "sys_exit" {
+            "raw_tp_sys_exit"
+        } else {
+            "raw_tp_sys_enter"
+        };
+        let program: &mut RawTracePoint = bpf.program_mut(prog_name).unwrap().try_into()?;
         program.load()?;
         program.attach(raw_tp)?;
     } else if let Some(raw_tp) = &config.raw_tracepoint_task_regs {

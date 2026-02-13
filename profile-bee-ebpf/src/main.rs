@@ -8,8 +8,8 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext},
 };
 use profile_bee_ebpf::{
-    collect_trace, collect_trace_raw_syscall, collect_trace_raw_tp_generic,
-    collect_trace_raw_tp_with_task_regs,
+    collect_trace, collect_trace_raw_syscall, collect_trace_raw_syscall_exit,
+    collect_trace_raw_tp_generic, collect_trace_raw_tp_with_task_regs,
 };
 
 #[perf_event]
@@ -48,6 +48,12 @@ pub fn tracepoint_profile(ctx: TracePointContext) -> u32 {
 #[raw_tracepoint(tracepoint = "sys_enter")]
 pub fn raw_tp_sys_enter(ctx: RawTracePointContext) -> u32 {
     unsafe { collect_trace_raw_syscall(ctx) }
+    0
+}
+
+#[raw_tracepoint(tracepoint = "sys_exit")]
+pub fn raw_tp_sys_exit(ctx: RawTracePointContext) -> u32 {
+    unsafe { collect_trace_raw_syscall_exit(ctx) }
     0
 }
 

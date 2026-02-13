@@ -194,22 +194,17 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     }
 }
 
-/// Collect trace for raw tracepoint programs attached to sys_enter/sys_exit.
+/// Collect trace for raw tracepoint attached to sys_enter.
 ///
 /// Raw tracepoint args for sys_enter: args[0] = struct pt_regs *, args[1] = syscall id
-/// Raw tracepoint args for sys_exit:  args[0] = struct pt_regs *, args[1] = return value
-///
-/// Unlike `collect_trace`, this reads pt_regs from the tracepoint args rather than
-/// from ctx.as_ptr(), since RawTracePointContext's as_ptr() returns bpf_raw_tracepoint_args.
 #[inline(always)]
 pub unsafe fn collect_trace_raw_syscall(ctx: RawTracePointContext) {
-    // Read args from bpf_raw_tracepoint_args
     let args = ctx.as_ptr() as *const bpf_raw_tracepoint_args;
     let args_ptr = (*args).args.as_ptr();
 
-    // args[0] = struct pt_regs *regs (pointer to interrupted userspace registers)
+    // args[0] = struct pt_regs *
     let regs_ptr = args_ptr.read() as *const pt_regs;
-    // args[1] = long syscall_id
+    // args[1] = long syscall_id (for sys_enter this IS the syscall number)
     let syscall_nr = args_ptr.add(1).read() as i64;
 
     // Filter by target syscall number (-1 = match all)
@@ -218,12 +213,45 @@ pub unsafe fn collect_trace_raw_syscall(ctx: RawTracePointContext) {
         return;
     }
 
-    // Read pt_regs from kernel memory
     let Ok(regs) = bpf_probe_read_kernel(regs_ptr) else {
         return;
     };
 
-    // From here, same logic as collect_trace but using regs directly
+    collect_trace_with_regs_and_ctx(ctx, &regs);
+}
+
+/// Collect trace for raw tracepoint attached to sys_exit.
+///
+/// Raw tracepoint args for sys_exit: args[0] = struct pt_regs *, args[1] = return value
+/// The syscall number is NOT in args[1] (that's the return value), so we read
+/// it from pt_regs.orig_rax which the kernel preserves across the syscall.
+#[inline(always)]
+pub unsafe fn collect_trace_raw_syscall_exit(ctx: RawTracePointContext) {
+    let args = ctx.as_ptr() as *const bpf_raw_tracepoint_args;
+    let args_ptr = (*args).args.as_ptr();
+
+    // args[0] = struct pt_regs *
+    let regs_ptr = args_ptr.read() as *const pt_regs;
+
+    let Ok(regs) = bpf_probe_read_kernel(regs_ptr) else {
+        return;
+    };
+
+    // For sys_exit, get the syscall number from pt_regs.orig_rax
+    let syscall_nr = regs.orig_rax as i64;
+
+    let target = target_syscall_nr();
+    if target >= 0 && syscall_nr != target {
+        return;
+    }
+
+    collect_trace_with_regs_and_ctx(ctx, &regs);
+}
+
+/// Shared body for raw syscall tracepoint collection.
+/// Called after syscall NR filtering with the already-read pt_regs.
+#[inline(always)]
+unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &pt_regs) {
     let pid = ctx.pid();
 
     if pid == 0 && skip_idle() {
@@ -252,10 +280,10 @@ pub unsafe fn collect_trace_raw_syscall(ctx: RawTracePointContext) {
     let pointer = &mut *pointer;
 
     let (ip, bp, len, sp) = if dwarf_enabled() {
-        let (ip, bp, len) = dwarf_copy_stack_regs(&regs, &mut pointer.pointers, tgid);
+        let (ip, bp, len) = dwarf_copy_stack_regs(regs, &mut pointer.pointers, tgid);
         (ip, bp, len, regs.rsp)
     } else {
-        copy_stack_regs(&regs, &mut pointer.pointers)
+        copy_stack_regs(regs, &mut pointer.pointers)
     };
     pointer.len = len;
 
