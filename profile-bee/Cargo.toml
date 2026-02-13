@@ -11,6 +11,7 @@ include = [
   "Cargo.toml",
   "src/**/*.rs",
   "bin/**/*.rs",
+  "assets/**",
   "ebpf-bin/profile-bee.bpf.o",
 ]
 
