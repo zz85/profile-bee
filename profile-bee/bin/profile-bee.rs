@@ -40,11 +40,10 @@ struct DwarfRefreshUpdate {
     version,
     about = "eBPF-based CPU profiler with flamegraph generation and interactive TUI.\n\
              Supports kprobe, uprobe (with glob/regex matching), and tracepoint probes.\n\
-             Requires root (sudo). Run --help for examples.",
+             Renders TUI, SVG, JSON, stackcollapse, HTML. Run --help for examples.",
     long_about = None,
-    after_long_help = "\x1b[1mNote:\x1b[0m probee requires root privileges (sudo) to load eBPF programs.
-
-\x1b[1mExamples:\x1b[0m
+    override_usage = "(sudo) probee [OPTIONS] [-- <COMMAND>...]",
+    after_long_help = "\x1b[1mExamples:\x1b[0m
   # Interactive TUI flamegraph (live profiling)
   sudo probee --tui
 
