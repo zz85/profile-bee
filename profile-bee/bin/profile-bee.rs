@@ -76,9 +76,10 @@ struct Opt {
     #[arg(long)]
     skip_idle: bool,
 
-    /// Time to run CPU profiling in milliseconds,
-    #[arg(short, long, default_value_t = 10000)]
-    time: usize,
+    /// Time to run CPU profiling in milliseconds (0 = run until Ctrl-C).
+    /// Defaults to 10000 in CLI mode; defaults to 0 (unlimited) in --tui / --serve modes.
+    #[arg(short, long)]
+    time: Option<usize>,
 
     /// Frequency for sampling,
     #[arg(short, long, default_value_t = 99)]
@@ -557,7 +558,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // Set up stopping mechanisms
     // Pass the external PID if we're monitoring one (not spawned)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
-    setup_stopping_mechanisms(opt.time, perf_tx.clone(), stopper.clone(), spawn, external_pid);
+    // CLI and serve-only modes default to 10s profiling windows;
+    // TUI modes handle this separately (default 0 = unlimited).
+    let duration = opt.time.unwrap_or(10000);
+    setup_stopping_mechanisms(duration, perf_tx.clone(), stopper.clone(), spawn, external_pid);
 
     task::spawn(async move {
         if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
@@ -763,18 +767,18 @@ fn setup_stopping_mechanisms(
     // - 3. child process stops (when spawned with -- or --cmd)
     // - 4. target PID exits (when profiling with --pid)
 
-    // Timer-based stopping
-    // Clone the stopping handler so that when the timer expires,
-    // it will signal the spawned process to be killed
-    let time_stop_tx = perf_tx.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
-        // Send Stop message to exit the profiling loop
-        // NOTE: Don't kill the spawned process here — it must stay alive
-        // for symbolization (reading /proc/<pid>/maps) after profiling stops.
-        // The caller kills it after processing.
-        time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
-    });
+    // Timer-based stopping (duration == 0 means run indefinitely)
+    if duration > 0 {
+        let time_stop_tx = perf_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
+            // Send Stop message to exit the profiling loop
+            // NOTE: Don't kill the spawned process here — it must stay alive
+            // for symbolization (reading /proc/<pid>/maps) after profiling stops.
+            // The caller kills it after processing.
+            time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
+        });
+    }
 
     // Child process completion stopping (for spawned processes)
     if let Some(mut child) = spawn {
@@ -1123,7 +1127,7 @@ fn output_results(
             stacks,
             format!(
                 "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
-                opt.time, opt.frequency
+                opt.time.unwrap_or(10000), opt.frequency
             ),
         )
         .map_err(|e| {
@@ -1529,7 +1533,7 @@ async fn run_combined_mode(
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid.clone() } else { None };
     setup_stopping_mechanisms(
-        opt.time,
+        opt.time.unwrap_or(0),
         perf_tx.clone(),
         stopper.clone(),
         spawn,
@@ -1594,7 +1598,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
     setup_stopping_mechanisms(
-        opt.time,
+        opt.time.unwrap_or(0),
         perf_tx.clone(),
         stopper.clone(),
         spawn,
