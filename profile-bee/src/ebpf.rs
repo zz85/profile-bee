@@ -102,14 +102,10 @@ pub struct ProfilerConfig {
 
 /// Creates an aya Ebpf object
 pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
-    #[cfg(debug_assertions)]
-    let data = include_bytes_aligned!("../../target/bpfel-unknown-none/debug/profile-bee");
-    #[cfg(not(debug_assertions))]
-    let data = include_bytes_aligned!("../../target/bpfel-unknown-none/release/profile-bee");
+    // The eBPF object file is selected by build.rs: it uses a freshly-built
+    // binary from `cargo xtask build-ebpf` if available, otherwise the prebuilt
+    // binary shipped in ebpf-bin/. Either way it ends up in OUT_DIR.
+    let data = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/profile-bee.bpf.o"));
 
     let skip_idle = if config.skip_idle { 1u8 } else { 0u8 };
     let dwarf_enabled = if config.dwarf { 1u8 } else { 0u8 };

@@ -9,9 +9,9 @@ repository = "https://github.com/zz85/profile-bee"
 include = [
   "build.rs",
   "Cargo.toml",
-  "files.rs",
   "src/**/*.rs",
   "bin/**/*.rs",
+  "ebpf-bin/profile-bee.bpf.o",
 ]
 
 [dependencies]
