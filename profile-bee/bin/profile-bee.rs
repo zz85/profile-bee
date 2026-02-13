@@ -632,9 +632,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // Set up stopping mechanisms
     // Pass the external PID if we're monitoring one (not spawned)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
-    // CLI and serve-only modes default to 10s profiling windows;
-    // TUI modes handle this separately (default 0 = unlimited).
-    let duration = opt.time.unwrap_or(10000);
+    // CLI defaults to 10s profiling windows;
+    // serve mode defaults to unlimited (like TUI modes).
+    let duration = opt.time.unwrap_or(if opt.serve { 0 } else { 10000 });
     setup_stopping_mechanisms(duration, perf_tx.clone(), stopper.clone(), spawn, external_pid);
 
     task::spawn(async move {
