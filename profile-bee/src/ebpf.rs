@@ -4,7 +4,7 @@ use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
 };
-use aya::programs::{TracePoint, UProbe};
+use aya::programs::{RawTracePoint, TracePoint, UProbe};
 use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 
@@ -82,6 +82,18 @@ pub struct ProfilerConfig {
     /// New smart uprobe config with multi-attach support.
     pub smart_uprobe: Option<SmartUProbeConfig>,
     pub tracepoint: Option<String>,
+    /// Raw tracepoint name for syscall raw_tp (e.g., "sys_enter").
+    /// Uses collect_trace_raw_syscall which reads pt_regs from args[0].
+    pub raw_tracepoint: Option<String>,
+    /// Raw tracepoint name for generic raw_tp with task pt_regs (e.g., "sched_switch").
+    /// Uses bpf_get_current_task_btf() + bpf_task_pt_regs() for full FP/DWARF unwinding.
+    /// Requires kernel >= 5.15; falls back to raw_tracepoint_generic on older kernels.
+    pub raw_tracepoint_task_regs: Option<String>,
+    /// Raw tracepoint name for generic raw_tp (e.g., "sched_switch").
+    /// Uses collect_trace_raw_tp_generic which relies on bpf_get_stackid only.
+    pub raw_tracepoint_generic: Option<String>,
+    /// Target syscall number for raw tracepoint filtering (-1 = all).
+    pub target_syscall_nr: i64,
     pub pid: Option<u32>,
     pub cpu: Option<u32>,
     pub self_profile: bool,
@@ -101,11 +113,13 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
 
     let skip_idle = if config.skip_idle { 1u8 } else { 0u8 };
     let dwarf_enabled = if config.dwarf { 1u8 } else { 0u8 };
+    let target_syscall_nr: i64 = config.target_syscall_nr;
 
     let bpf = EbpfLoader::new()
         .set_global("SKIP_IDLE", &skip_idle, true)
         .set_global("NOTIFY_TYPE", &config.stream_mode, true)
         .set_global("DWARF_ENABLED", &dwarf_enabled, true)
+        .set_global("TARGET_SYSCALL_NR", &target_syscall_nr, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {
@@ -209,6 +223,25 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
             uprobe_config.path.as_str(),
             uprobe_config.pid,
         )?;
+    } else if let Some(raw_tp) = &config.raw_tracepoint {
+        // Pick the correct syscall raw_tp program based on enter vs exit
+        let prog_name = if raw_tp == "sys_exit" {
+            "raw_tp_sys_exit"
+        } else {
+            "raw_tp_sys_enter"
+        };
+        let program: &mut RawTracePoint = bpf.program_mut(prog_name).unwrap().try_into()?;
+        program.load()?;
+        program.attach(raw_tp)?;
+    } else if let Some(raw_tp) = &config.raw_tracepoint_task_regs {
+        let program: &mut RawTracePoint =
+            bpf.program_mut("raw_tp_with_regs").unwrap().try_into()?;
+        program.load()?;
+        program.attach(raw_tp)?;
+    } else if let Some(raw_tp) = &config.raw_tracepoint_generic {
+        let program: &mut RawTracePoint = bpf.program_mut("raw_tp_generic").unwrap().try_into()?;
+        program.load()?;
+        program.attach(raw_tp)?;
     } else if let Some(tracepoint) = &config.tracepoint {
         let program: &mut TracePoint = bpf.program_mut("tracepoint_profile").unwrap().try_into()?;
         program.load()?;

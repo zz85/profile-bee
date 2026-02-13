@@ -151,6 +151,266 @@ struct Opt {
     command: Vec<String>,
 }
 
+/// Parse a syscall tracepoint name like "syscalls:sys_enter_write" into
+/// a raw tracepoint name ("sys_enter") and syscall NR.
+/// Returns None if this is not a syscall tracepoint.
+///
+/// Only `sys_enter_*` tracepoints are handled here because the raw
+/// tracepoint args layout exposes the syscall NR in `args[1]`, which
+/// the eBPF program uses for filtering.  `sys_exit_*` raw tracepoints
+/// put the *return value* in `args[1]` (not the NR), so routing them
+/// through the raw-tp + NR-filter path would silently break filtering.
+/// Returning None for sys_exit lets the caller fall through to the
+/// generic tracepoint / perf-event attachment path instead.
+fn parse_syscall_tracepoint(tp: &str) -> Option<(&str, i64)> {
+    let mut parts = tp.splitn(2, ':');
+    let category = parts.next()?;
+    let name = parts.next()?;
+
+    if category != "syscalls" {
+        return None;
+    }
+
+    // sys_enter_write -> raw_tp="sys_enter", syscall="write"
+    // sys_exit_* is intentionally NOT matched — see doc comment above.
+    let syscall_name = if let Some(s) = name.strip_prefix("sys_enter_") {
+        s
+    } else {
+        return None;
+    };
+
+    let nr = syscall_name_to_nr(syscall_name)?;
+    Some(("sys_enter", nr))
+}
+
+/// Map x86_64 syscall name to its number.
+/// Based on Linux x86_64 syscall table (stable ABI).
+fn syscall_name_to_nr(name: &str) -> Option<i64> {
+    // Common syscalls — extend as needed
+    let nr = match name {
+        "read" => 0,
+        "write" => 1,
+        "open" => 2,
+        "close" => 3,
+        "stat" => 4,
+        "fstat" => 5,
+        "lstat" => 6,
+        "poll" => 7,
+        "lseek" => 8,
+        "mmap" => 9,
+        "mprotect" => 10,
+        "munmap" => 11,
+        "brk" => 12,
+        "ioctl" => 16,
+        "pread64" => 17,
+        "pwrite64" => 18,
+        "readv" => 19,
+        "writev" => 20,
+        "access" => 21,
+        "pipe" => 22,
+        "select" => 23,
+        "sched_yield" => 24,
+        "dup" => 32,
+        "dup2" => 33,
+        "nanosleep" => 35,
+        "getpid" => 39,
+        "socket" => 41,
+        "connect" => 42,
+        "accept" => 43,
+        "sendto" => 44,
+        "recvfrom" => 45,
+        "sendmsg" => 46,
+        "recvmsg" => 47,
+        "bind" => 49,
+        "listen" => 50,
+        "clone" => 56,
+        "fork" => 57,
+        "vfork" => 58,
+        "execve" => 59,
+        "exit" => 60,
+        "wait4" => 61,
+        "kill" => 62,
+        "fcntl" => 72,
+        "flock" => 73,
+        "fsync" => 74,
+        "fdatasync" => 75,
+        "getcwd" => 79,
+        "chdir" => 80,
+        "rename" => 82,
+        "mkdir" => 83,
+        "rmdir" => 84,
+        "creat" => 85,
+        "link" => 86,
+        "unlink" => 87,
+        "readlink" => 89,
+        "chmod" => 90,
+        "chown" => 92,
+        "getuid" => 102,
+        "getgid" => 104,
+        "geteuid" => 107,
+        "getegid" => 108,
+        "getppid" => 110,
+        "getpgrp" => 111,
+        "setsid" => 112,
+        "sigaltstack" => 131,
+        "statfs" => 137,
+        "fstatfs" => 138,
+        "prctl" => 157,
+        "arch_prctl" => 158,
+        "gettid" => 186,
+        "futex" => 202,
+        "getdents64" => 217,
+        "clock_gettime" => 228,
+        "exit_group" => 231,
+        "epoll_wait" => 232,
+        "epoll_ctl" => 233,
+        "openat" => 257,
+        "newfstatat" => 262,
+        "accept4" => 288,
+        "epoll_pwait" => 281,
+        "pipe2" => 293,
+        "preadv" => 295,
+        "pwritev" => 296,
+        "getrandom" => 318,
+        "execveat" => 322,
+        "copy_file_range" => 326,
+        "preadv2" => 327,
+        "pwritev2" => 328,
+        "io_uring_setup" => 425,
+        "io_uring_enter" => 426,
+        "io_uring_register" => 427,
+        "clone3" => 435,
+        "close_range" => 436,
+        "openat2" => 437,
+        _ => return None,
+    };
+    Some(nr)
+}
+
+/// Set up eBPF profiler with automatic raw tracepoint fallback.
+///
+/// For ALL tracepoints, this tries attaching via `RawTracePoint`
+/// (which uses `bpf_raw_tracepoint_open` and bypasses BPF LSM restrictions
+/// on `PERF_EVENT_IOC_SET_BPF`). If that fails, it falls back to the
+/// regular `TracePoint` attachment.
+///
+/// Fallback chain for non-syscall tracepoints:
+///   1. raw_tp with task pt_regs (kernel >= 5.15, full FP/DWARF unwinding)
+///   2. raw_tp generic (bpf_get_stackid only)
+///   3. perf TracePoint (legacy, may be blocked by BPF LSM)
+///
+/// For syscall tracepoints (syscalls:sys_enter_* only):
+///   1. raw_tp sys_enter with NR filtering (pt_regs from args[0], syscall NR via args[1])
+///   2. raw_tp sys_enter with task pt_regs (no per-syscall filtering, full unwinding)
+///   3. raw_tp sys_enter generic (bpf_get_stackid only)
+///   4. perf TracePoint (legacy)
+///
+/// Note: the aggregate raw tracepoint name ("sys_enter") is used for ALL
+/// raw_tp fallback attempts, since per-syscall names like "sys_enter_write"
+/// don't exist as raw tracepoints.
+/// sys_exit_* is NOT routed here — see parse_syscall_tracepoint.
+fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfiler, anyhow::Error> {
+    if let Some(tp) = config.tracepoint.clone() {
+        // Determine the raw tracepoint name to use for fallback attempts.
+        // For syscall tracepoints (e.g. "syscalls:sys_enter_write") we must
+        // use the aggregate name ("sys_enter") — per-syscall names like
+        // "sys_enter_write" don't exist as raw tracepoints.
+        // For non-syscall tracepoints we use the event name after the colon.
+        let (raw_tp_name, syscall_info) = if let Some((raw_tp, syscall_nr)) = parse_syscall_tracepoint(&tp) {
+            (raw_tp.to_string(), Some(syscall_nr))
+        } else if let Some(name) = parse_tracepoint_name(&tp) {
+            (name.to_string(), None)
+        } else {
+            // No parseable tracepoint name — skip raw_tp attempts entirely
+            return setup_ebpf_profiler(config);
+        };
+
+        // For syscall tracepoints, first try the syscall-specific raw_tp
+        // (has pt_regs in args[0], syscall NR filtering via args[1])
+        if let Some(syscall_nr) = syscall_info {
+            let tp_saved = config.tracepoint.take();
+            config.raw_tracepoint = Some(raw_tp_name.clone());
+            config.target_syscall_nr = syscall_nr;
+
+            match setup_ebpf_profiler(config) {
+                Ok(profiler) => {
+                    eprintln!(
+                        "Attached via raw tracepoint '{}' (syscall nr={})",
+                        raw_tp_name, syscall_nr
+                    );
+                    return Ok(profiler);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Raw tracepoint (syscall) failed ({}), trying task_pt_regs...",
+                        e
+                    );
+                    config.raw_tracepoint = None;
+                    config.target_syscall_nr = -1;
+                    config.tracepoint = tp_saved;
+                }
+            }
+        }
+
+        // Try raw_tp with task pt_regs (kernel >= 5.15, full unwinding)
+        {
+            let tp_saved = config.tracepoint.take();
+            config.raw_tracepoint_task_regs = Some(raw_tp_name.clone());
+
+            match setup_ebpf_profiler(config) {
+                Ok(profiler) => {
+                    eprintln!(
+                        "Attached via raw tracepoint '{}' (task pt_regs, full unwinding)",
+                        raw_tp_name
+                    );
+                    return Ok(profiler);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Raw tracepoint with task_pt_regs failed ({}), trying generic...",
+                        e
+                    );
+                    config.raw_tracepoint_task_regs = None;
+                    config.tracepoint = tp_saved;
+                }
+            }
+        }
+
+        // Try generic raw_tp (bpf_get_stackid only, no custom unwinding)
+        {
+            let tp_saved = config.tracepoint.take();
+            config.raw_tracepoint_generic = Some(raw_tp_name.clone());
+
+            match setup_ebpf_profiler(config) {
+                Ok(profiler) => {
+                    eprintln!(
+                        "Attached via generic raw tracepoint '{}' (stackid only)",
+                        raw_tp_name
+                    );
+                    return Ok(profiler);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Generic raw tracepoint failed ({}), falling back to perf tracepoint...",
+                        e
+                    );
+                    config.raw_tracepoint_generic = None;
+                    config.tracepoint = tp_saved;
+                }
+            }
+        }
+    }
+
+    // Final fallback: use config as-is (regular TracePoint or other program type)
+    setup_ebpf_profiler(config)
+}
+
+/// Extract the tracepoint name from "category:name" format for raw_tp attachment.
+/// For raw tracepoints, the name is just the event name without the category.
+fn parse_tracepoint_name(tp: &str) -> Option<&str> {
+    tp.split(':').nth(1)
+}
+
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
     let opt = Opt::parse();
@@ -204,7 +464,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     };
 
     // Create eBPF profiler configuration from command line options (without pid first)
-    let config = ProfilerConfig {
+    let mut config = ProfilerConfig {
         skip_idle: opt.skip_idle,
         stream_mode: opt.stream_mode,
         frequency: opt.frequency,
@@ -212,6 +472,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         uprobe: None,
         smart_uprobe,
         tracepoint: opt.tracepoint.clone(),
+        raw_tracepoint: None,
+        raw_tracepoint_task_regs: None,
+        raw_tracepoint_generic: None,
+        target_syscall_nr: -1,
         pid: opt.pid.clone(),
         cpu: opt.cpu,
         self_profile: opt.self_profile,
@@ -220,7 +484,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     // Setup eBPF profiler first to ensure verification succeeds
     let verification_start = std::time::Instant::now();
-    let mut ebpf_profiler = setup_ebpf_profiler(&config)?;
+    let mut ebpf_profiler = setup_ebpf_with_tp_fallback(&mut config)?;
     let verification_time = verification_start.elapsed();
     println!("eBPF verification completed in {:?}", verification_time);
 
@@ -930,6 +1194,10 @@ fn build_profiler_config(
         uprobe: None,
         smart_uprobe,
         tracepoint: opt.tracepoint.clone(),
+        raw_tracepoint: None,
+        raw_tracepoint_task_regs: None,
+        raw_tracepoint_generic: None,
+        target_syscall_nr: -1,
         pid,
         cpu: opt.cpu,
         self_profile: opt.self_profile,
@@ -941,7 +1209,7 @@ fn build_profiler_config(
 /// and target-PID filtering.  Returns everything the profiling thread needs.
 #[cfg(feature = "tui")]
 fn setup_ebpf_and_dwarf(
-    config: &ProfilerConfig,
+    config: &mut ProfilerConfig,
     perf_tx: &mpsc::Sender<PerfWork>,
     pid: Option<u32>,
     dwarf: bool,
@@ -953,7 +1221,7 @@ fn setup_ebpf_and_dwarf(
     ),
     anyhow::Error,
 > {
-    let mut ebpf_profiler = setup_ebpf_profiler(config)?;
+    let mut ebpf_profiler = setup_ebpf_with_tp_fallback(config)?;
     let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
 
     // Load DWARF unwind tables and start the background refresh thread
@@ -1247,10 +1515,10 @@ async fn run_combined_mode(
     };
 
     // Shared infrastructure
-    let config = build_profiler_config(&opt, pid)?;
+    let mut config = build_profiler_config(&opt, pid)?;
     let (perf_tx, perf_rx) = mpsc::channel();
     let (ebpf_profiler, ring_buf, tgid_request_tx) =
-        setup_ebpf_and_dwarf(&config, &perf_tx, pid, opt.dwarf)?;
+        setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf)?;
 
     // TUI app + update handle
     let update_mode = parse_update_mode(&opt.update_mode);
@@ -1312,10 +1580,10 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     };
 
     // Shared infrastructure
-    let config = build_profiler_config(&opt, pid)?;
+    let mut config = build_profiler_config(&opt, pid)?;
     let (perf_tx, perf_rx) = mpsc::channel();
     let (ebpf_profiler, ring_buf, tgid_request_tx) =
-        setup_ebpf_and_dwarf(&config, &perf_tx, pid, opt.dwarf)?;
+        setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf)?;
 
     // TUI app + update handle
     let update_mode = parse_update_mode(&opt.update_mode);

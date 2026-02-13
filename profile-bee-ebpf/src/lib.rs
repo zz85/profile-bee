@@ -4,10 +4,14 @@
 /// different ebpf applications.
 ///
 use aya_ebpf::{
-    bindings::{pt_regs, BPF_F_USER_STACK},
-    helpers::{bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_user},
+    bindings::{bpf_raw_tracepoint_args, pt_regs, BPF_F_USER_STACK},
+    helpers::{
+        bpf_get_current_task_btf, bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_kernel,
+        bpf_probe_read_user, bpf_task_pt_regs,
+    },
     macros::map,
     maps::{Array, HashMap, PerCpuArray, RingBuf, StackTrace},
+    programs::RawTracePointContext,
     EbpfContext,
 };
 
@@ -32,6 +36,11 @@ static NOTIFY_TYPE: u8 = EVENT_TRACE_ALWAYS;
 #[no_mangle]
 static DWARF_ENABLED: u8 = 0;
 
+/// Target syscall number to filter for raw tracepoint mode.
+/// -1 = match all syscalls (no filtering)
+#[no_mangle]
+static TARGET_SYSCALL_NR: i64 = -1;
+
 /// Target PID to profile (0 = profile all processes)
 /// Stored in an Array map so userspace can update it after process spawn.
 #[map(name = "target_pid_map")]
@@ -51,6 +60,11 @@ unsafe fn notify_type() -> u8 {
 unsafe fn dwarf_enabled() -> bool {
     let enabled = core::ptr::read_volatile(&DWARF_ENABLED);
     enabled > 0
+}
+
+#[inline]
+unsafe fn target_syscall_nr() -> i64 {
+    core::ptr::read_volatile(&TARGET_SYSCALL_NR)
 }
 
 #[inline]
@@ -101,6 +115,14 @@ pub static SHARD_7: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRI
 #[map(name = "proc_info")]
 pub static PROC_INFO: HashMap<ProcInfoKey, ProcInfo> = HashMap::with_max_entries(1024, 0);
 
+/// Collect trace with custom FP/DWARF stack unwinding via pt_regs.
+///
+/// SAFETY: ctx.as_ptr() MUST point to a valid pt_regs struct. This is true for:
+/// - PerfEventContext (bpf_perf_event_data, kernel rewrites field access to pt_regs)
+/// - ProbeContext / RetProbeContext (context IS pt_regs)
+///
+/// NOT valid for TracePointContext or RawTracePointContext — use
+/// collect_trace_stackid_only for those.
 #[inline(always)]
 pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     let pid = ctx.pid();
@@ -133,12 +155,12 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
     let pointer = &mut *pointer;
 
+    let regs = ctx.as_ptr() as *const pt_regs;
     let (ip, bp, len, sp) = if dwarf_enabled() {
-        let (ip, bp, len) = dwarf_copy_stack(&ctx, &mut pointer.pointers, tgid);
-        let regs = ctx.as_ptr() as *const pt_regs;
+        let (ip, bp, len) = dwarf_copy_stack_regs(&*regs, &mut pointer.pointers, tgid);
         (ip, bp, len, (*regs).rsp)
     } else {
-        copy_stack(&ctx, &mut pointer.pointers)
+        copy_stack_regs(&*regs, &mut pointer.pointers)
     };
     pointer.len = len;
 
@@ -180,18 +202,326 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     }
 }
 
+/// Collect trace for raw tracepoint attached to sys_enter.
+///
+/// Raw tracepoint args for sys_enter: args[0] = struct pt_regs *, args[1] = syscall id
+#[inline(always)]
+pub unsafe fn collect_trace_raw_syscall(ctx: RawTracePointContext) {
+    let args = ctx.as_ptr() as *const bpf_raw_tracepoint_args;
+    let args_ptr = (*args).args.as_ptr();
+
+    // args[0] = struct pt_regs *
+    let regs_ptr = args_ptr.read() as *const pt_regs;
+    // args[1] = long syscall_id (for sys_enter this IS the syscall number)
+    let syscall_nr = args_ptr.add(1).read() as i64;
+
+    // Filter by target syscall number (-1 = match all)
+    let target = target_syscall_nr();
+    if target >= 0 && syscall_nr != target {
+        return;
+    }
+
+    let Ok(regs) = bpf_probe_read_kernel(regs_ptr) else {
+        return;
+    };
+
+    collect_trace_with_regs_and_ctx(ctx, &regs);
+}
+
+/// Collect trace for raw tracepoint attached to sys_exit.
+///
+/// Raw tracepoint args for sys_exit: args[0] = struct pt_regs *, args[1] = return value
+/// The syscall number is NOT in args[1] (that's the return value), so we read
+/// it from pt_regs.orig_rax which the kernel preserves across the syscall.
+#[inline(always)]
+pub unsafe fn collect_trace_raw_syscall_exit(ctx: RawTracePointContext) {
+    let args = ctx.as_ptr() as *const bpf_raw_tracepoint_args;
+    let args_ptr = (*args).args.as_ptr();
+
+    // args[0] = struct pt_regs *
+    let regs_ptr = args_ptr.read() as *const pt_regs;
+
+    let Ok(regs) = bpf_probe_read_kernel(regs_ptr) else {
+        return;
+    };
+
+    // For sys_exit, get the syscall number from pt_regs.orig_rax
+    let syscall_nr = regs.orig_rax as i64;
+
+    let target = target_syscall_nr();
+    if target >= 0 && syscall_nr != target {
+        return;
+    }
+
+    collect_trace_with_regs_and_ctx(ctx, &regs);
+}
+
+/// Shared body for raw syscall tracepoint collection.
+/// Called after syscall NR filtering with the already-read pt_regs.
+#[inline(always)]
+unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &pt_regs) {
+    let pid = ctx.pid();
+
+    if pid == 0 && skip_idle() {
+        return;
+    }
+
+    let tgid = ctx.tgid();
+
+    let filter_pid = target_pid();
+    if filter_pid != 0 && tgid != filter_pid {
+        return;
+    }
+
+    let cpu = bpf_get_smp_processor_id();
+    let user_stack_id = STACK_TRACES
+        .get_stackid(&ctx, BPF_F_USER_STACK.into())
+        .map_or(-1, |stack_id| stack_id as i32);
+    let kernel_stack_id = STACK_TRACES
+        .get_stackid(&ctx, 0)
+        .map_or(-1, |stack_id| stack_id as i32);
+
+    let Some(pointer) = STORAGE.get_ptr_mut(0) else {
+        return;
+    };
+
+    let pointer = &mut *pointer;
+
+    let (ip, bp, len, sp) = if dwarf_enabled() {
+        let (ip, bp, len) = dwarf_copy_stack_regs(regs, &mut pointer.pointers, tgid);
+        (ip, bp, len, regs.rsp)
+    } else {
+        copy_stack_regs(regs, &mut pointer.pointers)
+    };
+    pointer.len = len;
+
+    let cmd = ctx.command().unwrap_or_default();
+    let stack_info = StackInfo {
+        tgid,
+        user_stack_id,
+        kernel_stack_id,
+        cmd,
+        cpu,
+        ip,
+        bp,
+        sp,
+    };
+
+    let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
+
+    let notify_code = notify_type();
+    let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+
+    if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
+        *count += 1;
+    } else {
+        let _ = COUNTS.insert(&stack_info, &1, 0);
+        notify = true;
+    }
+
+    if notify {
+        if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+            let _writable = entry.write(stack_info);
+            entry.submit(0);
+        }
+    }
+}
+
+/// Collect trace using bpf_get_stackid() only — no custom FP/DWARF unwinding.
+///
+/// Used for contexts where ctx.as_ptr() does NOT point to pt_regs:
+/// - TracePointContext (points to tracepoint-specific data struct)
+/// - RawTracePointContext (points to bpf_raw_tracepoint_args)
+///
+/// bpf_get_stackid() still works because the kernel internally synthesizes
+/// pt_regs from the current call stack. ip/bp/sp are set to 0.
+#[inline(always)]
+pub unsafe fn collect_trace_stackid_only<C: EbpfContext>(ctx: C) {
+    let pid = ctx.pid();
+
+    if pid == 0 && skip_idle() {
+        return;
+    }
+
+    let tgid = ctx.tgid();
+
+    let filter_pid = target_pid();
+    if filter_pid != 0 && tgid != filter_pid {
+        return;
+    }
+
+    let cpu = bpf_get_smp_processor_id();
+    let user_stack_id = STACK_TRACES
+        .get_stackid(&ctx, BPF_F_USER_STACK.into())
+        .map_or(-1, |stack_id| stack_id as i32);
+    let kernel_stack_id = STACK_TRACES
+        .get_stackid(&ctx, 0)
+        .map_or(-1, |stack_id| stack_id as i32);
+
+    let Some(pointer) = STORAGE.get_ptr_mut(0) else {
+        return;
+    };
+    let pointer = &mut *pointer;
+    pointer.len = 0;
+
+    let cmd = ctx.command().unwrap_or_default();
+    let stack_info = StackInfo {
+        tgid,
+        user_stack_id,
+        kernel_stack_id,
+        cmd,
+        cpu,
+        ip: 0,
+        bp: 0,
+        sp: 0,
+    };
+
+    let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
+
+    let notify_code = notify_type();
+    let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+
+    if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
+        *count += 1;
+    } else {
+        let _ = COUNTS.insert(&stack_info, &1, 0);
+        notify = true;
+    }
+
+    if notify {
+        if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+            let _writable = entry.write(stack_info);
+            entry.submit(0);
+        }
+    }
+}
+
+/// Collect trace for generic raw tracepoint programs using task pt_regs.
+///
+/// Uses bpf_get_current_task_btf() + bpf_task_pt_regs() to obtain the
+/// interrupted userspace registers, enabling full frame-pointer/DWARF
+/// unwinding even for non-syscall tracepoints (sched, block, net, tcp, etc.).
+///
+/// Requires kernel >= 5.15 for bpf_task_pt_regs(). Programs using this
+/// function will fail to load on older kernels, falling back to
+/// collect_trace_raw_tp_generic (bpf_get_stackid only).
+#[inline(always)]
+pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
+    let pid = ctx.pid();
+
+    if pid == 0 && skip_idle() {
+        return;
+    }
+
+    let tgid = ctx.tgid();
+
+    let filter_pid = target_pid();
+    if filter_pid != 0 && tgid != filter_pid {
+        return;
+    }
+
+    // Get pt_regs from current task (kernel >= 5.15)
+    let task = bpf_get_current_task_btf();
+    let regs_ptr = bpf_task_pt_regs(task) as *const pt_regs;
+    if regs_ptr.is_null() {
+        return;
+    }
+
+    let cpu = bpf_get_smp_processor_id();
+    let user_stack_id = STACK_TRACES
+        .get_stackid(&ctx, BPF_F_USER_STACK.into())
+        .map_or(-1, |stack_id| stack_id as i32);
+    let kernel_stack_id = STACK_TRACES
+        .get_stackid(&ctx, 0)
+        .map_or(-1, |stack_id| stack_id as i32);
+
+    let Some(pointer) = STORAGE.get_ptr_mut(0) else {
+        return;
+    };
+    let pointer = &mut *pointer;
+
+    // bpf_task_pt_regs returns a kernel pointer — read with bpf_probe_read_kernel
+    let Ok(regs) = bpf_probe_read_kernel(regs_ptr) else {
+        // Fallback: no custom unwinding, just use stack IDs
+        pointer.len = 0;
+        let cmd = ctx.command().unwrap_or_default();
+        let stack_info = StackInfo {
+            tgid,
+            user_stack_id,
+            kernel_stack_id,
+            cmd,
+            cpu,
+            ip: 0,
+            bp: 0,
+            sp: 0,
+        };
+        let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
+        let notify_code = notify_type();
+        let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+        if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
+            *count += 1;
+        } else {
+            let _ = COUNTS.insert(&stack_info, &1, 0);
+            notify = true;
+        }
+        if notify {
+            if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+                let _writable = entry.write(stack_info);
+                entry.submit(0);
+            }
+        }
+        return;
+    };
+
+    let (ip, bp, len, sp) = if dwarf_enabled() {
+        let (ip, bp, len) = dwarf_copy_stack_regs(&regs, &mut pointer.pointers, tgid);
+        (ip, bp, len, regs.rsp)
+    } else {
+        copy_stack_regs(&regs, &mut pointer.pointers)
+    };
+    pointer.len = len;
+
+    let cmd = ctx.command().unwrap_or_default();
+    let stack_info = StackInfo {
+        tgid,
+        user_stack_id,
+        kernel_stack_id,
+        cmd,
+        cpu,
+        ip,
+        bp,
+        sp,
+    };
+
+    let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
+
+    let notify_code = notify_type();
+    let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+
+    if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
+        *count += 1;
+    } else {
+        let _ = COUNTS.insert(&stack_info, &1, 0);
+        notify = true;
+    }
+
+    if notify {
+        if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+            let _writable = entry.write(stack_info);
+            entry.submit(0);
+        }
+    }
+}
+
 const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
-/// DWARF-based stack unwinding using pre-loaded unwind tables
+/// DWARF-based stack unwinding using pre-loaded unwind tables (from pt_regs directly)
 #[inline(always)]
-unsafe fn dwarf_copy_stack<C: EbpfContext>(
-    ctx: &C,
+unsafe fn dwarf_copy_stack_regs(
+    regs: &pt_regs,
     pointers: &mut [u64],
     tgid: u32,
 ) -> (u64, u64, usize) {
-    let regs = ctx.as_ptr() as *const pt_regs;
-    let regs = &*regs;
-
     let ip = regs.rip;
     let mut sp = regs.rsp;
     let mut bp = regs.rbp;
@@ -203,7 +533,7 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
     let proc_info = match PROC_INFO.get(&proc_key) {
         Some(info) => info,
         None => {
-            let (ip, bp, len, _sp) = copy_stack(ctx, pointers);
+            let (ip, bp, len, _sp) = copy_stack_regs(regs, pointers);
             return (ip, bp, len);
         }
     };
@@ -299,12 +629,10 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
                 }
             }
             // Signal frame: CFA = saved RSP = *(RSP + 160)
-            CFA_REG_DEREF_RSP => {
-                match bpf_probe_read_user((sp + 160) as *const u64) {
-                    Ok(val) => val,
-                    Err(_) => break,
-                }
-            }
+            CFA_REG_DEREF_RSP => match bpf_probe_read_user((sp + 160) as *const u64) {
+                Ok(val) => val,
+                Err(_) => break,
+            },
             _ => break,
         };
 
@@ -313,7 +641,11 @@ unsafe fn dwarf_copy_stack<C: EbpfContext>(
         }
 
         // Return address: CFA-8 for normal frames, *(RSP+168) for signal frames
-        let ra_addr = if is_signal { sp + 168 } else { cfa.wrapping_sub(8) };
+        let ra_addr = if is_signal {
+            sp + 168
+        } else {
+            cfa.wrapping_sub(8)
+        };
         let return_addr = match bpf_probe_read_user(ra_addr as *const u64) {
             Ok(val) => val,
             Err(_) => break,
@@ -431,13 +763,9 @@ unsafe fn binary_search_unwind_entry(
     shard_lookup(shard_id, lo - 1)
 }
 
-/// puts the userspace stack in the target pointer slice
+/// puts the userspace stack in the target pointer slice (from pt_regs directly)
 #[inline(always)]
-unsafe fn copy_stack<C: EbpfContext>(ctx: &C, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
-    // refernce pt_regs
-    let regs = ctx.as_ptr() as *const pt_regs;
-    let regs = &*regs;
-
+unsafe fn copy_stack_regs(regs: &pt_regs, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
     // instruction pointer
     let ip = regs.rip;
     let sp = regs.rsp;
