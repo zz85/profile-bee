@@ -194,19 +194,29 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
     }
 
     match mouse_event.kind {
-        MouseEventKind::Down(_) => {
-            // When clicking, try to select the stack at that position
-            // The coordinates are relative to the terminal, so we need to account for the UI layout
-            // We'll use a simple approach: store the click coordinates and let the UI handle it
-            // For now, we'll implement basic left/right click handling
-
-            // Left click: select stack
-            // This is a simplified implementation - actual coordinate-to-stack mapping
-            // would need to be done in the view layer with layout information
-
-            // For now, we won't implement coordinate-based selection as it requires
-            // significant refactoring of the rendering code to track stack positions.
-            // Instead, we could support scroll wheel for navigation.
+        MouseEventKind::Down(button) => {
+            // Handle mouse clicks
+            use crossterm::event::MouseButton;
+            match button {
+                MouseButton::Left => {
+                    // Left click: select the stack at this position
+                    let x = mouse_event.column;
+                    let y = mouse_event.row;
+                    if let Some(stack_id) = app.find_stack_at_position(x, y) {
+                        app.flamegraph_view.select_id(&stack_id);
+                    }
+                }
+                MouseButton::Right => {
+                    // Right click: zoom into the stack at this position
+                    let x = mouse_event.column;
+                    let y = mouse_event.row;
+                    if let Some(stack_id) = app.find_stack_at_position(x, y) {
+                        app.flamegraph_view.select_id(&stack_id);
+                        app.flamegraph_view.set_zoom();
+                    }
+                }
+                _ => {}
+            }
         }
         MouseEventKind::ScrollDown => {
             // Scroll down - move to child stack

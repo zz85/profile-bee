@@ -1,4 +1,4 @@
-use crate::flame::{FlameGraph, SearchPattern};
+use crate::flame::{FlameGraph, SearchPattern, StackIdentifier};
 use crate::state::{FlameGraphState, UpdateMode};
 use crate::view::FlameGraphView;
 use std::collections::HashMap;
@@ -13,6 +13,14 @@ pub type AppResult<T> = std::result::Result<T, Box<dyn error::Error>>;
 pub enum FlameGraphInput {
     File(String),
     Live,
+}
+
+#[derive(Debug, Clone)]
+pub struct StackPosition {
+    pub stack_id: StackIdentifier,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
 }
 
 #[derive(Debug)]
@@ -50,6 +58,8 @@ pub struct App {
     next_flamegraph: Arc<Mutex<Option<ParsedFlameGraph>>>,
     /// Shared update mode for the profiling thread
     update_mode_handle: Arc<Mutex<UpdateMode>>,
+    /// Stack positions from last render (for mouse click handling)
+    pub stack_positions: Vec<StackPosition>,
 }
 
 impl App {
@@ -66,6 +76,7 @@ impl App {
             dirty: true,
             next_flamegraph: Arc::new(Mutex::new(None)),
             update_mode_handle: Arc::new(Mutex::new(UpdateMode::default())),
+            stack_positions: Vec::new(),
         }
     }
 
@@ -91,6 +102,7 @@ impl App {
             debug: false,
             dirty: true,
             update_mode_handle,
+            stack_positions: Vec::new(),
         }
     }
 
@@ -204,5 +216,18 @@ impl App {
 
     pub fn toggle_debug(&mut self) {
         self.debug = !self.debug;
+    }
+
+    /// Find the stack at the given screen coordinates
+    pub fn find_stack_at_position(&self, x: u16, y: u16) -> Option<StackIdentifier> {
+        // Find the last (topmost) stack that contains this position
+        // We iterate in reverse to get the most specific (deepest) stack
+        self.stack_positions
+            .iter()
+            .rev()
+            .find(|pos| {
+                x >= pos.x && x < pos.x + pos.width && y == pos.y
+            })
+            .map(|pos| pos.stack_id)
     }
 }
