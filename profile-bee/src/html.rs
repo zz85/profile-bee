@@ -136,7 +136,7 @@ pub fn collapse_to_json(stacks: &[&str]) -> String {
         }
 
         if depth + 1 != crumbs.len() {
-            crumbs.truncate(depth);
+            crumbs.truncate(depth + 1);
         }
 
         let self_value = false;
@@ -230,4 +230,45 @@ fn test_serialization() {
         test_json,
         r##"{"name":"hi","value":10,"children":[{"name":"test 1","value":3,"children":[]},{"name":"test 2","value":4,"children":[]}]}"##
     );
+}
+
+#[test]
+fn test_varying_depth_stacks() {
+    // This test specifically checks the truncate bug
+    // When we go from deep stack to shallow stack,
+    // the crumbs should be truncated correctly
+    let stacks = [
+        "a;b;c 1",
+        "a;b 1",   // Shallower than previous
+        "a;b;d 1", // Same depth but different branch
+        "a 1",     // Even shallower
+        "a;e 1",   // Back to depth 2
+    ];
+
+    let json = collapse_to_json(&stacks.iter().map(|s| *s).collect::<Vec<_>>());
+
+    // Parse the JSON to verify it's valid
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("Valid JSON");
+
+    // Verify structure
+    assert_eq!(parsed["name"], "");
+    let children = parsed["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1); // Should have one root child "a"
+
+    let a = &children[0];
+    assert_eq!(a["name"], "a");
+    assert_eq!(a["value"], 5); // Sum of all stacks
+
+    let a_children = a["children"].as_array().unwrap();
+    assert_eq!(a_children.len(), 2); // Should have "b" and "e"
+
+    // Find b and e
+    let b = a_children.iter().find(|c| c["name"] == "b").unwrap();
+    let e = a_children.iter().find(|c| c["name"] == "e").unwrap();
+
+    assert_eq!(b["value"], 3); // a;b;c + a;b + a;b;d
+    assert_eq!(e["value"], 1); // a;e
+
+    let b_children = b["children"].as_array().unwrap();
+    assert_eq!(b_children.len(), 2); // Should have "c" and "d"
 }
