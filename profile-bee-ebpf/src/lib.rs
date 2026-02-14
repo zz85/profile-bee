@@ -46,6 +46,11 @@ static TARGET_SYSCALL_NR: i64 = -1;
 #[map(name = "target_pid_map")]
 static TARGET_PID_MAP: Array<u32> = Array::with_max_entries(1, 0);
 
+/// PID to monitor for exit (0 = don't monitor any process exit)
+/// Stored in an Array map so userspace can update it dynamically.
+#[map(name = "monitor_exit_pid_map")]
+static MONITOR_EXIT_PID_MAP: Array<u32> = Array::with_max_entries(1, 0);
+
 #[inline]
 unsafe fn skip_idle() -> bool {
     let skip = core::ptr::read_volatile(&SKIP_IDLE);
@@ -75,6 +80,14 @@ unsafe fn target_pid() -> u32 {
     }
 }
 
+#[inline]
+unsafe fn monitor_exit_pid() -> u32 {
+    match MONITOR_EXIT_PID_MAP.get(0) {
+        Some(&pid) => pid,
+        None => 0,
+    }
+}
+
 /* Setup maps */
 #[map]
 static mut STORAGE: PerCpuArray<FramePointers> = PerCpuArray::with_max_entries(1, 0);
@@ -88,6 +101,9 @@ pub static STACK_ID_TO_TRACES: HashMap<StackInfo, FramePointers> =
 
 #[map]
 static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
+
+#[map(name = "process_exit_events")]
+static RING_BUF_PROCESS_EXIT: RingBuf = RingBuf::with_byte_size(4096, 0);
 
 #[map(name = "stack_traces")]
 pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
@@ -818,6 +834,29 @@ unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
 #[inline(always)]
 fn invalid_userspace_pointer(ip: u64) -> bool {
     ip == 0 || ip >= __START_KERNEL_MAP
+}
+
+/// Handle sched_process_exit tracepoint for process exit monitoring.
+/// Notifies userspace when the monitored PID exits.
+#[inline(always)]
+pub unsafe fn handle_process_exit<C: EbpfContext>(ctx: C) {
+    use profile_bee_common::ProcessExitEvent;
+
+    let tgid = ctx.tgid();
+    let monitor_pid = monitor_exit_pid();
+
+    // Only send notification if this is the PID we're monitoring
+    if monitor_pid != 0 && tgid == monitor_pid {
+        // Send exit notification to userspace
+        if let Some(mut entry) = RING_BUF_PROCESS_EXIT.reserve::<ProcessExitEvent>(0) {
+            let exit_event = ProcessExitEvent {
+                pid: tgid,
+                exit_code: 0, // Exit code is not easily accessible from sched_process_exit
+            };
+            let _writable = entry.write(exit_event);
+            entry.submit(0);
+        }
+    }
 }
 
 // Make this simple now - checking for valid pointers can include
