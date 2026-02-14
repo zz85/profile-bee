@@ -112,6 +112,11 @@ struct Opt {
     #[arg(long, default_value = "accumulate", value_parser = ["reset", "accumulate", "decay"])]
     update_mode: String,
 
+    /// Enable mouse support for TUI flamegraph navigation (experimental)
+    #[cfg(feature = "tui")]
+    #[arg(long)]
+    tui_mouse: bool,
+
     /// Avoid profiling idle cpu cycles
     #[arg(long)]
     skip_idle: bool,
@@ -1564,10 +1569,11 @@ fn spawn_profiling_thread(
 #[cfg(feature = "tui")]
 fn run_tui_event_loop(
     app: &mut profile_bee_tui::app::App,
+    mouse_enabled: bool,
 ) -> Result<(), anyhow::Error> {
     use profile_bee_tui::{
         event::{Event, EventHandler},
-        handler::handle_key_events,
+        handler::{handle_key_events, handle_mouse_events},
         tui::Tui,
     };
     use std::io;
@@ -1577,7 +1583,7 @@ fn run_tui_event_loop(
     let terminal = profile_bee_tui::ratatui::Terminal::new(backend)?;
     let events = EventHandler::new(250);
     let mut tui = Tui::new(terminal, events);
-    tui.init().map_err(|e| anyhow::anyhow!("{e}"))?;
+    tui.init(mouse_enabled).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     while app.running {
         if app.dirty {
@@ -1592,7 +1598,13 @@ fn run_tui_event_loop(
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 app.dirty = true;
             }
-            Event::Mouse(_) => {}
+            Event::Mouse(mouse_event) => {
+                if mouse_enabled {
+                    handle_mouse_events(mouse_event, app)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    app.dirty = true;
+                }
+            }
             Event::Resize(_, _) => {
                 app.dirty = true;
             }
@@ -1674,7 +1686,7 @@ async fn run_combined_mode(
     );
 
     // TUI event loop
-    run_tui_event_loop(&mut app)?;
+    run_tui_event_loop(&mut app, opt.tui_mouse)?;
 
     drop(stopper);
     println!("\nExiting combined mode");
@@ -1739,7 +1751,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     );
 
     // TUI event loop
-    run_tui_event_loop(&mut app)?;
+    run_tui_event_loop(&mut app, opt.tui_mouse)?;
 
     drop(stopper);
     println!("\nExiting TUI mode");
