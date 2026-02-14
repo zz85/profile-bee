@@ -171,27 +171,31 @@ pub fn setup_tail_call_unwinding(bpf: &mut Ebpf) -> Result<(), anyhow::Error> {
 
 ### Phase 2: Loop-Based Deep Unwinding ✅ (Completed)
 
-Implemented as a flat single-level loop rather than true tail calls. The key insight: replacing the nested outer/inner loop (`max_iterations × FRAMES_PER_TAIL_CALL`) with a single `for _ in 0..LEGACY_MAX_DWARF_STACK_DEPTH` flat loop reduces BPF verifier complexity and reliably captures ~21 frames.
+Intermediate step: replaced nested outer/inner loop with a single flat `for _ in 0..LEGACY_MAX_DWARF_STACK_DEPTH` loop. This was superseded by true tail-call chaining (see below).
+
+### Phase 2b: True Tail-Call Chaining ✅ (Completed)
+
+Implemented real `PROG_ARRAY.tail_call()` dispatch, achieving the full `MAX_DWARF_STACK_DEPTH = 165` frames. Verified with 200-level recursion (captures 166 frames, hitting the limit exactly).
 
 Changes made:
-- [x] Refactored `dwarf_copy_stack` to take `&pt_regs` directly instead of generic `EbpfContext`
-- [x] Replaced nested loop with flat `for _ in 0..LEGACY_MAX_DWARF_STACK_DEPTH` loop
-- [x] Each iteration calls `dwarf_unwind_one_frame()` — same function that will be used in true tail-call mode
-- [x] Per-CPU `DwarfUnwindState` used for all state (ready for tail-call transition)
+- [x] `dwarf_try_tail_call()` initializes per-CPU `DwarfUnwindState` and tail-calls into step program
+- [x] `dwarf_unwind_step` as `#[perf_event]` tail-callable program (unwinds 5 frames per invocation)
+- [x] `dwarf_finalize_stack()` copies results from state to STORAGE and submits to maps/ring buffer
+- [x] `DwarfUnwindState` extended with finalization context (stack_ids, cmd, cpu, initial regs)
+- [x] `setup_tail_call_unwinding()` in userspace loads step program and registers it in `PROG_ARRAY`
+- [x] Legacy 21-frame inline path (`dwarf_copy_stack_regs`) preserved as automatic fallback when tail calls are unavailable (kprobe/uprobe contexts, older kernels, registration failure)
 
-**Note:** True tail-call chaining via `PROG_ARRAY.tail_call()` is still needed to reach `MAX_DWARF_STACK_DEPTH = 165` frames. The flat loop is limited by the BPF verifier's instruction budget (~21 frames). Enabling true tail calls requires wiring up `setup_tail_call_unwinding()` in userspace to register the step program in `PROG_ARRAY`.
+### Phase 3: Userspace Integration ✅ (Completed)
 
-### Phase 3: Userspace Integration (Pending)
-
-- [ ] Add `setup_tail_call_unwinding()` to `ebpf.rs`
-- [ ] Call registration after eBPF load
-- [ ] Add runtime detection of tail-call support
-- [ ] Fallback to legacy mode on older kernels
+- [x] Add `setup_tail_call_unwinding()` to `ebpf.rs`
+- [x] Call registration after eBPF load (in main binary when `--dwarf` enabled)
+- [ ] Add runtime detection of tail-call support (currently: graceful fallback if tail call fails)
+- [x] Fallback to legacy mode on older kernels (automatic: failed tail call falls through to inline path)
 
 ### Phase 4: Testing (Partial)
 
-- [x] Add test for 50+ frame depth (`test_dwarf_deepstack` — verifies ≥20 frames from 50-level recursion)
-- [ ] Add test for 100+ frame depth (requires true tail calls)
+- [x] Add test for 50+ frame depth (`test_dwarf_deepstack` — captures full 57 frames from 50-level recursion)
+- [x] Verify 165-frame ceiling (200-level recursion captures 166 frames)
 - [ ] Verify performance (should be similar to legacy)
 - [ ] Test on kernels 5.4, 5.10, 5.15, 6.x
 

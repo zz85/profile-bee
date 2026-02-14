@@ -141,10 +141,13 @@ In `dwarf_copy_stack()` (simplified):
 pointers[0] = RIP
 sp = RSP, bp = RBP, current_ip = RIP
 
-// Flat loop (no nesting) to maximize frames within verifier budget.
-// LEGACY_MAX_DWARF_STACK_DEPTH = 21 iterations gives ~22 total frames.
-// True tail-call chaining (PROG_ARRAY) would allow MAX_DWARF_STACK_DEPTH = 165.
-for i in 1..LEGACY_MAX_DWARF_STACK_DEPTH:
+// Tail-call chaining: collect_trace inits per-CPU state, then tail-calls
+// dwarf_unwind_step via PROG_ARRAY. Each invocation unwinds 5 frames and
+// tail-calls itself (up to 33 times, kernel limit) for MAX_DWARF_STACK_DEPTH = 165.
+// Legacy fallback (no tail calls): flat loop of LEGACY_MAX_DWARF_STACK_DEPTH = 21.
+
+// Per tail-call invocation (dwarf_unwind_step):
+for _ in 0..FRAMES_PER_TAIL_CALL:
     mapping = find_mapping(current_ip)        // linear scan, max 16
     relative_pc = current_ip - mapping.load_bias
     entry = binary_search(mapping.table_id, relative_pc)  // max 19 iterations
@@ -156,10 +159,13 @@ for i in 1..LEGACY_MAX_DWARF_STACK_DEPTH:
 
     if return_addr == 0: break
 
-    pointers[i] = return_addr
+    pointers[frame_count++] = return_addr
     sp = cfa
     bp = restore_bp(entry, cfa)
     current_ip = return_addr
+
+// If more frames needed: PROG_ARRAY.tail_call(ctx, 0) — re-enters this step
+// If done or limit reached: finalize (copy pointers to STORAGE, submit to ring buffer)
 ```
 
 ### BPF Verifier Constraints
@@ -168,8 +174,8 @@ The eBPF code is structured to pass the BPF verifier:
 - All loops use bounded `for _ in 0..CONST` ranges
 - Binary search uses `for _ in 0..19` (not `while`)
 - Mapping scan uses `for m in 0..16` with early break
-- The unwind loop uses a **flat single-level loop** (not nested outer/inner) to minimize instruction complexity: `for _ in 0..LEGACY_MAX_DWARF_STACK_DEPTH` where `LEGACY_MAX_DWARF_STACK_DEPTH = 21`
-- True tail-call chaining via `PROG_ARRAY` would allow `MAX_DWARF_STACK_DEPTH = 165` (5 frames × 33 tail calls) by resetting the verifier instruction budget per call. Infrastructure is in place (`DwarfUnwindState`, `UNWIND_STATE`, `PROG_ARRAY` maps) but userspace registration is not yet wired up.
+- **Tail-call chaining** via `PROG_ARRAY` achieves `MAX_DWARF_STACK_DEPTH = 165` frames (5 frames × 33 tail calls). Each tail call resets the verifier's instruction budget, so the per-invocation complexity stays low (~5 × (8 mapping + 16 binary search) ≈ 600 instructions). The `dwarf_unwind_step` program unwinds `FRAMES_PER_TAIL_CALL` (5) frames then tail-calls itself.
+- **Legacy fallback**: a flat loop of `LEGACY_MAX_DWARF_STACK_DEPTH = 21` frames is used when tail calls are unavailable (kprobe/uprobe contexts, or if `PROG_ARRAY` registration fails)
 - Functions are `#[inline(always)]` to avoid BPF function call overhead
 - Sharded tables reduce verifier complexity by keeping per-binary tables smaller
 
@@ -197,7 +203,7 @@ The eBPF code is structured to pass the BPF verifier:
 
 - **No hot-reload**: dlopen'd libraries after startup won't have unwind tables (but periodic rescanning is supported)
 - **MAX_PROC_MAPS = 16**: processes with very many shared libraries may exceed this
-- **~21 frame depth (flat loop)**: stacks deeper than ~21 frames are truncated by the BPF verifier's instruction limit. Infrastructure for tail-call chaining (up to 165 frames) is in place but not yet enabled from userspace. See [tail_call_unwinding.md](tail_call_unwinding.md).
+- **165 frame depth**: achieved via tail-call chaining through `PROG_ARRAY` (5 frames per tail call × 33 tail calls). Legacy flat-loop fallback limited to ~21 frames when tail calls are unavailable (kprobe/uprobe contexts, older kernels).
 - **MAX_UNWIND_TABLE_SIZE = 500K per binary**: very large binaries (Chrome, Firefox) with >500K unwind entries will be truncated
 - **MAX_UNWIND_TABLES = 64**: system-wide profiling limited to 64 unique binaries
 - **No signal trampolines**: unwinding through signal handlers may stop early on kernels where the vDSO lacks `.eh_frame` entries for `__restore_rt` (libc's `__restore_rt` is handled)

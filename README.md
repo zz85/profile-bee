@@ -247,7 +247,7 @@ sudo probee --svg output.svg --time 5000 -- ./my-fp-binary
 - Rust: Add `-g` flag when compiling
 - C/C++: Compile with debug symbols (`-g` flag)
 
-**Limitations:** Max 16 executable mappings per process, 500K unwind table entries total, 32 frame depth. x86_64 only. Libraries loaded via dlopen are detected within ~1 second.
+**Limitations:** Max 16 executable mappings per process, 500K unwind table entries per binary, up to 165 frame depth (via tail-call chaining; legacy fallback: 21 frames). x86_64 only. Libraries loaded via dlopen are detected within ~1 second.
 
 See [docs/dwarf_unwinding_design.md](docs/dwarf_unwinding_design.md) for architecture details, and [Polar Signals' article on profiling without frame pointers](https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers) for background.
 

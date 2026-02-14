@@ -29,29 +29,31 @@ leaf → recurse ×20 → main → __libc_start_main → _start
 
 The fix captures the full 20-level recursion. The remaining 2-frame gap vs perf is because perf unwinds in userspace with no depth limit.
 
-**Tail-call chaining to reach 165 frames — IN PROGRESS**
+**Tail-call chaining to reach 165 frames — DONE**
 
-**Status:** Infrastructure added, implementation in progress. See [docs/tail_call_unwinding.md](tail_call_unwinding.md) for complete design and implementation details.
+**Status:** Implemented. True tail-call chaining via `PROG_ARRAY` achieves up to 165 frames (verified with 200-level recursion test capturing 166 frames). See [docs/tail_call_unwinding.md](tail_call_unwinding.md) for design and implementation details.
 
-To reach 32+ frames, the eBPF unwind loop is being split into a tail-call chain. This is the approach used by production profilers like [opentelemetry-ebpf-profiler](https://github.com/open-telemetry/opentelemetry-ebpf-profiler) and parca-agent.
+To reach 32+ frames, the eBPF unwind loop was split into a tail-call chain. This is the approach used by production profilers like [opentelemetry-ebpf-profiler](https://github.com/open-telemetry/opentelemetry-ebpf-profiler) and parca-agent.
 
-**Current progress:**
+**Progress:**
 
 ✅ Phase 1: Infrastructure (Completed)
-- `DwarfUnwindState` structure for per-CPU state storage
+- `DwarfUnwindState` structure for per-CPU state storage (extended with finalization context)
 - `UNWIND_STATE` and `PROG_ARRAY` maps added to eBPF code
 - Constants updated: `MAX_DWARF_STACK_DEPTH = 165` (5 frames/call × 33 tail calls)
 - Legacy implementation preserved at `LEGACY_MAX_DWARF_STACK_DEPTH = 21`
 
-🚧 Phase 2: Implementation (In Progress)
-- Splitting `dwarf_copy_stack()` into init and step functions
-- Making step function tail-callable
-- Registering programs in `PROG_ARRAY` from userspace
+✅ Phase 2: Implementation (Completed)
+- `dwarf_try_tail_call()` initializes per-CPU state and tail-calls into step program
+- `dwarf_unwind_step` as `#[perf_event]` tail-callable program
+- `dwarf_finalize_stack()` copies results to STORAGE and submits to ring buffer
+- `setup_tail_call_unwinding()` registers step program in `PROG_ARRAY` from userspace
+- Legacy 21-frame inline path preserved as automatic fallback
 
-📋 Phase 3: Testing (Pending)
-- Tests for 50+, 100+ frame depths
-- Performance validation
-- Kernel compatibility testing (5.4, 5.10, 5.15, 6.x)
+✅ Phase 3: Testing (Partially Complete)
+- 14 E2E tests passing, including 50-level deep stack test
+- 200-level recursion verified at 166 frames (hitting 165 limit)
+- Kernel compatibility testing on additional kernels still pending
 
 **Design highlights:**
 - **5 frames per tail call** keeps verifier happy (~600-800 instructions/call vs 4K limit)

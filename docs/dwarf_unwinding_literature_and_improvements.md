@@ -69,7 +69,7 @@ Follows the Parca architecture:
 - `DwarfUnwindManager` parses `/proc/[pid]/maps`, reads `.eh_frame` via `gimli`, generates `Vec<UnwindEntry>` sorted by PC
 - `UnwindEntry` is **32 bytes**: `u64 pc` + `u8 cfa_type` + 3 pad + `i32 cfa_offset` + `u8 ra_type` + 3 pad + `i32 ra_offset` + `u8 rbp_type` + 3 pad + `i32 rbp_offset`
 - Loaded into BPF `Array<UnwindEntry>` (max 250K entries) + `HashMap<ProcInfoKey, ProcInfo>`
-- eBPF: `dwarf_copy_stack()` does linear mapping scan (max 8), binary search (max 16 iterations), CFA computation, `bpf_probe_read_user` for RA/RBP, up to 32 frames
+- eBPF: `dwarf_copy_stack()` does linear mapping scan (max 8), binary search (max 16 iterations), CFA computation, `bpf_probe_read_user` for RA/RBP, up to 165 frames via tail-call chaining (legacy fallback: 21 frames)
 - Falls back to FP-based `copy_stack()` if no proc_info found for the tgid
 
 ### Dead Code: `unwinder/` Module
