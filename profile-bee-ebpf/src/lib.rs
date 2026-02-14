@@ -19,8 +19,8 @@ use aya_ebpf::{
 use profile_bee_common::{
     DwarfUnwindState, FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry,
     CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
-    FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS, MAX_SHARD_ENTRIES,
-    REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
+    FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH, MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS,
+    MAX_SHARD_ENTRIES, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -181,6 +181,17 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     let pointer = &mut *pointer;
 
     let regs = ctx.as_ptr() as *const pt_regs;
+
+    // Try tail-call-based DWARF unwinding for deep stacks (up to 165 frames).
+    // If the tail call succeeds, execution transfers to dwarf_unwind_step and
+    // this function never continues past this point.
+    // If it fails (program not registered, wrong program type, etc.),
+    // we fall through to the legacy inline DWARF path below.
+    if dwarf_enabled() {
+        dwarf_try_tail_call(&ctx, &*regs, tgid, user_stack_id, kernel_stack_id, cpu);
+        // If we reach here, the tail call failed — continue with legacy path
+    }
+
     let (ip, bp, len, sp) = if dwarf_enabled() {
         let (ip, bp, len) = dwarf_copy_stack_regs(&*regs, &mut pointer.pointers, tgid);
         (ip, bp, len, (*regs).rsp)
@@ -855,101 +866,157 @@ unsafe fn dwarf_copy_stack_regs(
     (ip, bp, len)
 }
 
-/// Initialize DWARF unwinding state and start tail-call chain.
-/// This is called from collect_trace when tail-call unwinding is enabled.
+/// Initialize DWARF unwind state and attempt to tail-call into the step program.
+/// If the tail call succeeds, execution transfers to dwarf_unwind_step and this
+/// function never returns. If it fails (step program not registered, wrong program
+/// type for kprobe/uprobe, or max tail calls reached), we return to the caller
+/// which falls through to the legacy 21-frame inline DWARF path.
 #[inline(always)]
-unsafe fn dwarf_copy_stack_with_tail_calls<C: EbpfContext>(
+unsafe fn dwarf_try_tail_call<C: EbpfContext>(
     ctx: &C,
-    pointers: &mut [u64],
+    regs: &pt_regs,
     tgid: u32,
-) -> (u64, u64, usize) {
-    let regs = ctx.as_ptr() as *const pt_regs;
-    let regs = &*regs;
-
-    let ip = regs.rip;
-    let sp = regs.rsp;
-    let bp = regs.rbp;
-
-    // Store first frame
-    pointers[0] = ip;
-
-    // Look up the process's unwind information
-    let proc_key = ProcInfoKey { tgid, _pad: 0 };
-    let proc_info = match PROC_INFO.get(&proc_key) {
-        Some(info) => info,
-        None => {
-            // No DWARF info - fall back to frame pointer unwinding
-            let (ip, bp, len, _sp) = copy_stack_regs(regs, pointers);
-            return (ip, bp, len);
-        }
-    };
-
-    // Initialize state in per-CPU map
+    user_stack_id: i32,
+    kernel_stack_id: i32,
+    cpu: u32,
+) {
     let Some(state) = UNWIND_STATE.get_ptr_mut(0) else {
-        return (ip, bp, 1);
+        return;
     };
 
-    // Copy frame pointers array to state
-    for i in 0..pointers.len() {
-        (*state).pointers[i] = pointers[i];
-    }
-
+    // Initialize unwind state with first frame
+    (*state).pointers[0] = regs.rip;
     (*state).frame_count = 1;
-    (*state).current_ip = ip;
-    (*state).sp = sp;
-    (*state).bp = bp;
+    (*state).current_ip = regs.rip;
+    (*state).sp = regs.rsp;
+    (*state).bp = regs.rbp;
     (*state).tgid = tgid;
-    (*state).mapping_count = proc_info.mapping_count;
+    (*state).mapping_count = 0; // Step program reads from PROC_INFO directly
 
-    // Perform unwinding in a loop (simulating tail calls for now)
-    // In a real tail-call implementation, this would call PROG_ARRAY.tail_call()
-    let max_iterations = 33; // Max tail calls
-    for _ in 0..max_iterations {
-        let mut unwound_frames = 0;
+    // Save finalization context so the step program can complete the work
+    (*state).user_stack_id = user_stack_id;
+    (*state).kernel_stack_id = kernel_stack_id;
+    (*state).cmd = ctx.command().unwrap_or_default();
+    (*state).cpu = cpu;
+    (*state).initial_ip = regs.rip;
+    (*state).initial_bp = regs.rbp;
+    (*state).initial_sp = regs.rsp;
 
-        // Unwind up to FRAMES_PER_TAIL_CALL frames
-        for _ in 0..FRAMES_PER_TAIL_CALL {
-            if (*state).frame_count >= (*state).pointers.len() {
-                break;
-            }
-
-            if !dwarf_unwind_one_frame(&mut *state, proc_info) {
-                // Unwinding complete or failed
-                unwound_frames = 0;
-                break;
-            }
-            unwound_frames += 1;
-        }
-
-        // If we didn't unwind any frames, we're done
-        if unwound_frames == 0 {
-            break;
-        }
-
-        // In real tail-call implementation: PROG_ARRAY.tail_call(ctx, 0)
-        // For now, we continue in the loop
-    }
-
-    // Copy results back to output array
-    let final_len = (*state).frame_count;
-    for i in 0..final_len.min(pointers.len()) {
-        pointers[i] = (*state).pointers[i];
-    }
-
-    (ip, bp, final_len)
+    // Attempt tail call. If successful, we never return.
+    // If it fails (wrong program type, index not populated), we return.
+    let _ = PROG_ARRAY.tail_call(ctx, 0);
 }
 
-/// DWARF-based stack unwinding using tail-call chaining.
-/// This is the entry point called from collect_trace.
+/// Finalize DWARF unwinding: copy results from per-CPU state to STORAGE,
+/// build StackInfo, and submit to maps/ring buffer.
+/// Called from dwarf_unwind_step when the tail-call chain is complete.
 #[inline(always)]
-unsafe fn dwarf_copy_stack<C: EbpfContext>(
-    ctx: &C,
-    pointers: &mut [u64],
-    tgid: u32,
-) -> (u64, u64, usize) {
-    // Use tail-call version (currently implemented as a loop)
-    // TODO: Enable true tail-call when ProgramArray is properly initialized from userspace
-    dwarf_copy_stack_with_tail_calls(ctx, pointers, tgid)
+unsafe fn dwarf_finalize_stack(state: &DwarfUnwindState) {
+    let Some(pointer) = STORAGE.get_ptr_mut(0) else {
+        return;
+    };
+    let pointer = &mut *pointer;
+
+    // Copy unwound frame pointers from state to STORAGE
+    let len = state.frame_count;
+    for i in 0..MAX_DWARF_STACK_DEPTH {
+        if i >= len || i >= pointer.pointers.len() {
+            break;
+        }
+        pointer.pointers[i] = state.pointers[i];
+    }
+    pointer.len = len;
+
+    let stack_info = StackInfo {
+        tgid: state.tgid,
+        user_stack_id: state.user_stack_id,
+        kernel_stack_id: state.kernel_stack_id,
+        cmd: state.cmd,
+        cpu: state.cpu,
+        ip: state.initial_ip,
+        bp: state.initial_bp,
+        sp: state.initial_sp,
+    };
+
+    let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
+
+    let notify_code = notify_type();
+    let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+
+    if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
+        *count += 1;
+    } else {
+        let _ = COUNTS.insert(&stack_info, &1, 0);
+        notify = true;
+    }
+
+    if notify {
+        if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+            let _writable = entry.write(stack_info);
+            entry.submit(0);
+        }
+    }
+}
+
+/// DWARF unwind step program body. Called via tail-call from collect_trace.
+/// Unwinds FRAMES_PER_TAIL_CALL frames, then either tail-calls itself for more
+/// or finalizes the stack trace.
+pub unsafe fn dwarf_unwind_step_impl<C: EbpfContext>(ctx: C) {
+    let Some(state) = UNWIND_STATE.get_ptr_mut(0) else {
+        return;
+    };
+    let state = &mut *state;
+
+    let proc_key = ProcInfoKey {
+        tgid: state.tgid,
+        _pad: 0,
+    };
+    let Some(proc_info) = PROC_INFO.get(&proc_key) else {
+        // No proc info found — finalize with whatever frames we have
+        dwarf_finalize_stack(state);
+        return;
+    };
+
+    // Set mapping_count from proc_info (not stored during init to save verifier budget)
+    state.mapping_count = proc_info.mapping_count;
+
+    // Unwind up to FRAMES_PER_TAIL_CALL frames per tail-call invocation
+    let mut did_unwind = false;
+    for _ in 0..FRAMES_PER_TAIL_CALL {
+        if state.frame_count >= MAX_DWARF_STACK_DEPTH {
+            break;
+        }
+        if state.frame_count >= state.pointers.len() {
+            break;
+        }
+        if !dwarf_unwind_one_frame(state, proc_info) {
+            // Unwinding complete or failed — finalize
+            dwarf_finalize_stack(state);
+            return;
+        }
+        did_unwind = true;
+    }
+
+    if !did_unwind || state.frame_count >= MAX_DWARF_STACK_DEPTH {
+        // Reached max depth or no progress — finalize
+        dwarf_finalize_stack(state);
+        return;
+    }
+
+    // More frames to unwind — tail-call back into ourselves.
+    // If this fails (max 33 tail calls reached), we finalize below.
+    let _ = PROG_ARRAY.tail_call(&ctx, 0);
+
+    // Tail call failed (max tail calls reached) — finalize with what we have
+    dwarf_finalize_stack(state);
+}
+
+/// DWARF-based stack unwinding entry point (legacy, no tail calls).
+/// Used as fallback when tail-call dispatch is not available.
+/// Uses per-CPU state and a flat loop limited to LEGACY_MAX_DWARF_STACK_DEPTH (21) frames.
+#[inline(always)]
+unsafe fn dwarf_copy_stack(regs: &pt_regs, pointers: &mut [u64], tgid: u32) -> (u64, u64, usize) {
+    dwarf_copy_stack_regs(regs, pointers, tgid)
 }
 
 /// Try a single frame-pointer-based unwind step.

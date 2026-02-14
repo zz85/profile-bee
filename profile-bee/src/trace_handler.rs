@@ -208,11 +208,7 @@ impl TraceHandler {
 
         let user_stack = if utrace_id > -1 {
             stack_traces.get(&(utrace_id as u32), 0).ok().map(|stack| {
-                let addrs: Vec<Addr> = stack
-                    .frames()
-                    .iter()
-                    .map(|frame| frame.ip)
-                    .collect();
+                let addrs: Vec<Addr> = stack.frames().iter().map(|frame| frame.ip).collect();
                 addrs
             })
         } else {

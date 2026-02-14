@@ -151,6 +151,8 @@ pub struct ProcInfo {
 
 /// Per-CPU state for DWARF unwinding with tail-call support.
 /// This structure is stored in a PerCpuArray and persists across tail calls.
+/// It contains both unwinding state and finalization context so the tail-call
+/// step program can complete the work started by collect_trace.
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct DwarfUnwindState {
@@ -164,8 +166,23 @@ pub struct DwarfUnwindState {
     pub sp: u64,
     /// Current base pointer
     pub bp: u64,
+    /// Initial RIP (for StackInfo.ip after finalization)
+    pub initial_ip: u64,
+    /// Initial RBP (for StackInfo.bp after finalization)
+    pub initial_bp: u64,
+    /// Initial RSP (for StackInfo.sp after finalization)
+    pub initial_sp: u64,
     /// Process ID for looking up unwind tables
     pub tgid: u32,
     /// Mapping count for the process
     pub mapping_count: u32,
+    /// Saved user stack ID from bpf_get_stackid (for finalization)
+    pub user_stack_id: i32,
+    /// Saved kernel stack ID from bpf_get_stackid (for finalization)
+    pub kernel_stack_id: i32,
+    /// Saved process command name (for finalization)
+    pub cmd: [u8; 16],
+    /// Saved CPU ID (for finalization)
+    pub cpu: u32,
+    pub _pad2: u32,
 }

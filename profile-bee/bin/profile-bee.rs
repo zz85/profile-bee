@@ -160,8 +160,8 @@ struct Opt {
     group_by_cpu: bool,
 
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
-    #[arg(long, default_value_t = false, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_missing_value = "true")]
-    dwarf: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    dwarf: Option<bool>,
 
     /// PID to profile
     #[arg(short, long)]
@@ -555,7 +555,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         pid: opt.pid.clone(),
         cpu: opt.cpu,
         self_profile: opt.self_profile,
-        dwarf: opt.dwarf,
+        dwarf: opt.dwarf.unwrap_or(false),
     };
 
     // Setup eBPF profiler first to ensure verification succeeds
@@ -578,7 +578,18 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     // If DWARF unwinding is enabled, load unwind tables BEFORE setting TARGET_PID
     // This ensures unwind information is available from the first sample
-    let tgid_request_tx = if opt.dwarf {
+    let tgid_request_tx = if opt.dwarf.unwrap_or(false) {
+        // Set up tail-call unwinding for deep stacks (up to 165 frames)
+        match ebpf_profiler.setup_tail_call_unwinding() {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!(
+                    "Warning: tail-call unwinding setup failed, falling back to 21-frame limit: {:?}",
+                    e
+                );
+            }
+        }
+
         let mut dwarf_manager = DwarfUnwindManager::new();
 
         // Load initial process if specified
@@ -1292,7 +1303,7 @@ fn build_profiler_config(
         pid,
         cpu: opt.cpu,
         self_profile: opt.self_profile,
-        dwarf: opt.dwarf,
+        dwarf: opt.dwarf.unwrap_or(false),
     })
 }
 
@@ -1317,6 +1328,17 @@ fn setup_ebpf_and_dwarf(
 
     // Load DWARF unwind tables and start the background refresh thread
     let tgid_request_tx = if dwarf {
+        // Set up tail-call unwinding for deep stacks (up to 165 frames)
+        match ebpf_profiler.setup_tail_call_unwinding() {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!(
+                    "Warning: tail-call unwinding setup failed, falling back to 21-frame limit: {:?}",
+                    e
+                );
+            }
+        }
+
         let mut dwarf_manager = DwarfUnwindManager::new();
         if let Some(target_pid) = pid {
             println!("Loading DWARF unwind tables for pid {}...", target_pid);
@@ -1613,7 +1635,7 @@ async fn run_combined_mode(
     let mut config = build_profiler_config(&opt, pid)?;
     let (perf_tx, perf_rx) = mpsc::channel();
     let (ebpf_profiler, ring_buf, tgid_request_tx) =
-        setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf)?;
+        setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf.unwrap_or(false))?;
 
     // TUI app + update handle
     let update_mode = parse_update_mode(&opt.update_mode);
@@ -1678,7 +1700,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     let mut config = build_profiler_config(&opt, pid)?;
     let (perf_tx, perf_rx) = mpsc::channel();
     let (ebpf_profiler, ring_buf, tgid_request_tx) =
-        setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf)?;
+        setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf.unwrap_or(false))?;
 
     // TUI app + update handle
     let update_mode = parse_update_mode(&opt.update_mode);

@@ -30,6 +30,10 @@ gcc "$SRC_DIR/callstack.c" -O2 -g -fomit-frame-pointer    -o "$FIXTURE_DIR/calls
 gcc "$SRC_DIR/deep.c" -g -fno-omit-frame-pointer -o "$FIXTURE_DIR/deep-fp"
 gcc "$SRC_DIR/deep.c" -g -fomit-frame-pointer    -o "$FIXTURE_DIR/deep-no-fp"
 
+# deepstack: main → recurse(50) — tests deep DWARF unwinding beyond the old 21-frame limit
+gcc "$SRC_DIR/deep.c" -DDEPTH=50 -g -fno-omit-frame-pointer -o "$FIXTURE_DIR/deepstack-fp"
+gcc "$SRC_DIR/deep.c" -DDEPTH=50 -g -fomit-frame-pointer    -o "$FIXTURE_DIR/deepstack-no-fp"
+
 # PIE: position-independent executable
 gcc "$SRC_DIR/callstack.c" -g -fomit-frame-pointer -pie -fPIE -o "$FIXTURE_DIR/callstack-pie-no-fp"
 

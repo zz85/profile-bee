@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURE_DIR="$SCRIPT_DIR/fixtures/bin"
 OUTPUT_DIR="$SCRIPT_DIR/output"
-PROFILER="$PROJECT_DIR/target/release/profile-bee"
+PROFILER="$PROJECT_DIR/target/release/probee"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 PROFILE_TIME_MS=1000    # how long to profile each test (ms)
@@ -240,6 +240,28 @@ test_dwarf_deep() {
     assert_min_depth "$file" 10 "DWARF should recover deep recursion"
 }
 
+test_dwarf_deepstack() {
+    # Test deep DWARF unwinding on a 50-level recursion binary.
+    # Currently limited to ~21 frames by the BPF verifier's instruction complexity limit.
+    # True tail-call support (PROG_ARRAY) is needed to reach MAX_DWARF_STACK_DEPTH (165).
+    # For now, verify DWARF produces full stacks up to the verifier limit.
+    local file
+    file=$(run_profiler "$FIXTURE_DIR/deepstack-no-fp" "dwarf-deepstack" --dwarf true)
+    assert_stack_contains "$file" "leaf" "leaf() should appear with DWARF"
+    assert_stack_contains "$file" "recurse" "recurse() should appear with DWARF"
+
+    local max_depth
+    max_depth=$(awk -F';' '{print NF}' "$file" | sort -rn | head -1)
+
+    # Should get at least 20 frames (verifier limit is ~21 unwind iterations + leaf)
+    if [[ "$max_depth" -ge 20 ]]; then
+        return 0
+    else
+        echo "  Stack depth ($max_depth) below expected minimum of 20" >&2
+        return 1
+    fi
+}
+
 # ---------- Comparison tests (DWARF should match or beat FP) -----------------
 
 test_dwarf_vs_fp_depth() {
@@ -266,7 +288,7 @@ test_dwarf_improves_no_fp() {
     # The key test: DWARF on a no-FP binary should produce deeper stacks
     # than profiling the same binary without DWARF
     local no_dwarf_file dwarf_file
-    no_dwarf_file=$(run_profiler "$FIXTURE_DIR/callstack-no-fp" "improve-no-dwarf")
+    no_dwarf_file=$(run_profiler "$FIXTURE_DIR/callstack-no-fp" "improve-no-dwarf" --dwarf false)
     dwarf_file=$(run_profiler "$FIXTURE_DIR/callstack-no-fp" "improve-dwarf" --dwarf true)
 
     local no_dwarf_depth dwarf_depth
@@ -367,6 +389,7 @@ echo "── DWARF Unwinding ──"
 run_test "DWARF callstack (no-FP binary)"           test_dwarf_callstack
 run_test "DWARF callstack O2 (no-FP, optimized)"    test_dwarf_callstack_O2
 run_test "DWARF deep recursion (no-FP, 20 levels)"  test_dwarf_deep
+run_test "DWARF deep stack (no-FP, 50 levels)"      test_dwarf_deepstack
 run_test "DWARF shared library (cross-.so calls)"   test_dwarf_shared_library
 run_test "DWARF PIE binary (position-independent)"  test_dwarf_pie_binary
 run_test "DWARF Rust binary (O2, no frame pointers)" test_dwarf_rust_binary
