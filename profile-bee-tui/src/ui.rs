@@ -31,6 +31,7 @@ pub struct FlamelensWidgetState {
     frame_width: u16,
     render_time: Duration,
     cursor_position: Option<(u16, u16)>,
+    pub stack_positions: Vec<crate::app::StackPosition>,
 }
 
 pub struct ZoomState {
@@ -139,7 +140,7 @@ impl<'a> FlamelensWidget<'a> {
         let tic = std::time::Instant::now();
         let main_area = layout[1];
         if self.is_flamegraph_view() {
-            self.render_flamegraph(main_area, buf)
+            self.render_flamegraph(main_area, buf, state)
         } else {
             self.render_table(main_area, buf);
             false
@@ -192,7 +193,10 @@ impl<'a> FlamelensWidget<'a> {
         help_tags
     }
 
-    fn render_flamegraph(&self, area: Rect, buf: &mut Buffer) -> bool {
+    fn render_flamegraph(&self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) -> bool {
+        // Clear previous stack positions
+        state.stack_positions.clear();
+
         let zoom_state = self
             .app
             .flamegraph_state()
@@ -225,6 +229,7 @@ impl<'a> FlamelensWidget<'a> {
             area.bottom(),
             &zoom_state,
             &re,
+            state,
         );
         has_more_rows_to_render
     }
@@ -248,6 +253,7 @@ impl<'a> FlamelensWidget<'a> {
         y_max: u16,
         zoom_state: &Option<ZoomState>,
         re: &Option<&regex::Regex>,
+        state: &mut FlamelensWidgetState,
     ) -> bool {
         let after_level_offset = stack.level >= self.app.flamegraph_state().level_offset;
 
@@ -255,6 +261,14 @@ impl<'a> FlamelensWidget<'a> {
         let effective_x_budget = x_budget as u16;
         if y < y_max && effective_x_budget > 0 {
             if after_level_offset {
+                // Record stack position for mouse click handling
+                state.stack_positions.push(crate::app::StackPosition {
+                    stack_id: stack.id,
+                    x,
+                    y,
+                    width: effective_x_budget,
+                });
+
                 let stack_color = self.get_stack_color(stack, zoom_state);
                 let text_color = FlamelensWidget::<'a>::get_text_color(stack_color);
                 let style = Style::default().fg(text_color).bg(stack_color);
@@ -303,6 +317,7 @@ impl<'a> FlamelensWidget<'a> {
                 y_max,
                 zoom_state,
                 re,
+                state,
             );
             x_offset += child_x_budget as u16;
         }
@@ -723,4 +738,6 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Some(input_buffer) = &mut app.input_buffer {
         input_buffer.cursor = flamelens_state.cursor_position;
     }
+    // Copy stack positions for mouse click handling
+    app.stack_positions = flamelens_state.stack_positions;
 }

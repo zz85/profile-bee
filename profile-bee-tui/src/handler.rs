@@ -4,7 +4,7 @@ use crate::{
     app::{App, AppResult, InputBuffer},
     state::ViewKind,
 };
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tui_input::backend::crossterm::EventHandler;
 
 /// Handles the key events and updates the state of [`App`].
@@ -183,5 +183,51 @@ pub fn handle_input_buffer(key_event: KeyEvent, app: &mut App) -> AppResult<()> 
             }
         }
     }
+    Ok(())
+}
+
+/// Handles mouse events and updates the state of [`App`].
+pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<()> {
+    // Only handle mouse events in flamegraph view
+    if app.flamegraph_state().view_kind != ViewKind::FlameGraph {
+        return Ok(());
+    }
+
+    match mouse_event.kind {
+        MouseEventKind::Down(button) => {
+            // Handle mouse clicks
+            use crossterm::event::MouseButton;
+            match button {
+                MouseButton::Left => {
+                    // Left click: select the stack at this position
+                    let x = mouse_event.column;
+                    let y = mouse_event.row;
+                    if let Some(stack_id) = app.find_stack_at_position(x, y) {
+                        app.flamegraph_view.select_id(&stack_id);
+                    }
+                }
+                MouseButton::Right => {
+                    // Right click: zoom into the stack at this position
+                    let x = mouse_event.column;
+                    let y = mouse_event.row;
+                    if let Some(stack_id) = app.find_stack_at_position(x, y) {
+                        app.flamegraph_view.select_id(&stack_id);
+                        app.flamegraph_view.set_zoom();
+                    }
+                }
+                _ => {}
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            // Scroll down - move to child stack
+            app.flamegraph_view.to_child_stack();
+        }
+        MouseEventKind::ScrollUp => {
+            // Scroll up - move to parent stack
+            app.flamegraph_view.to_parent_stack();
+        }
+        _ => {}
+    }
+
     Ok(())
 }
