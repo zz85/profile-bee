@@ -80,7 +80,7 @@ pub fn raw_tp_with_regs(ctx: RawTracePointContext) -> u32 {
 
 /// Tracepoint for monitoring process exit events.
 /// This allows us to detect when a monitored PID exits without polling.
-#[tracepoint(tracepoint = "sched:sched_process_exit")]
+#[tracepoint(category = "sched", name = "sched_process_exit")]
 pub fn tracepoint_process_exit(ctx: TracePointContext) -> u32 {
     unsafe { handle_process_exit(ctx) }
     0
