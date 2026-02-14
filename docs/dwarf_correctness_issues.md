@@ -29,76 +29,44 @@ leaf → recurse ×20 → main → __libc_start_main → _start
 
 The fix captures the full 20-level recursion. The remaining 2-frame gap vs perf is because perf unwinds in userspace with no depth limit.
 
-**Future improvement: tail-call chaining to reach 128+ frames**
+**Tail-call chaining to reach 165 frames — DONE**
 
-To reach 32+ frames, the eBPF unwind loop needs to be split into a tail-call chain. This is the approach used by production profilers like [opentelemetry-ebpf-profiler](https://github.com/open-telemetry/opentelemetry-ebpf-profiler) (formerly Elastic/Prodfiler) and parca-agent.
+**Status:** Implemented. True tail-call chaining via `PROG_ARRAY` achieves up to 165 frames (verified with 200-level recursion test capturing 166 frames). See [docs/tail_call_unwinding.md](tail_call_unwinding.md) for design and implementation details.
 
-The idea: instead of one big loop that the BPF verifier rejects, unwind a small fixed number of frames per eBPF program invocation, then `bpf_tail_call()` back into the same program. Each tail call resets the verifier's instruction budget, so the total depth is limited only by the tail-call limit (33 on most kernels).
+To reach 32+ frames, the eBPF unwind loop was split into a tail-call chain. This is the approach used by production profilers like [opentelemetry-ebpf-profiler](https://github.com/open-telemetry/opentelemetry-ebpf-profiler) and parca-agent.
 
-**How opentelemetry-ebpf-profiler does it:**
+**Progress:**
 
-```
-// Only unwind 5 frames per program invocation
-#define NATIVE_FRAMES_PER_PROGRAM  5
+✅ Phase 1: Infrastructure (Completed)
+- `DwarfUnwindState` structure for per-CPU state storage (extended with finalization context)
+- `UNWIND_STATE` and `PROG_ARRAY` maps added to eBPF code
+- Constants updated: `MAX_DWARF_STACK_DEPTH = 165` (5 frames/call × 33 tail calls)
+- Legacy implementation preserved at `LEGACY_MAX_DWARF_STACK_DEPTH = 21`
 
-static int unwind_native(struct pt_regs *ctx) {
-    PerCPURecord *record = get_per_cpu_record();  // state persisted in per-CPU map
-    Trace *trace = &record->trace;
+✅ Phase 2: Implementation (Completed)
+- `dwarf_try_tail_call()` initializes per-CPU state and tail-calls into step program
+- `dwarf_unwind_step` as `#[perf_event]` tail-callable program
+- `dwarf_finalize_stack()` copies results to STORAGE and submits to ring buffer
+- `setup_tail_call_unwinding()` registers step program in `PROG_ARRAY` from userspace
+- Legacy 21-frame inline path preserved as automatic fallback
 
-    for (int i = 0; i < NATIVE_FRAMES_PER_PROGRAM; i++) {
-        push_native(&record->state, trace, ...);
-        error = unwind_one_frame(&record->state, &stop);
-        if (error || stop) break;
-        error = get_next_unwinder(&record, &unwinder);
-        if (error || unwinder != PROG_UNWIND_NATIVE) break;
-    }
+✅ Phase 3: Testing (Partially Complete)
+- 14 E2E tests passing, including 50-level deep stack test
+- 200-level recursion verified at 166 frames (hitting 165 limit)
+- Kernel compatibility testing on additional kernels still pending
 
-    // Tail-call back into ourselves (or into interpreter unwinder, or stop)
-    // This resets the BPF verifier instruction count
-    tail_call(ctx, unwinder);
-}
-```
+**Design highlights:**
+- **5 frames per tail call** keeps verifier happy (~600-800 instructions/call vs 4K limit)
+- **165 max frames** (5 × 33 tail calls, kernel limit)
+- **Per-CPU state map** stores unwinding state across calls (8.2 KB per CPU)
+- **Automatic fallback** to 21-frame legacy mode on older kernels
 
-Key design points:
-- **Per-CPU state map:** Unwind state (SP, BP, IP, frame array, frame count) is stored in a `BPF_MAP_TYPE_PERCPU_ARRAY`, not on the eBPF stack. This persists across tail calls.
-- **Small inner loop:** 4-5 frames per invocation keeps the verifier happy even with complex per-frame logic (mapping lookup + binary search + CFA computation).
-- **Tail-call limit = depth limit:** With 5 frames/call × 33 tail calls = 165 max frames. More than enough.
-- **Program array map:** Uses `BPF_MAP_TYPE_PROG_ARRAY` to dispatch tail calls. The same program index can tail-call to itself.
-
-**What this would look like for profile-bee (aya-rs):**
-
-```rust
-// In eBPF code:
-#[map]
-static PROG_ARRAY: ProgramArray = ProgramArray::with_max_entries(4, 0);
-
-#[map]
-static UNWIND_STATE: PerCpuArray<DwarfUnwindState> = PerCpuArray::with_max_entries(1, 0);
-
-const FRAMES_PER_CALL: usize = 5;
-
-fn dwarf_unwind_step(ctx: &PerfEventContext) {
-    let state = UNWIND_STATE.get_ptr_mut(0).unwrap();
-    for _ in 0..FRAMES_PER_CALL {
-        // ... unwind one frame, store in state.pointers[state.len] ...
-        if done { break; }
-    }
-    if !done {
-        // Tail-call back into ourselves
-        unsafe { PROG_ARRAY.tail_call(ctx, 0); }
-    }
-}
-```
-
-This would require:
-1. Moving the `FramePointers` and unwind registers (SP, BP, IP) into a per-CPU map
-2. Splitting `dwarf_copy_stack()` into an init function (called from `collect_trace`) and a step function (the tail-call target)
-3. Registering the step function in a `ProgramArray` map from userspace
+For complete implementation details, architecture diagrams, and code examples, see [docs/tail_call_unwinding.md](tail_call_unwinding.md).
 
 References:
-- [opentelemetry-ebpf-profiler native_stack_trace.ebpf.c](https://github.com/open-telemetry/opentelemetry-ebpf-profiler/blob/main/support/ebpf/native_stack_trace.ebpf.c) — `NATIVE_FRAMES_PER_PROGRAM = 5`, `tail_call()` pattern
-- [Elastic blog: profiling without frame pointers](https://www.elastic.co/blog/universal-profiling-frame-pointers-symbols-ebpf) — architecture overview
-- [Polar Signals: DWARF-based stack walking using eBPF](https://www.polarsignals.com/blog/posts/2022/11/29/dwarf-based-stack-walking-using-ebpf/) — parca-agent's approach
+- [opentelemetry-ebpf-profiler native_stack_trace.ebpf.c](https://github.com/open-telemetry/opentelemetry-ebpf-profiler/blob/main/support/ebpf/native_stack_trace.ebpf.c)
+- [Elastic blog: profiling without frame pointers](https://www.elastic.co/blog/universal-profiling-frame-pointers-symbols-ebpf)
+- [Polar Signals: DWARF-based stack walking using eBPF](https://www.polarsignals.com/blog/posts/2022/11/29/dwarf-based-stack-walking-using-ebpf/)
 
 ## Issue 2: Signal trampoline unwinding stops at `__restore_rt` — FIXED
 

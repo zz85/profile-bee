@@ -9,7 +9,8 @@ use aya_ebpf::{
 };
 use profile_bee_ebpf::{
     collect_trace, collect_trace_raw_syscall, collect_trace_raw_syscall_exit,
-    collect_trace_raw_tp_with_task_regs, collect_trace_stackid_only, handle_process_exit,
+    collect_trace_raw_tp_with_task_regs, collect_trace_stackid_only, dwarf_unwind_step_impl,
+    handle_process_exit,
 };
 
 #[perf_event]
@@ -83,6 +84,18 @@ pub fn raw_tp_with_regs(ctx: RawTracePointContext) -> u32 {
 #[tracepoint(category = "sched", name = "sched_process_exit")]
 pub fn tracepoint_process_exit(ctx: TracePointContext) -> u32 {
     unsafe { handle_process_exit(ctx) }
+    0
+}
+
+/// DWARF unwind step program — tail-call target for deep stack unwinding.
+/// Not attached to any perf event directly; only called via PROG_ARRAY tail call
+/// from collect_trace (perf_event context). Unwinds FRAMES_PER_TAIL_CALL frames
+/// per invocation and tail-calls itself for more, up to MAX_DWARF_STACK_DEPTH.
+#[perf_event]
+pub fn dwarf_unwind_step(ctx: PerfEventContext) -> u32 {
+    unsafe {
+        dwarf_unwind_step_impl(ctx);
+    }
     0
 }
 

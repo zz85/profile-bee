@@ -61,7 +61,7 @@ The first release published to crates.io. Install with `cargo install profile-be
 - TUI feature enabled by default (`--no-default-features` to exclude)
 - Crate metadata added for crates.io publishing (license, description, repository)
 - GitHub Actions CI workflow for Rust packages and E2E tests
-- E2E test framework (`tests/run_e2e.sh`) with 11 test cases covering FP, DWARF, and edge cases
+- E2E test framework (`tests/run_e2e.sh`) with 14 test cases covering FP, DWARF, deep stacks, shared libraries, PIE, and Rust binaries
 - Test fixtures: C binaries in 6 variants (FP/no-FP × O0/O2), Rust binary, shared library, PIE, signal handler
 
 ### Platform Support

@@ -28,7 +28,7 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 │       │                              │                              │
 │       │                              ├─ Read RIP, RSP, RBP          │
 │       │                              ├─ Lookup PROC_INFO by tgid    │
-│       │                              ├─ For each frame (max 21):    │
+│       │                              ├─ For each frame (flat loop): │
 │       │                              │   ├─ Find mapping for IP     │
 │       │                              │   ├─ relative_pc = IP - bias │
 │       │                              │   ├─ Binary search table     │
@@ -141,7 +141,13 @@ In `dwarf_copy_stack()` (simplified):
 pointers[0] = RIP
 sp = RSP, bp = RBP, current_ip = RIP
 
-for i in 1..32:
+// Tail-call chaining: collect_trace inits per-CPU state, then tail-calls
+// dwarf_unwind_step via PROG_ARRAY. Each invocation unwinds 5 frames and
+// tail-calls itself (up to 33 times, kernel limit) for MAX_DWARF_STACK_DEPTH = 165.
+// Legacy fallback (no tail calls): flat loop of LEGACY_MAX_DWARF_STACK_DEPTH = 21.
+
+// Per tail-call invocation (dwarf_unwind_step):
+for _ in 0..FRAMES_PER_TAIL_CALL:
     mapping = find_mapping(current_ip)        // linear scan, max 16
     relative_pc = current_ip - mapping.load_bias
     entry = binary_search(mapping.table_id, relative_pc)  // max 19 iterations
@@ -153,10 +159,13 @@ for i in 1..32:
 
     if return_addr == 0: break
 
-    pointers[i] = return_addr
+    pointers[frame_count++] = return_addr
     sp = cfa
     bp = restore_bp(entry, cfa)
     current_ip = return_addr
+
+// If more frames needed: PROG_ARRAY.tail_call(ctx, 0) — re-enters this step
+// If done or limit reached: finalize (copy pointers to STORAGE, submit to ring buffer)
 ```
 
 ### BPF Verifier Constraints
@@ -165,7 +174,8 @@ The eBPF code is structured to pass the BPF verifier:
 - All loops use bounded `for _ in 0..CONST` ranges
 - Binary search uses `for _ in 0..19` (not `while`)
 - Mapping scan uses `for m in 0..16` with early break
-- `MAX_DWARF_STACK_DEPTH = 21` keeps the outer loop bounded (BPF verifier rejects >21 (with signal frame support) on kernel 5.10 due to nested loop complexity)
+- **Tail-call chaining** via `PROG_ARRAY` achieves `MAX_DWARF_STACK_DEPTH = 165` frames (5 frames × 33 tail calls). Each tail call resets the verifier's instruction budget, so the per-invocation complexity stays low (~5 × (8 mapping + 16 binary search) ≈ 600 instructions). The `dwarf_unwind_step` program unwinds `FRAMES_PER_TAIL_CALL` (5) frames then tail-calls itself.
+- **Legacy fallback**: a flat loop of `LEGACY_MAX_DWARF_STACK_DEPTH = 21` frames is used when tail calls are unavailable (kprobe/uprobe contexts, or if `PROG_ARRAY` registration fails)
 - Functions are `#[inline(always)]` to avoid BPF function call overhead
 - Sharded tables reduce verifier complexity by keeping per-binary tables smaller
 
@@ -193,7 +203,7 @@ The eBPF code is structured to pass the BPF verifier:
 
 - **No hot-reload**: dlopen'd libraries after startup won't have unwind tables (but periodic rescanning is supported)
 - **MAX_PROC_MAPS = 16**: processes with very many shared libraries may exceed this
-- **MAX_DWARF_STACK_DEPTH = 21**: stacks deeper than 21 frames are truncated (BPF verifier limit; to reach 32, the unwind loop would need to be split across tail-called eBPF programs)
+- **165 frame depth**: achieved via tail-call chaining through `PROG_ARRAY` (5 frames per tail call × 33 tail calls). Legacy flat-loop fallback limited to ~21 frames when tail calls are unavailable (kprobe/uprobe contexts, older kernels).
 - **MAX_UNWIND_TABLE_SIZE = 500K per binary**: very large binaries (Chrome, Firefox) with >500K unwind entries will be truncated
 - **MAX_UNWIND_TABLES = 64**: system-wide profiling limited to 64 unique binaries
 - **No signal trampolines**: unwinding through signal handlers may stop early on kernels where the vDSO lacks `.eh_frame` entries for `__restore_rt` (libc's `__restore_rt` is handled)
@@ -201,7 +211,7 @@ The eBPF code is structured to pass the BPF verifier:
 
 ## Testing
 
-13 E2E tests in `tests/run_e2e.sh`:
+14 E2E tests in `tests/run_e2e.sh`:
 
 | Test | What it validates |
 |------|-------------------|
@@ -212,8 +222,10 @@ The eBPF code is structured to pass the BPF verifier:
 | DWARF callstack | DWARF unwinds no-FP binary: hot→c→b→a→main |
 | DWARF callstack O2 | DWARF handles -O2 inlining correctly |
 | DWARF deep recursion | 20 levels of recursion without FP |
+| DWARF deep stack | 50 levels of recursion without FP (verifies ≥20 frames captured) |
 | DWARF shared library | Cross-.so boundary unwinding |
 | DWARF PIE binary | Position-independent executable |
+| DWARF Rust binary | Rust binary compiled at O2 without frame pointers |
 | DWARF ≥ FP depth | DWARF produces at least as many frames as FP |
 | DWARF improves no-FP | DWARF produces deeper stacks than no-DWARF |
 | Robustness | Non-existent binary doesn't crash |

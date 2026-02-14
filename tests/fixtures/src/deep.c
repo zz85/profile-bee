@@ -4,10 +4,15 @@
 // Compile variants:
 //   gcc deep.c -g -fno-omit-frame-pointer -o deep-fp
 //   gcc deep.c -g -fomit-frame-pointer    -o deep-no-fp
+//   gcc deep.c -DDEPTH=50 -g -fomit-frame-pointer -o deepstack-no-fp
 
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+#ifndef DEPTH
+#define DEPTH 20
+#endif
 
 volatile int keep_running = 1;
 void handle_signal(int sig) { keep_running = 0; }
@@ -29,6 +34,6 @@ int main(void) {
     signal(SIGINT, handle_signal);
     signal(SIGALRM, handle_signal);
     alarm(10);  // self-terminate after 10s to prevent orphan processes
-    recurse(20);
+    recurse(DEPTH);
     return 0;
 }

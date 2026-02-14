@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use aya::maps::{Array, HashMap, MapData, RingBuf, StackTraceMap};
+use aya::maps::{Array, HashMap, MapData, ProgramArray, RingBuf, StackTraceMap};
 use aya::programs::{
     perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
     KProbe, PerfEvent,
@@ -9,7 +9,7 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 
 use aya::Pod;
-use profile_bee_common::{ProcInfo, ProcInfoKey, UnwindEntry, ProcessExitEvent};
+use profile_bee_common::{ProcInfo, ProcInfoKey, ProcessExitEvent, UnwindEntry};
 
 // Create a newtype wrapper around StackInfo
 #[repr(transparent)]
@@ -459,6 +459,45 @@ impl EbpfProfiler {
             );
         }
 
+        Ok(())
+    }
+
+    /// Set up tail-call unwinding: load the dwarf_unwind_step program and register
+    /// it in PROG_ARRAY so the eBPF collect_trace can tail-call into it for deep
+    /// DWARF stack unwinding (up to 165 frames vs 21 with legacy inline loop).
+    pub fn setup_tail_call_unwinding(&mut self) -> Result<(), anyhow::Error> {
+        use aya::programs::PerfEvent;
+
+        // Load the step program (but don't attach it to any perf event —
+        // it's only invoked via tail call from collect_trace)
+        {
+            let step_prog: &mut PerfEvent = self
+                .bpf
+                .program_mut("dwarf_unwind_step")
+                .ok_or(anyhow!("dwarf_unwind_step program not found"))?
+                .try_into()?;
+            step_prog.load()?;
+        }
+        // Mutable borrow released
+
+        // Clone the program FD so we can pass it to ProgramArray::set
+        // without conflicting borrows on self.bpf
+        let step_fd = self
+            .bpf
+            .program("dwarf_unwind_step")
+            .ok_or(anyhow!("dwarf_unwind_step not found after load"))?
+            .fd()?
+            .try_clone()?;
+
+        // Register the step program at index 0 of PROG_ARRAY
+        let mut prog_array = ProgramArray::try_from(
+            self.bpf
+                .map_mut("prog_array")
+                .ok_or(anyhow!("prog_array map not found"))?,
+        )?;
+        prog_array.set(0, &step_fd, 0)?;
+
+        tracing::info!("Tail-call DWARF unwinding enabled (up to 165 frames)");
         Ok(())
     }
 }
