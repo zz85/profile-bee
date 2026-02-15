@@ -114,17 +114,21 @@
     // flameGraph.label(label);
 
 
-    const refresh = (data) => Promise.resolve(data || d3.json("/json")).then(data => {
-      flameGraph.update(data);
-    }).catch(error => {
-      console.warn(error);
-    })
+    function refresh(data) {
+      Promise.resolve(data || d3.json("/json")).then(function(data) {
+        flameGraph.update(data);
+      }).catch(function(error) {
+        console.warn(error);
+      });
+    }
 
-    const merge = (data) => Promise.resolve(data || d3.json("/json")).then(data => {
-      flameGraph.merge(data);
-    }).catch(error => {
-      console.warn(error);
-    })
+    function merge(data) {
+      Promise.resolve(data || d3.json("/json")).then(function(data) {
+        flameGraph.merge(data);
+      }).catch(function(error) {
+        console.warn(error);
+      });
+    }
 
     function update(data) {
       if (document.getElementById('update_mode').value != 'merge') {

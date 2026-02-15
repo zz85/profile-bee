@@ -42,21 +42,24 @@ pub async fn start_server(mut rx: Receiver<String>) {
 
     let writer = latest_data.clone();
     tokio::spawn(async move {
+        tracing::debug!("start_server: broadcast receiver task started, waiting for data");
         while let Ok(data) = rx.recv().await {
-            println!("Received....");
+            tracing::info!("start_server: received broadcast data ({} bytes)", data.len());
             let mut write = writer.lock().expect("poisoned");
             *write = data.clone();
             drop(write);
 
             let mut write = access_subscribers.lock().expect("poisoned");
             write.retain(|tx| tx.send(data.clone()).is_ok());
-            println!("{} realtime subscribers", write.len());
+            tracing::info!("start_server: {} realtime SSE subscribers", write.len());
         }
+        tracing::warn!("start_server: broadcast receiver loop ended (sender dropped)");
     });
 
     let json_copy = latest_data.clone();
     // GET /json -> stack trace json
     let json = warp::path("json").and(warp::get()).map(move || {
+        tracing::debug!("start_server: GET /json request");
         let json = json_copy.lock().expect("poisoned").clone();
 
         warp::http::Response::builder()
@@ -69,6 +72,7 @@ pub async fn start_server(mut rx: Receiver<String>) {
         .and(warp::get())
         .and(subscriptions)
         .map(|subscriptions| {
+            tracing::info!("start_server: GET /stream - new SSE subscriber");
             let stream = connected(subscriptions);
 
             // returns a stream when replies is sent via server-sent events
@@ -77,6 +81,7 @@ pub async fn start_server(mut rx: Receiver<String>) {
 
     // GET / -> index html
     let index = warp::path::end().map(move || {
+        tracing::debug!("start_server: GET / request");
         let json_copy = latest_data.lock().expect("poisoned");
 
         warp::http::Response::builder()
@@ -84,16 +89,18 @@ pub async fn start_server(mut rx: Receiver<String>) {
             .body(flamegraph_html(&json_copy))
     });
 
+    tracing::info!("start_server: listening on http://127.0.0.1:8000/");
     eprintln!("Listening on port 8000. Goto http://localhost:8000/");
     warp::serve(index.or(json).or(stream))
         .run(([127, 0, 0, 1], 8000))
         .await;
+    tracing::warn!("start_server: warp server exited");
 }
 
 fn connected(
     subscriptions: Arc<Mutex<Vec<mpsc::UnboundedSender<String>>>>,
 ) -> impl Stream<Item = Result<Event, warp::Error>> + Send + 'static {
-    println!("new subscription");
+    tracing::info!("connected: new SSE subscription registered");
 
     // Use an unbounded channel to handle buffering and flushing of messages
     // to the event source...
