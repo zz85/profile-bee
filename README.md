@@ -18,6 +18,24 @@ Profile Bee is an eBPF-based CPU profiler that ships as a single binary — no B
 
 ## Install
 
+### Option 1: Shell Installer (Recommended)
+
+Download and install the latest release with a single command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zz85/profile-bee/main/install.sh | bash
+```
+
+Or with wget:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/zz85/profile-bee/main/install.sh | bash
+```
+
+This installs pre-built binaries to `~/.local/bin`. No Rust toolchain required.
+
+### Option 2: Cargo Install
+
 ```bash
 cargo install profile-bee
 ```
