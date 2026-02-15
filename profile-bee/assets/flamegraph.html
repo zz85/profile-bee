@@ -23,8 +23,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monos
 .toolbar .title a { font-size: 14px; color: #333; text-decoration: none; }
 .toolbar .title a:hover { text-decoration: underline; }
 .toolbar .sep { border-left: 1px solid #ddd; height: 20px; }
-#status { font-size: 12px; color: #888; }
+#status { font-size: 12px; color: #888; cursor: pointer; }
 #status.live { color: #2a2; }
+#status.paused { color: #c80; }
 #details {
   position: sticky; bottom: 0;
   padding: 6px 12px; font-size: 13px; color: #555;
@@ -39,8 +40,9 @@ canvas { display: block; }
   <span id="status"></span>
   <span class="sep"></span>
   <button onclick="resetZoom()">Reset zoom</button>
-  <button id="sortBtn" onclick="toggleSort()">Sort: size</button>
-  <button id="dirBtn" onclick="toggleDir()">▼ Top-down</button>
+  <button id="sortBtn" onclick="toggleSort()">Sort: name</button>
+  <button id="dirBtn" onclick="toggleDir()">▲ Bottom-up</button>
+  <button id="refreshBtn" onclick="fetchAndUpdate()" style="display:none">Refresh</button>
   <input type="text" id="search" placeholder="Search..." oninput="onSearch(this.value)">
   <button onclick="clearSearch()">✕</button>
 </div>
@@ -61,8 +63,9 @@ var totalLevels = 0;
 
 var CELL_H = 20;
 var FONT = '12px monospace';
-var sortByName = false;
-var bottomUp = false;
+var sortByName = true;
+var bottomUp = true;
+var paused = false;
 var canvas = document.getElementById('fg');
 var ctx = canvas.getContext('2d');
 var dpr = window.devicePixelRatio || 1;
@@ -143,7 +146,6 @@ function render() {
   var scale = canvasW / base.w;
   var baseX = base.x;
 
-  // Build ancestor set for zoomed frame (drawn full-width)
   var ancestors = {};
   if (zoomFrame) {
     var a = zoomFrame;
@@ -157,7 +159,7 @@ function render() {
   for (var i = 0; i < frames.length; i++) {
     var f = frames[i];
     var py = bottomUp ? canvasH - (f.depth + 1) * CELL_H : f.depth * CELL_H;
-    if (py >= canvasH) continue;
+    if (py + CELL_H <= 0 || py >= canvasH) continue;
 
     var px, pw;
     if (ancestors[f.depth] === f) {
@@ -196,7 +198,6 @@ function frameAt(mx, my) {
   var depth = bottomUp ? Math.floor((canvasH - my) / CELL_H) : Math.floor(my / CELL_H);
   if (depth < 0 || depth >= totalLevels) return null;
 
-  // Check ancestors first (they're full-width when zoomed)
   if (zoomFrame) {
     var a = zoomFrame;
     while (a.parent >= 0) { a = frames[a.parent]; if (a.depth === depth) return a; }
@@ -235,6 +236,13 @@ function onSearch(term) { searchTerm = term; render(); }
 function clearSearch() { document.getElementById('search').value = ''; searchTerm = ''; render(); }
 function toggleSort() { sortByName = !sortByName; document.getElementById('sortBtn').textContent = 'Sort: ' + (sortByName ? 'name' : 'size'); applyData(lastData); }
 function toggleDir() { bottomUp = !bottomUp; document.getElementById('dirBtn').textContent = (bottomUp ? '\u25b2 Bottom-up' : '\u25bc Top-down'); render(); }
+
+function togglePause() {
+  paused = !paused;
+  var s = document.getElementById('status');
+  if (paused) { s.textContent = '\u25a0 Paused'; s.className = 'paused'; }
+  else { s.textContent = '\u25cf Live'; s.className = 'live'; if (pendingData) scheduleApply(); }
+}
 
 // ── Zoom state preservation ──────────────────────────────────────
 function getZoomPath() {
@@ -276,15 +284,21 @@ var pendingData = null, rafScheduled = false, sse = null;
 function scheduleApply() {
   if (rafScheduled) return;
   rafScheduled = true;
-  requestAnimationFrame(function() { rafScheduled = false; if (pendingData) { applyData(pendingData); pendingData = null; } });
+  requestAnimationFrame(function() {
+    rafScheduled = false;
+    if (pendingData && !paused) { applyData(pendingData); pendingData = null; }
+  });
 }
 
 function startStream() {
   if (sse) return;
   sse = new EventSource(location.origin + '/stream');
   document.getElementById('status').textContent = 'Connecting\u2026';
-  sse.onopen = function() { var s = document.getElementById('status'); s.textContent = '\u25cf Live'; s.className = 'live'; };
-  sse.onmessage = function(msg) { pendingData = JSON.parse(msg.data); scheduleApply(); };
+  sse.onopen = function() {
+    var s = document.getElementById('status');
+    if (!paused) { s.textContent = '\u25cf Live'; s.className = 'live'; }
+  };
+  sse.onmessage = function(msg) { pendingData = JSON.parse(msg.data); if (!paused) scheduleApply(); };
   sse.onerror = function() { var s = document.getElementById('status'); s.textContent = '\u25cb Disconnected'; s.className = ''; sse.close(); sse = null; setTimeout(startStream, 3000); };
 }
 
@@ -293,6 +307,8 @@ function fetchAndUpdate() {
 }
 
 // ── Init ─────────────────────────────────────────────────────────
+if (SERVE_MODE) document.getElementById('refreshBtn').style.display = '';
+document.getElementById('status').addEventListener('click', function() { if (SERVE_MODE && sse) togglePause(); });
 buildFrames(rawData);
 resizeCanvas();
 render();

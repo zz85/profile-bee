@@ -113,7 +113,7 @@ fn connected(
     rx.map(|msg| Ok(Event::default().data(msg)))
 }
 
-/// turns a sorted stackcollapsed format into d3-flamegraph json format
+/// turns a sorted stackcollapsed format into flamegraph json format
 pub fn collapse_to_json(stacks: &[&str]) -> String {
     let root = Stack::new("");
     let mut crumbs = vec![root.clone()];
@@ -172,7 +172,7 @@ pub fn generate_html_file(filename: &Path, data: &str) {
 }
 
 // Self-contained HTML template — no external JS/CSS dependencies
-const HTML_TEMPLATE: &str = include_str!("../assets/d3-flamegraph.html");
+const HTML_TEMPLATE: &str = include_str!("../assets/flamegraph.html");
 
 fn flamegraph_html(stacks: &str) -> String {
     flamegraph_html_with_mode(stacks, false)
