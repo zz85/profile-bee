@@ -107,7 +107,7 @@ function buildFrames(data) {
 function render() {
   var base = zoomFrame || rootFrame;
   var baseDepth = base ? base.depth : 0;
-  var levels = rootFrame ? totalLevels - baseDepth : 0;
+  var levels = rootFrame ? totalLevels : 0;
   var w = canvas.parentElement.clientWidth;
   var h = levels > 0 ? levels * CELL_H : 60;
 
@@ -133,22 +133,34 @@ function render() {
   var scale = canvasW / base.w;
   var baseX = base.x;
 
+  // Build ancestor set for zoomed frame (drawn full-width)
+  var ancestors = {};
+  if (zoomFrame) {
+    var a = zoomFrame;
+    while (a.parent >= 0) { a = frames[a.parent]; ancestors[a.depth] = a; }
+  }
+
   ctx.font = FONT; ctx.textBaseline = 'middle';
   var hasSearch = searchTerm.length > 0;
   var searchLower = searchTerm.toLowerCase();
 
   for (var i = 0; i < frames.length; i++) {
     var f = frames[i];
-    if (f.depth < baseDepth) continue;
-
-    var px = (f.x - baseX) * scale;
-    var pw = f.w * scale;
-    if (px + pw <= 0 || px >= canvasW || pw < 0.5) continue;
-    if (px < 0) { pw += px; px = 0; }
-    if (px + pw > canvasW) pw = canvasW - px;
-
-    var py = (f.depth - baseDepth) * CELL_H;
+    var py = f.depth * CELL_H;
     if (py >= canvasH) continue;
+
+    var px, pw;
+    if (ancestors[f.depth] === f) {
+      // Ancestor of zoom target: draw full width
+      px = 0; pw = canvasW;
+    } else {
+      if (f.depth < baseDepth) continue;
+      px = (f.x - baseX) * scale;
+      pw = f.w * scale;
+      if (px + pw <= 0 || px >= canvasW || pw < 0.5) continue;
+      if (px < 0) { pw += px; px = 0; }
+      if (px + pw > canvasW) pw = canvasW - px;
+    }
 
     var isMatch = hasSearch && f.name.toLowerCase().indexOf(searchLower) !== -1;
     var isHovered = f === hoveredFrame;
@@ -171,10 +183,16 @@ function render() {
 function frameAt(mx, my) {
   if (!rootFrame) return null;
   var base = zoomFrame || rootFrame;
-  var baseDepth = base.depth;
   var scale = canvasW / base.w;
-  var depth = Math.floor(my / CELL_H) + baseDepth;
-  if (depth < baseDepth || depth >= totalLevels) return null;
+  var depth = Math.floor(my / CELL_H);
+  if (depth < 0 || depth >= totalLevels) return null;
+
+  // Check ancestors first (they're full-width when zoomed)
+  if (zoomFrame) {
+    var a = zoomFrame;
+    while (a.parent >= 0) { a = frames[a.parent]; if (a.depth === depth) return a; }
+  }
+
   for (var i = 0; i < frames.length; i++) {
     var f = frames[i];
     if (f.depth !== depth) continue;
