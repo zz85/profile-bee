@@ -61,7 +61,21 @@ var canvas = document.getElementById('fg');
 var ctx = canvas.getContext('2d');
 var dpr = window.devicePixelRatio || 1;
 var canvasW = 0, canvasH = 0;
-var lastW = 0, lastH = 0;
+
+function resizeCanvas() {
+  var toolbar = document.querySelector('.toolbar');
+  var details = document.getElementById('details');
+  var w = window.innerWidth;
+  var h = window.innerHeight - toolbar.offsetHeight - details.offsetHeight;
+  if (h < 60) h = 60;
+  if (w === canvasW && h === canvasH) return;
+  canvasW = w; canvasH = h;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
 
 // ── Colors ───────────────────────────────────────────────────────
 function nameHash(name) {
@@ -105,31 +119,19 @@ function buildFrames(data) {
 
 // ── Render ───────────────────────────────────────────────────────
 function render() {
-  var base = zoomFrame || rootFrame;
-  var baseDepth = base ? base.depth : 0;
-  var levels = rootFrame ? totalLevels : 0;
-  var w = canvas.parentElement.clientWidth;
-  var h = levels > 0 ? levels * CELL_H : 60;
-
-  if (w !== lastW || h !== lastH) {
-    lastW = w; lastH = h;
-    canvasW = w; canvasH = h;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    canvas.style.width = w + 'px';
-    canvas.style.height = h + 'px';
-  }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, canvasW, canvasH);
 
   if (!rootFrame) {
     ctx.font = '14px monospace'; ctx.fillStyle = '#999'; ctx.textAlign = 'center';
-    ctx.fillText('Waiting for profiling data\u2026', canvasW / 2, 30);
+    ctx.fillText('Waiting for profiling data\u2026', canvasW / 2, canvasH / 2);
     ctx.textAlign = 'start';
     return;
   }
 
+  var base = zoomFrame || rootFrame;
   if (base.w === 0) return;
+  var baseDepth = base.depth;
   var scale = canvasW / base.w;
   var baseX = base.x;
 
@@ -151,7 +153,6 @@ function render() {
 
     var px, pw;
     if (ancestors[f.depth] === f) {
-      // Ancestor of zoom target: draw full width
       px = 0; pw = canvasW;
     } else {
       if (f.depth < baseDepth) continue;
@@ -219,7 +220,7 @@ canvas.addEventListener('click', function(e) {
   var f = frameAt(e.clientX - rect.left, e.clientY - rect.top);
   if (f) { zoomFrame = (f === zoomFrame || f === rootFrame) ? null : f; render(); }
 });
-window.addEventListener('resize', function() { lastW = 0; render(); });
+window.addEventListener('resize', function() { resizeCanvas(); render(); });
 
 function resetZoom() { zoomFrame = null; render(); }
 function onSearch(term) { searchTerm = term; render(); }
@@ -282,6 +283,7 @@ function fetchAndUpdate() {
 
 // ── Init ─────────────────────────────────────────────────────────
 buildFrames(rawData);
+resizeCanvas();
 render();
 if (SERVE_MODE) { startStream(); if (!rootFrame) fetchAndUpdate(); }
 </script>
