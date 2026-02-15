@@ -171,35 +171,13 @@ pub fn generate_html_file(filename: &Path, data: &str) {
     std::fs::write(filename, html).expect("Unable to write stack html file");
 }
 
-// Uses https://github.com/spiermar/d3-flame-graph
+// Self-contained HTML template — no external JS/CSS dependencies
 const HTML_TEMPLATE: &str = include_str!("../assets/d3-flamegraph.html");
-const SCRIPTS: &str = include_str!("../assets/scripts.js");
-const STYLES: &str = include_str!("../assets/styles.css");
-
-const EXTERNAL_SCRIPTS: &str = r#"<script src="https://d3js.org/d3.v7.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/d3-tip/0.9.1/d3-tip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.min.js"></script>"#;
-
-const EXTERNAL_STYLES: &str = r#"
-<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css" />
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.css" />"#;
 
 fn flamegraph_html(stacks: &str) -> String {
-    let embedded = true;
-
-    let template = HTML_TEMPLATE
+    HTML_TEMPLATE
         .replace("{stack}", stacks)
-        .replace("{title}", "profile-bee");
-
-    if embedded {
-        template
-            .replace("{scripts}", &format!("<script>{}</script>", SCRIPTS))
-            .replace("{styles}", &format!("<style>{}</style>", STYLES))
-    } else {
-        template
-            .replace("{scripts}", EXTERNAL_SCRIPTS)
-            .replace("{styles}", EXTERNAL_STYLES)
-    }
+        .replace("{title}", "profile-bee")
 }
 
 #[test]

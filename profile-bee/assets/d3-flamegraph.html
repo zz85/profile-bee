@@ -1,292 +1,356 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
-  <meta charset="utf-8">
-  <meta http-equiv="X-UA-Compatible" content="IE=edge">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {
-      padding-top: 20px;
-      padding-bottom: 20px;
-    }
-
-    .header {
-      padding-bottom: 20px;
-      padding-right: 15px;
-      padding-left: 15px;
-      border-bottom: 1px solid #e5e5e5;
-    }
-
-    .header h3 {
-      margin-top: 0;
-      margin-bottom: 0;
-      line-height: 40px;
-    }
-
-    .header h3 a {
-      color: inherit;
-      text-decoration: none;
-    }
-
-    .header h3 a:hover {
-      text-decoration: underline;
-    }
-
-    .container {
-      max-width: 990px;
-    }
-  </style>
-  {styles}
-  <title>{title}</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #fafafa; }
+.toolbar {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  background: #fff; border-bottom: 1px solid #ddd; flex-wrap: wrap;
+}
+.toolbar a, .toolbar button {
+  padding: 4px 10px; border: 1px solid #ccc; border-radius: 3px;
+  background: #f5f5f5; color: #333; text-decoration: none; cursor: pointer;
+  font-size: 13px; line-height: 1.4;
+}
+.toolbar a:hover, .toolbar button:hover { background: #e8e8e8; }
+.toolbar input[type="text"] {
+  padding: 4px 8px; border: 1px solid #ccc; border-radius: 3px; font-size: 13px;
+}
+.toolbar .title { font-weight: 600; margin-right: auto; }
+.toolbar .title a { border: none; background: none; font-size: 14px; color: #333; }
+.toolbar .title a:hover { text-decoration: underline; background: none; }
+#status { font-size: 12px; color: #888; }
+#details {
+  padding: 6px 12px; font-size: 13px; color: #555;
+  background: #fff; border-top: 1px solid #ddd; min-height: 24px;
+}
+canvas { display: block; width: 100%; cursor: pointer; }
+</style>
 </head>
-
 <body>
-  <div class="container">
-    <div class="header clearfix">
-      <nav>
-        <div class="pull-right">
-          <form class="form-inline" id="form">
-            <a class="btn" href="javascript: stream();">Realtime updates</a>
-            <span id="status"></span>
-            <a class="btn" href="javascript: update();">Update data</a>
-            <select id="update_mode">
-              <option value="refresh">Refresh</option>
-              <option value="merge">Merge</option>
-            </select>
+<div class="toolbar">
+  <span class="title"><a href="https://github.com/zz85/profile-bee" target="_blank" rel="noopener">{title}</a></span>
+  <button onclick="startStream()">Realtime updates</button>
+  <span id="status"></span>
+  <button onclick="fetchAndUpdate()">Update</button>
+  <button onclick="resetZoom()">Reset zoom</button>
+  <input type="text" id="search" placeholder="Search..." oninput="onSearch(this.value)">
+  <button onclick="clearSearch()">Clear</button>
+</div>
+<canvas id="fg"></canvas>
+<div id="details">&nbsp;</div>
 
-            <a class="btn" href="javascript: resetZoom();">Reset zoom</a>
-            <a class="btn" href="javascript: clear();">Clear</a>
-            <div class="form-group">
-              <input type="text" class="form-control" id="term">
-            </div>
-            <a class="btn btn-primary" href="javascript: search();">Search</a>
-          </form>
-        </div>
-      </nav>
-      <h3 class="text-muted"><a href="https://github.com/zz85/profile-bee" target="_blank" rel="noopener">{title}</a></h3>
-    </div>
-    <div id="chart">
-    </div>
-    <hr>
-    <div id="details">
-    </div>
-  </div>
+<script>
+// ── Data ─────────────────────────────────────────────────────────
+var rawData = {stack};
 
-  {scripts}
+// ── Flamegraph state ─────────────────────────────────────────────
+var frames = [];       // flat array: {name, depth, x, w, value, selfValue, children, parent, color}
+var rootFrame = null;
+var zoomFrame = null;  // currently zoomed frame (null = root)
+var searchTerm = "";
+var hoveredFrame = null;
+var totalLevels = 0;
 
-  <script type="text/javascript">
-    var data = {stack};
-  </script>
+var CELL_H = 20;
+var FONT = '12px monospace';
+var canvas = document.getElementById('fg');
+var ctx = canvas.getContext('2d');
+var dpr = window.devicePixelRatio || 1;
+var canvasW = 0;
+var canvasH = 0;
 
-  <script type="text/javascript">
-    var flameGraph = flamegraph()
-      .width(960)
-      .cellHeight(18)
-      .height(540)
-      .transitionDuration(750)
-      .minFrameSize(5)
-      .transitionEase(d3.easeCubic)
-      .sort(true)
-      .title("")
-      .onClick(onClick)
-      .selfValue(false);
+// ── Color palette ────────────────────────────────────────────────
+function hashColor(name) {
+  var h = 0;
+  for (var i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+  // warm flame palette: hue 20-55 (orange-yellow), sat 60-90%, light 55-75%
+  var hue = 20 + Math.abs(h % 36);
+  var sat = 60 + Math.abs((h >> 8) % 31);
+  var lit = 55 + Math.abs((h >> 16) % 21);
+  return 'hsl(' + hue + ',' + sat + '%,' + lit + '%)';
+}
 
-    d3.select("#chart")
-      .datum(data)
-      .call(flameGraph);
+function dimColor(name) {
+  var h = 0;
+  for (var i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+  var hue = 20 + Math.abs(h % 36);
+  return 'hsl(' + hue + ',20%,80%)';
+}
 
-    var details = document.getElementById("details");
-    flameGraph.setDetailsElement(details);
+// ── Build flat frame list from {name, value, children} tree ──────
+function buildFrames(data) {
+  frames = [];
+  totalLevels = 0;
+  if (!data || !data.value) { rootFrame = null; return; }
 
-    // ── Zoom state tracking ──────────────────────────────────────
-    // d3-flamegraph destroys the hierarchy on update(), so we track
-    // the zoomed node's name-path ourselves and restore it after.
-    var currentZoomPath = null;
-
-    // Capture zoom path when user clicks a frame
-    var originalOnClick = onClick;
-    function onClick(d) {
-      // d is a d3 hierarchy node; walk up to build the name path
-      currentZoomPath = getNodePath(d);
-      console.info("Zoomed to: " + currentZoomPath.join(" → "));
+  function walk(node, depth, x, parentIdx) {
+    var idx = frames.length;
+    var w = node.value;
+    var selfVal = node.value;
+    if (node.children) {
+      for (var i = 0; i < node.children.length; i++) selfVal -= node.children[i].value;
     }
-
-    // Build name-path from root to this node
-    function getNodePath(node) {
-      var path = [];
-      var n = node;
-      while (n) {
-        path.unshift(n.data.name);
-        n = n.parent;
-      }
-      return path;
-    }
-
-    // Walk the new hierarchy to find a node matching the saved path
-    function findNodeByPath(root, path) {
-      if (!path || path.length === 0) return null;
-      var node = root;
-      // path[0] is the root name, start matching from path[1]
-      for (var i = 1; i < path.length; i++) {
-        if (!node.children) return null;
-        var found = null;
-        for (var j = 0; j < node.children.length; j++) {
-          if (node.children[j].data.name === path[i]) {
-            found = node.children[j];
-            break;
-          }
-        }
-        if (!found) return null;
-        node = found;
-      }
-      return node;
-    }
-
-    // ── Double-buffered live update ──────────────────────────────
-    var pendingData = null;
-    var refreshScheduled = false;
-    var isFirstUpdate = true;
-
-    function scheduleRefresh() {
-      if (refreshScheduled) return;
-      refreshScheduled = true;
-      requestAnimationFrame(function() {
-        refreshScheduled = false;
-        if (pendingData === null) return;
-        var snapshot = pendingData;
-        pendingData = null;
-        applyUpdate(snapshot);
-      });
-    }
-
-    function applyUpdate(newData) {
-      // Save state before update
-      var savedZoomPath = currentZoomPath;
-      var savedSearch = document.getElementById('term').value;
-
-      // Disable animation for live updates (first render keeps it)
-      if (isFirstUpdate) {
-        isFirstUpdate = false;
-      } else {
-        flameGraph.transitionDuration(0);
-      }
-
-      // Apply the data
-      flameGraph.update(newData);
-
-      // Restore zoom: find the same node in the new tree
-      if (savedZoomPath && savedZoomPath.length > 1) {
-        var chartNode = d3.select("#chart").datum();
-        // chartNode is the root of the d3 hierarchy after update
-        if (chartNode) {
-          // d3-flamegraph wraps data in a hierarchy; get the root
-          var root = d3.hierarchy(chartNode);
-          var target = findNodeByPath(root, savedZoomPath);
-          if (target) {
-            // zoomTo expects the internal hierarchy node, but after
-            // update() the internal nodes are different objects.
-            // Use the DOM: find the rect whose data matches and click it.
-            restoreZoomViaDOM(savedZoomPath);
-          }
-        }
-      }
-
-      // Restore search
-      if (savedSearch) {
-        flameGraph.search(savedSearch);
-      }
-
-      // Restore transition for user interactions
-      flameGraph.transitionDuration(750);
-    }
-
-    // Find and programmatically zoom to a node via the rendered SVG
-    function restoreZoomViaDOM(path) {
-      // The target frame name is the last element in the path
-      var targetName = path[path.length - 1];
-      // d3-flamegraph renders each frame as a <g> with a <title> or
-      // text element containing the name. Query all frame groups.
-      var frames = d3.select("#chart").selectAll("g.d3-flame-graph-frame");
-      frames.each(function(d) {
-        if (d && d.data && getNodePath(d).join("\x00") === path.join("\x00")) {
-          // Found the matching node — trigger the internal zoom
-          flameGraph.zoomTo(d);
-          currentZoomPath = path;
-        }
-      });
-    }
-
-    // ── Public API ───────────────────────────────────────────────
-
-    function refresh(data) {
-      Promise.resolve(data || d3.json("/json")).then(function(data) {
-        flameGraph.update(data);
-      }).catch(function(error) {
-        console.warn(error);
-      });
-    }
-
-    function merge(data) {
-      Promise.resolve(data || d3.json("/json")).then(function(data) {
-        flameGraph.merge(data);
-      }).catch(function(error) {
-        console.warn(error);
-      });
-    }
-
-    function update(data) {
-      if (data) {
-        pendingData = data;
-        scheduleRefresh();
-      } else {
-        // Manual button click — fetch and apply with animation
-        if (document.getElementById('update_mode').value !== 'merge') {
-          refresh();
-        } else {
-          merge();
-        }
-      }
-    }
-
-    document.getElementById("form").addEventListener("submit", function (event) {
-      event.preventDefault();
-      search();
+    frames.push({
+      name: node.name || 'all',
+      depth: depth,
+      x: x,
+      w: w,
+      selfValue: Math.max(0, selfVal),
+      value: node.value,
+      parent: parentIdx,
+      color: hashColor(node.name || 'all'),
+      dimColor: dimColor(node.name || 'all'),
     });
-
-    function search() {
-      var term = document.getElementById("term").value;
-      flameGraph.search(term);
-    }
-
-    function clear() {
-      document.getElementById('term').value = '';
-      flameGraph.clear();
-    }
-
-    function resetZoom() {
-      currentZoomPath = null;
-      flameGraph.resetZoom();
-    }
-
-    function stream() {
-      var uri = location.origin + '/stream'
-      var sse = new EventSource(uri);
-      sse.onopen = function () {
-        document.getElementById('status').innerHTML = 'Connected for flamegraph updates';
-      }
-
-      sse.onmessage = function (msg) {
-        var data = JSON.parse(msg.data);
-        update(data);
-      };
-
-      sse.onerror = function (err) {
-        document.getElementById('status').innerHTML = 'Disconnected'
-        console.error(err);
+    if (depth + 1 > totalLevels) totalLevels = depth + 1;
+    if (node.children) {
+      // sort children by value descending for stable layout
+      var sorted = node.children.slice().sort(function(a, b) { return b.value - a.value; });
+      var cx = x;
+      for (var i = 0; i < sorted.length; i++) {
+        walk(sorted[i], depth + 1, cx, idx);
+        cx += sorted[i].value;
       }
     }
-  </script>
+  }
+  walk(data, 0, 0, -1);
+  rootFrame = frames[0] || null;
+}
+
+// ── Layout & render ──────────────────────────────────────────────
+function resize() {
+  canvasW = canvas.parentElement.clientWidth;
+  canvasH = (totalLevels + 1) * CELL_H;
+  canvas.width = canvasW * dpr;
+  canvas.height = canvasH * dpr;
+  canvas.style.height = canvasH + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function render() {
+  if (!rootFrame) return;
+  resize();
+  ctx.clearRect(0, 0, canvasW, canvasH);
+  ctx.font = FONT;
+  ctx.textBaseline = 'middle';
+
+  var base = zoomFrame || rootFrame;
+  var baseX = base.x;
+  var baseW = base.w;
+  if (baseW === 0) return;
+  var scale = canvasW / baseW;
+  var hasSearch = searchTerm.length > 0;
+  var searchLower = searchTerm.toLowerCase();
+
+  for (var i = 0; i < frames.length; i++) {
+    var f = frames[i];
+    // Compute pixel position relative to zoom
+    var px = (f.x - baseX) * scale;
+    var pw = f.w * scale;
+    // Skip frames outside viewport
+    if (px + pw < 0 || px > canvasW) continue;
+    if (pw < 0.5) continue;
+    // Clamp
+    if (px < 0) { pw += px; px = 0; }
+    if (px + pw > canvasW) pw = canvasW - px;
+
+    // Y: bottom-up (root at bottom)
+    var py = canvasH - (f.depth + 1) * CELL_H;
+
+    // Color
+    var isMatch = hasSearch && f.name.toLowerCase().indexOf(searchLower) !== -1;
+    var isHovered = (f === hoveredFrame);
+    if (hasSearch && !isMatch) {
+      ctx.fillStyle = f.dimColor;
+    } else if (isHovered) {
+      ctx.fillStyle = '#ff8';
+    } else {
+      ctx.fillStyle = f.color;
+    }
+
+    ctx.fillRect(px, py, pw - 0.5, CELL_H - 1);
+
+    // Border for hovered
+    if (isHovered) {
+      ctx.strokeStyle = '#333';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(px + 0.5, py + 0.5, pw - 1.5, CELL_H - 2);
+    }
+
+    // Label
+    if (pw > 30) {
+      ctx.fillStyle = '#222';
+      var maxTextW = pw - 6;
+      var label = f.name;
+      var measured = ctx.measureText(label).width;
+      if (measured > maxTextW) {
+        // Truncate with ellipsis
+        var ratio = maxTextW / measured;
+        var chars = Math.max(1, Math.floor(label.length * ratio) - 2);
+        label = label.substring(0, chars) + '..';
+      }
+      ctx.fillText(label, px + 3, py + CELL_H / 2);
+    }
+  }
+}
+
+// ── Hit testing ──────────────────────────────────────────────────
+function frameAt(mx, my) {
+  if (!rootFrame) return null;
+  var base = zoomFrame || rootFrame;
+  var scale = canvasW / base.w;
+  // Which depth level?
+  var depth = Math.floor((canvasH - my) / CELL_H);
+  // Linear scan at that depth (could optimize with spatial index)
+  for (var i = 0; i < frames.length; i++) {
+    var f = frames[i];
+    if (f.depth !== depth) continue;
+    var px = (f.x - base.x) * scale;
+    var pw = f.w * scale;
+    if (mx >= px && mx < px + pw) return f;
+  }
+  return null;
+}
+
+// ── Interaction ──────────────────────────────────────────────────
+canvas.addEventListener('mousemove', function(e) {
+  var rect = canvas.getBoundingClientRect();
+  var f = frameAt(e.clientX - rect.left, e.clientY - rect.top);
+  if (f !== hoveredFrame) {
+    hoveredFrame = f;
+    render();
+  }
+  var det = document.getElementById('details');
+  if (f) {
+    var pct = rootFrame.value > 0 ? (f.value / rootFrame.value * 100).toFixed(2) : '0';
+    det.textContent = f.name + '  (' + f.value + ' samples, ' + pct + '%, self: ' + f.selfValue + ')';
+  } else {
+    det.innerHTML = '&nbsp;';
+  }
+});
+
+canvas.addEventListener('mouseleave', function() {
+  hoveredFrame = null;
+  render();
+  document.getElementById('details').innerHTML = '&nbsp;';
+});
+
+canvas.addEventListener('click', function(e) {
+  var rect = canvas.getBoundingClientRect();
+  var f = frameAt(e.clientX - rect.left, e.clientY - rect.top);
+  if (f) {
+    zoomFrame = (f === zoomFrame) ? rootFrame : f;
+    render();
+  }
+});
+
+window.addEventListener('resize', render);
+
+// ── Controls ─────────────────────────────────────────────────────
+function resetZoom() {
+  zoomFrame = null;
+  render();
+}
+
+function onSearch(term) {
+  searchTerm = term;
+  render();
+}
+
+function clearSearch() {
+  document.getElementById('search').value = '';
+  searchTerm = '';
+  render();
+}
+
+// ── Data update (preserves zoom by name path) ────────────────────
+function getZoomPath() {
+  if (!zoomFrame || zoomFrame === rootFrame) return null;
+  // Walk up parent chain to build name path
+  var path = [];
+  var f = zoomFrame;
+  while (f && f.parent >= 0) {
+    path.unshift(f.name);
+    f = frames[f.parent];
+  }
+  return path;
+}
+
+function restoreZoom(path) {
+  if (!path || path.length === 0 || !rootFrame) { zoomFrame = null; return; }
+  // Walk down from root's children matching the path
+  var candidates = [];
+  for (var i = 0; i < frames.length; i++) {
+    if (frames[i].parent === 0) candidates.push(i);
+  }
+  var current = null;
+  for (var p = 0; p < path.length; p++) {
+    var found = false;
+    for (var c = 0; c < candidates.length; c++) {
+      if (frames[candidates[c]].name === path[p]) {
+        current = candidates[c];
+        // Gather children of this frame for next level
+        candidates = [];
+        for (var i = 0; i < frames.length; i++) {
+          if (frames[i].parent === current) candidates.push(i);
+        }
+        found = true;
+        break;
+      }
+    }
+    if (!found) { zoomFrame = null; return; }
+  }
+  zoomFrame = current !== null ? frames[current] : null;
+}
+
+function applyData(data) {
+  var savedPath = getZoomPath();
+  buildFrames(data);
+  restoreZoom(savedPath);
+  render();
+}
+
+// ── SSE double-buffered updates ──────────────────────────────────
+var pendingData = null;
+var rafScheduled = false;
+
+function scheduleApply() {
+  if (rafScheduled) return;
+  rafScheduled = true;
+  requestAnimationFrame(function() {
+    rafScheduled = false;
+    if (pendingData) {
+      applyData(pendingData);
+      pendingData = null;
+    }
+  });
+}
+
+function startStream() {
+  var sse = new EventSource(location.origin + '/stream');
+  sse.onopen = function() {
+    document.getElementById('status').textContent = 'Connected';
+  };
+  sse.onmessage = function(msg) {
+    pendingData = JSON.parse(msg.data);
+    scheduleApply();
+  };
+  sse.onerror = function() {
+    document.getElementById('status').textContent = 'Disconnected';
+  };
+}
+
+function fetchAndUpdate() {
+  fetch('/json').then(function(r) { return r.json(); }).then(applyData).catch(console.warn);
+}
+
+// ── Initial render ───────────────────────────────────────────────
+buildFrames(rawData);
+render();
+</script>
 </body>
-
 </html>
