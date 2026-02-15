@@ -24,6 +24,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monos
 .toolbar .title a:hover { text-decoration: underline; }
 .toolbar .sep { border-left: 1px solid #ddd; height: 20px; }
 #status { font-size: 12px; color: #888; }
+#status.live { color: #2a2; }
 #details {
   position: sticky; bottom: 0;
   padding: 6px 12px; font-size: 13px; color: #555;
@@ -38,6 +39,8 @@ canvas { display: block; }
   <span id="status"></span>
   <span class="sep"></span>
   <button onclick="resetZoom()">Reset zoom</button>
+  <button id="sortBtn" onclick="toggleSort()">Sort: size</button>
+  <button id="dirBtn" onclick="toggleDir()">▼ Top-down</button>
   <input type="text" id="search" placeholder="Search..." oninput="onSearch(this.value)">
   <button onclick="clearSearch()">✕</button>
 </div>
@@ -47,6 +50,7 @@ canvas { display: block; }
 <script>
 var SERVE_MODE = {serve_mode};
 var rawData = {stack};
+var lastData = rawData;
 
 var frames = [];
 var rootFrame = null;
@@ -57,6 +61,8 @@ var totalLevels = 0;
 
 var CELL_H = 20;
 var FONT = '12px monospace';
+var sortByName = false;
+var bottomUp = false;
 var canvas = document.getElementById('fg');
 var ctx = canvas.getContext('2d');
 var dpr = window.devicePixelRatio || 1;
@@ -108,7 +114,9 @@ function buildFrames(data) {
     });
     if (depth + 1 > totalLevels) totalLevels = depth + 1;
     if (node.children) {
-      var sorted = node.children.slice().sort(function(a, b) { return b.value - a.value; });
+      var sorted = node.children.slice().sort(sortByName
+        ? function(a, b) { return (a.name || '').localeCompare(b.name || ''); }
+        : function(a, b) { return b.value - a.value; });
       var cx = x, idx = frames.length - 1;
       for (var i = 0; i < sorted.length; i++) { walk(sorted[i], depth + 1, cx, idx); cx += sorted[i].value; }
     }
@@ -148,7 +156,7 @@ function render() {
 
   for (var i = 0; i < frames.length; i++) {
     var f = frames[i];
-    var py = f.depth * CELL_H;
+    var py = bottomUp ? canvasH - (f.depth + 1) * CELL_H : f.depth * CELL_H;
     if (py >= canvasH) continue;
 
     var px, pw;
@@ -185,7 +193,7 @@ function frameAt(mx, my) {
   if (!rootFrame) return null;
   var base = zoomFrame || rootFrame;
   var scale = canvasW / base.w;
-  var depth = Math.floor(my / CELL_H);
+  var depth = bottomUp ? Math.floor((canvasH - my) / CELL_H) : Math.floor(my / CELL_H);
   if (depth < 0 || depth >= totalLevels) return null;
 
   // Check ancestors first (they're full-width when zoomed)
@@ -225,6 +233,8 @@ window.addEventListener('resize', function() { resizeCanvas(); render(); });
 function resetZoom() { zoomFrame = null; render(); }
 function onSearch(term) { searchTerm = term; render(); }
 function clearSearch() { document.getElementById('search').value = ''; searchTerm = ''; render(); }
+function toggleSort() { sortByName = !sortByName; document.getElementById('sortBtn').textContent = 'Sort: ' + (sortByName ? 'name' : 'size'); applyData(lastData); }
+function toggleDir() { bottomUp = !bottomUp; document.getElementById('dirBtn').textContent = (bottomUp ? '\u25b2 Bottom-up' : '\u25bc Top-down'); render(); }
 
 // ── Zoom state preservation ──────────────────────────────────────
 function getZoomPath() {
@@ -253,6 +263,7 @@ function restoreZoom(path) {
 }
 
 function applyData(data) {
+  lastData = data;
   var savedPath = getZoomPath();
   buildFrames(data);
   restoreZoom(savedPath);
@@ -272,9 +283,9 @@ function startStream() {
   if (sse) return;
   sse = new EventSource(location.origin + '/stream');
   document.getElementById('status').textContent = 'Connecting\u2026';
-  sse.onopen = function() { document.getElementById('status').textContent = '\u25cf Live'; };
+  sse.onopen = function() { var s = document.getElementById('status'); s.textContent = '\u25cf Live'; s.className = 'live'; };
   sse.onmessage = function(msg) { pendingData = JSON.parse(msg.data); scheduleApply(); };
-  sse.onerror = function() { document.getElementById('status').textContent = '\u25cb Disconnected'; sse.close(); sse = null; setTimeout(startStream, 3000); };
+  sse.onerror = function() { var s = document.getElementById('status'); s.textContent = '\u25cb Disconnected'; s.className = ''; sse.close(); sse = null; setTimeout(startStream, 3000); };
 }
 
 function fetchAndUpdate() {
