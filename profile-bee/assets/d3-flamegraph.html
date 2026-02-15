@@ -6,13 +6,11 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    /* Space out content a bit */
     body {
       padding-top: 20px;
       padding-bottom: 20px;
     }
 
-    /* Custom page header */
     .header {
       padding-bottom: 20px;
       padding-right: 15px;
@@ -20,7 +18,6 @@
       border-bottom: 1px solid #e5e5e5;
     }
 
-    /* Make the masthead heading the same height as the navigation */
     .header h3 {
       margin-top: 0;
       margin-bottom: 0;
@@ -36,7 +33,6 @@
       text-decoration: underline;
     }
 
-    /* Customize container */
     .container {
       max-width: 990px;
     }
@@ -103,11 +99,51 @@
     var details = document.getElementById("details");
     flameGraph.setDetailsElement(details);
 
-    // --- Double-buffered live update ---
-    // SSE pushes arrive from the server at whatever rate it sends.
-    // We buffer the latest payload and apply it on a separate
-    // requestAnimationFrame-throttled timer so the UI stays responsive
-    // and we never re-render faster than the browser can paint.
+    // ── Zoom state tracking ──────────────────────────────────────
+    // d3-flamegraph destroys the hierarchy on update(), so we track
+    // the zoomed node's name-path ourselves and restore it after.
+    var currentZoomPath = null;
+
+    // Capture zoom path when user clicks a frame
+    var originalOnClick = onClick;
+    function onClick(d) {
+      // d is a d3 hierarchy node; walk up to build the name path
+      currentZoomPath = getNodePath(d);
+      console.info("Zoomed to: " + currentZoomPath.join(" → "));
+    }
+
+    // Build name-path from root to this node
+    function getNodePath(node) {
+      var path = [];
+      var n = node;
+      while (n) {
+        path.unshift(n.data.name);
+        n = n.parent;
+      }
+      return path;
+    }
+
+    // Walk the new hierarchy to find a node matching the saved path
+    function findNodeByPath(root, path) {
+      if (!path || path.length === 0) return null;
+      var node = root;
+      // path[0] is the root name, start matching from path[1]
+      for (var i = 1; i < path.length; i++) {
+        if (!node.children) return null;
+        var found = null;
+        for (var j = 0; j < node.children.length; j++) {
+          if (node.children[j].data.name === path[i]) {
+            found = node.children[j];
+            break;
+          }
+        }
+        if (!found) return null;
+        node = found;
+      }
+      return node;
+    }
+
+    // ── Double-buffered live update ──────────────────────────────
     var pendingData = null;
     var refreshScheduled = false;
     var isFirstUpdate = true;
@@ -124,27 +160,64 @@
       });
     }
 
-    function applyUpdate(data) {
-      // First update gets the nice intro animation; subsequent live
-      // updates apply instantly so the graph doesn't re-animate.
+    function applyUpdate(newData) {
+      // Save state before update
+      var savedZoomPath = currentZoomPath;
+      var savedSearch = document.getElementById('term').value;
+
+      // Disable animation for live updates (first render keeps it)
       if (isFirstUpdate) {
         isFirstUpdate = false;
       } else {
         flameGraph.transitionDuration(0);
       }
 
-      if (document.getElementById('update_mode').value !== 'merge') {
-        flameGraph.update(data);
-      } else {
-        flameGraph.merge(data);
+      // Apply the data
+      flameGraph.update(newData);
+
+      // Restore zoom: find the same node in the new tree
+      if (savedZoomPath && savedZoomPath.length > 1) {
+        var chartNode = d3.select("#chart").datum();
+        // chartNode is the root of the d3 hierarchy after update
+        if (chartNode) {
+          // d3-flamegraph wraps data in a hierarchy; get the root
+          var root = d3.hierarchy(chartNode);
+          var target = findNodeByPath(root, savedZoomPath);
+          if (target) {
+            // zoomTo expects the internal hierarchy node, but after
+            // update() the internal nodes are different objects.
+            // Use the DOM: find the rect whose data matches and click it.
+            restoreZoomViaDOM(savedZoomPath);
+          }
+        }
       }
 
-      // Restore transition duration for user-initiated actions
-      // (zoom, search highlight) that should still animate.
+      // Restore search
+      if (savedSearch) {
+        flameGraph.search(savedSearch);
+      }
+
+      // Restore transition for user interactions
       flameGraph.transitionDuration(750);
     }
 
-    // --- Public API used by buttons and SSE ---
+    // Find and programmatically zoom to a node via the rendered SVG
+    function restoreZoomViaDOM(path) {
+      // The target frame name is the last element in the path
+      var targetName = path[path.length - 1];
+      // d3-flamegraph renders each frame as a <g> with a <title> or
+      // text element containing the name. Query all frame groups.
+      var frames = d3.select("#chart").selectAll("g.d3-flame-graph-frame");
+      frames.each(function(d) {
+        if (d && d.data && getNodePath(d).join("\x00") === path.join("\x00")) {
+          // Found the matching node — trigger the internal zoom
+          flameGraph.zoomTo(d);
+          currentZoomPath = path;
+        }
+      });
+    }
+
+    // ── Public API ───────────────────────────────────────────────
 
     function refresh(data) {
       Promise.resolve(data || d3.json("/json")).then(function(data) {
@@ -164,11 +237,10 @@
 
     function update(data) {
       if (data) {
-        // Called with data (from SSE or programmatic) — buffer it
         pendingData = data;
         scheduleRefresh();
       } else {
-        // Manual button click — fetch and apply immediately with animation
+        // Manual button click — fetch and apply with animation
         if (document.getElementById('update_mode').value !== 'merge') {
           refresh();
         } else {
@@ -193,11 +265,8 @@
     }
 
     function resetZoom() {
+      currentZoomPath = null;
       flameGraph.resetZoom();
-    }
-
-    function onClick(d) {
-      console.info("Clicked on " + d.data.name);
     }
 
     function stream() {
