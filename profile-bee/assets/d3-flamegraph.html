@@ -27,6 +27,15 @@
       line-height: 40px;
     }
 
+    .header h3 a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .header h3 a:hover {
+      text-decoration: underline;
+    }
+
     /* Customize container */
     .container {
       max-width: 990px;
@@ -59,7 +68,7 @@
           </form>
         </div>
       </nav>
-      <h3 class="text-muted">{title}</h3>
+      <h3 class="text-muted"><a href="https://github.com/zz85/profile-bee" target="_blank" rel="noopener">{title}</a></h3>
     </div>
     <div id="chart">
     </div>
@@ -83,22 +92,9 @@
       .minFrameSize(5)
       .transitionEase(d3.easeCubic)
       .sort(true)
-      //Example to sort in reverse order
-      //.sort(function(a,b){ return d3.descending(a.name, b.name);})
       .title("")
       .onClick(onClick)
-      // .differential(false)
       .selfValue(false);
-
-
-    // Example on how to use custom tooltips using d3-tip.
-    // var tip = d3.tip()
-    //   .direction("s")
-    //   .offset([8, 0])
-    //   .attr('class', 'd3-flame-graph-tip')
-    //   .html(function(d) { return "name: " + d.data.name + ", value: " + d.data.value; });
-
-    // flameGraph.tooltip(tip);
 
     d3.select("#chart")
       .datum(data)
@@ -107,12 +103,48 @@
     var details = document.getElementById("details");
     flameGraph.setDetailsElement(details);
 
-    // Example on how to use custom labels
-    // var label = function(d) {
-    //  return "name: " + d.name + ", value: " + d.value;
-    // }
-    // flameGraph.label(label);
+    // --- Double-buffered live update ---
+    // SSE pushes arrive from the server at whatever rate it sends.
+    // We buffer the latest payload and apply it on a separate
+    // requestAnimationFrame-throttled timer so the UI stays responsive
+    // and we never re-render faster than the browser can paint.
+    var pendingData = null;
+    var refreshScheduled = false;
+    var isFirstUpdate = true;
 
+    function scheduleRefresh() {
+      if (refreshScheduled) return;
+      refreshScheduled = true;
+      requestAnimationFrame(function() {
+        refreshScheduled = false;
+        if (pendingData === null) return;
+        var snapshot = pendingData;
+        pendingData = null;
+        applyUpdate(snapshot);
+      });
+    }
+
+    function applyUpdate(data) {
+      // First update gets the nice intro animation; subsequent live
+      // updates apply instantly so the graph doesn't re-animate.
+      if (isFirstUpdate) {
+        isFirstUpdate = false;
+      } else {
+        flameGraph.transitionDuration(0);
+      }
+
+      if (document.getElementById('update_mode').value !== 'merge') {
+        flameGraph.update(data);
+      } else {
+        flameGraph.merge(data);
+      }
+
+      // Restore transition duration for user-initiated actions
+      // (zoom, search highlight) that should still animate.
+      flameGraph.transitionDuration(750);
+    }
+
+    // --- Public API used by buttons and SSE ---
 
     function refresh(data) {
       Promise.resolve(data || d3.json("/json")).then(function(data) {
@@ -131,10 +163,17 @@
     }
 
     function update(data) {
-      if (document.getElementById('update_mode').value != 'merge') {
-        refresh(data);
+      if (data) {
+        // Called with data (from SSE or programmatic) — buffer it
+        pendingData = data;
+        scheduleRefresh();
       } else {
-        merge(data);
+        // Manual button click — fetch and apply immediately with animation
+        if (document.getElementById('update_mode').value !== 'merge') {
+          refresh();
+        } else {
+          merge();
+        }
       }
     }
 
@@ -169,9 +208,8 @@
       }
 
       sse.onmessage = function (msg) {
-        var data = JSON.parse(msg.data)
-        console.log(data);
-        update(data)
+        var data = JSON.parse(msg.data);
+        update(data);
       };
 
       sse.onerror = function (err) {
