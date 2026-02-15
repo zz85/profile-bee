@@ -8,9 +8,9 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext},
 };
 use profile_bee_ebpf::{
-    collect_trace, collect_trace_raw_syscall, collect_trace_raw_syscall_exit,
-    collect_trace_raw_tp_with_task_regs, collect_trace_stackid_only, dwarf_unwind_step_impl,
-    handle_process_exit,
+    collect_off_cpu_trace, collect_trace, collect_trace_raw_syscall,
+    collect_trace_raw_syscall_exit, collect_trace_raw_tp_with_task_regs,
+    collect_trace_stackid_only, dwarf_unwind_step_impl, handle_process_exit,
 };
 
 #[perf_event]
@@ -25,6 +25,15 @@ pub fn profile_cpu(ctx: PerfEventContext) -> u32 {
 #[kprobe]
 pub fn kprobe_profile(ctx: ProbeContext) -> u32 {
     unsafe { collect_trace(ctx) }
+    0
+}
+
+/// Off-CPU profiling kprobe: attaches to finish_task_switch() to trace
+/// context switches and measure blocked time. Accumulates off-CPU time
+/// in microseconds (not sample counts) into the shared COUNTS map.
+#[kprobe]
+pub fn offcpu_profile(ctx: ProbeContext) -> u32 {
+    unsafe { collect_off_cpu_trace(ctx) }
     0
 }
 

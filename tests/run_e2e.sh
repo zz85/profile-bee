@@ -362,11 +362,79 @@ test_samples_collected() {
     fi
 }
 
+# ---------- Off-CPU profiling tests -----------------------------------------
+
+# Run profile-bee in off-CPU mode against a command, return collapse file path.
+# Usage: run_offcpu_profiler <binary> <output_name> [extra_args...]
+run_offcpu_profiler() {
+    local binary="$1"
+    local name="$2"
+    shift 2
+    local extra_args=("$@")
+    local collapse_file="$OUTPUT_DIR/${name}.collapse"
+
+    local profiler_output
+    profiler_output=$(timeout "$TEST_TIMEOUT" "$PROFILER" \
+        --cmd "$binary" \
+        --time "$PROFILE_TIME_MS" \
+        --off-cpu \
+        --collapse "$collapse_file" \
+        --skip-idle \
+        "${extra_args[@]+"${extra_args[@]}"}" 2>&1) || true
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "--- profiler output ---" >&2
+        echo "$profiler_output" >&2
+        echo "--- end ---" >&2
+    fi
+
+    if [[ ! -f "$collapse_file" ]]; then
+        echo "Collapse file not created: $collapse_file" >&2
+        return 1
+    fi
+
+    echo "$collapse_file"
+}
+
+test_offcpu_sleep() {
+    # Off-CPU profiling should capture blocking stacks from the sleep fixture.
+    # The fixture calls nanosleep in a loop, so we expect to see nanosleep-related
+    # kernel stacks and the user call chain: do_sleep → sleep_inner → main.
+    local file
+    file=$(run_offcpu_profiler "$FIXTURE_DIR/offcpu-sleep-fp" "offcpu-sleep")
+    # Should have non-zero off-CPU time captured
+    local total
+    total=$(count_samples "$file")
+    if [[ "$total" -le 0 ]]; then
+        echo "  No off-CPU time collected (total=$total)" >&2
+        return 1
+    fi
+    # The stack should contain our blocking functions
+    assert_stack_contains "$file" "sleep_inner" "sleep_inner() should appear in off-CPU stacks"
+    assert_stack_contains "$file" "do_sleep" "do_sleep() should appear in off-CPU stacks"
+    assert_stack_contains "$file" "main" "main() should appear in off-CPU stacks"
+}
+
+test_offcpu_min_block_filter() {
+    # With a very high min-block-time, most events should be filtered out
+    local file
+    file=$(run_offcpu_profiler "$FIXTURE_DIR/offcpu-sleep-fp" "offcpu-filtered" --min-block-time 999999999)
+    local total
+    total=$(count_samples "$file")
+    # With min block time of ~1000 seconds, a 1-second trace should have very few/no events
+    if [[ "$total" -le 100 ]]; then
+        return 0  # Expected: very few events pass the filter
+    else
+        echo "  Expected few events with high min-block-time, got total=$total" >&2
+        return 1
+    fi
+}
+
 # ── Run all tests ────────────────────────────────────────────────────────────
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║        profile-bee DWARF Unwinding E2E Tests                ║"
+echo "║        profile-bee E2E Tests                                ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  Profiler:  $PROFILER"
 echo "║  Fixtures:  $FIXTURE_DIR"
@@ -402,6 +470,11 @@ echo ""
 
 echo "── Robustness ──"
 run_test "Non-existent binary doesn't crash"        test_dwarf_nonexistent_binary
+echo ""
+
+echo "── Off-CPU Profiling ──"
+run_test "Off-CPU captures sleep stacks"             test_offcpu_sleep
+run_test "Off-CPU min-block-time filter"             test_offcpu_min_block_filter
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────────

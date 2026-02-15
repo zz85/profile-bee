@@ -74,6 +74,11 @@ struct DwarfRefreshUpdate {
   # Discovery mode — list matching probe targets
   sudo probee --list-probes 'pthread_*'
 
+  # Off-CPU profiling — measure blocked/waiting time
+  sudo probee --off-cpu --svg offcpu.svg --time 5000
+  sudo probee --off-cpu --tui --pid 1234
+  sudo probee --off-cpu --min-block-time 100 --svg offcpu.svg -- ./my-app
+
 \x1b[1mShort alias:\x1b[0m pbee (e.g., sudo pbee --tui)"
 )]
 struct Opt {
@@ -190,6 +195,25 @@ struct Opt {
     /// Command and arguments to spawn and profile (use after `--`)
     #[arg(last = true)]
     command: Vec<String>,
+
+    /// Enable off-CPU profiling mode. Measures blocked/waiting time instead of
+    /// CPU samples by tracing context switches via kprobe on finish_task_switch.
+    /// Output values represent microseconds of off-CPU (blocked) time.
+    /// Mutually exclusive with --kprobe, --uprobe, --tracepoint.
+    #[arg(long)]
+    off_cpu: bool,
+
+    /// Minimum off-CPU block time to record in microseconds (default 1).
+    /// Context switches shorter than this are filtered out to reduce noise.
+    /// Only effective with --off-cpu.
+    #[arg(long, default_value_t = 1)]
+    min_block_time: u64,
+
+    /// Maximum off-CPU block time to record in microseconds (default unlimited).
+    /// Context switches longer than this are filtered out.
+    /// Only effective with --off-cpu.
+    #[arg(long, default_value_t = u64::MAX)]
+    max_block_time: u64,
 }
 
 impl Opt {
@@ -216,6 +240,8 @@ impl Opt {
             || self.list_probes.is_some()
             // Explicit time means the user wants to profile
             || self.time.is_some()
+            // Off-CPU profiling mode
+            || self.off_cpu
     }
 }
 
@@ -524,6 +550,19 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     println!("Starting {:?}", opt);
 
+    if opt.off_cpu {
+        println!("Off-CPU profiling mode: tracing context switches via finish_task_switch");
+        println!(
+            "  Block time filter: {} - {} us",
+            opt.min_block_time,
+            if opt.max_block_time == u64::MAX {
+                "unlimited".to_string()
+            } else {
+                opt.max_block_time.to_string()
+            }
+        );
+    }
+
     // Handle --list-probes discovery mode (print and exit)
     if let Some(ref probe_str) = opt.list_probes {
         return handle_list_probes(probe_str, opt.pid, opt.uprobe_pid);
@@ -531,6 +570,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     // profile_bee::load(&opt.cmd.unwrap()).unwrap();
     // return Ok(());
+
+    // Validate mutually exclusive options
+    if opt.off_cpu && (opt.kprobe.is_some() || !opt.uprobe.is_empty() || opt.tracepoint.is_some()) {
+        return Err(anyhow::anyhow!(
+            "--off-cpu is mutually exclusive with --kprobe, --uprobe, and --tracepoint"
+        ));
+    }
 
     // Resolve smart uprobe specs (if any)
     let smart_uprobe = if !opt.uprobe.is_empty() {
@@ -556,6 +602,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         cpu: opt.cpu,
         self_profile: opt.self_profile,
         dwarf: opt.dwarf.unwrap_or(false),
+        off_cpu: opt.off_cpu,
+        min_block_us: opt.min_block_time,
+        max_block_us: opt.max_block_time,
     };
 
     // Setup eBPF profiler first to ensure verification succeeds
@@ -1134,7 +1183,7 @@ fn process_profiling_data(
 
     // TODO stack processing can be expensive, so consider moving into a separate task
     // to avoid blocking the collection loop
-    println!("Total samples: {}", samples);
+    println!("Total value: {} (samples or us off-CPU time)", samples);
 
     let mut out = stacks
         .into_iter()
@@ -1220,13 +1269,22 @@ fn output_results(
 ) -> anyhow::Result<()> {
     // Generate SVG if requested
     if let Some(svg) = &opt.svg {
-        output_svg(
-            svg,
-            stacks,
+        let title = if opt.off_cpu {
+            format!(
+                "Off-CPU Time Flame Graph ({}ms, finish_task_switch)",
+                opt.time.unwrap_or(10000)
+            )
+        } else {
             format!(
                 "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
                 opt.time.unwrap_or(10000), opt.frequency
-            ),
+            )
+        };
+        output_svg(
+            svg,
+            stacks,
+            title,
+            opt.off_cpu,
         )
         .map_err(|e| {
             println!("Failed to write svg file {:?} - {:?}", e, svg);
@@ -1263,9 +1321,12 @@ fn output_results(
 }
 
 /// Creates a flamegraph svg file using the inferno-flamegraph lib
-fn output_svg(path: &PathBuf, str: &[String], title: String) -> anyhow::Result<()> {
+fn output_svg(path: &PathBuf, str: &[String], title: String, off_cpu: bool) -> anyhow::Result<()> {
     let mut svg_opts = Options::default();
     svg_opts.title = title;
+    if off_cpu {
+        svg_opts.count_name = "us".to_string();
+    }
     let mut svg_file = std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(path)?);
     flamegraph::from_lines(&mut svg_opts, str.iter().map(|v| v.as_str()), &mut svg_file)?;
 
@@ -1304,6 +1365,9 @@ fn build_profiler_config(
         cpu: opt.cpu,
         self_profile: opt.self_profile,
         dwarf: opt.dwarf.unwrap_or(false),
+        off_cpu: opt.off_cpu,
+        min_block_us: opt.min_block_time,
+        max_block_us: opt.max_block_time,
     })
 }
 
