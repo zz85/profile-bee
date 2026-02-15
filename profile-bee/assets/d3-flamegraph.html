@@ -132,7 +132,21 @@ function resize() {
 }
 
 function render() {
-  if (!rootFrame) return;
+  if (!rootFrame) {
+    canvasW = canvas.parentElement.clientWidth;
+    canvasH = 60;
+    canvas.width = canvasW * dpr;
+    canvas.height = canvasH * dpr;
+    canvas.style.height = canvasH + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, canvasW, canvasH);
+    ctx.font = '14px monospace';
+    ctx.fillStyle = '#999';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for profiling data\u2026', canvasW / 2, 30);
+    ctx.textAlign = 'start';
+    return;
+  }
   resize();
   ctx.clearRect(0, 0, canvasW, canvasH);
   ctx.font = FONT;
@@ -351,6 +365,9 @@ function fetchAndUpdate() {
 // ── Initial render ───────────────────────────────────────────────
 buildFrames(rawData);
 render();
+// Auto-start SSE for live updates; also fetch in case inline data was empty
+startStream();
+if (!rootFrame) fetchAndUpdate();
 </script>
 </body>
 </html>
