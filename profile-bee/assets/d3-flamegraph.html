@@ -81,7 +81,7 @@ function dimColor(name) {
 function buildFrames(data) {
   frames = [];
   totalLevels = 0;
-  if (!data || !data.value) { rootFrame = null; return; }
+  if (!data || data.value === undefined) { rootFrame = null; return; }
 
   function walk(node, depth, x, parentIdx) {
     var selfVal = node.value;
@@ -152,16 +152,19 @@ function render() {
 
   for (var i = 0; i < frames.length; i++) {
     var f = frames[i];
+    // Skip ancestors above the zoom base
+    var relDepth = f.depth - baseDepth;
+    if (relDepth < 0) continue;
+
     var px = (f.x - baseX) * scale;
     var pw = f.w * scale;
-    if (px + pw < 0 || px > canvasW || pw < 0.5) continue;
+    if (px + pw <= 0 || px >= canvasW || pw < 0.5) continue;
     if (px < 0) { pw += px; px = 0; }
     if (px + pw > canvasW) pw = canvasW - px;
 
     // Y: bottom-up, relative to zoom base
-    var relDepth = f.depth - baseDepth;
     var py = canvasH - (relDepth + 1) * CELL_H;
-    if (py < -CELL_H || py > canvasH) continue;
+    if (py < 0 || py >= canvasH) continue;
 
     var isMatch = hasSearch && f.name.toLowerCase().indexOf(searchLower) !== -1;
     var isHovered = f === hoveredFrame;
@@ -187,6 +190,7 @@ function frameAt(mx, my) {
   var baseDepth = base.depth;
   var scale = canvasW / base.w;
   var relDepth = Math.floor((canvasH - my) / CELL_H);
+  if (relDepth < 0) return null;
   var absDepth = relDepth + baseDepth;
   for (var i = 0; i < frames.length; i++) {
     var f = frames[i];

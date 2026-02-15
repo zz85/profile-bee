@@ -680,8 +680,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     if opt.serve {
         // Serve mode: periodically flush data to the web server instead of
         // blocking until Stop. This ensures the web UI gets live updates.
+        // trace_count and known_tgids persist across flushes so data accumulates.
         let flush_interval = std::time::Duration::from_secs(2);
         let mut stopped = false;
+        let mut trace_count = HashMap::<StackInfo, usize>::new();
+        let mut known_tgids = std::collections::HashSet::<u32>::new();
 
         while !stopped {
             tracing::debug!("serve loop: collecting samples for {:?}", flush_interval);
@@ -697,6 +700,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 &tgid_request_tx,
                 flush_interval,
                 &mut stopped,
+                &mut trace_count,
+                &mut known_tgids,
             );
             tracing::debug!("serve loop: flushing {} stacks to web server (stopped={})", stacks.len(), stopped);
             output_results(&opt, &stacks, &tx)?;
@@ -1141,7 +1146,7 @@ fn process_profiling_data(
 
     if local_counting {
         process_local_counting(
-            trace_count,
+            &trace_count,
             profiler,
             stack_traces,
             group_by_cpu,
@@ -1198,11 +1203,11 @@ fn process_profiling_data_streaming(
     tgid_request_tx: &Option<mpsc::Sender<u32>>,
     timeout: std::time::Duration,
     stopped: &mut bool,
+    trace_count: &mut HashMap<StackInfo, usize>,
+    known_tgids: &mut std::collections::HashSet<u32>,
 ) -> Vec<String> {
-    let mut trace_count = HashMap::<StackInfo, usize>::new();
     let mut queue_processed = 0;
     let mut samples = 0;
-    let mut known_tgids = std::collections::HashSet::<u32>::new();
     let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
     let keys = counts.keys().flatten().collect::<Vec<_>>();
@@ -1284,7 +1289,7 @@ fn process_profiling_data_streaming(
 
 /// Process stack traces counted in user space
 fn process_local_counting(
-    trace_count: HashMap<StackInfo, usize>,
+    trace_count: &HashMap<StackInfo, usize>,
     profiler: &mut TraceHandler,
     stack_traces: &StackTraceMap<MapData>,
     group_by_cpu: bool,
