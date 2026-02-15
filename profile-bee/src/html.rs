@@ -86,7 +86,7 @@ pub async fn start_server(mut rx: Receiver<String>) {
 
         warp::http::Response::builder()
             .header("content-type", "text/html; charset=utf-8")
-            .body(flamegraph_html(&json_copy))
+            .body(flamegraph_html_with_mode(&json_copy, true))
     });
 
     tracing::info!("start_server: listening on http://127.0.0.1:8000/");
@@ -175,9 +175,14 @@ pub fn generate_html_file(filename: &Path, data: &str) {
 const HTML_TEMPLATE: &str = include_str!("../assets/d3-flamegraph.html");
 
 fn flamegraph_html(stacks: &str) -> String {
+    flamegraph_html_with_mode(stacks, false)
+}
+
+fn flamegraph_html_with_mode(stacks: &str, serve: bool) -> String {
     HTML_TEMPLATE
         .replace("{stack}", stacks)
         .replace("{title}", "profile-bee")
+        .replace("{serve_mode}", if serve { "true" } else { "false" })
 }
 
 #[test]

@@ -11,221 +11,176 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monos
   display: flex; align-items: center; gap: 8px; padding: 8px 12px;
   background: #fff; border-bottom: 1px solid #ddd; flex-wrap: wrap;
 }
-.toolbar a, .toolbar button {
+.toolbar button, .toolbar select {
   padding: 4px 10px; border: 1px solid #ccc; border-radius: 3px;
-  background: #f5f5f5; color: #333; text-decoration: none; cursor: pointer;
+  background: #f5f5f5; color: #333; cursor: pointer;
   font-size: 13px; line-height: 1.4;
 }
-.toolbar a:hover, .toolbar button:hover { background: #e8e8e8; }
+.toolbar button:hover { background: #e8e8e8; }
+.toolbar button.active { background: #d0e8ff; border-color: #8ac; }
 .toolbar input[type="text"] {
   padding: 4px 8px; border: 1px solid #ccc; border-radius: 3px; font-size: 13px;
 }
 .toolbar .title { font-weight: 600; margin-right: auto; }
-.toolbar .title a { border: none; background: none; font-size: 14px; color: #333; }
-.toolbar .title a:hover { text-decoration: underline; background: none; }
+.toolbar .title a { font-size: 14px; color: #333; text-decoration: none; }
+.toolbar .title a:hover { text-decoration: underline; }
+.toolbar .sep { border-left: 1px solid #ddd; height: 20px; }
 #status { font-size: 12px; color: #888; }
 #details {
+  position: sticky; bottom: 0;
   padding: 6px 12px; font-size: 13px; color: #555;
-  background: #fff; border-top: 1px solid #ddd; min-height: 24px;
+  background: #fff; border-top: 1px solid #ddd; min-height: 26px;
 }
-canvas { display: block; width: 100%; cursor: pointer; }
+canvas { display: block; }
 </style>
 </head>
 <body>
 <div class="toolbar">
   <span class="title"><a href="https://github.com/zz85/profile-bee" target="_blank" rel="noopener">{title}</a></span>
-  <button onclick="startStream()">Realtime updates</button>
   <span id="status"></span>
-  <button onclick="fetchAndUpdate()">Update</button>
+  <span class="sep"></span>
+  <select id="updateMode" title="How incoming data is applied">
+    <option value="replace">Replace</option>
+    <option value="merge">Merge (accumulate)</option>
+  </select>
   <button onclick="resetZoom()">Reset zoom</button>
+  <span class="sep"></span>
   <input type="text" id="search" placeholder="Search..." oninput="onSearch(this.value)">
-  <button onclick="clearSearch()">Clear</button>
+  <button onclick="clearSearch()">✕</button>
 </div>
 <canvas id="fg"></canvas>
 <div id="details">&nbsp;</div>
 
 <script>
-// ── Data ─────────────────────────────────────────────────────────
+var SERVE_MODE = {serve_mode};
 var rawData = {stack};
 
-// ── Flamegraph state ─────────────────────────────────────────────
-var frames = [];       // flat array: {name, depth, x, w, value, selfValue, children, parent, color}
+var frames = [];
 var rootFrame = null;
-var zoomFrame = null;  // currently zoomed frame (null = root)
-var searchTerm = "";
+var zoomFrame = null;
+var searchTerm = '';
 var hoveredFrame = null;
 var totalLevels = 0;
+var currentData = null;
 
 var CELL_H = 20;
 var FONT = '12px monospace';
 var canvas = document.getElementById('fg');
 var ctx = canvas.getContext('2d');
 var dpr = window.devicePixelRatio || 1;
-var canvasW = 0;
-var canvasH = 0;
+var canvasW = 0, canvasH = 0;
+var lastW = 0, lastH = 0;
 
-// ── Color palette ────────────────────────────────────────────────
+// ── Colors ───────────────────────────────────────────────────────
+function nameHash(name) {
+  var h = 0;
+  for (var i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+  return h;
+}
 function hashColor(name) {
-  var h = 0;
-  for (var i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
-  // warm flame palette: hue 20-55 (orange-yellow), sat 60-90%, light 55-75%
-  var hue = 20 + Math.abs(h % 36);
-  var sat = 60 + Math.abs((h >> 8) % 31);
-  var lit = 55 + Math.abs((h >> 16) % 21);
-  return 'hsl(' + hue + ',' + sat + '%,' + lit + '%)';
+  var h = nameHash(name);
+  return 'hsl(' + (20 + Math.abs(h % 36)) + ',' + (60 + Math.abs((h >> 8) % 31)) + '%,' + (55 + Math.abs((h >> 16) % 21)) + '%)';
 }
-
 function dimColor(name) {
-  var h = 0;
-  for (var i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
-  var hue = 20 + Math.abs(h % 36);
-  return 'hsl(' + hue + ',20%,80%)';
+  return 'hsl(' + (20 + Math.abs(nameHash(name) % 36)) + ',20%,80%)';
 }
 
-// ── Build flat frame list from {name, value, children} tree ──────
+// ── Build frames ─────────────────────────────────────────────────
 function buildFrames(data) {
   frames = [];
   totalLevels = 0;
   if (!data || !data.value) { rootFrame = null; return; }
+  currentData = data;
 
   function walk(node, depth, x, parentIdx) {
     var idx = frames.length;
-    var w = node.value;
     var selfVal = node.value;
-    if (node.children) {
-      for (var i = 0; i < node.children.length; i++) selfVal -= node.children[i].value;
-    }
+    if (node.children) for (var i = 0; i < node.children.length; i++) selfVal -= node.children[i].value;
+    var n = node.name || 'root';
     frames.push({
-      name: node.name || 'all',
-      depth: depth,
-      x: x,
-      w: w,
-      selfValue: Math.max(0, selfVal),
-      value: node.value,
-      parent: parentIdx,
-      color: hashColor(node.name || 'all'),
-      dimColor: dimColor(node.name || 'all'),
+      name: n, depth: depth, x: x, w: node.value,
+      selfValue: Math.max(0, selfVal), value: node.value,
+      parent: parentIdx, color: hashColor(n), dimColor: dimColor(n),
     });
     if (depth + 1 > totalLevels) totalLevels = depth + 1;
     if (node.children) {
-      // sort children by value descending for stable layout
       var sorted = node.children.slice().sort(function(a, b) { return b.value - a.value; });
       var cx = x;
-      for (var i = 0; i < sorted.length; i++) {
-        walk(sorted[i], depth + 1, cx, idx);
-        cx += sorted[i].value;
-      }
+      for (var i = 0; i < sorted.length; i++) { walk(sorted[i], depth + 1, cx, idx); cx += sorted[i].value; }
     }
   }
   walk(data, 0, 0, -1);
   rootFrame = frames[0] || null;
 }
 
-// ── Layout & render ──────────────────────────────────────────────
-function resize() {
-  canvasW = canvas.parentElement.clientWidth;
-  canvasH = (totalLevels + 1) * CELL_H;
-  canvas.width = canvasW * dpr;
-  canvas.height = canvasH * dpr;
-  canvas.style.height = canvasH + 'px';
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-
+// ── Render ───────────────────────────────────────────────────────
 function render() {
-  if (!rootFrame) {
-    canvasW = canvas.parentElement.clientWidth;
-    canvasH = 60;
-    canvas.width = canvasW * dpr;
-    canvas.height = canvasH * dpr;
-    canvas.style.height = canvasH + 'px';
+  var w = canvas.parentElement.clientWidth;
+  var h = rootFrame ? totalLevels * CELL_H : 60;
+
+  if (w !== lastW || h !== lastH) {
+    lastW = w; lastH = h;
+    canvasW = w; canvasH = h;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, canvasW, canvasH);
-    ctx.font = '14px monospace';
-    ctx.fillStyle = '#999';
-    ctx.textAlign = 'center';
+  }
+  ctx.clearRect(0, 0, canvasW, canvasH);
+
+  if (!rootFrame) {
+    ctx.font = '14px monospace'; ctx.fillStyle = '#999'; ctx.textAlign = 'center';
     ctx.fillText('Waiting for profiling data\u2026', canvasW / 2, 30);
     ctx.textAlign = 'start';
     return;
   }
-  resize();
-  ctx.clearRect(0, 0, canvasW, canvasH);
-  ctx.font = FONT;
-  ctx.textBaseline = 'middle';
 
+  ctx.font = FONT; ctx.textBaseline = 'middle';
   var base = zoomFrame || rootFrame;
+  if (base.w === 0) return;
+  var scale = canvasW / base.w;
   var baseX = base.x;
-  var baseW = base.w;
-  if (baseW === 0) return;
-  var scale = canvasW / baseW;
   var hasSearch = searchTerm.length > 0;
   var searchLower = searchTerm.toLowerCase();
 
   for (var i = 0; i < frames.length; i++) {
     var f = frames[i];
-    // Compute pixel position relative to zoom
     var px = (f.x - baseX) * scale;
     var pw = f.w * scale;
-    // Skip frames outside viewport
-    if (px + pw < 0 || px > canvasW) continue;
-    if (pw < 0.5) continue;
-    // Clamp
+    if (px + pw < 0 || px > canvasW || pw < 0.5) continue;
     if (px < 0) { pw += px; px = 0; }
     if (px + pw > canvasW) pw = canvasW - px;
 
-    // Y: bottom-up (root at bottom)
     var py = canvasH - (f.depth + 1) * CELL_H;
-
-    // Color
     var isMatch = hasSearch && f.name.toLowerCase().indexOf(searchLower) !== -1;
-    var isHovered = (f === hoveredFrame);
-    if (hasSearch && !isMatch) {
-      ctx.fillStyle = f.dimColor;
-    } else if (isHovered) {
-      ctx.fillStyle = '#ff8';
-    } else {
-      ctx.fillStyle = f.color;
-    }
+    var isHovered = f === hoveredFrame;
 
+    ctx.fillStyle = (hasSearch && !isMatch) ? f.dimColor : isHovered ? '#ff8' : f.color;
     ctx.fillRect(px, py, pw - 0.5, CELL_H - 1);
 
-    // Border for hovered
-    if (isHovered) {
-      ctx.strokeStyle = '#333';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(px + 0.5, py + 0.5, pw - 1.5, CELL_H - 2);
-    }
+    if (isHovered) { ctx.strokeStyle = '#333'; ctx.lineWidth = 1; ctx.strokeRect(px + 0.5, py + 0.5, pw - 1.5, CELL_H - 2); }
 
-    // Label
     if (pw > 30) {
       ctx.fillStyle = '#222';
-      var maxTextW = pw - 6;
-      var label = f.name;
-      var measured = ctx.measureText(label).width;
-      if (measured > maxTextW) {
-        // Truncate with ellipsis
-        var ratio = maxTextW / measured;
-        var chars = Math.max(1, Math.floor(label.length * ratio) - 2);
-        label = label.substring(0, chars) + '..';
-      }
+      var label = f.name, mw = pw - 6, tw = ctx.measureText(label).width;
+      if (tw > mw) { var c = Math.max(1, Math.floor(label.length * mw / tw) - 2); label = label.substring(0, c) + '..'; }
       ctx.fillText(label, px + 3, py + CELL_H / 2);
     }
   }
 }
 
-// ── Hit testing ──────────────────────────────────────────────────
+// ── Hit test ─────────────────────────────────────────────────────
 function frameAt(mx, my) {
   if (!rootFrame) return null;
   var base = zoomFrame || rootFrame;
   var scale = canvasW / base.w;
-  // Which depth level?
   var depth = Math.floor((canvasH - my) / CELL_H);
-  // Linear scan at that depth (could optimize with spatial index)
   for (var i = 0; i < frames.length; i++) {
     var f = frames[i];
     if (f.depth !== depth) continue;
     var px = (f.x - base.x) * scale;
-    var pw = f.w * scale;
-    if (mx >= px && mx < px + pw) return f;
+    if (mx >= px && mx < px + f.w * scale) return f;
   }
   return null;
 }
@@ -234,140 +189,107 @@ function frameAt(mx, my) {
 canvas.addEventListener('mousemove', function(e) {
   var rect = canvas.getBoundingClientRect();
   var f = frameAt(e.clientX - rect.left, e.clientY - rect.top);
-  if (f !== hoveredFrame) {
-    hoveredFrame = f;
-    render();
-  }
+  if (f !== hoveredFrame) { hoveredFrame = f; render(); }
   var det = document.getElementById('details');
   if (f) {
     var pct = rootFrame.value > 0 ? (f.value / rootFrame.value * 100).toFixed(2) : '0';
     det.textContent = f.name + '  (' + f.value + ' samples, ' + pct + '%, self: ' + f.selfValue + ')';
-  } else {
-    det.innerHTML = '&nbsp;';
-  }
+  } else { det.innerHTML = '&nbsp;'; }
 });
-
-canvas.addEventListener('mouseleave', function() {
-  hoveredFrame = null;
-  render();
-  document.getElementById('details').innerHTML = '&nbsp;';
-});
-
+canvas.addEventListener('mouseleave', function() { hoveredFrame = null; render(); document.getElementById('details').innerHTML = '&nbsp;'; });
 canvas.addEventListener('click', function(e) {
   var rect = canvas.getBoundingClientRect();
   var f = frameAt(e.clientX - rect.left, e.clientY - rect.top);
-  if (f) {
-    zoomFrame = (f === zoomFrame) ? rootFrame : f;
-    render();
-  }
+  if (f) { zoomFrame = (f === zoomFrame) ? rootFrame : f; render(); }
 });
+window.addEventListener('resize', function() { lastW = 0; render(); });
 
-window.addEventListener('resize', render);
+function resetZoom() { zoomFrame = null; render(); }
+function onSearch(term) { searchTerm = term; render(); }
+function clearSearch() { document.getElementById('search').value = ''; searchTerm = ''; render(); }
 
-// ── Controls ─────────────────────────────────────────────────────
-function resetZoom() {
-  zoomFrame = null;
-  render();
-}
-
-function onSearch(term) {
-  searchTerm = term;
-  render();
-}
-
-function clearSearch() {
-  document.getElementById('search').value = '';
-  searchTerm = '';
-  render();
-}
-
-// ── Data update (preserves zoom by name path) ────────────────────
+// ── Zoom state preservation ──────────────────────────────────────
 function getZoomPath() {
   if (!zoomFrame || zoomFrame === rootFrame) return null;
-  // Walk up parent chain to build name path
-  var path = [];
-  var f = zoomFrame;
-  while (f && f.parent >= 0) {
-    path.unshift(f.name);
-    f = frames[f.parent];
-  }
+  var path = [], f = zoomFrame;
+  while (f && f.parent >= 0) { path.unshift(f.name); f = frames[f.parent]; }
   return path;
 }
-
 function restoreZoom(path) {
-  if (!path || path.length === 0 || !rootFrame) { zoomFrame = null; return; }
-  // Walk down from root's children matching the path
-  var candidates = [];
-  for (var i = 0; i < frames.length; i++) {
-    if (frames[i].parent === 0) candidates.push(i);
-  }
-  var current = null;
+  if (!path || !path.length || !rootFrame) { zoomFrame = null; return; }
+  var cands = [], i;
+  for (i = 0; i < frames.length; i++) if (frames[i].parent === 0) cands.push(i);
+  var cur = null;
   for (var p = 0; p < path.length; p++) {
     var found = false;
-    for (var c = 0; c < candidates.length; c++) {
-      if (frames[candidates[c]].name === path[p]) {
-        current = candidates[c];
-        // Gather children of this frame for next level
-        candidates = [];
-        for (var i = 0; i < frames.length; i++) {
-          if (frames[i].parent === current) candidates.push(i);
-        }
-        found = true;
-        break;
+    for (var c = 0; c < cands.length; c++) {
+      if (frames[cands[c]].name === path[p]) {
+        cur = cands[c]; cands = [];
+        for (i = 0; i < frames.length; i++) if (frames[i].parent === cur) cands.push(i);
+        found = true; break;
       }
     }
     if (!found) { zoomFrame = null; return; }
   }
-  zoomFrame = current !== null ? frames[current] : null;
+  zoomFrame = cur !== null ? frames[cur] : null;
+}
+
+// ── Merge trees (accumulate counts) ──────────────────────────────
+function mergeTrees(existing, incoming) {
+  if (!existing || !existing.value) return incoming;
+  if (!incoming || !incoming.value) return existing;
+  var merged = { name: existing.name, value: existing.value + incoming.value, children: [] };
+  // Index existing children by name
+  var byName = {};
+  if (existing.children) for (var i = 0; i < existing.children.length; i++) byName[existing.children[i].name] = existing.children[i];
+  // Merge incoming children
+  if (incoming.children) {
+    for (var i = 0; i < incoming.children.length; i++) {
+      var ic = incoming.children[i];
+      if (byName[ic.name]) { merged.children.push(mergeTrees(byName[ic.name], ic)); delete byName[ic.name]; }
+      else merged.children.push(ic);
+    }
+  }
+  // Keep remaining existing children
+  for (var k in byName) merged.children.push(byName[k]);
+  return merged;
 }
 
 function applyData(data) {
+  var mode = document.getElementById('updateMode').value;
+  if (mode === 'merge' && currentData) data = mergeTrees(currentData, data);
   var savedPath = getZoomPath();
   buildFrames(data);
   restoreZoom(savedPath);
   render();
 }
 
-// ── SSE double-buffered updates ──────────────────────────────────
-var pendingData = null;
-var rafScheduled = false;
+// ── SSE ──────────────────────────────────────────────────────────
+var pendingData = null, rafScheduled = false, sse = null;
 
 function scheduleApply() {
   if (rafScheduled) return;
   rafScheduled = true;
-  requestAnimationFrame(function() {
-    rafScheduled = false;
-    if (pendingData) {
-      applyData(pendingData);
-      pendingData = null;
-    }
-  });
+  requestAnimationFrame(function() { rafScheduled = false; if (pendingData) { applyData(pendingData); pendingData = null; } });
 }
 
 function startStream() {
-  var sse = new EventSource(location.origin + '/stream');
-  sse.onopen = function() {
-    document.getElementById('status').textContent = 'Connected';
-  };
-  sse.onmessage = function(msg) {
-    pendingData = JSON.parse(msg.data);
-    scheduleApply();
-  };
-  sse.onerror = function() {
-    document.getElementById('status').textContent = 'Disconnected';
-  };
+  if (sse) return;
+  sse = new EventSource(location.origin + '/stream');
+  document.getElementById('status').textContent = 'Connecting\u2026';
+  sse.onopen = function() { document.getElementById('status').textContent = '\u25cf Live'; };
+  sse.onmessage = function(msg) { pendingData = JSON.parse(msg.data); scheduleApply(); };
+  sse.onerror = function() { document.getElementById('status').textContent = '\u25cb Disconnected'; sse.close(); sse = null; setTimeout(startStream, 3000); };
 }
 
 function fetchAndUpdate() {
   fetch('/json').then(function(r) { return r.json(); }).then(applyData).catch(console.warn);
 }
 
-// ── Initial render ───────────────────────────────────────────────
+// ── Init ─────────────────────────────────────────────────────────
 buildFrames(rawData);
 render();
-// Auto-start SSE for live updates; also fetch in case inline data was empty
-startStream();
-if (!rootFrame) fetchAndUpdate();
+if (SERVE_MODE) { startStream(); if (!rootFrame) fetchAndUpdate(); }
 </script>
 </body>
 </html>
