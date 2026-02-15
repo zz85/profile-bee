@@ -105,8 +105,11 @@ function buildFrames(data) {
 
 // ── Render ───────────────────────────────────────────────────────
 function render() {
+  var base = zoomFrame || rootFrame;
+  var baseDepth = base ? base.depth : 0;
+  var levels = rootFrame ? totalLevels - baseDepth : 0;
   var w = canvas.parentElement.clientWidth;
-  var h = rootFrame ? totalLevels * CELL_H : 60;
+  var h = levels > 0 ? levels * CELL_H : 60;
 
   if (w !== lastW || h !== lastH) {
     lastW = w; lastH = h;
@@ -126,14 +129,9 @@ function render() {
     return;
   }
 
-  // Render top-down: root at y=0, children at y=CELL_H, etc.
-  // Then translate so the whole thing is bottom-aligned.
-  var base = zoomFrame || rootFrame;
   if (base.w === 0) return;
   var scale = canvasW / base.w;
   var baseX = base.x;
-  var baseDepth = base.depth;
-  var yOff = canvasH - (totalLevels - baseDepth) * CELL_H;
 
   ctx.font = FONT; ctx.textBaseline = 'middle';
   var hasSearch = searchTerm.length > 0;
@@ -149,8 +147,8 @@ function render() {
     if (px < 0) { pw += px; px = 0; }
     if (px + pw > canvasW) pw = canvasW - px;
 
-    var py = yOff + (f.depth - baseDepth) * CELL_H;
-    if (py + CELL_H <= 0 || py >= canvasH) continue;
+    var py = (f.depth - baseDepth) * CELL_H;
+    if (py >= canvasH) continue;
 
     var isMatch = hasSearch && f.name.toLowerCase().indexOf(searchLower) !== -1;
     var isHovered = f === hoveredFrame;
@@ -175,9 +173,7 @@ function frameAt(mx, my) {
   var base = zoomFrame || rootFrame;
   var baseDepth = base.depth;
   var scale = canvasW / base.w;
-  var yOff = canvasH - (totalLevels - baseDepth) * CELL_H;
-  // Invert: py = yOff + (depth - baseDepth) * CELL_H  →  depth = (my - yOff) / CELL_H + baseDepth
-  var depth = Math.floor((my - yOff) / CELL_H) + baseDepth;
+  var depth = Math.floor(my / CELL_H) + baseDepth;
   if (depth < baseDepth || depth >= totalLevels) return null;
   for (var i = 0; i < frames.length; i++) {
     var f = frames[i];
