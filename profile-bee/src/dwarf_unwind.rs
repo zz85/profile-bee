@@ -416,13 +416,11 @@ impl DwarfUnwindManager {
     /// Rescan a process's memory mappings and load any new ones.
     /// Returns the list of new shard IDs added (for incremental eBPF updates).
     pub fn refresh_process(&mut self, tgid: u32) -> Result<Vec<u8>, String> {
-        // Track shard IDs before update
-        let old_shard_ids: Vec<u8> = (0..self.binary_tables.len() as u8).collect();
+        // Track number of shards before update
+        let old_len = self.binary_tables.len();
         self.scan_and_update(tgid)?;
-        // Find new shards: those that exist now but didn't before
-        let new_shard_ids: Vec<u8> = (0..self.binary_tables.len() as u8)
-            .filter(|id| !old_shard_ids.contains(id))
-            .collect();
+        // Find new shards: those added after old_len
+        let new_shard_ids: Vec<u8> = (old_len as u8..self.binary_tables.len() as u8).collect();
         Ok(new_shard_ids)
     }
 
@@ -650,6 +648,9 @@ impl DwarfUnwindManager {
 
                         // Array of maps pattern: push the new unwind table as a new element
                         // The index of this element will be the shard_id
+                        // Invariant: next_shard_id always equals binary_tables.len() before push
+                        debug_assert_eq!(sid as usize, self.binary_tables.len(), 
+                            "shard_id must match Vec index");
                         self.binary_tables.push(unwind_entries);
 
                         // Cache using build ID if available, otherwise use path
@@ -899,8 +900,8 @@ mod tests {
         
         // Verify initialization creates empty Vec with proper capacity
         assert_eq!(manager.binary_tables.len(), 0, "Should start with no shards");
-        assert_eq!(manager.binary_tables.capacity(), MAX_UNWIND_SHARDS, 
-                   "Should allocate capacity for MAX_UNWIND_SHARDS");
+        assert!(manager.binary_tables.capacity() >= MAX_UNWIND_SHARDS, 
+                   "Should allocate capacity for at least MAX_UNWIND_SHARDS");
         
         // Load current process to populate binary_tables
         let pid = std::process::id();
