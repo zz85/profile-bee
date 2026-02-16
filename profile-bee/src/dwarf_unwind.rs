@@ -620,7 +620,7 @@ impl DwarfUnwindManager {
 
                         if tc > MAX_SHARD_ENTRIES {
                             tracing::warn!(
-                                "Binary unwind table too large: {} entries (max {} per binary), skipping",
+                                "Binary unwind table too large: {} entries (max {} per shard), skipping",
                                 tc,
                                 MAX_SHARD_ENTRIES,
                             );

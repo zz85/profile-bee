@@ -116,10 +116,10 @@ pub const LEGACY_MAX_DWARF_STACK_DEPTH: usize = 21;
 
 pub const MAX_PROC_MAPS: usize = 8;
 
-/// Maximum number of binaries that can have unwind tables loaded simultaneously
-pub const MAX_UNWIND_SHARDS: usize = 32;
-/// Maximum unwind entries per shard (2^18, requires 18 binary search iterations)
-pub const MAX_SHARD_ENTRIES: u32 = 262_144;
+/// Number of per-binary Array shard maps in eBPF (shard_0 .. shard_7)
+pub const MAX_UNWIND_SHARDS: usize = 8;
+/// Maximum unwind entries per shard (2^16, covered by 16 binary search iterations)
+pub const MAX_SHARD_ENTRIES: u32 = 65_536;
 /// Sentinel value: no shard assigned to this mapping
 pub const SHARD_NONE: u8 = 0xFF;
 
