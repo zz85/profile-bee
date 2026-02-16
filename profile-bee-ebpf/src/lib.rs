@@ -10,7 +10,7 @@ use aya_ebpf::{
         bpf_probe_read_user, bpf_task_pt_regs,
     },
     macros::map,
-    maps::{Array, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
+    maps::{Array, ArrayOfMaps, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
     programs::RawTracePointContext,
     EbpfContext,
 };
@@ -109,7 +109,7 @@ static RING_BUF_PROCESS_EXIT: RingBuf = RingBuf::with_byte_size(4096, 0);
 #[map(name = "stack_traces")]
 pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
 
-// DWARF unwind maps — sharded per-binary Array tables
+// DWARF unwind maps — sharded per-binary Array tables (32 shards)
 
 #[map(name = "shard_0")]
 pub static SHARD_0: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
@@ -127,6 +127,54 @@ pub static SHARD_5: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRI
 pub static SHARD_6: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
 #[map(name = "shard_7")]
 pub static SHARD_7: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_8")]
+pub static SHARD_8: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_9")]
+pub static SHARD_9: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_10")]
+pub static SHARD_10: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_11")]
+pub static SHARD_11: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_12")]
+pub static SHARD_12: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_13")]
+pub static SHARD_13: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_14")]
+pub static SHARD_14: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_15")]
+pub static SHARD_15: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_16")]
+pub static SHARD_16: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_17")]
+pub static SHARD_17: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_18")]
+pub static SHARD_18: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_19")]
+pub static SHARD_19: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_20")]
+pub static SHARD_20: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_21")]
+pub static SHARD_21: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_22")]
+pub static SHARD_22: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_23")]
+pub static SHARD_23: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_24")]
+pub static SHARD_24: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_25")]
+pub static SHARD_25: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_26")]
+pub static SHARD_26: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_27")]
+pub static SHARD_27: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_28")]
+pub static SHARD_28: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_29")]
+pub static SHARD_29: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_30")]
+pub static SHARD_30: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "shard_31")]
+pub static SHARD_31: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
 
 /// Per-process unwind info: maps tgid to ProcInfo (exec mappings)
 #[map(name = "proc_info")]
@@ -1047,12 +1095,36 @@ unsafe fn shard_lookup(shard_id: u8, idx: u32) -> Option<UnwindEntry> {
         5 => SHARD_5.get(idx).copied(),
         6 => SHARD_6.get(idx).copied(),
         7 => SHARD_7.get(idx).copied(),
+        8 => SHARD_8.get(idx).copied(),
+        9 => SHARD_9.get(idx).copied(),
+        10 => SHARD_10.get(idx).copied(),
+        11 => SHARD_11.get(idx).copied(),
+        12 => SHARD_12.get(idx).copied(),
+        13 => SHARD_13.get(idx).copied(),
+        14 => SHARD_14.get(idx).copied(),
+        15 => SHARD_15.get(idx).copied(),
+        16 => SHARD_16.get(idx).copied(),
+        17 => SHARD_17.get(idx).copied(),
+        18 => SHARD_18.get(idx).copied(),
+        19 => SHARD_19.get(idx).copied(),
+        20 => SHARD_20.get(idx).copied(),
+        21 => SHARD_21.get(idx).copied(),
+        22 => SHARD_22.get(idx).copied(),
+        23 => SHARD_23.get(idx).copied(),
+        24 => SHARD_24.get(idx).copied(),
+        25 => SHARD_25.get(idx).copied(),
+        26 => SHARD_26.get(idx).copied(),
+        27 => SHARD_27.get(idx).copied(),
+        28 => SHARD_28.get(idx).copied(),
+        29 => SHARD_29.get(idx).copied(),
+        30 => SHARD_30.get(idx).copied(),
+        31 => SHARD_31.get(idx).copied(),
         _ => None,
     }
 }
 
-/// Max binary search iterations (covers 2^16 = 65K entries = MAX_SHARD_ENTRIES)
-const MAX_BIN_SEARCH_DEPTH: u32 = 16;
+/// Max binary search iterations (covers 2^18 = 262K entries = MAX_SHARD_ENTRIES)
+const MAX_BIN_SEARCH_DEPTH: u32 = 18;
 
 #[inline(always)]
 unsafe fn binary_search_unwind_entry(
