@@ -43,6 +43,7 @@ canvas { display: block; }
   <button id="sortBtn" onclick="toggleSort()">Sort: name</button>
   <button id="dirBtn" onclick="toggleDir()">▲ Bottom-up</button>
   <button id="refreshBtn" onclick="fetchAndUpdate()" style="display:none">Refresh</button>
+  <button id="accumBtn" onclick="toggleAccum()" style="display:none">Accumulate: off</button>
   <input type="text" id="search" placeholder="Search..." oninput="onSearch(this.value)">
   <button onclick="clearSearch()">✕</button>
 </div>
@@ -66,6 +67,7 @@ var FONT = '12px monospace';
 var sortByName = true;
 var bottomUp = true;
 var paused = false;
+var accumulate = false;
 var canvas = document.getElementById('fg');
 var ctx = canvas.getContext('2d');
 var dpr = window.devicePixelRatio || 1;
@@ -244,6 +246,29 @@ function togglePause() {
   else { s.textContent = '\u25cf Live'; s.className = 'live'; if (pendingData) scheduleApply(); }
 }
 
+function toggleAccum() {
+  accumulate = !accumulate;
+  document.getElementById('accumBtn').textContent = 'Accumulate: ' + (accumulate ? 'on' : 'off');
+}
+
+function mergeTree(a, b) {
+  if (!a) return b; if (!b) return a;
+  var merged = { name: a.name, value: a.value + b.value, children: null };
+  var ac = a.children || [], bc = b.children || [];
+  if (!ac.length && !bc.length) return merged;
+  var map = {};
+  for (var i = 0; i < ac.length; i++) map[ac[i].name] = ac[i];
+  var out = [];
+  for (var i = 0; i < bc.length; i++) {
+    var k = bc[i].name;
+    if (map[k]) { out.push(mergeTree(map[k], bc[i])); delete map[k]; }
+    else out.push(bc[i]);
+  }
+  for (var k in map) out.push(map[k]);
+  merged.children = out.length ? out : null;
+  return merged;
+}
+
 // ── Zoom state preservation ──────────────────────────────────────
 function getZoomPath() {
   if (!zoomFrame || zoomFrame === rootFrame) return null;
@@ -271,9 +296,9 @@ function restoreZoom(path) {
 }
 
 function applyData(data) {
-  lastData = data;
+  lastData = (accumulate && lastData && lastData.value !== undefined) ? mergeTree(lastData, data) : data;
   var savedPath = getZoomPath();
-  buildFrames(data);
+  buildFrames(lastData);
   restoreZoom(savedPath);
   render();
 }
@@ -307,7 +332,7 @@ function fetchAndUpdate() {
 }
 
 // ── Init ─────────────────────────────────────────────────────────
-if (SERVE_MODE) document.getElementById('refreshBtn').style.display = '';
+if (SERVE_MODE) { document.getElementById('refreshBtn').style.display = ''; document.getElementById('accumBtn').style.display = ''; }
 document.getElementById('status').addEventListener('click', function() { if (SERVE_MODE && sse) togglePause(); });
 buildFrames(rawData);
 resizeCanvas();
