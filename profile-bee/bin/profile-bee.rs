@@ -112,10 +112,10 @@ struct Opt {
     #[arg(long, default_value = "accumulate", value_parser = ["reset", "accumulate", "decay"])]
     update_mode: String,
 
-    /// Enable mouse support for TUI flamegraph navigation (experimental)
+    /// Disable mouse support for TUI flamegraph navigation
     #[cfg(feature = "tui")]
     #[arg(long)]
-    tui_mouse: bool,
+    no_tui_mouse: bool,
 
     /// Avoid profiling idle cpu cycles
     #[arg(long)]
@@ -1822,7 +1822,7 @@ async fn run_combined_mode(
     );
 
     // TUI event loop
-    run_tui_event_loop(&mut app, opt.tui_mouse)?;
+    run_tui_event_loop(&mut app, !opt.no_tui_mouse)?;
 
     drop(stopper);
     println!("\nExiting combined mode");
@@ -1887,7 +1887,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     );
 
     // TUI event loop
-    run_tui_event_loop(&mut app, opt.tui_mouse)?;
+    run_tui_event_loop(&mut app, !opt.no_tui_mouse)?;
 
     drop(stopper);
     println!("\nExiting TUI mode");
