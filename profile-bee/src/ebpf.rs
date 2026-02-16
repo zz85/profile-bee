@@ -397,8 +397,8 @@ impl EbpfProfiler {
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
     ) -> Result<(), anyhow::Error> {
-        // Load all shards
-        let all_shard_ids: Vec<u8> = manager.binary_tables.keys().copied().collect();
+        // Load all shards - using array indexing pattern
+        let all_shard_ids: Vec<u8> = (0..manager.binary_tables.len() as u8).collect();
         self.update_dwarf_tables(manager, &all_shard_ids)
     }
 
@@ -426,7 +426,9 @@ impl EbpfProfiler {
         if !new_shard_ids.is_empty() {
             let mut total_entries = 0usize;
             for &shard_id in new_shard_ids {
-                if let Some(entries) = manager.binary_tables.get(&shard_id) {
+                // Array of maps pattern: use direct indexing
+                if (shard_id as usize) < manager.binary_tables.len() {
+                    let entries = &manager.binary_tables[shard_id as usize];
                     self.load_shard(shard_id, entries)?;
                     total_entries += entries.len();
                     tracing::info!("Loaded shard {} with {} entries", shard_id, entries.len());

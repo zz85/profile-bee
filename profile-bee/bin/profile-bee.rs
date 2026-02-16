@@ -30,8 +30,9 @@ enum PerfWork {
 }
 
 /// Incremental DWARF unwind table update
+/// Uses array of maps pattern: Vec indexed by shard_id contains the unwind entries
 struct DwarfRefreshUpdate {
-    shard_updates: Vec<(u8, Vec<UnwindEntry>)>,  // (shard_id, entries)
+    shard_updates: Vec<Vec<UnwindEntry>>,  // Array indexed by shard_id
     proc_info: Vec<(u32, ProcInfo)>,
 }
 
@@ -1007,18 +1008,19 @@ fn send_refresh(
     tx: &mpsc::Sender<PerfWork>,
     new_shard_ids: Vec<u8>,
 ) -> Result<(), ()> {
-    let mut shard_updates = Vec::new();
-    for &shard_id in &new_shard_ids {
-        if let Some(entries) = manager.binary_tables.get(&shard_id) {
-            shard_updates.push((shard_id, entries.clone()));
-        }
-    }
+    // Array of maps pattern: clone the entire binary_tables Vec
+    // This preserves all shards, not just the new ones, for complete state transfer
+    let shard_updates = manager.binary_tables.clone();
+    
     let proc_info: Vec<(u32, ProcInfo)> = manager
         .proc_info
         .iter()
         .map(|(&t, &p)| (t, p))
         .collect();
-    let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
+    let total_entries: usize = new_shard_ids.iter()
+        .filter_map(|&id| shard_updates.get(id as usize))
+        .map(|v| v.len())
+        .sum();
     println!(
         "DWARF refresh: {} new shards with {} total entries",
         new_shard_ids.len(), total_entries,
@@ -1035,7 +1037,11 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
     use profile_bee::ebpf::{UnwindEntryPod, ProcInfoKeyPod, ProcInfoPod};
     use profile_bee_common::ProcInfoKey;
 
-    for (shard_id, entries) in &update.shard_updates {
+    // Array of maps pattern: iterate over Vec with index as shard_id
+    for (shard_id, entries) in update.shard_updates.iter().enumerate() {
+        if entries.is_empty() {
+            continue; // Skip empty shards
+        }
         let map_name = format!("shard_{}", shard_id);
         if let Some(map) = bpf.map_mut(&map_name) {
             if let Ok(mut arr) = Array::<&mut MapData, UnwindEntryPod>::try_from(map) {
