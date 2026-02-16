@@ -61,7 +61,7 @@ src/
   trace_handler.rs          TraceHandler: address → symbol resolution (blazesym), caching
   types.rs                  StackFrameInfo, FrameCount, StackInfoExt trait
   cache.rs                  ProcessCache, AddrCache, PointerStackFramesCache (LRU-style)
-  html.rs                   HTML/d3 flamegraph output (Stack tree builder)
+  html.rs                   HTML flamegraph output (Stack tree builder)
   spawn.rs                  SpawnProcess: child process lifecycle for --cmd
   probe_spec.rs             ProbeSpec enum: parse uprobe specs (exact/glob/regex/source/demangled)
   probe_resolver.rs         ProbeResolver: spec → ResolvedProbe via ELF .symtab/.dynsym scanning
@@ -116,8 +116,8 @@ Key flags — all optional, sensible defaults:
 |------|------|---------|------|
 | `--tui` | bool | false | Interactive terminal flamegraph |
 | `--svg <path>` | Option | None | SVG flamegraph output |
-| `--html <path>` | Option | None | HTML d3 flamegraph |
-| `--json <path>` | Option | None | JSON d3 format |
+| `--html <path>` | Option | None | HTML flamegraph |
+| `--json <path>` | Option | None | JSON flamegraph format |
 | `--collapse <path>` | Option | None | Stackcollapse format |
 | `--serve` | bool | false | Real-time web server (port 8000) |
 | `--pid <pid>` | Option | None | Target specific PID |

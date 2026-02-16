@@ -179,10 +179,11 @@ fn flamegraph_html(stacks: &str) -> String {
 }
 
 fn flamegraph_html_with_mode(stacks: &str, serve: bool) -> String {
+    let safe_stacks = stacks.replace("</", "<\\/");
     HTML_TEMPLATE
-        .replace("{stack}", stacks)
         .replace("{title}", "profile-bee")
         .replace("{serve_mode}", if serve { "true" } else { "false" })
+        .replace("{stack}", &safe_stacks)
 }
 
 #[test]

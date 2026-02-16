@@ -759,7 +759,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 &mut known_tgids,
             );
             tracing::debug!("serve loop: flushing {} stacks to web server (stopped={})", stacks.len(), stopped);
-            output_results(&opt, &stacks, &tx)?;
+            output_results(&opt, &stacks, &tx, stopped)?;
         }
     } else {
         // Non-serve mode: block until Stop, output once, exit.
@@ -776,7 +776,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             &tgid_request_tx,
         );
         tracing::debug!("batch mode: process_profiling_data returned {} stacks", stacks.len());
-        output_results(&opt, &stacks, &tx)?;
+        output_results(&opt, &stacks, &tx, true)?;
     }
 
     drop(stopper);
@@ -1441,30 +1441,33 @@ fn output_results(
     opt: &Opt,
     stacks: &[String],
     tx: &tokio::sync::broadcast::Sender<String>,
+    final_flush: bool,
 ) -> anyhow::Result<()> {
-    // Generate SVG if requested
-    if let Some(svg) = &opt.svg {
-        let title = if opt.off_cpu {
-            format!(
-                "Off-CPU Time Flame Graph ({}ms, finish_task_switch)",
-                opt.time.unwrap_or(10000)
+    // Generate SVG if requested (only on final flush)
+    if final_flush {
+        if let Some(svg) = &opt.svg {
+            let title = if opt.off_cpu {
+                format!(
+                    "Off-CPU Time Flame Graph ({}ms, finish_task_switch)",
+                    opt.time.unwrap_or(10000)
+                )
+            } else {
+                format!(
+                    "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
+                    opt.time.unwrap_or(10000), opt.frequency
+                )
+            };
+            output_svg(
+                svg,
+                stacks,
+                title,
+                opt.off_cpu,
             )
-        } else {
-            format!(
-                "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
-                opt.time.unwrap_or(10000), opt.frequency
-            )
-        };
-        output_svg(
-            svg,
-            stacks,
-            title,
-            opt.off_cpu,
-        )
-        .map_err(|e| {
-            println!("Failed to write svg file {:?} - {:?}", e, svg);
-            e
-        })?;
+            .map_err(|e| {
+                println!("Failed to write svg file {:?} - {:?}", e, svg);
+                e
+            })?;
+        }
     }
 
     // Generate HTML/JSON if requested
@@ -1472,13 +1475,15 @@ fn output_results(
         let json = collapse_to_json(&stacks.iter().map(|v| v.as_str()).collect::<Vec<_>>());
         tracing::debug!("output_results: generated JSON ({} bytes)", json.len());
 
-        if let Some(json_path) = &opt.json {
-            std::fs::write(json_path, &json)
-                .map_err(|e| anyhow::anyhow!("Unable to write JSON file: {}", e))?;
-        }
+        if final_flush {
+            if let Some(json_path) = &opt.json {
+                std::fs::write(json_path, &json)
+                    .map_err(|e| anyhow::anyhow!("Unable to write JSON file: {}", e))?;
+            }
 
-        if let Some(html_path) = &opt.html {
-            generate_html_file(html_path, &json);
+            if let Some(html_path) = &opt.html {
+                generate_html_file(html_path, &json);
+            }
         }
 
         if let Err(e) = tx.send(json) {
@@ -1488,11 +1493,13 @@ fn output_results(
         }
     }
 
-    // Write collapsed stacks if requested
-    if let Some(name) = &opt.collapse {
-        println!("Writing to file: {}", name.display());
-        std::fs::write(name, stacks.join("\n"))
-            .map_err(|e| anyhow::anyhow!("Unable to write stack collapsed file: {}", e))?;
+    // Write collapsed stacks if requested (only on final flush)
+    if final_flush {
+        if let Some(name) = &opt.collapse {
+            println!("Writing to file: {}", name.display());
+            std::fs::write(name, stacks.join("\n"))
+                .map_err(|e| anyhow::anyhow!("Unable to write stack collapsed file: {}", e))?;
+        }
     }
 
     Ok(())

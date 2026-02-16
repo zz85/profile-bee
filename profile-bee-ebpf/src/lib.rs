@@ -1303,10 +1303,10 @@ unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
 
     // --- Step 3: Capture stack trace for the waking thread ---
     let user_stack_id = STACK_TRACES
-        .get_stackid(ctx, BPF_F_USER_STACK.into())
+        .get_stackid::<C>(ctx, BPF_F_USER_STACK.into())
         .map_or(-1, |stack_id| stack_id as i32);
     let kernel_stack_id = STACK_TRACES
-        .get_stackid(ctx, 0)
+        .get_stackid::<C>(ctx, 0)
         .map_or(-1, |stack_id| stack_id as i32);
 
     // Use per-CPU storage for frame pointers
