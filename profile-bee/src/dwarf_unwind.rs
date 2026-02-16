@@ -649,8 +649,7 @@ impl DwarfUnwindManager {
                         // Array of maps pattern: push the new unwind table as a new element
                         // The index of this element will be the shard_id
                         // Invariant: next_shard_id always equals binary_tables.len() before push
-                        debug_assert_eq!(sid as usize, self.binary_tables.len(), 
-                            "shard_id must match Vec index");
+                        debug_assert_eq!(sid as usize, self.binary_tables.len());
                         self.binary_tables.push(unwind_entries);
 
                         // Cache using build ID if available, otherwise use path

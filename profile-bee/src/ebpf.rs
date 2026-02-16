@@ -426,9 +426,8 @@ impl EbpfProfiler {
         if !new_shard_ids.is_empty() {
             let mut total_entries = 0usize;
             for &shard_id in new_shard_ids {
-                // Array of maps pattern: use direct indexing
-                if (shard_id as usize) < manager.binary_tables.len() {
-                    let entries = &manager.binary_tables[shard_id as usize];
+                // Array of maps pattern: use get() for safe access
+                if let Some(entries) = manager.binary_tables.get(shard_id as usize) {
                     self.load_shard(shard_id, entries)?;
                     total_entries += entries.len();
                     tracing::info!("Loaded shard {} with {} entries", shard_id, entries.len());
