@@ -517,6 +517,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     if opt.serve {
+        tracing::info!("Spawning web server task on port 8000");
         tokio::spawn(async {
             profile_bee::html::start_server(rx).await;
         });
@@ -676,8 +677,38 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let started = Instant::now();
 
-    loop {
-        // Process collected data
+    if opt.serve {
+        // Serve mode: periodically flush data to the web server instead of
+        // blocking until Stop. This ensures the web UI gets live updates.
+        // trace_count and known_tgids persist across flushes so data accumulates.
+        let flush_interval = std::time::Duration::from_secs(2);
+        let mut stopped = false;
+        let mut trace_count = HashMap::<StackInfo, usize>::new();
+        let mut known_tgids = std::collections::HashSet::<u32>::new();
+
+        while !stopped {
+            tracing::debug!("serve loop: collecting samples for {:?}", flush_interval);
+            let stacks = process_profiling_data_streaming(
+                counts,
+                stack_traces,
+                &perf_rx,
+                &mut profiler,
+                opt.stream_mode,
+                opt.group_by_cpu,
+                stacked_pointers,
+                &mut ebpf_profiler.bpf,
+                &tgid_request_tx,
+                flush_interval,
+                &mut stopped,
+                &mut trace_count,
+                &mut known_tgids,
+            );
+            tracing::debug!("serve loop: flushing {} stacks to web server (stopped={})", stacks.len(), stopped);
+            output_results(&opt, &stacks, &tx)?;
+        }
+    } else {
+        // Non-serve mode: block until Stop, output once, exit.
+        tracing::debug!("batch mode: calling process_profiling_data (blocks until Stop)");
         let stacks = process_profiling_data(
             counts,
             stack_traces,
@@ -689,19 +720,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             &mut ebpf_profiler.bpf,
             &tgid_request_tx,
         );
-
-        // Generate and save output files
+        tracing::debug!("batch mode: process_profiling_data returned {} stacks", stacks.len());
         output_results(&opt, &stacks, &tx)?;
-
-        if !opt.serve {
-            // only loop with serve mode
-            break;
-        }
     }
 
     drop(stopper);
 
-    println!("Profiler ran for {:?}", started.elapsed());
+    tracing::info!("Profiler ran for {:?}", started.elapsed());
 
     profiler.print_stats();
 
@@ -870,8 +895,10 @@ fn setup_stopping_mechanisms(
     let stop_tx = perf_tx.clone();
     let stopping = stopping;
     tokio::spawn(async move {
+        tracing::debug!("setup_stopping_mechanisms: waiting for Ctrl-C");
         println!("Waiting for Ctrl-C...");
         tokio::signal::ctrl_c().await.unwrap_or_default();
+        tracing::info!("setup_stopping_mechanisms: Ctrl-C received, sending Stop");
         println!("Received Ctrl-C");
         drop(stopping);
         stop_tx.send(PerfWork::Stop).unwrap_or_default();
@@ -1063,6 +1090,9 @@ fn process_profiling_data(
         match work {
             PerfWork::StackInfo(stack) => {
                 queue_processed += 1;
+                if queue_processed == 1 {
+                    tracing::debug!("process_profiling_data: received first StackInfo event");
+                }
 
                 // Request DWARF loading for newly seen processes
                 if let Some(tx) = tgid_request_tx {
@@ -1098,10 +1128,14 @@ fn process_profiling_data(
                 apply_dwarf_refresh(bpf, update);
             }
             PerfWork::ProcessExit(_exit_event) => {
+                tracing::info!("process_profiling_data: received ProcessExit, breaking recv loop");
                 // Process exit detected by eBPF - stop profiling
                 break;
             }
-            PerfWork::Stop => break,
+            PerfWork::Stop => {
+                tracing::info!("process_profiling_data: received Stop, breaking recv loop");
+                break;
+            }
         }
     }
 
@@ -1112,7 +1146,7 @@ fn process_profiling_data(
 
     if local_counting {
         process_local_counting(
-            trace_count,
+            &trace_count,
             profiler,
             stack_traces,
             group_by_cpu,
@@ -1154,9 +1188,108 @@ fn process_profiling_data(
     out
 }
 
+/// Streaming variant of process_profiling_data for --serve mode.
+/// Collects samples for up to `timeout` then returns whatever has accumulated.
+/// Sets `stopped = true` when a Stop/ProcessExit message is received.
+fn process_profiling_data_streaming(
+    counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
+    stack_traces: &StackTraceMap<MapData>,
+    perf_rx: &mpsc::Receiver<PerfWork>,
+    profiler: &mut TraceHandler,
+    stream_mode: u8,
+    group_by_cpu: bool,
+    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
+    bpf: &mut Ebpf,
+    tgid_request_tx: &Option<mpsc::Sender<u32>>,
+    timeout: std::time::Duration,
+    stopped: &mut bool,
+    trace_count: &mut HashMap<StackInfo, usize>,
+    known_tgids: &mut std::collections::HashSet<u32>,
+) -> Vec<String> {
+    let mut queue_processed = 0;
+    let mut samples = 0;
+    let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
+
+    let keys = counts.keys().flatten().collect::<Vec<_>>();
+    for k in keys {
+        let _ = counts.remove(&k);
+    }
+
+    let deadline = Instant::now() + timeout;
+
+    // Drain events until timeout or Stop
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        match perf_rx.recv_timeout(remaining) {
+            Ok(PerfWork::StackInfo(stack)) => {
+                queue_processed += 1;
+                if queue_processed == 1 {
+                    tracing::debug!("process_profiling_data_streaming: received first StackInfo");
+                }
+                if let Some(tx) = tgid_request_tx {
+                    if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
+                        let _ = tx.send(stack.tgid);
+                    }
+                }
+                if local_counting {
+                    let trace = trace_count.entry(stack).or_insert(0);
+                    *trace += 1;
+                    if *trace == 1 {
+                        profiler.get_exp_stacked_frames(&stack, stack_traces, group_by_cpu, stacked_pointers);
+                    }
+                } else {
+                    profiler.get_exp_stacked_frames(&stack, stack_traces, group_by_cpu, stacked_pointers);
+                }
+            }
+            Ok(PerfWork::DwarfRefresh(update)) => {
+                apply_dwarf_refresh(bpf, update);
+            }
+            Ok(PerfWork::ProcessExit(_)) => {
+                tracing::info!("process_profiling_data_streaming: ProcessExit received");
+                *stopped = true;
+                break;
+            }
+            Ok(PerfWork::Stop) => {
+                tracing::info!("process_profiling_data_streaming: Stop received");
+                *stopped = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!("process_profiling_data_streaming: channel disconnected");
+                *stopped = true;
+                break;
+            }
+        }
+    }
+
+    tracing::debug!("process_profiling_data_streaming: processed {} events", queue_processed);
+
+    let mut stacks = Vec::new();
+    if local_counting {
+        process_local_counting(trace_count, profiler, stack_traces, group_by_cpu, &mut samples, &mut stacks, stacked_pointers);
+    } else {
+        process_kernel_counting(counts, profiler, stack_traces, group_by_cpu, &mut samples, &mut stacks, stacked_pointers);
+    }
+
+    let mut out = stacks
+        .into_iter()
+        .map(|frames| {
+            let key = frames.frames.iter().map(|s| s.fmt_symbol()).collect::<Vec<_>>().join(";");
+            format!("{} {}", &key, frames.count)
+        })
+        .collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
 /// Process stack traces counted in user space
 fn process_local_counting(
-    trace_count: HashMap<StackInfo, usize>,
+    trace_count: &HashMap<StackInfo, usize>,
     profiler: &mut TraceHandler,
     stack_traces: &StackTraceMap<MapData>,
     group_by_cpu: bool,
@@ -1237,6 +1370,7 @@ fn output_results(
     // Generate HTML/JSON if requested
     if opt.html.is_some() || opt.json.is_some() || opt.serve {
         let json = collapse_to_json(&stacks.iter().map(|v| v.as_str()).collect::<Vec<_>>());
+        tracing::debug!("output_results: generated JSON ({} bytes)", json.len());
 
         if let Some(json_path) = &opt.json {
             std::fs::write(json_path, &json)
@@ -1248,7 +1382,9 @@ fn output_results(
         }
 
         if let Err(e) = tx.send(json) {
-            println!("Error sending JSON data: {:?}", e);
+            tracing::warn!("output_results: broadcast send failed (no receivers?): {:?}", e);
+        } else {
+            tracing::debug!("output_results: broadcast sent to {} receivers", tx.receiver_count());
         }
     }
 

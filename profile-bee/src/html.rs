@@ -42,21 +42,24 @@ pub async fn start_server(mut rx: Receiver<String>) {
 
     let writer = latest_data.clone();
     tokio::spawn(async move {
+        tracing::debug!("start_server: broadcast receiver task started, waiting for data");
         while let Ok(data) = rx.recv().await {
-            println!("Received....");
+            tracing::info!("start_server: received broadcast data ({} bytes)", data.len());
             let mut write = writer.lock().expect("poisoned");
             *write = data.clone();
             drop(write);
 
             let mut write = access_subscribers.lock().expect("poisoned");
             write.retain(|tx| tx.send(data.clone()).is_ok());
-            println!("{} realtime subscribers", write.len());
+            tracing::info!("start_server: {} realtime SSE subscribers", write.len());
         }
+        tracing::warn!("start_server: broadcast receiver loop ended (sender dropped)");
     });
 
     let json_copy = latest_data.clone();
     // GET /json -> stack trace json
     let json = warp::path("json").and(warp::get()).map(move || {
+        tracing::debug!("start_server: GET /json request");
         let json = json_copy.lock().expect("poisoned").clone();
 
         warp::http::Response::builder()
@@ -69,6 +72,7 @@ pub async fn start_server(mut rx: Receiver<String>) {
         .and(warp::get())
         .and(subscriptions)
         .map(|subscriptions| {
+            tracing::info!("start_server: GET /stream - new SSE subscriber");
             let stream = connected(subscriptions);
 
             // returns a stream when replies is sent via server-sent events
@@ -77,23 +81,26 @@ pub async fn start_server(mut rx: Receiver<String>) {
 
     // GET / -> index html
     let index = warp::path::end().map(move || {
+        tracing::debug!("start_server: GET / request");
         let json_copy = latest_data.lock().expect("poisoned");
 
         warp::http::Response::builder()
             .header("content-type", "text/html; charset=utf-8")
-            .body(flamegraph_html(&json_copy))
+            .body(flamegraph_html_with_mode(&json_copy, true))
     });
 
+    tracing::info!("start_server: listening on http://127.0.0.1:8000/");
     eprintln!("Listening on port 8000. Goto http://localhost:8000/");
     warp::serve(index.or(json).or(stream))
         .run(([127, 0, 0, 1], 8000))
         .await;
+    tracing::warn!("start_server: warp server exited");
 }
 
 fn connected(
     subscriptions: Arc<Mutex<Vec<mpsc::UnboundedSender<String>>>>,
 ) -> impl Stream<Item = Result<Event, warp::Error>> + Send + 'static {
-    println!("new subscription");
+    tracing::info!("connected: new SSE subscription registered");
 
     // Use an unbounded channel to handle buffering and flushing of messages
     // to the event source...
@@ -106,7 +113,7 @@ fn connected(
     rx.map(|msg| Ok(Event::default().data(msg)))
 }
 
-/// turns a sorted stackcollapsed format into d3-flamegraph json format
+/// turns a sorted stackcollapsed format into flamegraph json format
 pub fn collapse_to_json(stacks: &[&str]) -> String {
     let root = Stack::new("");
     let mut crumbs = vec![root.clone()];
@@ -164,35 +171,18 @@ pub fn generate_html_file(filename: &Path, data: &str) {
     std::fs::write(filename, html).expect("Unable to write stack html file");
 }
 
-// Uses https://github.com/spiermar/d3-flame-graph
-const HTML_TEMPLATE: &str = include_str!("../assets/d3-flamegraph.html");
-const SCRIPTS: &str = include_str!("../assets/scripts.js");
-const STYLES: &str = include_str!("../assets/styles.css");
-
-const EXTERNAL_SCRIPTS: &str = r#"<script src="https://d3js.org/d3.v7.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/d3-tip/0.9.1/d3-tip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.min.js"></script>"#;
-
-const EXTERNAL_STYLES: &str = r#"
-<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css" />
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.css" />"#;
+// Self-contained HTML template — no external JS/CSS dependencies
+const HTML_TEMPLATE: &str = include_str!("../assets/flamegraph.html");
 
 fn flamegraph_html(stacks: &str) -> String {
-    let embedded = true;
+    flamegraph_html_with_mode(stacks, false)
+}
 
-    let template = HTML_TEMPLATE
+fn flamegraph_html_with_mode(stacks: &str, serve: bool) -> String {
+    HTML_TEMPLATE
         .replace("{stack}", stacks)
-        .replace("{title}", "profile-bee");
-
-    if embedded {
-        template
-            .replace("{scripts}", &format!("<script>{}</script>", SCRIPTS))
-            .replace("{styles}", &format!("<style>{}</style>", STYLES))
-    } else {
-        template
-            .replace("{scripts}", EXTERNAL_SCRIPTS)
-            .replace("{styles}", EXTERNAL_STYLES)
-    }
+        .replace("{title}", "profile-bee")
+        .replace("{serve_mode}", if serve { "true" } else { "false" })
 }
 
 #[test]

@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #fafafa; }
+.toolbar {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  background: #fff; border-bottom: 1px solid #ddd; flex-wrap: wrap;
+}
+.toolbar button {
+  padding: 4px 10px; border: 1px solid #ccc; border-radius: 3px;
+  background: #f5f5f5; color: #333; cursor: pointer; font-size: 13px; line-height: 1.4;
+}
+.toolbar button:hover { background: #e8e8e8; }
+.toolbar input[type="text"] {
+  padding: 4px 8px; border: 1px solid #ccc; border-radius: 3px; font-size: 13px;
+}
+.toolbar .title { font-weight: 600; margin-right: auto; }
+.toolbar .title a { font-size: 14px; color: #333; text-decoration: none; }
+.toolbar .title a:hover { text-decoration: underline; }
+.toolbar .sep { border-left: 1px solid #ddd; height: 20px; }
+#status { font-size: 12px; color: #888; cursor: pointer; }
+#status.live { color: #2a2; }
+#status.paused { color: #c80; }
+#details {
+  position: sticky; bottom: 0;
+  padding: 6px 12px; font-size: 13px; color: #555;
+  background: #fff; border-top: 1px solid #ddd; min-height: 26px;
+}
+canvas { display: block; }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <span class="title"><a href="https://github.com/zz85/profile-bee" target="_blank" rel="noopener">{title}</a></span>
+  <span id="status"></span>
+  <span class="sep"></span>
+  <button onclick="resetZoom()">Reset zoom</button>
+  <button id="sortBtn" onclick="toggleSort()">Sort: name</button>
+  <button id="dirBtn" onclick="toggleDir()">▲ Bottom-up</button>
+  <button id="refreshBtn" onclick="fetchAndUpdate()" style="display:none">Refresh</button>
+  <button id="accumBtn" onclick="toggleAccum()" style="display:none">Accumulate: off</button>
+  <input type="text" id="search" placeholder="Search..." oninput="onSearch(this.value)">
+  <button onclick="clearSearch()">✕</button>
+</div>
+<canvas id="fg"></canvas>
+<div id="details">&nbsp;</div>
+
+<script>
+var SERVE_MODE = {serve_mode};
+var rawData = {stack};
+var lastData = rawData;
+
+var frames = [];
+var rootFrame = null;
+var zoomFrame = null;
+var searchTerm = '';
+var hoveredFrame = null;
+var totalLevels = 0;
+
+var CELL_H = 20;
+var FONT = '12px monospace';
+var sortByName = true;
+var bottomUp = true;
+var paused = false;
+var accumulate = false;
+var canvas = document.getElementById('fg');
+var ctx = canvas.getContext('2d');
+var dpr = window.devicePixelRatio || 1;
+var canvasW = 0, canvasH = 0;
+
+function resizeCanvas() {
+  var toolbar = document.querySelector('.toolbar');
+  var details = document.getElementById('details');
+  var w = window.innerWidth;
+  var h = window.innerHeight - toolbar.offsetHeight - details.offsetHeight;
+  if (h < 60) h = 60;
+  if (w === canvasW && h === canvasH) return;
+  canvasW = w; canvasH = h;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+// ── Colors ───────────────────────────────────────────────────────
+function nameHash(name) {
+  var h = 0;
+  for (var i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+  return h;
+}
+function hashColor(name) {
+  var h = nameHash(name);
+  return 'hsl(' + (20 + Math.abs(h % 36)) + ',' + (60 + Math.abs((h >> 8) % 31)) + '%,' + (55 + Math.abs((h >> 16) % 21)) + '%)';
+}
+function dimColor(name) {
+  return 'hsl(' + (20 + Math.abs(nameHash(name) % 36)) + ',20%,80%)';
+}
+
+// ── Build frames ─────────────────────────────────────────────────
+function buildFrames(data) {
+  frames = [];
+  totalLevels = 0;
+  if (!data || data.value === undefined) { rootFrame = null; return; }
+
+  function walk(node, depth, x, parentIdx) {
+    var selfVal = node.value;
+    if (node.children) for (var i = 0; i < node.children.length; i++) selfVal -= node.children[i].value;
+    var n = node.name || 'root';
+    frames.push({
+      name: n, depth: depth, x: x, w: node.value,
+      selfValue: Math.max(0, selfVal), value: node.value,
+      parent: parentIdx, color: hashColor(n), dimColor: dimColor(n),
+    });
+    if (depth + 1 > totalLevels) totalLevels = depth + 1;
+    if (node.children) {
+      var sorted = node.children.slice().sort(sortByName
+        ? function(a, b) { return (a.name || '').localeCompare(b.name || ''); }
+        : function(a, b) { return b.value - a.value; });
+      var cx = x, idx = frames.length - 1;
+      for (var i = 0; i < sorted.length; i++) { walk(sorted[i], depth + 1, cx, idx); cx += sorted[i].value; }
+    }
+  }
+  walk(data, 0, 0, -1);
+  rootFrame = frames[0] || null;
+}
+
+// ── Render ───────────────────────────────────────────────────────
+function render() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, canvasW, canvasH);
+
+  if (!rootFrame) {
+    ctx.font = '14px monospace'; ctx.fillStyle = '#999'; ctx.textAlign = 'center';
+    ctx.fillText('Waiting for profiling data\u2026', canvasW / 2, canvasH / 2);
+    ctx.textAlign = 'start';
+    return;
+  }
+
+  var base = zoomFrame || rootFrame;
+  if (base.w === 0) return;
+  var baseDepth = base.depth;
+  var scale = canvasW / base.w;
+  var baseX = base.x;
+
+  var ancestors = {};
+  if (zoomFrame) {
+    var a = zoomFrame;
+    while (a.parent >= 0) { a = frames[a.parent]; ancestors[a.depth] = a; }
+  }
+
+  ctx.font = FONT; ctx.textBaseline = 'middle';
+  var hasSearch = searchTerm.length > 0;
+  var searchLower = searchTerm.toLowerCase();
+
+  for (var i = 0; i < frames.length; i++) {
+    var f = frames[i];
+    var py = bottomUp ? canvasH - (f.depth + 1) * CELL_H : f.depth * CELL_H;
+    if (py + CELL_H <= 0 || py >= canvasH) continue;
+
+    var px, pw;
+    if (ancestors[f.depth] === f) {
+      px = 0; pw = canvasW;
+    } else {
+      if (f.depth < baseDepth) continue;
+      px = (f.x - baseX) * scale;
+      pw = f.w * scale;
+      if (px + pw <= 0 || px >= canvasW || pw < 0.5) continue;
+      if (px < 0) { pw += px; px = 0; }
+      if (px + pw > canvasW) pw = canvasW - px;
+    }
+
+    var isMatch = hasSearch && f.name.toLowerCase().indexOf(searchLower) !== -1;
+    var isHovered = f === hoveredFrame;
+
+    ctx.fillStyle = (hasSearch && !isMatch) ? f.dimColor : isHovered ? '#ff8' : f.color;
+    ctx.fillRect(px, py, pw - 0.5, CELL_H - 1);
+
+    if (isHovered) { ctx.strokeStyle = '#333'; ctx.lineWidth = 1; ctx.strokeRect(px + 0.5, py + 0.5, pw - 1.5, CELL_H - 2); }
+
+    if (pw > 30) {
+      ctx.fillStyle = '#222';
+      var label = f.name, mw = pw - 6, tw = ctx.measureText(label).width;
+      if (tw > mw) { var c = Math.max(1, Math.floor(label.length * mw / tw) - 2); label = label.substring(0, c) + '..'; }
+      ctx.fillText(label, px + 3, py + CELL_H / 2);
+    }
+  }
+}
+
+// ── Hit test ─────────────────────────────────────────────────────
+function frameAt(mx, my) {
+  if (!rootFrame) return null;
+  var base = zoomFrame || rootFrame;
+  var scale = canvasW / base.w;
+  var depth = bottomUp ? Math.floor((canvasH - my) / CELL_H) : Math.floor(my / CELL_H);
+  if (depth < 0 || depth >= totalLevels) return null;
+
+  if (zoomFrame) {
+    var a = zoomFrame;
+    while (a.parent >= 0) { a = frames[a.parent]; if (a.depth === depth) return a; }
+  }
+
+  for (var i = 0; i < frames.length; i++) {
+    var f = frames[i];
+    if (f.depth !== depth) continue;
+    var px = (f.x - base.x) * scale;
+    if (mx >= px && mx < px + f.w * scale) return f;
+  }
+  return null;
+}
+
+// ── Interaction ──────────────────────────────────────────────────
+canvas.addEventListener('mousemove', function(e) {
+  var rect = canvas.getBoundingClientRect();
+  var f = frameAt(e.clientX - rect.left, e.clientY - rect.top);
+  if (f !== hoveredFrame) { hoveredFrame = f; render(); }
+  var det = document.getElementById('details');
+  if (f) {
+    var pct = rootFrame.value > 0 ? (f.value / rootFrame.value * 100).toFixed(2) : '0';
+    det.textContent = f.name + '  (' + f.value + ' samples, ' + pct + '%, self: ' + f.selfValue + ')';
+  } else { det.innerHTML = '&nbsp;'; }
+});
+canvas.addEventListener('mouseleave', function() { hoveredFrame = null; render(); document.getElementById('details').innerHTML = '&nbsp;'; });
+canvas.addEventListener('click', function(e) {
+  var rect = canvas.getBoundingClientRect();
+  var f = frameAt(e.clientX - rect.left, e.clientY - rect.top);
+  if (f) { zoomFrame = (f === zoomFrame || f === rootFrame) ? null : f; render(); }
+});
+window.addEventListener('resize', function() { resizeCanvas(); render(); });
+
+function resetZoom() { zoomFrame = null; render(); }
+function onSearch(term) { searchTerm = term; render(); }
+function clearSearch() { document.getElementById('search').value = ''; searchTerm = ''; render(); }
+function toggleSort() { sortByName = !sortByName; document.getElementById('sortBtn').textContent = 'Sort: ' + (sortByName ? 'name' : 'size'); applyData(lastData); }
+function toggleDir() { bottomUp = !bottomUp; document.getElementById('dirBtn').textContent = (bottomUp ? '\u25b2 Bottom-up' : '\u25bc Top-down'); render(); }
+
+function togglePause() {
+  paused = !paused;
+  var s = document.getElementById('status');
+  if (paused) { s.textContent = '\u25a0 Paused'; s.className = 'paused'; }
+  else { s.textContent = '\u25cf Live'; s.className = 'live'; if (pendingData) scheduleApply(); }
+}
+
+function toggleAccum() {
+  accumulate = !accumulate;
+  document.getElementById('accumBtn').textContent = 'Accumulate: ' + (accumulate ? 'on' : 'off');
+}
+
+function mergeTree(a, b) {
+  if (!a) return b; if (!b) return a;
+  var merged = { name: a.name, value: a.value + b.value, children: null };
+  var ac = a.children || [], bc = b.children || [];
+  if (!ac.length && !bc.length) return merged;
+  var map = {};
+  for (var i = 0; i < ac.length; i++) map[ac[i].name] = ac[i];
+  var out = [];
+  for (var i = 0; i < bc.length; i++) {
+    var k = bc[i].name;
+    if (map[k]) { out.push(mergeTree(map[k], bc[i])); delete map[k]; }
+    else out.push(bc[i]);
+  }
+  for (var k in map) out.push(map[k]);
+  merged.children = out.length ? out : null;
+  return merged;
+}
+
+// ── Zoom state preservation ──────────────────────────────────────
+function getZoomPath() {
+  if (!zoomFrame || zoomFrame === rootFrame) return null;
+  var path = [], f = zoomFrame;
+  while (f && f.parent >= 0) { path.unshift(f.name); f = frames[f.parent]; }
+  return path;
+}
+function restoreZoom(path) {
+  if (!path || !path.length || !rootFrame) { zoomFrame = null; return; }
+  var cands = [], i;
+  for (i = 0; i < frames.length; i++) if (frames[i].parent === 0) cands.push(i);
+  var cur = null;
+  for (var p = 0; p < path.length; p++) {
+    var found = false;
+    for (var c = 0; c < cands.length; c++) {
+      if (frames[cands[c]].name === path[p]) {
+        cur = cands[c]; cands = [];
+        for (i = 0; i < frames.length; i++) if (frames[i].parent === cur) cands.push(i);
+        found = true; break;
+      }
+    }
+    if (!found) { zoomFrame = null; return; }
+  }
+  zoomFrame = cur !== null ? frames[cur] : null;
+}
+
+function applyData(data) {
+  lastData = (accumulate && lastData && lastData.value !== undefined) ? mergeTree(lastData, data) : data;
+  var savedPath = getZoomPath();
+  buildFrames(lastData);
+  restoreZoom(savedPath);
+  render();
+}
+
+// ── SSE ──────────────────────────────────────────────────────────
+var pendingData = null, rafScheduled = false, sse = null;
+
+function scheduleApply() {
+  if (rafScheduled) return;
+  rafScheduled = true;
+  requestAnimationFrame(function() {
+    rafScheduled = false;
+    if (pendingData && !paused) { applyData(pendingData); pendingData = null; }
+  });
+}
+
+function startStream() {
+  if (sse) return;
+  sse = new EventSource(location.origin + '/stream');
+  document.getElementById('status').textContent = 'Connecting\u2026';
+  sse.onopen = function() {
+    var s = document.getElementById('status');
+    if (!paused) { s.textContent = '\u25cf Live'; s.className = 'live'; }
+  };
+  sse.onmessage = function(msg) { pendingData = JSON.parse(msg.data); if (!paused) scheduleApply(); };
+  sse.onerror = function() { var s = document.getElementById('status'); s.textContent = '\u25cb Disconnected'; s.className = ''; sse.close(); sse = null; setTimeout(startStream, 3000); };
+}
+
+function fetchAndUpdate() {
+  fetch('/json').then(function(r) { return r.json(); }).then(applyData).catch(console.warn);
+}
+
+// ── Init ─────────────────────────────────────────────────────────
+if (SERVE_MODE) { document.getElementById('refreshBtn').style.display = ''; document.getElementById('accumBtn').style.display = ''; }
+document.getElementById('status').addEventListener('click', function() { if (SERVE_MODE && sse) togglePause(); });
+buildFrames(rawData);
+resizeCanvas();
+render();
+if (SERVE_MODE) { startStream(); if (!rootFrame) fetchAndUpdate(); }
+</script>
+</body>
+</html>
