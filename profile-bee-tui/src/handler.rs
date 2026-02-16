@@ -7,8 +7,7 @@ use crate::{
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tui_input::backend::crossterm::EventHandler;
 
-/// Double-click detection state
-static mut LAST_CLICK: Option<(Instant, u16, u16)> = None;
+/// Double-click detection threshold
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 
 /// Handles the key events and updates the state of [`App`].
@@ -208,13 +207,11 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
                     let now = Instant::now();
                     
                     // Check for double-click
-                    let is_double_click = unsafe {
-                        if let Some((last_time, last_x, last_y)) = LAST_CLICK {
-                            now.duration_since(last_time) <= DOUBLE_CLICK_THRESHOLD
-                                && x == last_x && y == last_y
-                        } else {
-                            false
-                        }
+                    let is_double_click = if let Some((last_time, last_x, last_y)) = app.last_click {
+                        now.duration_since(last_time) <= DOUBLE_CLICK_THRESHOLD
+                            && x == last_x && y == last_y
+                    } else {
+                        false
                     };
                     
                     if is_double_click {
@@ -224,14 +221,14 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
                             app.flamegraph_view.set_zoom();
                         }
                         // Clear the last click to prevent triple-click issues
-                        unsafe { LAST_CLICK = None; }
+                        app.last_click = None;
                     } else {
                         // Single click: select the stack
                         if let Some(stack_id) = app.find_stack_at_position(x, y) {
                             app.flamegraph_view.select_id(&stack_id);
                         }
                         // Record this click for double-click detection
-                        unsafe { LAST_CLICK = Some((now, x, y)); }
+                        app.last_click = Some((now, x, y));
                     }
                 }
                 MouseButton::Right => {

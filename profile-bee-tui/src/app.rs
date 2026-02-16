@@ -60,6 +60,8 @@ pub struct App {
     update_mode_handle: Arc<Mutex<UpdateMode>>,
     /// Stack positions from last render (for mouse click handling)
     pub stack_positions: Vec<StackPosition>,
+    /// Last click for double-click detection
+    pub last_click: Option<(std::time::Instant, u16, u16)>,
 }
 
 impl App {
@@ -77,6 +79,7 @@ impl App {
             next_flamegraph: Arc::new(Mutex::new(None)),
             update_mode_handle: Arc::new(Mutex::new(UpdateMode::default())),
             stack_positions: Vec::new(),
+            last_click: None,
         }
     }
 
@@ -103,6 +106,7 @@ impl App {
             dirty: true,
             update_mode_handle,
             stack_positions: Vec::new(),
+            last_click: None,
         }
     }
 
@@ -226,7 +230,8 @@ impl App {
             .iter()
             .rev()
             .find(|pos| {
-                x >= pos.x && x < pos.x + pos.width && y == pos.y
+                let end = pos.x.saturating_add(pos.width);
+                x >= pos.x && x < end && y == pos.y
             })
             .map(|pos| pos.stack_id)
     }
