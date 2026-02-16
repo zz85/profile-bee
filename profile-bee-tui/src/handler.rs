@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     app::{App, AppResult, InputBuffer},
@@ -6,6 +6,10 @@ use crate::{
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tui_input::backend::crossterm::EventHandler;
+
+/// Double-click detection state
+static mut LAST_CLICK: Option<(Instant, u16, u16)> = None;
+const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 
 /// Handles the key events and updates the state of [`App`].
 pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
@@ -199,11 +203,35 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
             use crossterm::event::MouseButton;
             match button {
                 MouseButton::Left => {
-                    // Left click: select the stack at this position
                     let x = mouse_event.column;
                     let y = mouse_event.row;
-                    if let Some(stack_id) = app.find_stack_at_position(x, y) {
-                        app.flamegraph_view.select_id(&stack_id);
+                    let now = Instant::now();
+                    
+                    // Check for double-click
+                    let is_double_click = unsafe {
+                        if let Some((last_time, last_x, last_y)) = LAST_CLICK {
+                            now.duration_since(last_time) <= DOUBLE_CLICK_THRESHOLD
+                                && x == last_x && y == last_y
+                        } else {
+                            false
+                        }
+                    };
+                    
+                    if is_double_click {
+                        // Double-click: zoom into the stack (like pressing Enter)
+                        if let Some(stack_id) = app.find_stack_at_position(x, y) {
+                            app.flamegraph_view.select_id(&stack_id);
+                            app.flamegraph_view.set_zoom();
+                        }
+                        // Clear the last click to prevent triple-click issues
+                        unsafe { LAST_CLICK = None; }
+                    } else {
+                        // Single click: select the stack
+                        if let Some(stack_id) = app.find_stack_at_position(x, y) {
+                            app.flamegraph_view.select_id(&stack_id);
+                        }
+                        // Record this click for double-click detection
+                        unsafe { LAST_CLICK = Some((now, x, y)); }
                     }
                 }
                 MouseButton::Right => {
