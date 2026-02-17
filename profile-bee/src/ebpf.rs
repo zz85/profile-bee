@@ -103,6 +103,12 @@ pub struct ProfilerConfig {
     pub cpu: Option<u32>,
     pub self_profile: bool,
     pub dwarf: bool,
+    /// Enable off-CPU profiling mode (trace context switches, measure blocked time)
+    pub off_cpu: bool,
+    /// Minimum off-CPU block time in microseconds to record (default 1)
+    pub min_block_us: u64,
+    /// Maximum off-CPU block time in microseconds to record (default u64::MAX)
+    pub max_block_us: u64,
 }
 
 /// Creates an aya Ebpf object
@@ -114,6 +120,7 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
 
     let skip_idle = if config.skip_idle { 1u8 } else { 0u8 };
     let dwarf_enabled = if config.dwarf { 1u8 } else { 0u8 };
+    let off_cpu_enabled = if config.off_cpu { 1u8 } else { 0u8 };
     let target_syscall_nr: i64 = config.target_syscall_nr;
 
     let bpf = EbpfLoader::new()
@@ -121,6 +128,9 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
         .set_global("NOTIFY_TYPE", &config.stream_mode, true)
         .set_global("DWARF_ENABLED", &dwarf_enabled, true)
         .set_global("TARGET_SYSCALL_NR", &target_syscall_nr, true)
+        .set_global("OFF_CPU_ENABLED", &off_cpu_enabled, true)
+        .set_global("MIN_BLOCK_US", &config.min_block_us, true)
+        .set_global("MAX_BLOCK_US", &config.max_block_us, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {
@@ -137,7 +147,33 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
 pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyhow::Error> {
     let mut bpf = load_ebpf(config)?;
 
-    if let Some(kprobe) = &config.kprobe {
+    if config.off_cpu {
+        // Off-CPU profiling: attach kprobe to finish_task_switch
+        let program: &mut KProbe = bpf.program_mut("offcpu_profile").unwrap().try_into()?;
+        program.load()?;
+
+        // Try the standard symbol name first, then the .isra.* variant
+        // (some kernels compile finish_task_switch with interprocedural
+        // scalar replacement of aggregates, renaming the symbol).
+        match program.attach("finish_task_switch", 0) {
+            Ok(_) => {
+                eprintln!("Off-CPU profiling: attached to finish_task_switch");
+            }
+            Err(e1) => match program.attach("finish_task_switch.isra.0", 0) {
+                Ok(_) => {
+                    eprintln!("Off-CPU profiling: attached to finish_task_switch.isra.0");
+                }
+                Err(e2) => {
+                    return Err(anyhow!(
+                        "Failed to attach off-CPU kprobe to finish_task_switch: {:?}, \
+                             also tried finish_task_switch.isra.0: {:?}",
+                        e1,
+                        e2
+                    ));
+                }
+            },
+        }
+    } else if let Some(kprobe) = &config.kprobe {
         let program: &mut KProbe = bpf.program_mut("kprobe_profile").unwrap().try_into()?;
         program.load()?;
         program.attach(kprobe, 0)?;

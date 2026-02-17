@@ -6,8 +6,9 @@
 use aya_ebpf::{
     bindings::{bpf_raw_tracepoint_args, pt_regs, BPF_F_USER_STACK},
     helpers::{
-        bpf_get_current_task_btf, bpf_get_smp_processor_id, bpf_probe_read, bpf_probe_read_kernel,
-        bpf_probe_read_user, bpf_task_pt_regs,
+        bpf_get_current_pid_tgid, bpf_get_current_task_btf, bpf_get_smp_processor_id,
+        bpf_ktime_get_ns, bpf_probe_read, bpf_probe_read_kernel, bpf_probe_read_user,
+        bpf_task_pt_regs,
     },
     macros::map,
     maps::{Array, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
@@ -36,6 +37,23 @@ static NOTIFY_TYPE: u8 = EVENT_TRACE_ALWAYS;
 /// Whether to use DWARF-based unwinding (1) or frame-pointer based (0)
 #[no_mangle]
 static DWARF_ENABLED: u8 = 0;
+
+/// Whether off-CPU profiling is enabled (1) or disabled (0).
+/// When enabled, the offcpu_profile kprobe traces context switches via
+/// finish_task_switch() and accumulates blocked time (in microseconds)
+/// instead of sample counts.
+#[no_mangle]
+static OFF_CPU_ENABLED: u8 = 0;
+
+/// Minimum off-CPU block time in microseconds to record (default 1us).
+/// Context switches shorter than this are filtered out to reduce noise.
+#[no_mangle]
+static MIN_BLOCK_US: u64 = 1;
+
+/// Maximum off-CPU block time in microseconds to record (default u64::MAX).
+/// Context switches longer than this are filtered out (e.g., idle threads).
+#[no_mangle]
+static MAX_BLOCK_US: u64 = 0xFFFFFFFFFFFFFFFF;
 
 /// Target syscall number to filter for raw tracepoint mode.
 /// -1 = match all syscalls (no filtering)
@@ -71,6 +89,16 @@ unsafe fn dwarf_enabled() -> bool {
 #[inline]
 unsafe fn target_syscall_nr() -> i64 {
     core::ptr::read_volatile(&TARGET_SYSCALL_NR)
+}
+
+#[inline]
+unsafe fn min_block_us() -> u64 {
+    core::ptr::read_volatile(&MIN_BLOCK_US)
+}
+
+#[inline]
+unsafe fn max_block_us() -> u64 {
+    core::ptr::read_volatile(&MAX_BLOCK_US)
 }
 
 #[inline]
@@ -139,6 +167,21 @@ pub static UNWIND_STATE: PerCpuArray<DwarfUnwindState> = PerCpuArray::with_max_e
 /// Program array for tail-call chaining during DWARF unwinding
 #[map(name = "prog_array")]
 pub static PROG_ARRAY: ProgramArray = ProgramArray::with_max_entries(4, 0);
+
+// --- Off-CPU profiling maps ---
+
+/// Tracks when each thread (by kernel PID = thread ID) went off-CPU.
+/// Key: thread PID (u32), Value: bpf_ktime_get_ns() timestamp (u64).
+#[map(name = "off_cpu_start")]
+pub static OFF_CPU_START: HashMap<u32, u64> = HashMap::with_max_entries(16384, 0);
+
+/// Per-CPU tracking of which thread PID was last running on each CPU.
+/// Used to identify the "prev" thread during context switches without
+/// needing to read task_struct fields at unknown offsets.
+/// Key: CPU index, Value: thread PID (u32).
+/// Max entries = 1024 (sufficient for up to 1024 CPUs).
+#[map(name = "last_pid_on_cpu")]
+pub static LAST_PID_ON_CPU: Array<u32> = Array::with_max_entries(1024, 0);
 
 /// Collect trace with custom FP/DWARF stack unwinding via pt_regs.
 ///
@@ -1147,6 +1190,175 @@ unsafe fn get_frame(fp: &mut u64) -> Option<u64> {
 #[inline(always)]
 fn invalid_userspace_pointer(ip: u64) -> bool {
     ip == 0 || ip >= __START_KERNEL_MAP
+}
+
+// ---------------------------------------------------------------------------
+// Off-CPU profiling
+// ---------------------------------------------------------------------------
+
+/// Off-CPU profiling: trace context switches via kprobe on finish_task_switch.
+///
+/// This function is called from a kprobe attached to `finish_task_switch(prev)`.
+/// It uses a per-CPU map to track which thread was previously running on each
+/// CPU, avoiding the need to read task_struct fields at kernel-version-dependent
+/// offsets.
+///
+/// The algorithm:
+///   1. Look up which thread was previously running on this CPU (= "prev")
+///   2. Record that prev went off-CPU at the current timestamp
+///   3. Update the per-CPU map with the current (waking) thread's PID
+///   4. Check if the current thread has a recorded off-CPU start time
+///   5. Compute delta (blocked time in microseconds), apply filters
+///   6. Capture stack trace and accumulate delta into COUNTS map
+///
+/// The stack trace belongs to the current (waking) thread. Application stack
+/// traces don't change while off-CPU, so this captures the blocking context.
+///
+/// ## Alternative approach (documented for future work)
+///
+/// A `#[raw_tracepoint(tracepoint = "sched_switch")]` could be used instead,
+/// which provides a more stable API (no kernel symbol name variations like
+/// `finish_task_switch.isra.*`). The raw tracepoint args for sched_switch are:
+///   - args[0] = bool preempt
+///   - args[1] = struct task_struct *prev
+///   - args[2] = struct task_struct *next
+/// This would require different arg parsing but avoids kprobe symbol issues.
+#[inline(always)]
+pub unsafe fn collect_off_cpu_trace<C: EbpfContext>(ctx: C) {
+    let now = bpf_ktime_get_ns();
+    collect_off_cpu_trace_percpu(&ctx, now);
+}
+
+/// Per-CPU based off-CPU trace collection.
+///
+/// Uses a per-CPU map to track which thread PID was last running on each CPU.
+/// When a context switch occurs (finish_task_switch entry):
+///   1. Look up the PID that was previously running on this CPU (= prev)
+///   2. Record off-CPU start time for prev
+///   3. Update per-CPU map with current PID
+///   4. Check if current has an off-CPU start time, compute delta, record stack
+///
+/// This avoids reading task_struct fields at unknown offsets.
+#[inline(always)]
+unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let current_pid = pid_tgid as u32; // thread ID (kernel PID)
+    let current_tgid = (pid_tgid >> 32) as u32; // process ID (TGID)
+
+    let cpu = bpf_get_smp_processor_id();
+
+    // --- Step 1: Record off-CPU start for the previously-running thread ---
+    // Look up who was last running on this CPU
+    if let Some(prev_pid_ptr) = LAST_PID_ON_CPU.get_ptr_mut(cpu) {
+        let prev_pid = *prev_pid_ptr;
+
+        // Record that prev went off-CPU now (if prev is a real thread)
+        if prev_pid != 0 {
+            let _ = OFF_CPU_START.insert(&prev_pid, &now, 0);
+        }
+
+        // Update: current is now running on this CPU
+        *prev_pid_ptr = current_pid;
+    }
+
+    // --- Step 2: Compute off-CPU time for the current (waking) thread ---
+    let Some(start_ts) = OFF_CPU_START.get(&current_pid).copied() else {
+        return; // No recorded off-CPU start — first time seeing this thread
+    };
+
+    // Clean up the start time entry
+    let _ = OFF_CPU_START.remove(&current_pid);
+
+    // Sanity check: start should be before now
+    if start_ts > now {
+        return;
+    }
+
+    let delta_ns = now - start_ts;
+    let delta_us = delta_ns / 1000;
+
+    // Apply min/max block time filters
+    let min_us = min_block_us();
+    let max_us = max_block_us();
+    if delta_us < min_us || delta_us > max_us {
+        return;
+    }
+
+    // Skip idle threads if configured
+    if current_pid == 0 && skip_idle() {
+        return;
+    }
+
+    // Filter by target PID if specified
+    let filter_pid = target_pid();
+    if filter_pid != 0 && current_tgid != filter_pid {
+        return;
+    }
+
+    // --- Step 3: Capture stack trace for the waking thread ---
+    let user_stack_id = STACK_TRACES
+        .get_stackid(ctx, BPF_F_USER_STACK.into())
+        .map_or(-1, |stack_id| stack_id as i32);
+    let kernel_stack_id = STACK_TRACES
+        .get_stackid(ctx, 0)
+        .map_or(-1, |stack_id| stack_id as i32);
+
+    // Use per-CPU storage for frame pointers
+    let Some(pointer) = STORAGE.get_ptr_mut(0) else {
+        return;
+    };
+    let pointer = &mut *pointer;
+
+    // For kprobe context, ctx.as_ptr() is pt_regs for the CURRENT task.
+    // We can use it for FP-based unwinding of the current task's user stack.
+    // Note: For off-CPU, the user stack was frozen when the thread went to
+    // sleep, and bpf_get_stackid captures it from the saved registers.
+    // Custom FP/DWARF unwinding also works here since the kernel preserves
+    // the task's register state.
+    let regs = ctx.as_ptr() as *const pt_regs;
+
+    // Attempt FP/DWARF unwinding if enabled, otherwise just use stackid
+    let (ip, bp, len, sp) = if dwarf_enabled() {
+        let (ip, bp, len) = dwarf_copy_stack_regs(&*regs, &mut pointer.pointers, current_tgid);
+        (ip, bp, len, (*regs).rsp)
+    } else {
+        copy_stack_regs(&*regs, &mut pointer.pointers)
+    };
+    pointer.len = len;
+
+    let cmd = ctx.command().unwrap_or_default();
+    let stack_info = StackInfo {
+        tgid: current_tgid,
+        user_stack_id,
+        kernel_stack_id,
+        cmd,
+        cpu,
+        ip,
+        bp,
+        sp,
+    };
+
+    let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
+
+    let notify_code = notify_type();
+    let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+
+    // --- Step 4: Accumulate off-CPU time (microseconds) into COUNTS ---
+    // Unlike on-CPU profiling which increments by 1 (sample count),
+    // off-CPU profiling accumulates the blocked time in microseconds.
+    if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
+        *count += delta_us;
+    } else {
+        let _ = COUNTS.insert(&stack_info, &delta_us, 0);
+        notify = true;
+    }
+
+    if notify {
+        if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+            let _writable = entry.write(stack_info);
+            entry.submit(0);
+        }
+    }
 }
 
 /// Handle sched_process_exit tracepoint for process exit monitoring.

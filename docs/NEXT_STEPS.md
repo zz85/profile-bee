@@ -2,9 +2,9 @@
 
 Prioritized roadmap for profile-bee, roughly ordered by impact.
 
-## 1. Off-CPU Profiling
+## ~~1. Off-CPU Profiling~~ ✅ Done (basic)
 
-On-CPU profiling only tells half the story. Off-CPU profiling (via `sched_switch` tracepoints or `finish_task_switch` kprobes) would show where time is spent blocked on I/O, locks, or sleep — making profile-bee a much more complete tool.
+Basic off-CPU profiling implemented via `kprobe:finish_task_switch` with per-CPU tracking, min/max block-time filtering, and all output formats. See [docs/off_cpu_profiling.md](off_cpu_profiling.md) for the full design, comparison with the OTel/Polar Signals approach, and planned improvements (sched_switch tracepoint, probabilistic sampling, DWARF unwinding for off-CPU stacks, simultaneous on+off CPU mode).
 
 ## ~~2. System-wide DWARF Unwinding~~ ✅ Done
 

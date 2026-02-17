@@ -41,6 +41,9 @@ gcc "$SRC_DIR/callstack.c" -g -fomit-frame-pointer -pie -fPIE -o "$FIXTURE_DIR/c
 gcc -shared -fPIC -g -fomit-frame-pointer "$SRC_DIR/libhotlib.c" -o "$FIXTURE_DIR/libhotlib.so"
 gcc "$SRC_DIR/sharedlib.c" -g -fomit-frame-pointer -L"$FIXTURE_DIR" -lhotlib -Wl,-rpath,'$ORIGIN' -o "$FIXTURE_DIR/sharedlib-no-fp"
 
+# offcpu_sleep: deterministic off-CPU blocking via nanosleep (for off-CPU profiling tests)
+gcc "$SRC_DIR/offcpu_sleep.c" -g -fno-omit-frame-pointer -o "$FIXTURE_DIR/offcpu-sleep-fp"
+
 # ── Rust test programs ────────────────────────────────────────────────────────
 
 echo "Building Rust test fixtures..."
