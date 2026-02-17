@@ -13,3 +13,6 @@ Cargo.lock
 # Release artifacts
 *.tar.gz
 *.zip
+
+# Test fixture binaries (rebuilt via tests/build_fixtures.sh)
+tests/fixtures/bin/
