@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya-ebpf = "0.1.1"
-aya-log-ebpf = "0.1.0"
+aya-ebpf = { git = "https://github.com/zz85/aya", branch = "array-of-maps" }
+aya-log-ebpf = { git = "https://github.com/zz85/aya", branch = "array-of-maps" }
 profile-bee-common = { path = "../profile-bee-common" }
 
 [[bin]]

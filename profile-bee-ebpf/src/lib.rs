@@ -4,14 +4,16 @@
 /// different ebpf applications.
 ///
 use aya_ebpf::{
-    bindings::{bpf_raw_tracepoint_args, pt_regs, BPF_F_USER_STACK},
+    bindings::{
+        bpf_map_type::BPF_MAP_TYPE_ARRAY, bpf_raw_tracepoint_args, pt_regs, BPF_F_USER_STACK,
+    },
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_current_task_btf, bpf_get_smp_processor_id,
-        bpf_ktime_get_ns, bpf_probe_read, bpf_probe_read_kernel, bpf_probe_read_user,
-        bpf_task_pt_regs,
+        bpf_ktime_get_ns, bpf_map_lookup_elem, bpf_probe_read, bpf_probe_read_kernel,
+        bpf_probe_read_user, bpf_task_pt_regs,
     },
     macros::map,
-    maps::{Array, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
+    maps::{Array, ArrayOfMaps, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
     programs::RawTracePointContext,
     EbpfContext,
 };
@@ -20,8 +22,9 @@ use aya_ebpf::{
 use profile_bee_common::{
     DwarfUnwindState, FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry,
     CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
-    FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH, MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS,
-    MAX_SHARD_ENTRIES, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
+    FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH, MAX_BIN_SEARCH_DEPTH,
+    MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET,
+    REG_RULE_SAME_VALUE, SHARD_NONE,
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -137,24 +140,24 @@ static RING_BUF_PROCESS_EXIT: RingBuf = RingBuf::with_byte_size(4096, 0);
 #[map(name = "stack_traces")]
 pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
 
-// DWARF unwind maps — sharded per-binary Array tables
+// DWARF unwind maps — single outer ArrayOfMaps containing per-binary inner Array maps.
+// Each inner map holds UnwindEntry values, keyed by u32 index.
+// The outer map is indexed by shard_id (0..MAX_UNWIND_SHARDS-1).
+// Userspace creates inner maps of the exact size needed per binary, then inserts
+// their FDs into this outer map. This eliminates the old 8-shard / 65K-entry caps.
 
-#[map(name = "shard_0")]
-pub static SHARD_0: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
-#[map(name = "shard_1")]
-pub static SHARD_1: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
-#[map(name = "shard_2")]
-pub static SHARD_2: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
-#[map(name = "shard_3")]
-pub static SHARD_3: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
-#[map(name = "shard_4")]
-pub static SHARD_4: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
-#[map(name = "shard_5")]
-pub static SHARD_5: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
-#[map(name = "shard_6")]
-pub static SHARD_6: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
-#[map(name = "shard_7")]
-pub static SHARD_7: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[map(name = "unwind_shards")]
+pub static UNWIND_SHARDS: ArrayOfMaps = ArrayOfMaps::with_max_entries(
+    MAX_UNWIND_SHARDS as u32, // outer: up to MAX_UNWIND_SHARDS inner maps
+    BPF_MAP_TYPE_ARRAY,       // inner map type
+    core::mem::size_of::<u32>() as u32, // inner key_size
+    core::mem::size_of::<UnwindEntry>() as u32, // inner value_size
+    MAX_SHARD_ENTRIES,        // inner max_entries — must match what userspace creates
+    // (kernel <5.14 requires exact match between template and
+    // inserted inner maps; on 5.14+ this could be relaxed to
+    // allow variable-sized inner maps via runtime feature probe)
+    0, // flags
+);
 
 /// Per-process unwind info: maps tgid to ProcInfo (exec mappings)
 #[map(name = "proc_info")]
@@ -210,10 +213,10 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
     let cpu = bpf_get_smp_processor_id();
     let user_stack_id = STACK_TRACES
-        .get_stackid(&ctx, BPF_F_USER_STACK.into())
+        .get_stackid::<C>(&ctx, BPF_F_USER_STACK.into())
         .map_or(-1, |stack_id| stack_id as i32);
     let kernel_stack_id = STACK_TRACES
-        .get_stackid(&ctx, 0)
+        .get_stackid::<C>(&ctx, 0)
         .map_or(-1, |stack_id| stack_id as i32);
 
     // Use CPU based storage so it doesn't occupy space on stack
@@ -354,10 +357,10 @@ unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &pt_r
 
     let cpu = bpf_get_smp_processor_id();
     let user_stack_id = STACK_TRACES
-        .get_stackid(&ctx, BPF_F_USER_STACK.into())
+        .get_stackid::<RawTracePointContext>(&ctx, BPF_F_USER_STACK.into())
         .map_or(-1, |stack_id| stack_id as i32);
     let kernel_stack_id = STACK_TRACES
-        .get_stackid(&ctx, 0)
+        .get_stackid::<RawTracePointContext>(&ctx, 0)
         .map_or(-1, |stack_id| stack_id as i32);
 
     let Some(pointer) = STORAGE.get_ptr_mut(0) else {
@@ -431,10 +434,10 @@ pub unsafe fn collect_trace_stackid_only<C: EbpfContext>(ctx: C) {
 
     let cpu = bpf_get_smp_processor_id();
     let user_stack_id = STACK_TRACES
-        .get_stackid(&ctx, BPF_F_USER_STACK.into())
+        .get_stackid::<C>(&ctx, BPF_F_USER_STACK.into())
         .map_or(-1, |stack_id| stack_id as i32);
     let kernel_stack_id = STACK_TRACES
-        .get_stackid(&ctx, 0)
+        .get_stackid::<C>(&ctx, 0)
         .map_or(-1, |stack_id| stack_id as i32);
 
     let Some(pointer) = STORAGE.get_ptr_mut(0) else {
@@ -508,10 +511,10 @@ pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
 
     let cpu = bpf_get_smp_processor_id();
     let user_stack_id = STACK_TRACES
-        .get_stackid(&ctx, BPF_F_USER_STACK.into())
+        .get_stackid::<RawTracePointContext>(&ctx, BPF_F_USER_STACK.into())
         .map_or(-1, |stack_id| stack_id as i32);
     let kernel_stack_id = STACK_TRACES
-        .get_stackid(&ctx, 0)
+        .get_stackid::<RawTracePointContext>(&ctx, 0)
         .map_or(-1, |stack_id| stack_id as i32);
 
     let Some(pointer) = STORAGE.get_ptr_mut(0) else {
@@ -1077,25 +1080,28 @@ unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
     Some((ra, new_bp))
 }
 
-/// Dispatch to the correct shard Array by shard_id.
-/// This is an 8-way static match — the verifier sees constant branches, no loop.
+/// Look up an UnwindEntry from the array-of-maps by shard_id and index.
+///
+/// 1. Look up shard_id in the outer UNWIND_SHARDS → get pointer to inner map
+/// 2. Look up idx in the inner map → get pointer to UnwindEntry
+///
+/// Two bpf_map_lookup_elem calls replace the old 8-way static match.
 #[inline(always)]
 unsafe fn shard_lookup(shard_id: u8, idx: u32) -> Option<UnwindEntry> {
-    match shard_id {
-        0 => SHARD_0.get(idx).copied(),
-        1 => SHARD_1.get(idx).copied(),
-        2 => SHARD_2.get(idx).copied(),
-        3 => SHARD_3.get(idx).copied(),
-        4 => SHARD_4.get(idx).copied(),
-        5 => SHARD_5.get(idx).copied(),
-        6 => SHARD_6.get(idx).copied(),
-        7 => SHARD_7.get(idx).copied(),
-        _ => None,
-    }
-}
+    // Step 1: look up the inner map in the outer array-of-maps
+    let inner_map_ptr = UNWIND_SHARDS.get(shard_id as u32)?;
 
-/// Max binary search iterations (covers 2^16 = 65K entries = MAX_SHARD_ENTRIES)
-const MAX_BIN_SEARCH_DEPTH: u32 = 16;
+    // Step 2: look up the entry in the inner map
+    let entry_ptr = bpf_map_lookup_elem(
+        inner_map_ptr,
+        &idx as *const u32 as *const core::ffi::c_void,
+    );
+    if entry_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the inner map value_size matches sizeof(UnwindEntry) (enforced at map creation)
+    Some(core::ptr::read_unaligned(entry_ptr as *const UnwindEntry))
+}
 
 #[inline(always)]
 unsafe fn binary_search_unwind_entry(

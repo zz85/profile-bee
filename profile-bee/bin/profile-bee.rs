@@ -30,8 +30,9 @@ enum PerfWork {
 }
 
 /// Incremental DWARF unwind table update
+/// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
 struct DwarfRefreshUpdate {
-    shard_updates: Vec<(u8, Vec<UnwindEntry>)>,  // (shard_id, entries)
+    shard_updates: Vec<(u8, Vec<UnwindEntry>)>,  // (shard_id, entries) for new shards
     proc_info: Vec<(u32, ProcInfo)>,
 }
 
@@ -1061,19 +1062,21 @@ fn send_refresh(
     tx: &mpsc::Sender<PerfWork>,
     new_shard_ids: Vec<u8>,
 ) -> Result<(), ()> {
+    // Only clone the new shards (not the entire binary_tables)
     let mut shard_updates = Vec::new();
     for &shard_id in &new_shard_ids {
-        if let Some(entries) = manager.binary_tables.get(&shard_id) {
+        if let Some(entries) = manager.binary_tables.get(shard_id as usize) {
             shard_updates.push((shard_id, entries.clone()));
         }
     }
+
     let proc_info: Vec<(u32, ProcInfo)> = manager
         .proc_info
         .iter()
         .map(|(&t, &p)| (t, p))
         .collect();
     let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
-    println!(
+    tracing::debug!(
         "DWARF refresh: {} new shards with {} total entries",
         new_shard_ids.len(), total_entries,
     );
@@ -1085,17 +1088,51 @@ fn send_refresh(
 
 /// Apply incremental DWARF unwind table updates to eBPF maps
 fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
-    use aya::maps::{Array, HashMap};
-    use profile_bee::ebpf::{UnwindEntryPod, ProcInfoKeyPod, ProcInfoPod};
+    use aya::maps::HashMap;
+    use profile_bee::ebpf::{ProcInfoKeyPod, ProcInfoPod};
     use profile_bee_common::ProcInfoKey;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    // Get the outer ArrayOfMaps raw FD for inserting inner maps
+    let outer_raw_fd = match bpf.map("unwind_shards") {
+        Some(map) => {
+            // Map variants all wrap MapData; extract fd via pattern matching
+            match map {
+                aya::maps::Map::ArrayOfMaps(map_data) => map_data.fd().as_fd().as_raw_fd(),
+                _ => {
+                    tracing::warn!("DWARF refresh: unwind_shards is not ArrayOfMaps");
+                    return;
+                }
+            }
+        }
+        None => {
+            tracing::warn!("DWARF refresh: unwind_shards map not found");
+            return;
+        }
+    };
 
     for (shard_id, entries) in &update.shard_updates {
-        let map_name = format!("shard_{}", shard_id);
-        if let Some(map) = bpf.map_mut(&map_name) {
-            if let Ok(mut arr) = Array::<&mut MapData, UnwindEntryPod>::try_from(map) {
-                for (idx, entry) in entries.iter().enumerate() {
-                    let _ = arr.set(idx as u32, UnwindEntryPod(*entry), 0);
+        if entries.is_empty() {
+            continue;
+        }
+        match profile_bee::ebpf::create_and_populate_inner_map(*shard_id, entries) {
+            Ok(inner_fd) => {
+                // Insert the inner map FD into the outer ArrayOfMaps via BPF_MAP_UPDATE_ELEM
+                use std::os::fd::AsRawFd;
+                let ret = profile_bee::ebpf::bpf_map_update_fd(
+                    outer_raw_fd, *shard_id as u32, inner_fd.as_raw_fd()
+                );
+                if ret < 0 {
+                    tracing::warn!(
+                        "DWARF refresh: failed to insert shard_{} into outer map: {}",
+                        shard_id,
+                        std::io::Error::last_os_error()
+                    );
                 }
+                // inner_fd dropped; kernel holds a reference via the outer map
+            }
+            Err(e) => {
+                tracing::warn!("DWARF refresh: failed to create shard_{}: {}", shard_id, e);
             }
         }
     }

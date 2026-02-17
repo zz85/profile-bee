@@ -35,8 +35,8 @@ impl FileMetadata {
     /// Extract metadata from a file path using stat()
     fn from_path(path: &Path) -> Result<Self, String> {
         use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(path)
-            .map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
+        let metadata =
+            fs::metadata(path).map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
         Ok(Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -357,8 +357,14 @@ pub fn generate_unwind_table_from_bytes(
 
 /// Holds the unwind tables for all currently profiled processes
 pub struct DwarfUnwindManager {
-    /// Per-binary unwind tables: map from shard_id to the entries
-    pub binary_tables: HashMap<u8, Vec<UnwindEntry>>,
+    /// Per-binary unwind tables: array of maps pattern (Vec<Vec<UnwindEntry>>)
+    /// Each index represents a shard_id (0..MAX_UNWIND_SHARDS-1).
+    /// Using an array instead of HashMap provides:
+    /// - Faster lookups via direct indexing (O(1) vs hash computation)
+    /// - Better cache locality for sequential access
+    /// - Natural enforcement of MAX_UNWIND_SHARDS limit
+    /// Each Vec<UnwindEntry> is the unwind table for one binary/shard.
+    pub binary_tables: Vec<Vec<UnwindEntry>>,
     /// Per-process mapping information
     pub proc_info: HashMap<u32, ProcInfo>,
     /// Next shard_id to assign to a new binary
@@ -375,7 +381,9 @@ pub struct DwarfUnwindManager {
 impl DwarfUnwindManager {
     pub fn new() -> Self {
         Self {
-            binary_tables: HashMap::new(),
+            // Initialize as empty Vec with capacity for MAX_UNWIND_SHARDS
+            // Using Vec instead of HashMap for the "array of maps" pattern
+            binary_tables: Vec::with_capacity(MAX_UNWIND_SHARDS),
             proc_info: HashMap::new(),
             next_shard_id: 0,
             metadata_cache: HashMap::new(),
@@ -408,14 +416,11 @@ impl DwarfUnwindManager {
     /// Rescan a process's memory mappings and load any new ones.
     /// Returns the list of new shard IDs added (for incremental eBPF updates).
     pub fn refresh_process(&mut self, tgid: u32) -> Result<Vec<u8>, String> {
-        let old_shard_ids: Vec<u8> = self.binary_tables.keys().copied().collect();
+        // Track number of shards before update
+        let old_len = self.binary_tables.len();
         self.scan_and_update(tgid)?;
-        let new_shard_ids: Vec<u8> = self
-            .binary_tables
-            .keys()
-            .copied()
-            .filter(|id| !old_shard_ids.contains(id))
-            .collect();
+        // Find new shards: those added after old_len
+        let new_shard_ids: Vec<u8> = (old_len as u8..self.binary_tables.len() as u8).collect();
         Ok(new_shard_ids)
     }
 
@@ -533,11 +538,12 @@ impl DwarfUnwindManager {
 
                 if let Some(sid) = metadata_cache_hit {
                     // Hot path: metadata cache hit - no file read needed!
-                    let tc = self
-                        .binary_tables
-                        .get(&sid)
-                        .map(|t| t.len() as u32)
-                        .unwrap_or(0);
+                    // Array access pattern: check if shard_id is within bounds
+                    let tc = if (sid as usize) < self.binary_tables.len() {
+                        self.binary_tables[sid as usize].len() as u32
+                    } else {
+                        0
+                    };
                     (sid, tc)
                 } else {
                     // Cold path: metadata cache miss - need to read binary
@@ -566,15 +572,16 @@ impl DwarfUnwindManager {
                                 self.metadata_cache.insert(meta, sid);
                             }
                         }
-                        let tc = self
-                            .binary_tables
-                            .get(&sid)
-                            .map(|t| t.len() as u32)
-                            .unwrap_or(0);
+                        // Array access pattern: check if shard_id is within bounds
+                        let tc = if (sid as usize) < self.binary_tables.len() {
+                            self.binary_tables[sid as usize].len() as u32
+                        } else {
+                            0
+                        };
                         (sid, tc)
                     } else {
                         // Cache miss - need to parse the binary
-                        let (unwind_entries, build_id_opt) = if let Some(data) = binary_data {
+                        let (mut unwind_entries, build_id_opt) = if let Some(data) = binary_data {
                             match generate_unwind_table_from_bytes(&data) {
                                 Ok(result) => result,
                                 Err(e) => {
@@ -619,13 +626,15 @@ impl DwarfUnwindManager {
                         };
 
                         if tc > MAX_SHARD_ENTRIES {
-                            tracing::warn!(
-                                "Binary unwind table too large: {} entries (max {} per shard), skipping",
+                            tracing::debug!(
+                                "Binary unwind table very large: {} entries (max supported by binary search: {}), truncating",
                                 tc,
                                 MAX_SHARD_ENTRIES,
                             );
-                            continue;
+                            unwind_entries.truncate(MAX_SHARD_ENTRIES as usize);
                         }
+
+                        let tc = unwind_entries.len() as u32;
 
                         if self.next_shard_id as usize >= MAX_UNWIND_SHARDS {
                             tracing::warn!(
@@ -639,7 +648,11 @@ impl DwarfUnwindManager {
                         let sid = self.next_shard_id;
                         self.next_shard_id += 1;
 
-                        self.binary_tables.insert(sid, unwind_entries);
+                        // Array of maps pattern: push the new unwind table as a new element
+                        // The index of this element will be the shard_id
+                        // Invariant: next_shard_id always equals binary_tables.len() before push
+                        debug_assert_eq!(sid as usize, self.binary_tables.len());
+                        self.binary_tables.push(unwind_entries);
 
                         // Cache using build ID if available, otherwise use path
                         if let Some(build_id) = build_id_opt {
@@ -679,7 +692,8 @@ impl DwarfUnwindManager {
 
     /// Returns the total number of table entries across all binaries
     pub fn total_entries(&self) -> usize {
-        self.binary_tables.values().map(|t| t.len()).sum()
+        // Array of maps pattern: iterate over all elements in the Vec
+        self.binary_tables.iter().map(|t| t.len()).sum()
     }
 }
 
@@ -876,6 +890,91 @@ mod tests {
         assert!(
             new_metadata_cache_size >= metadata_cache_size,
             "Metadata cache should not shrink"
+        );
+    }
+
+    #[test]
+    fn test_array_of_maps_pattern() {
+        // Test that validates the "array of maps" pattern implementation
+        // The binary_tables field is now Vec<Vec<UnwindEntry>> instead of HashMap<u8, Vec<UnwindEntry>>
+        let mut manager = DwarfUnwindManager::new();
+
+        // Verify initialization creates empty Vec with proper capacity
+        assert_eq!(
+            manager.binary_tables.len(),
+            0,
+            "Should start with no shards"
+        );
+        assert!(
+            manager.binary_tables.capacity() >= MAX_UNWIND_SHARDS,
+            "Should allocate capacity for at least MAX_UNWIND_SHARDS"
+        );
+
+        // Load current process to populate binary_tables
+        let pid = std::process::id();
+        let result = manager.load_process(pid);
+        assert!(result.is_ok(), "Failed to load process: {:?}", result);
+
+        // Verify array of maps pattern: Vec indexed by shard_id
+        let num_shards = manager.binary_tables.len();
+        assert!(
+            num_shards > 0,
+            "Expected at least one shard after loading process"
+        );
+        assert!(
+            num_shards <= MAX_UNWIND_SHARDS,
+            "Should not exceed MAX_UNWIND_SHARDS ({})",
+            MAX_UNWIND_SHARDS
+        );
+
+        // Verify each shard contains unwind entries
+        for (shard_id, entries) in manager.binary_tables.iter().enumerate() {
+            assert!(
+                !entries.is_empty(),
+                "Shard {} should contain entries after loading",
+                shard_id
+            );
+
+            // Verify entries are sorted by PC (required for binary search in eBPF)
+            for window in entries.windows(2) {
+                assert!(
+                    window[0].pc <= window[1].pc,
+                    "Entries in shard {} not sorted: {} > {}",
+                    shard_id,
+                    window[0].pc,
+                    window[1].pc
+                );
+            }
+        }
+
+        // Test direct array access pattern (what makes this faster than HashMap)
+        for shard_id in 0..manager.binary_tables.len() {
+            let entries = &manager.binary_tables[shard_id];
+            assert!(
+                !entries.is_empty(),
+                "Direct access to shard {} should work",
+                shard_id
+            );
+        }
+
+        // Verify total_entries uses the array iterator correctly
+        let total: usize = manager.binary_tables.iter().map(|t| t.len()).sum();
+        assert_eq!(
+            manager.total_entries(),
+            total,
+            "total_entries() should match sum of all shard entry counts"
+        );
+
+        // Test refresh_process returns correct new shard IDs
+        let old_len = manager.binary_tables.len();
+        let new_shards = manager.refresh_process(pid).unwrap();
+
+        // On refresh without new libraries, should have no new shards
+        assert_eq!(new_shards.len(), 0, "Expected no new shards on refresh");
+        assert_eq!(
+            manager.binary_tables.len(),
+            old_len,
+            "binary_tables length should not change on refresh without new libs"
         );
     }
 }

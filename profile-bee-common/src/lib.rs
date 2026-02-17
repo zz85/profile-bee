@@ -116,10 +116,15 @@ pub const LEGACY_MAX_DWARF_STACK_DEPTH: usize = 21;
 
 pub const MAX_PROC_MAPS: usize = 8;
 
-/// Number of per-binary Array shard maps in eBPF (shard_0 .. shard_7)
-pub const MAX_UNWIND_SHARDS: usize = 8;
-/// Maximum unwind entries per shard (2^16, covered by 16 binary search iterations)
-pub const MAX_SHARD_ENTRIES: u32 = 65_536;
+/// Maximum number of inner shard maps in the outer ArrayOfMaps.
+/// With array-of-maps, unused slots cost nothing (no pre-allocated kernel memory).
+pub const MAX_UNWIND_SHARDS: usize = 64;
+/// Maximum unwind entries per inner shard map.
+/// With array-of-maps, each inner map is sized to the actual binary's table,
+/// but we need an upper bound for the binary search depth (17 iterations covers 2^17 = 128K).
+pub const MAX_SHARD_ENTRIES: u32 = 131_072;
+/// Binary search iterations needed: ceil(log2(MAX_SHARD_ENTRIES)) = 17
+pub const MAX_BIN_SEARCH_DEPTH: u32 = 17;
 /// Sentinel value: no shard assigned to this mapping
 pub const SHARD_NONE: u8 = 0xFF;
 
