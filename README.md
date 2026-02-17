@@ -1,20 +1,23 @@
-# profile-bee
-
-An eBPF-based CPU profiler for Linux, written in Rust. Single binary, no BCC/libbpf dependencies.
-
-![Architecture](https://raw.githubusercontent.com/zz85/profile-bee/main/docs/architecture-sketch.png)
-
-![TUI Screenshot](https://raw.githubusercontent.com/zz85/profile-bee/main/docs/tui-self-profile-screenshot.png)
-
 ## About
 
 Profile Bee is an eBPF-based CPU profiler that ships as a single binary — no BCC, libbpf, or perf tooling needed on the target host. Built with Rust and [aya](https://aya-rs.dev/).
+
+![Architecture](https://raw.githubusercontent.com/zz85/profile-bee/main/docs/architecture-sketch.png)
 
 - Just `cargo install`, `sudo probee --tui`, and you're looking at a live flamegraph — no package manager dance, no Python dependencies, no separate visualization step
 - Walks stacks directly in the kernel via frame pointers (fast, the default) or DWARF unwind tables (for those `-O2` binaries everyone ships without frame pointers)
 - Attaches to perf events, kprobes, uprobes, or tracepoints — auto-discovers uprobe targets with glob and regex matching
 - Demangles Rust and C++ symbols out of the box
 - Outputs to interactive TUI, SVG, HTML, JSON, stackcollapse, or a real-time web server — whatever fits your workflow
+
+## Screenshots
+
+Real-time TUI flamegraphs
+![TUI Screenshot](https://raw.githubusercontent.com/zz85/profile-bee/main/docs/tui-self-profile-screenshot.png)
+
+Real-time Web-based flamegraphs
+![Web interface](https://raw.githubusercontent.com/zz85/profile-bee/main/docs/probee-web.png)
+
 
 ## Install
 
@@ -62,19 +65,23 @@ sudo probee --serve --skip-idle
 
 # Trace function calls with uprobe
 sudo probee --uprobe malloc --time 1000 --svg malloc.svg
+
+# Off-CPU profiling — find where threads block
+sudo probee --off-cpu --tui -- ./my-server
 ```
 
 Run `probee` with no arguments or `probee --help` for the full list of options and examples.
 
 ## Features
 
-- **Interactive TUI** — real-time flamegraph viewer with vim-style navigation, search, and zoom
+- **Interactive TUI** — real-time flamegraph viewer with vim-style navigation, search, zoom, and mouse support (click, scroll, double-click to zoom)
+- **Off-CPU profiling** (`--off-cpu`) — trace context switches via `finish_task_switch` kprobe to find where threads block on I/O, locks, or sleep. Configurable block-time filters.
 - **Multiple output formats** — SVG, HTML, JSON (d3), and [stackcollapse](https://www.speedscope.app/) format
 - **Frame pointer unwinding** (default) — fast eBPF-based stack walking via `bpf_get_stackid`
 - **DWARF unwinding** (`--dwarf`) — profiles `-O2`/`-O3` binaries without frame pointers using `.eh_frame` tables loaded into eBPF maps
 - **Smart uprobes** — GDB-style symbol resolution with glob, regex, demangled name matching, and multi-attach
 - **kprobe & tracepoint** support — profile kernel functions and tracepoint events
-- **Real-time web server** (`--serve`) — live flamegraph updates over HTTP
+- **Real-time web server** (`--serve`) — live flamegraph updates over HTTP with interactive controls
 - **Automatic termination** — stops when `--pid` target or `--cmd` process exits
 - **Rust & C++ demangling** — via gimli/blazesym
 - **BPF-based aggregation** — stack counting in kernel to reduce userspace data transfer
@@ -265,7 +272,7 @@ sudo probee --svg output.svg --time 5000 -- ./my-fp-binary
 - Rust: Add `-g` flag when compiling
 - C/C++: Compile with debug symbols (`-g` flag)
 
-**Limitations:** Max 16 executable mappings per process, 500K unwind table entries per binary, up to 165 frame depth (via tail-call chaining; legacy fallback: 21 frames). x86_64 only. Libraries loaded via dlopen are detected within ~1 second.
+**Limitations:** Max 8 executable mappings per process, 131K unwind table entries per binary (up to 64 binaries), up to 165 frame depth (via tail-call chaining; legacy fallback: 21 frames). x86_64 only. Libraries loaded via dlopen are detected within ~1 second.
 
 See [docs/dwarf_unwinding_design.md](docs/dwarf_unwinding_design.md) for architecture details, and [Polar Signals' article on profiling without frame pointers](https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers) for background.
 
