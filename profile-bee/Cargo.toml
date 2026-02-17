@@ -20,8 +20,8 @@ include = [
 [dependencies]
 aya = { git = "https://github.com/zz85/aya", branch = "array-of-maps" }
 aya-log = { git = "https://github.com/zz85/aya", branch = "array-of-maps" }
-profile-bee-common = { version = "0.1.0", path = "../profile-bee-common", features=["user"] }
-profile-bee-tui = { version = "0.1.0", path = "../profile-bee-tui", optional = true }
+profile-bee-common = { version = "0.3.2", path = "../profile-bee-common", features=["user"] }
+profile-bee-tui = { version = "0.3.2", path = "../profile-bee-tui", optional = true }
 anyhow = "1.0.42"
 clap = { version = "4.0", features = ["derive"] }
 tokio = { version = "1.18", features = ["macros", "rt", "rt-multi-thread", "net", "signal", "time", "process"] }
