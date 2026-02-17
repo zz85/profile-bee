@@ -18,8 +18,8 @@ include = [
 ]
 
 [dependencies]
-aya = { version = ">=0.11", features=["async_tokio"] }
-aya-log = "0.2.1"
+aya = { git = "https://github.com/zz85/aya", branch = "array-of-maps" }
+aya-log = { git = "https://github.com/zz85/aya", branch = "array-of-maps" }
 profile-bee-common = { version = "0.1.0", path = "../profile-bee-common", features=["user"] }
 profile-bee-tui = { version = "0.1.0", path = "../profile-bee-tui", optional = true }
 anyhow = "1.0.42"

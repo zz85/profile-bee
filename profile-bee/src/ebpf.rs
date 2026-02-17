@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use aya::maps::{Array, HashMap, MapData, ProgramArray, RingBuf, StackTraceMap};
 use aya::programs::{
-    perf_event::{PerfEventScope, PerfTypeId, SamplePolicy},
+    perf_event::{PerfEventConfig, PerfEventScope, SamplePolicy, SoftwareEvent},
     KProbe, PerfEvent,
 };
 use aya::programs::{RawTracePoint, TracePoint, UProbe};
@@ -178,6 +178,9 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         program.load()?;
         program.attach(kprobe, 0)?;
     } else if let Some(smart) = &config.smart_uprobe {
+        use aya::programs::uprobe::UProbeAttachLocation;
+        use std::path::Path;
+
         // New smart uprobe path: attach to all resolved probe targets
         if smart.probes.is_empty() {
             return Err(anyhow!("no probe targets resolved — nothing to attach"));
@@ -199,14 +202,12 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
                     display_name,
                     probe.address,
                 );
-                program.attach(
-                    Some(probe.symbol_name.as_str()),
-                    probe.offset,
-                    probe.library_path.to_str().ok_or_else(|| {
-                        anyhow!("non-UTF8 library path: {}", probe.library_path.display())
-                    })?,
-                    smart.pid,
-                )?;
+                let point = if probe.offset > 0 {
+                    UProbeAttachLocation::SymbolOffset(probe.symbol_name.as_str(), probe.offset)
+                } else {
+                    UProbeAttachLocation::Symbol(probe.symbol_name.as_str())
+                };
+                program.attach(point, &probe.library_path, smart.pid.map(|p| p as u32))?;
             }
         }
 
@@ -222,17 +223,18 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
                     display_name,
                     probe.address,
                 );
-                program.attach(
-                    Some(probe.symbol_name.as_str()),
-                    probe.offset,
-                    probe.library_path.to_str().ok_or_else(|| {
-                        anyhow!("non-UTF8 library path: {}", probe.library_path.display())
-                    })?,
-                    smart.pid,
-                )?;
+                let point = if probe.offset > 0 {
+                    UProbeAttachLocation::SymbolOffset(probe.symbol_name.as_str(), probe.offset)
+                } else {
+                    UProbeAttachLocation::Symbol(probe.symbol_name.as_str())
+                };
+                program.attach(point, &probe.library_path, smart.pid.map(|p| p as u32))?;
             }
         }
     } else if let Some(uprobe_config) = &config.uprobe {
+        use aya::programs::uprobe::UProbeAttachLocation;
+        use std::path::Path;
+
         // Choose the right program based on is_retprobe flag
         let program_name = if uprobe_config.is_retprobe {
             "uretprobe_profile"
@@ -254,11 +256,16 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
             (Some(uprobe_config.function.as_str()), 0)
         };
 
+        let point = match fn_name {
+            Some(name) if offset > 0 => UProbeAttachLocation::SymbolOffset(name, offset),
+            Some(name) => UProbeAttachLocation::Symbol(name),
+            None => UProbeAttachLocation::AbsoluteOffset(offset),
+        };
+
         program.attach(
-            fn_name,
-            offset,
-            uprobe_config.path.as_str(),
-            uprobe_config.pid,
+            point,
+            Path::new(&uprobe_config.path),
+            uprobe_config.pid.map(|p| p as u32),
         )?;
     } else if let Some(raw_tp) = &config.raw_tracepoint {
         // Pick the correct syscall raw_tp program based on enter vs exit
@@ -293,18 +300,12 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
 
         program.load()?;
 
-        // https://elixir.bootlin.com/linux/v4.2/source/include/uapi/linux/perf_event.h#L103
-        const PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
-
-        // could change this to Hardware if your system supports
-        // `lscpu | grep -i pmu`
-        let perf_type = PerfTypeId::Software;
+        let perf_config = PerfEventConfig::Software(SoftwareEvent::CpuClock);
 
         if config.self_profile {
             program.attach(
-                perf_type,
-                PERF_COUNT_SW_CPU_CLOCK,
-                PerfEventScope::CallingProcessAnyCpu,
+                perf_config,
+                PerfEventScope::CallingProcess { cpu: None },
                 SamplePolicy::Frequency(config.frequency),
                 true,
             )?;
@@ -329,8 +330,7 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
 
             for cpu in cpus {
                 program.attach(
-                    perf_type.clone(),
-                    PERF_COUNT_SW_CPU_CLOCK,
+                    perf_config,
                     PerfEventScope::AllProcessesOneCpu { cpu },
                     SamplePolicy::Frequency(config.frequency),
                     true,
@@ -343,8 +343,7 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
 
             for cpu in cpus {
                 program.attach(
-                    perf_type.clone(),
-                    PERF_COUNT_SW_CPU_CLOCK,
+                    perf_config,
                     PerfEventScope::AllProcessesOneCpu { cpu },
                     SamplePolicy::Frequency(config.frequency),
                     true,
@@ -433,22 +432,41 @@ impl EbpfProfiler {
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
     ) -> Result<(), anyhow::Error> {
-        // Load all shards
-        let all_shard_ids: Vec<u8> = manager.binary_tables.keys().copied().collect();
+        // Load all shards - using array indexing pattern
+        let all_shard_ids: Vec<u8> = (0..manager.binary_tables.len() as u8).collect();
         self.update_dwarf_tables(manager, &all_shard_ids)
     }
 
-    /// Load a single shard's unwind entries into its eBPF Array map.
+    /// Load a single shard's unwind entries by creating a new inner Array map
+    /// and inserting it into the outer ArrayOfMaps at `shard_id`.
     fn load_shard(&mut self, shard_id: u8, entries: &[UnwindEntry]) -> Result<(), anyhow::Error> {
-        let map_name = format!("shard_{}", shard_id);
-        let mut arr: Array<&mut MapData, UnwindEntryPod> = Array::try_from(
-            self.bpf
-                .map_mut(&map_name)
-                .ok_or_else(|| anyhow!("{} map not found", map_name))?,
-        )?;
-        for (idx, entry) in entries.iter().enumerate() {
-            arr.set(idx as u32, UnwindEntryPod(*entry), 0)?;
+        if entries.is_empty() {
+            return Ok(());
         }
+
+        // Create and populate a new inner Array map with exactly the right size
+        let inner_fd = create_and_populate_inner_map(shard_id, entries)?;
+
+        // Get the outer ArrayOfMaps FD
+        use std::os::fd::{AsFd, AsRawFd};
+        let outer_raw_fd = match self.bpf.map("unwind_shards") {
+            Some(aya::maps::Map::ArrayOfMaps(map_data)) => map_data.fd().as_fd().as_raw_fd(),
+            Some(_) => return Err(anyhow!("unwind_shards is not ArrayOfMaps")),
+            None => return Err(anyhow!("unwind_shards map not found")),
+        };
+
+        // Insert the inner map's FD into the outer ArrayOfMaps
+        let ret = bpf_map_update_fd(outer_raw_fd, shard_id as u32, inner_fd.as_raw_fd());
+        if ret < 0 {
+            return Err(anyhow!(
+                "failed to insert shard_{} into outer ArrayOfMaps: {}",
+                shard_id,
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        // inner_fd is dropped here — the kernel holds a reference to the inner map
+        // via the outer ArrayOfMaps, so the inner map stays alive.
         Ok(())
     }
 
@@ -462,7 +480,8 @@ impl EbpfProfiler {
         if !new_shard_ids.is_empty() {
             let mut total_entries = 0usize;
             for &shard_id in new_shard_ids {
-                if let Some(entries) = manager.binary_tables.get(&shard_id) {
+                // Array of maps pattern: use get() for safe access
+                if let Some(entries) = manager.binary_tables.get(shard_id as usize) {
                     self.load_shard(shard_id, entries)?;
                     total_entries += entries.len();
                     tracing::info!("Loaded shard {} with {} entries", shard_id, entries.len());
@@ -535,5 +554,146 @@ impl EbpfProfiler {
 
         tracing::info!("Tail-call DWARF unwinding enabled (up to 165 frames)");
         Ok(())
+    }
+}
+
+/// Create a new BPF_MAP_TYPE_ARRAY map suitable as an inner map for the
+/// unwind_shards ArrayOfMaps. The map holds `MAX_SHARD_ENTRIES` UnwindEntry slots.
+///
+/// Uses the raw bpf() syscall to create the map, then populates it with the
+/// provided entries. The map is always created with `MAX_SHARD_ENTRIES` slots
+/// (matching the eBPF-side template) because kernel <5.14 requires inner maps
+/// to have exactly the same `max_entries` as the template used when creating
+/// the outer ArrayOfMaps.
+///
+/// TODO: On kernel 5.14+ the max_entries restriction is relaxed (commit 134fede4eecf).
+/// A runtime feature probe could detect this: create a throwaway ArrayOfMaps with
+/// template max_entries=1, try inserting an inner map with max_entries=2 — if it
+/// succeeds, use right-sized inner maps to save memory. Until then, every inner
+/// map is allocated at the fixed maximum size.
+///
+/// The kernel only needs the inner map's FD to persist as long as it's
+/// referenced from the outer ArrayOfMaps; once inserted there, the returned FD
+/// can be closed (the kernel holds its own reference).
+pub fn create_and_populate_inner_map(
+    shard_id: u8,
+    entries: &[UnwindEntry],
+) -> Result<std::os::fd::OwnedFd, anyhow::Error> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    if entries.is_empty() {
+        return Err(anyhow!("cannot create inner map with zero entries"));
+    }
+
+    // Always use fixed size to match the eBPF-side template (required on kernel <5.14).
+    let max_entries = profile_bee_common::MAX_SHARD_ENTRIES;
+    let key_size = std::mem::size_of::<u32>() as u32;
+    let value_size = std::mem::size_of::<UnwindEntry>() as u32;
+
+    // BPF_MAP_CREATE = 0, BPF_MAP_TYPE_ARRAY = 2
+    #[repr(C)]
+    #[derive(Default)]
+    struct BpfAttrMapCreate {
+        map_type: u32,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        map_flags: u32,
+    }
+
+    let attr = BpfAttrMapCreate {
+        map_type: 2, // BPF_MAP_TYPE_ARRAY
+        key_size,
+        value_size,
+        max_entries,
+        ..Default::default()
+    };
+
+    // SYS_bpf = 321 on x86_64, BPF_MAP_CREATE = 0
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            0u32, // BPF_MAP_CREATE
+            &attr as *const _ as *const libc::c_void,
+            std::mem::size_of::<BpfAttrMapCreate>(),
+        )
+    };
+    if fd < 0 {
+        return Err(anyhow!(
+            "bpf(BPF_MAP_CREATE) for shard_{} failed: {}",
+            shard_id,
+            std::io::Error::last_os_error()
+        ));
+    }
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+
+    // Populate the inner map with unwind entries using BPF_MAP_UPDATE_ELEM
+    #[repr(C)]
+    struct BpfAttrMapUpdate {
+        map_fd: u32,
+        key: u64,
+        value: u64,
+        flags: u64,
+    }
+
+    use std::os::fd::AsRawFd;
+    let map_raw_fd = owned_fd.as_raw_fd() as u32;
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let key = idx as u32;
+        let attr = BpfAttrMapUpdate {
+            map_fd: map_raw_fd,
+            key: &key as *const u32 as u64,
+            value: entry as *const UnwindEntry as u64,
+            flags: 0, // BPF_ANY
+        };
+
+        // BPF_MAP_UPDATE_ELEM = 2
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                2u32, // BPF_MAP_UPDATE_ELEM
+                &attr as *const _ as *const libc::c_void,
+                std::mem::size_of::<BpfAttrMapUpdate>(),
+            )
+        };
+        if ret < 0 {
+            return Err(anyhow!(
+                "bpf(BPF_MAP_UPDATE_ELEM) for shard_{} index {} failed: {}",
+                shard_id,
+                idx,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    Ok(owned_fd)
+}
+
+/// Helper: insert a map FD as a value into an outer map at the given key index.
+/// Used for BPF_MAP_TYPE_ARRAY_OF_MAPS: the "value" is the inner map's FD.
+pub fn bpf_map_update_fd(outer_map_fd: i32, key: u32, inner_map_fd: i32) -> i64 {
+    #[repr(C)]
+    struct BpfAttrMapUpdate {
+        map_fd: u32,
+        key: u64,
+        value: u64,
+        flags: u64,
+    }
+
+    let attr = BpfAttrMapUpdate {
+        map_fd: outer_map_fd as u32,
+        key: &key as *const u32 as u64,
+        value: &inner_map_fd as *const i32 as u64,
+        flags: 0,
+    };
+
+    unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            2u32, // BPF_MAP_UPDATE_ELEM
+            &attr as *const _ as *const libc::c_void,
+            std::mem::size_of::<BpfAttrMapUpdate>(),
+        )
     }
 }
