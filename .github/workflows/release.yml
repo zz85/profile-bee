@@ -37,6 +37,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
       - name: Install cross-compilation tools (aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |

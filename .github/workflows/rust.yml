@@ -35,6 +35,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -54,6 +56,8 @@ jobs:
         with:
           components: rust-src
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -76,6 +80,8 @@ jobs:
         with:
           components: rust-src
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
