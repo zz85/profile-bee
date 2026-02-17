@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.3.2
+
+### New Features
+
+- **Off-CPU profiling** (`--off-cpu`) — trace context switches via `kprobe:finish_task_switch` to find where threads block on I/O, locks, or sleep. Per-CPU tracking with configurable block-time filters (`--min-block-time`, `--max-block-time`). All output formats supported (TUI, SVG, HTML, JSON, collapse, web).
+- **TUI mouse support** — click to select frames, double-click to zoom, scroll wheel navigation. Enabled by default (`--no-tui-mouse` to disable).
+- **Web UI improvements** — rewritten flamegraph viewer with viewport-sized canvas, live controls, client-side accumulate mode, sort-by-name, bottom-up toggle, pause/refresh, green live indicator. Fixed zoom, Y layout, and ancestor frame visibility.
+
+### Improvements
+
+- **ArrayOfMaps for DWARF shards** — replaced 8 individual `shard_0..shard_7` eBPF Array maps with a single `BPF_MAP_TYPE_ARRAY_OF_MAPS`. Supports up to 64 binaries (was 8) with up to 131K unwind entries each (was 65K). Inner maps created on-demand to reduce idle memory usage.
+- **Oversized unwind tables truncated instead of skipped** — large binaries (e.g. glibc) now get partial DWARF coverage instead of none.
+- **DWARF refresh and truncation logs moved to debug level** — no longer interfere with TUI mode. Use `RUST_LOG=debug` to see them.
+- **Test fixture binaries removed from git** — rebuilt from source via `tests/build_fixtures.sh`. E2E test runner auto-detects missing or stale fixtures.
+
+### Bug Fixes
+
+- Fix HTML output script injection vulnerability — escape user-controlled strings in generated HTML
+- Fix HTML file write ordering — defer writes to avoid partial output on error
+- Fix HTML replacement order for correct template substitution
+- Fix eBPF `get_stackid` type inference with updated aya API (turbofish annotations)
+- Fix kernel <5.14 compatibility for ArrayOfMaps — use fixed `max_entries` matching the eBPF template
+
+### Dependencies
+
+- `aya` / `aya-ebpf`: switched to `github.com/zz85/aya` branch `array-of-maps` (adds `BPF_MAP_TYPE_ARRAY_OF_MAPS` support)
+
+### Infrastructure
+
+- E2E test suite expanded to 16 tests (added off-CPU profiling tests)
+- Prebuilt eBPF binary updated for `cargo install` compatibility
+
 ## v0.3.0 — Initial Public Release
 
 The first release published to crates.io. Install with `cargo install profile-bee` — no nightly Rust required.

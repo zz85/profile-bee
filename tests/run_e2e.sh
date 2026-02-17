@@ -61,9 +61,20 @@ if [[ ! -x "$PROFILER" ]]; then
     exit 1
 fi
 
-if [[ ! -d "$FIXTURE_DIR" ]]; then
-    echo "Building test fixtures..."
-    bash "$SCRIPT_DIR/build_fixtures.sh"
+if [[ ! -d "$FIXTURE_DIR" ]] || [[ -z "$(ls -A "$FIXTURE_DIR" 2>/dev/null)" ]]; then
+    echo -e "${RED}ERROR: Test fixtures not found at $FIXTURE_DIR${NC}"
+    echo "Run: bash tests/build_fixtures.sh"
+    exit 1
+else
+    # Warn if any source file is newer than the oldest binary
+    _newest_src=$(find "$SCRIPT_DIR/fixtures/src" -type f \( -name '*.c' -o -name '*.rs' \) -printf '%T@\n' 2>/dev/null | sort -rn | head -1)
+    _oldest_bin=$(find "$FIXTURE_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -n | head -1)
+    _newest_src_int=${_newest_src%.*}
+    _oldest_bin_int=${_oldest_bin%.*}
+    if [[ -n "$_newest_src_int" ]] && [[ -n "$_oldest_bin_int" ]] && [[ "$_newest_src_int" -gt "$_oldest_bin_int" ]]; then
+        echo -e "${YELLOW}WARNING: Test fixture sources are newer than binaries. Consider running:${NC}"
+        echo "  bash tests/build_fixtures.sh"
+    fi
 fi
 
 mkdir -p "$OUTPUT_DIR"
