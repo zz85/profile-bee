@@ -813,7 +813,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                     profile_bee_common::LEGACY_MAX_DWARF_STACK_DEPTH,
                 );
             } else {
-                tracing::info!("DWARF tail-call unwinding: all samples used tail-call path (165 frames)");
+                tracing::info!(
+                    "DWARF tail-call unwinding: all samples used tail-call path (165 frames)"
+                );
             }
         }
     }
