@@ -111,8 +111,11 @@ pub const FRAMES_PER_TAIL_CALL: usize = 5;
 pub const MAX_TAIL_CALLS: usize = 33;
 /// Maximum total stack depth with tail-call chaining
 pub const MAX_DWARF_STACK_DEPTH: usize = FRAMES_PER_TAIL_CALL * MAX_TAIL_CALLS; // 165 frames
-/// Legacy single-loop depth limit (for kernels without tail-call support)
-pub const LEGACY_MAX_DWARF_STACK_DEPTH: usize = 21;
+/// Legacy single-loop depth limit (for non-perf_event program types where
+/// tail-call chaining is unavailable: kprobe, uprobe, raw_tracepoint).
+/// Reduced from 21 to 20 to stay within the BPF verifier's 1M instruction limit
+/// on newer kernels (6.14+) where verification cost per instruction increased.
+pub const LEGACY_MAX_DWARF_STACK_DEPTH: usize = 20;
 
 pub const MAX_PROC_MAPS: usize = 8;
 

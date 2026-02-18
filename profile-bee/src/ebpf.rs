@@ -1,5 +1,7 @@
 use anyhow::anyhow;
-use aya::maps::{Array, HashMap, MapData, ProgramArray, RingBuf, StackTraceMap};
+use aya::maps::{
+    Array, HashMap, MapData, PerCpuArray, PerCpuValues, ProgramArray, RingBuf, StackTraceMap,
+};
 use aya::programs::{
     perf_event::{PerfEventConfig, PerfEventScope, SamplePolicy, SoftwareEvent},
     KProbe, PerfEvent,
@@ -553,6 +555,17 @@ impl EbpfProfiler {
 
         tracing::info!("Tail-call DWARF unwinding enabled (up to 165 frames)");
         Ok(())
+    }
+
+    /// Read DWARF unwinding diagnostics from the dwarf_stats PerCpuArray map.
+    /// Returns the total tail-call fallback count across all CPUs, or None if
+    /// the map doesn't exist (e.g., DWARF not enabled).
+    pub fn read_dwarf_stats(&mut self) -> Option<u64> {
+        let map = self.bpf.map_mut("dwarf_stats")?;
+        let stats: PerCpuArray<&mut MapData, u64> = PerCpuArray::try_from(map).ok()?;
+        let values: PerCpuValues<u64> = stats.get(&0, 0).ok()?;
+        let total: u64 = values.iter().sum();
+        Some(total)
     }
 }
 

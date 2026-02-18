@@ -803,6 +803,21 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     profiler.print_stats();
 
+    // Log DWARF tail-call fallback diagnostics if DWARF was enabled
+    if opt.dwarf.unwrap_or(false) {
+        if let Some(fallback_count) = ebpf_profiler.read_dwarf_stats() {
+            if fallback_count > 0 {
+                eprintln!(
+                    "DWARF tail-call fallback: {} samples used legacy {}-frame path",
+                    fallback_count,
+                    profile_bee_common::LEGACY_MAX_DWARF_STACK_DEPTH,
+                );
+            } else {
+                tracing::info!("DWARF tail-call unwinding: all samples used tail-call path (165 frames)");
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -20,6 +20,10 @@ PROFILE_TIME_MS=1000    # how long to profile each test (ms)
 FREQUENCY=99            # sampling frequency (Hz)
 TEST_TIMEOUT=30         # max seconds per individual test
 
+# Enable debug logging so profiler diagnostics (DWARF loading, tail-call setup,
+# verifier errors, etc.) are captured in test output and shown on failure.
+export RUST_LOG=debug
+
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
@@ -253,9 +257,8 @@ test_dwarf_deep() {
 
 test_dwarf_deepstack() {
     # Test deep DWARF unwinding on a 50-level recursion binary.
-    # Currently limited to ~21 frames by the BPF verifier's instruction complexity limit.
-    # True tail-call support (PROG_ARRAY) is needed to reach MAX_DWARF_STACK_DEPTH (165).
-    # For now, verify DWARF produces full stacks up to the verifier limit.
+    # With tail-call support (PROG_ARRAY), the perf_event path can unwind
+    # up to 165 frames. The legacy inline path (kprobe/uprobe) is limited to 20.
     local file
     file=$(run_profiler "$FIXTURE_DIR/deepstack-no-fp" "dwarf-deepstack" --dwarf true)
     assert_stack_contains "$file" "leaf" "leaf() should appear with DWARF"
