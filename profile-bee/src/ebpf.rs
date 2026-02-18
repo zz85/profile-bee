@@ -124,13 +124,13 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
     let target_syscall_nr: i64 = config.target_syscall_nr;
 
     let bpf = EbpfLoader::new()
-        .set_global("SKIP_IDLE", &skip_idle, true)
-        .set_global("NOTIFY_TYPE", &config.stream_mode, true)
-        .set_global("DWARF_ENABLED", &dwarf_enabled, true)
-        .set_global("TARGET_SYSCALL_NR", &target_syscall_nr, true)
-        .set_global("OFF_CPU_ENABLED", &off_cpu_enabled, true)
-        .set_global("MIN_BLOCK_US", &config.min_block_us, true)
-        .set_global("MAX_BLOCK_US", &config.max_block_us, true)
+        .override_global("SKIP_IDLE", &skip_idle, true)
+        .override_global("NOTIFY_TYPE", &config.stream_mode, true)
+        .override_global("DWARF_ENABLED", &dwarf_enabled, true)
+        .override_global("TARGET_SYSCALL_NR", &target_syscall_nr, true)
+        .override_global("OFF_CPU_ENABLED", &off_cpu_enabled, true)
+        .override_global("MIN_BLOCK_US", &config.min_block_us, true)
+        .override_global("MAX_BLOCK_US", &config.max_block_us, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {
@@ -179,7 +179,6 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         program.attach(kprobe, 0)?;
     } else if let Some(smart) = &config.smart_uprobe {
         use aya::programs::uprobe::UProbeAttachLocation;
-        use std::path::Path;
 
         // New smart uprobe path: attach to all resolved probe targets
         if smart.probes.is_empty() {

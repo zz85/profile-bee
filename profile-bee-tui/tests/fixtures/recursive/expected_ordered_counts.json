@@ -1,0 +1,63 @@
+{
+  "entries": [
+    {
+      "name": "deep_work (long_running.py:26)",
+      "count": {
+        "total": 109,
+        "own": 109
+      },
+      "visible": true
+    },
+    {
+      "name": "deep_work (long_running.py:27)",
+      "count": {
+        "total": 72,
+        "own": 72
+      },
+      "visible": true
+    },
+    {
+      "name": "work (long_running.py:8)",
+      "count": {
+        "total": 5,
+        "own": 5
+      },
+      "visible": true
+    },
+    {
+      "name": "work (long_running.py:7)",
+      "count": {
+        "total": 4,
+        "own": 4
+      },
+      "visible": true
+    },
+    {
+      "name": "deep_work (long_running.py:29)",
+      "count": {
+        "total": 9,
+        "own": 0
+      },
+      "visible": true
+    },
+    {
+      "name": "deep_work (long_running.py:28)",
+      "count": {
+        "total": 190,
+        "own": 0
+      },
+      "visible": true
+    },
+    {
+      "name": "<module> (long_running.py:36)",
+      "count": {
+        "total": 190,
+        "own": 0
+      },
+      "visible": true
+    }
+  ],
+  "num_rows": 7,
+  "sorted_column": "Own",
+  "search_pattern_ignored_because_of_no_match": false
+}

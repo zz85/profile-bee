@@ -1,0 +1,34 @@
+[
+  {
+    "id": 0,
+    "line_index": 0,
+    "start_index": 0,
+    "end_index": 0,
+    "total_count": 7,
+    "self_count": 0,
+    "parent": null,
+    "children": [
+      1
+    ],
+    "level": 0,
+    "width_factor": 1.0,
+    "hit": false,
+    "short_name": "all",
+    "full_name": "all"
+  },
+  {
+    "id": 1,
+    "line_index": 30,
+    "start_index": 30,
+    "end_index": 59,
+    "total_count": 7,
+    "self_count": 7,
+    "parent": 0,
+    "children": [],
+    "level": 1,
+    "width_factor": 1.0,
+    "hit": false,
+    "short_name": "<module> (long_running.py:24)",
+    "full_name": "<module> (long_running.py:24)"
+  }
+]

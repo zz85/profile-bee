@@ -1,8 +1,9 @@
 use crate::flame::{FlameGraph, SearchPattern, StackIdentifier, ROOT_ID};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpdateMode {
     Reset,
+    #[default]
     Accumulate,
     Decay,
 }
@@ -22,12 +23,6 @@ impl UpdateMode {
             UpdateMode::Accumulate => "Accumulate",
             UpdateMode::Decay => "Decay",
         }
-    }
-}
-
-impl Default for UpdateMode {
-    fn default() -> Self {
-        UpdateMode::Accumulate
     }
 }
 

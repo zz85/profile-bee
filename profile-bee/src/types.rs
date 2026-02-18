@@ -138,8 +138,8 @@ impl StackFrameInfo {
     pub fn fmt_source(&self) -> String {
         let short = self.fmt_shorter_source(4);
 
-        if short.is_some() {
-            format!(" ({})", short.unwrap())
+        if let Some(short) = short {
+            format!(" ({})", short)
         } else {
             "".to_string()
         }

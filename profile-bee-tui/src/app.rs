@@ -91,8 +91,10 @@ impl App {
     /// Constructs a new instance for live profiling mode with specified update mode
     pub fn with_live_and_mode(update_mode: UpdateMode) -> Self {
         let flamegraph = FlameGraph::from_string("".to_string(), true);
-        let mut state = FlameGraphState::default();
-        state.update_mode = update_mode;
+        let state = FlameGraphState {
+            update_mode,
+            ..Default::default()
+        };
         let update_mode_handle = Arc::new(Mutex::new(update_mode));
         Self {
             running: true,
