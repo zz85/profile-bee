@@ -20,9 +20,9 @@ PROFILE_TIME_MS=1000    # how long to profile each test (ms)
 FREQUENCY=99            # sampling frequency (Hz)
 TEST_TIMEOUT=30         # max seconds per individual test
 
-# Enable debug logging so profiler diagnostics (DWARF loading, tail-call setup,
-# verifier errors, etc.) are captured in test output and shown on failure.
-export RUST_LOG=debug
+# Enable debug logging for profiler diagnostics (DWARF loading, tail-call setup,
+# verifier errors, etc.) while keeping aya/dependency noise at info level.
+export RUST_LOG=info,probee=debug,profile_bee=debug
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
