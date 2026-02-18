@@ -95,3 +95,6 @@ jobs:
         run: bash tests/build_fixtures.sh
       - name: Run e2e tests
         run: sudo tests/run_e2e.sh --verbose
+      - name: Setup tmate session on failure
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3
