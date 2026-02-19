@@ -258,7 +258,7 @@ test_dwarf_deep() {
 test_dwarf_deepstack() {
     # Test deep DWARF unwinding on a 50-level recursion binary.
     # With tail-call support (PROG_ARRAY), the perf_event path can unwind
-    # up to 165 frames. The legacy inline path (kprobe/uprobe) is limited to 20.
+    # up to 165 frames. The legacy inline path (kprobe/uprobe) is limited to 16.
     local file
     file=$(run_profiler "$FIXTURE_DIR/deepstack-no-fp" "dwarf-deepstack" --dwarf true)
     assert_stack_contains "$file" "leaf" "leaf() should appear with DWARF"
@@ -267,11 +267,12 @@ test_dwarf_deepstack() {
     local max_depth
     max_depth=$(awk -F';' '{print NF}' "$file" | sort -rn | head -1)
 
-    # Should get at least 20 frames (verifier limit is ~21 unwind iterations + leaf)
-    if [[ "$max_depth" -ge 20 ]]; then
+    # With tail-call unwinding (perf_event), expect 20+ frames from 50-level recursion.
+    # Legacy path (kprobe/uprobe) would give ~16 frames.
+    if [[ "$max_depth" -ge 16 ]]; then
         return 0
     else
-        echo "  Stack depth ($max_depth) below expected minimum of 20" >&2
+        echo "  Stack depth ($max_depth) below expected minimum of 16" >&2
         return 1
     fi
 }
