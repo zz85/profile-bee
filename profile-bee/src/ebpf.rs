@@ -146,6 +146,42 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
     Ok(bpf)
 }
 
+/// Load the dwarf_unwind_step program and register it in PROG_ARRAY for tail-call
+/// DWARF unwinding. Operates on raw `Ebpf` so it can be called both from
+/// `setup_ebpf_profiler()` (before attach) and from `EbpfProfiler::setup_tail_call_unwinding()`.
+fn setup_tail_call_unwinding_inner(bpf: &mut Ebpf) -> Result<(), anyhow::Error> {
+    use aya::programs::PerfEvent;
+
+    // Load the step program (but don't attach it to any perf event —
+    // it's only invoked via tail call from collect_trace)
+    {
+        let step_prog: &mut PerfEvent = bpf
+            .program_mut("dwarf_unwind_step")
+            .ok_or(anyhow!("dwarf_unwind_step program not found"))?
+            .try_into()?;
+        step_prog.load()?;
+    }
+    // Mutable borrow released
+
+    // Clone the program FD so we can pass it to ProgramArray::set
+    // without conflicting borrows on bpf
+    let step_fd = bpf
+        .program("dwarf_unwind_step")
+        .ok_or(anyhow!("dwarf_unwind_step not found after load"))?
+        .fd()?
+        .try_clone()?;
+
+    // Register the step program at index 0 of PROG_ARRAY
+    let mut prog_array = ProgramArray::try_from(
+        bpf.map_mut("prog_array")
+            .ok_or(anyhow!("prog_array map not found"))?,
+    )?;
+    prog_array.set(0, &step_fd, 0)?;
+
+    tracing::info!("Tail-call DWARF unwinding enabled (up to 165 frames)");
+    Ok(())
+}
+
 pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyhow::Error> {
     let mut bpf = load_ebpf(config)?;
 
@@ -297,9 +333,33 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
 
         program.attach(category, name)?;
     } else {
-        let program: &mut PerfEvent = bpf.program_mut("profile_cpu").unwrap().try_into()?;
+        // Load profile_cpu program first, then release the borrow
+        {
+            let program: &mut PerfEvent = bpf.program_mut("profile_cpu").unwrap().try_into()?;
+            program.load()?;
+        }
 
-        program.load()?;
+        // Set up tail-call DWARF unwinding BEFORE attaching perf events.
+        // Once attached, samples fire immediately — if PROG_ARRAY isn't populated yet,
+        // those samples fall back to the legacy inline DWARF path.
+        //
+        // NOTE: If more pre-attach setup is needed in the future, consider splitting
+        // this function into separate load() and attach() phases (Option B) so callers
+        // can do arbitrary setup between program loading and event attachment.
+        if config.dwarf {
+            match setup_tail_call_unwinding_inner(&mut bpf) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!(
+                        "Warning: tail-call unwinding setup failed, falling back to legacy path: {:?}",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Re-borrow for attaching
+        let program: &mut PerfEvent = bpf.program_mut("profile_cpu").unwrap().try_into()?;
 
         let perf_config = PerfEventConfig::Software(SoftwareEvent::CpuClock);
 
@@ -521,40 +581,12 @@ impl EbpfProfiler {
     /// Set up tail-call unwinding: load the dwarf_unwind_step program and register
     /// it in PROG_ARRAY so the eBPF collect_trace can tail-call into it for deep
     /// DWARF stack unwinding (up to 165 frames vs 21 with legacy inline loop).
+    ///
+    /// Note: For perf_event programs, this is now called automatically inside
+    /// `setup_ebpf_profiler()` before attaching events. This method remains public
+    /// for kprobe/uprobe/tracepoint callers that need it separately.
     pub fn setup_tail_call_unwinding(&mut self) -> Result<(), anyhow::Error> {
-        use aya::programs::PerfEvent;
-
-        // Load the step program (but don't attach it to any perf event —
-        // it's only invoked via tail call from collect_trace)
-        {
-            let step_prog: &mut PerfEvent = self
-                .bpf
-                .program_mut("dwarf_unwind_step")
-                .ok_or(anyhow!("dwarf_unwind_step program not found"))?
-                .try_into()?;
-            step_prog.load()?;
-        }
-        // Mutable borrow released
-
-        // Clone the program FD so we can pass it to ProgramArray::set
-        // without conflicting borrows on self.bpf
-        let step_fd = self
-            .bpf
-            .program("dwarf_unwind_step")
-            .ok_or(anyhow!("dwarf_unwind_step not found after load"))?
-            .fd()?
-            .try_clone()?;
-
-        // Register the step program at index 0 of PROG_ARRAY
-        let mut prog_array = ProgramArray::try_from(
-            self.bpf
-                .map_mut("prog_array")
-                .ok_or(anyhow!("prog_array map not found"))?,
-        )?;
-        prog_array.set(0, &step_fd, 0)?;
-
-        tracing::info!("Tail-call DWARF unwinding enabled (up to 165 frames)");
-        Ok(())
+        setup_tail_call_unwinding_inner(&mut self.bpf)
     }
 
     /// Read DWARF unwinding diagnostics from the dwarf_stats PerCpuArray map.

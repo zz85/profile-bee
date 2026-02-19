@@ -637,17 +637,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // If DWARF unwinding is enabled, load unwind tables BEFORE setting TARGET_PID
     // This ensures unwind information is available from the first sample
     let tgid_request_tx = if opt.dwarf.unwrap_or(false) {
-        // Set up tail-call unwinding for deep stacks (up to 165 frames)
-        match ebpf_profiler.setup_tail_call_unwinding() {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!(
-                    "Warning: tail-call unwinding setup failed, falling back to 21-frame limit: {:?}",
-                    e
-                );
-            }
-        }
-
         let mut dwarf_manager = DwarfUnwindManager::new();
 
         // Load initial process if specified
@@ -1652,17 +1641,6 @@ fn setup_ebpf_and_dwarf(
 
     // Load DWARF unwind tables and start the background refresh thread
     let tgid_request_tx = if dwarf {
-        // Set up tail-call unwinding for deep stacks (up to 165 frames)
-        match ebpf_profiler.setup_tail_call_unwinding() {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!(
-                    "Warning: tail-call unwinding setup failed, falling back to 21-frame limit: {:?}",
-                    e
-                );
-            }
-        }
-
         let mut dwarf_manager = DwarfUnwindManager::new();
         if let Some(target_pid) = pid {
             println!("Loading DWARF unwind tables for pid {}...", target_pid);
