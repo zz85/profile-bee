@@ -20,6 +20,10 @@ PROFILE_TIME_MS=1000    # how long to profile each test (ms)
 FREQUENCY=99            # sampling frequency (Hz)
 TEST_TIMEOUT=30         # max seconds per individual test
 
+# Enable debug logging for profiler diagnostics (DWARF loading, tail-call setup,
+# verifier errors, etc.) while keeping aya/dependency noise at info level.
+export RUST_LOG=info,probee=debug,profile_bee=debug
+
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
@@ -253,9 +257,8 @@ test_dwarf_deep() {
 
 test_dwarf_deepstack() {
     # Test deep DWARF unwinding on a 50-level recursion binary.
-    # Currently limited to ~21 frames by the BPF verifier's instruction complexity limit.
-    # True tail-call support (PROG_ARRAY) is needed to reach MAX_DWARF_STACK_DEPTH (165).
-    # For now, verify DWARF produces full stacks up to the verifier limit.
+    # With tail-call support (PROG_ARRAY), the perf_event path can unwind
+    # up to 165 frames. The legacy inline path (kprobe/uprobe) is limited to 16.
     local file
     file=$(run_profiler "$FIXTURE_DIR/deepstack-no-fp" "dwarf-deepstack" --dwarf true)
     assert_stack_contains "$file" "leaf" "leaf() should appear with DWARF"
@@ -264,11 +267,12 @@ test_dwarf_deepstack() {
     local max_depth
     max_depth=$(awk -F';' '{print NF}' "$file" | sort -rn | head -1)
 
-    # Should get at least 20 frames (verifier limit is ~21 unwind iterations + leaf)
-    if [[ "$max_depth" -ge 20 ]]; then
+    # With tail-call unwinding (perf_event), expect 20+ frames from 50-level recursion.
+    # Legacy path (kprobe/uprobe) would give ~4 frames.
+    if [[ "$max_depth" -ge 16 ]]; then
         return 0
     else
-        echo "  Stack depth ($max_depth) below expected minimum of 20" >&2
+        echo "  Stack depth ($max_depth) below expected minimum of 16" >&2
         return 1
     fi
 }

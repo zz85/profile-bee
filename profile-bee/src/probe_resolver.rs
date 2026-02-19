@@ -38,6 +38,12 @@ pub struct ResolvedProbe {
 /// Resolves probe specifications to concrete uprobe attach targets.
 pub struct ProbeResolver;
 
+impl Default for ProbeResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProbeResolver {
     pub fn new() -> Self {
         Self
@@ -428,14 +434,13 @@ impl ProbeResolver {
                     for entry in entries.flatten() {
                         let fname = entry.file_name();
                         let fname_str = fname.to_string_lossy();
-                        if fname_str.starts_with(name)
-                            || fname_str.starts_with(&format!("lib{}", name))
+                        if (fname_str.starts_with(name)
+                            || fname_str.starts_with(&format!("lib{}", name)))
+                            && fname_str.contains(".so")
                         {
-                            if fname_str.contains(".so") {
-                                let path = entry.path();
-                                if !paths.contains(&path) {
-                                    paths.push(path);
-                                }
+                            let path = entry.path();
+                            if !paths.contains(&path) {
+                                paths.push(path);
                             }
                         }
                     }

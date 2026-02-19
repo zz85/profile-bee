@@ -44,7 +44,10 @@ pub async fn start_server(mut rx: Receiver<String>) {
     tokio::spawn(async move {
         tracing::debug!("start_server: broadcast receiver task started, waiting for data");
         while let Ok(data) = rx.recv().await {
-            tracing::info!("start_server: received broadcast data ({} bytes)", data.len());
+            tracing::info!(
+                "start_server: received broadcast data ({} bytes)",
+                data.len()
+            );
             let mut write = writer.lock().expect("poisoned");
             *write = data.clone();
             drop(write);
@@ -203,15 +206,21 @@ fn test_serialization() {
         r##"{"name":"","value":9,"children":[{"name":"a","value":8,"children":[{"name":"b","value":7,"children":[{"name":"c","value":2,"children":[{"name":"d","value":1,"children":[]}]},{"name":"e","value":3,"children":[]}]}]},{"name":"f","value":1,"children":[{"name":"g","value":1,"children":[]}]}]}"##
     );
 
-    let mut test = Stack::default();
-    test.name = "hi";
-    test.value = 10;
-    let mut test1 = Stack::default();
-    test1.name = "test 1";
-    test1.value = 3;
-    let mut test2 = Stack::default();
-    test2.name = "test 2";
-    test2.value = 4;
+    let mut test = Stack {
+        name: "hi",
+        value: 10,
+        ..Default::default()
+    };
+    let test1 = Stack {
+        name: "test 1",
+        value: 3,
+        ..Default::default()
+    };
+    let test2 = Stack {
+        name: "test 2",
+        value: 4,
+        ..Default::default()
+    };
     test.children.push(Rc::new(RefCell::new(test1)));
     test.children.push(Rc::new(RefCell::new(test2)));
 
@@ -229,14 +238,13 @@ fn test_varying_depth_stacks() {
     // When we go from deep stack to shallow stack,
     // the crumbs should be truncated correctly
     let stacks = [
-        "a;b;c 1",
-        "a;b 1",   // Shallower than previous
+        "a;b;c 1", "a;b 1",   // Shallower than previous
         "a;b;d 1", // Same depth but different branch
         "a 1",     // Even shallower
         "a;e 1",   // Back to depth 2
     ];
 
-    let json = collapse_to_json(&stacks.iter().map(|s| *s).collect::<Vec<_>>());
+    let json = collapse_to_json(stacks.as_ref());
 
     // Parse the JSON to verify it's valid
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("Valid JSON");

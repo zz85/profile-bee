@@ -171,6 +171,12 @@ pub static UNWIND_STATE: PerCpuArray<DwarfUnwindState> = PerCpuArray::with_max_e
 #[map(name = "prog_array")]
 pub static PROG_ARRAY: ProgramArray = ProgramArray::with_max_entries(4, 0);
 
+/// Counters for DWARF unwinding diagnostics.
+/// Index 0: tail-call fallback count (times tail_call failed and legacy path was used)
+/// Index 1: tail-call success implied (program loaded via tail-call path — not incremented here)
+#[map(name = "dwarf_stats")]
+pub static DWARF_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(4, 0);
+
 // --- Off-CPU profiling maps ---
 
 /// Tracks when each thread (by kernel PID = thread ID) went off-CPU.
@@ -235,7 +241,10 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     // we fall through to the legacy inline DWARF path below.
     if dwarf_enabled() {
         dwarf_try_tail_call(&ctx, &*regs, tgid, user_stack_id, kernel_stack_id, cpu);
-        // If we reach here, the tail call failed — continue with legacy path
+        // If we reach here, the tail call failed — track it for diagnostics
+        if let Some(counter) = DWARF_STATS.get_ptr_mut(0) {
+            *counter += 1;
+        }
     }
 
     let (ip, bp, len, sp) = if dwarf_enabled() {

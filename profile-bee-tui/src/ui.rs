@@ -193,7 +193,12 @@ impl<'a> FlamelensWidget<'a> {
         help_tags
     }
 
-    fn render_flamegraph(&self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) -> bool {
+    fn render_flamegraph(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        state: &mut FlamelensWidgetState,
+    ) -> bool {
         // Clear previous stack positions
         state.stack_positions.clear();
 

@@ -18,11 +18,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
+        run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
@@ -43,7 +43,7 @@ jobs:
             .
             profile-bee-ebpf
       - name: Build eBPF
-        run: cargo +nightly build -Z build-std=core --target bpfel-unknown-none --manifest-path profile-bee-ebpf/Cargo.toml
+        run: cd profile-bee-ebpf && cargo +nightly build -Z build-std=core --target bpfel-unknown-none
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -64,7 +64,7 @@ jobs:
             .
             profile-bee-ebpf
       - name: Build eBPF
-        run: cargo +nightly build -Z build-std=core --target bpfel-unknown-none --manifest-path profile-bee-ebpf/Cargo.toml
+        run: cd profile-bee-ebpf && cargo +nightly build -Z build-std=core --target bpfel-unknown-none
       - name: Build
         run: cargo build --workspace --verbose
       - name: Run tests
@@ -88,10 +88,13 @@ jobs:
             .
             profile-bee-ebpf
       - name: Build eBPF
-        run: cargo +nightly build --release -Z build-std=core --target bpfel-unknown-none --manifest-path profile-bee-ebpf/Cargo.toml
+        run: cd profile-bee-ebpf && cargo +nightly build --release -Z build-std=core --target bpfel-unknown-none
       - name: Build profile-bee
         run: cargo build --release
       - name: Build test fixtures
         run: bash tests/build_fixtures.sh
       - name: Run e2e tests
         run: sudo tests/run_e2e.sh --verbose
+      - name: Setup tmate session on failure
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3

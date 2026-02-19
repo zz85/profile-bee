@@ -205,15 +205,17 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
                     let x = mouse_event.column;
                     let y = mouse_event.row;
                     let now = Instant::now();
-                    
+
                     // Check for double-click
-                    let is_double_click = if let Some((last_time, last_x, last_y)) = app.last_click {
+                    let is_double_click = if let Some((last_time, last_x, last_y)) = app.last_click
+                    {
                         now.duration_since(last_time) <= DOUBLE_CLICK_THRESHOLD
-                            && x == last_x && y == last_y
+                            && x == last_x
+                            && y == last_y
                     } else {
                         false
                     };
-                    
+
                     if is_double_click {
                         // Double-click: zoom into the stack (like pressing Enter)
                         if let Some(stack_id) = app.find_stack_at_position(x, y) {

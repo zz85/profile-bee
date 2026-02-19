@@ -3,14 +3,19 @@ use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
-use profile_bee::ebpf::{setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig, StackInfoPod, SmartUProbeConfig};
-use profile_bee::ebpf::{FramePointersPod, attach_process_exit_tracepoint, setup_process_exit_ring_buffer};
+use profile_bee::ebpf::{
+    attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
+};
+use profile_bee::ebpf::{
+    setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig, SmartUProbeConfig,
+    StackInfoPod,
+};
 use profile_bee::html::{collapse_to_json, generate_html_file};
-use profile_bee::probe_spec::parse_probe_spec;
 use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, ResolvedProbe};
+use profile_bee::probe_spec::parse_probe_spec;
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
-use profile_bee_common::{StackInfo, UnwindEntry, ProcInfo, EVENT_TRACE_ALWAYS, ProcessExitEvent};
+use profile_bee_common::{ProcInfo, ProcessExitEvent, StackInfo, UnwindEntry, EVENT_TRACE_ALWAYS};
 use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -32,7 +37,7 @@ enum PerfWork {
 /// Incremental DWARF unwind table update
 /// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
 struct DwarfRefreshUpdate {
-    shard_updates: Vec<(u8, Vec<UnwindEntry>)>,  // (shard_id, entries) for new shards
+    shard_updates: Vec<(u8, Vec<UnwindEntry>)>, // (shard_id, entries) for new shards
     proc_info: Vec<(u32, ProcInfo)>,
 }
 
@@ -263,9 +268,7 @@ impl Opt {
 /// Returning None for sys_exit lets the caller fall through to the
 /// generic tracepoint / perf-event attachment path instead.
 fn parse_syscall_tracepoint(tp: &str) -> Option<(&str, i64)> {
-    let mut parts = tp.splitn(2, ':');
-    let category = parts.next()?;
-    let name = parts.next()?;
+    let (category, name) = tp.split_once(':')?;
 
     if category != "syscalls" {
         return None;
@@ -273,11 +276,7 @@ fn parse_syscall_tracepoint(tp: &str) -> Option<(&str, i64)> {
 
     // sys_enter_write -> raw_tp="sys_enter", syscall="write"
     // sys_exit_* is intentionally NOT matched — see doc comment above.
-    let syscall_name = if let Some(s) = name.strip_prefix("sys_enter_") {
-        s
-    } else {
-        return None;
-    };
+    let syscall_name = name.strip_prefix("sys_enter_")?;
 
     let nr = syscall_name_to_nr(syscall_name)?;
     Some(("sys_enter", nr))
@@ -416,14 +415,15 @@ fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfil
         // use the aggregate name ("sys_enter") — per-syscall names like
         // "sys_enter_write" don't exist as raw tracepoints.
         // For non-syscall tracepoints we use the event name after the colon.
-        let (raw_tp_name, syscall_info) = if let Some((raw_tp, syscall_nr)) = parse_syscall_tracepoint(&tp) {
-            (raw_tp.to_string(), Some(syscall_nr))
-        } else if let Some(name) = parse_tracepoint_name(&tp) {
-            (name.to_string(), None)
-        } else {
-            // No parseable tracepoint name — skip raw_tp attempts entirely
-            return setup_ebpf_profiler(config);
-        };
+        let (raw_tp_name, syscall_info) =
+            if let Some((raw_tp, syscall_nr)) = parse_syscall_tracepoint(&tp) {
+                (raw_tp.to_string(), Some(syscall_nr))
+            } else if let Some(name) = parse_tracepoint_name(&tp) {
+                (name.to_string(), None)
+            } else {
+                // No parseable tracepoint name — skip raw_tp attempts entirely
+                return setup_ebpf_profiler(config);
+            };
 
         // For syscall tracepoints, first try the syscall-specific raw_tp
         // (has pt_regs in args[0], syscall NR filtering via args[1])
@@ -518,7 +518,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // If no meaningful flags were provided, show help with examples and exit.
     if !opt.has_user_intent() {
         use clap::CommandFactory;
-        let bin_name = std::env::args().next().unwrap_or_else(|| "probee".to_string());
+        let bin_name = std::env::args()
+            .next()
+            .unwrap_or_else(|| "probee".to_string());
         Opt::command().bin_name(bin_name).print_long_help()?;
         std::process::exit(0);
     }
@@ -605,7 +607,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         raw_tracepoint_task_regs: None,
         raw_tracepoint_generic: None,
         target_syscall_nr: -1,
-        pid: opt.pid.clone(),
+        pid: opt.pid,
         cpu: opt.cpu,
         self_profile: opt.self_profile,
         dwarf: opt.dwarf.unwrap_or(false),
@@ -626,7 +628,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let pid = if let Some(cmd) = &spawn {
         Some(cmd.pid())
     } else {
-        opt.pid.clone()
+        opt.pid
     };
 
     // Set up communication channels (before DWARF block so refresh thread can use it)
@@ -635,17 +637,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // If DWARF unwinding is enabled, load unwind tables BEFORE setting TARGET_PID
     // This ensures unwind information is available from the first sample
     let tgid_request_tx = if opt.dwarf.unwrap_or(false) {
-        // Set up tail-call unwinding for deep stacks (up to 165 frames)
-        match ebpf_profiler.setup_tail_call_unwinding() {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!(
-                    "Warning: tail-call unwinding setup failed, falling back to 21-frame limit: {:?}",
-                    e
-                );
-            }
-        }
-
         let mut dwarf_manager = DwarfUnwindManager::new();
 
         // Load initial process if specified
@@ -709,7 +700,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             }
         });
 
-        println!("eBPF-based exit monitoring enabled for PID {}", pid_to_monitor);
+        println!(
+            "eBPF-based exit monitoring enabled for PID {}",
+            pid_to_monitor
+        );
     }
 
     let counts = &mut ebpf_profiler.counts;
@@ -722,7 +716,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // CLI defaults to 10s profiling windows;
     // serve mode defaults to unlimited (like TUI modes).
     let duration = opt.time.unwrap_or(if opt.serve { 0 } else { 10000 });
-    setup_stopping_mechanisms(duration, perf_tx.clone(), stopper.clone(), spawn, external_pid);
+    setup_stopping_mechanisms(
+        duration,
+        perf_tx.clone(),
+        stopper.clone(),
+        spawn,
+        external_pid,
+    );
 
     task::spawn(async move {
         if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
@@ -758,7 +758,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 &mut trace_count,
                 &mut known_tgids,
             );
-            tracing::debug!("serve loop: flushing {} stacks to web server (stopped={})", stacks.len(), stopped);
+            tracing::debug!(
+                "serve loop: flushing {} stacks to web server (stopped={})",
+                stacks.len(),
+                stopped
+            );
             output_results(&opt, &stacks, &tx, stopped)?;
         }
     } else {
@@ -775,7 +779,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             &mut ebpf_profiler.bpf,
             &tgid_request_tx,
         );
-        tracing::debug!("batch mode: process_profiling_data returned {} stacks", stacks.len());
+        tracing::debug!(
+            "batch mode: process_profiling_data returned {} stacks",
+            stacks.len()
+        );
         output_results(&opt, &stacks, &tx, true)?;
     }
 
@@ -785,6 +792,23 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     profiler.print_stats();
 
+    // Log DWARF tail-call fallback diagnostics if DWARF was enabled
+    if opt.dwarf.unwrap_or(false) {
+        if let Some(fallback_count) = ebpf_profiler.read_dwarf_stats() {
+            if fallback_count > 0 {
+                eprintln!(
+                    "DWARF tail-call fallback: {} samples used legacy {}-frame path",
+                    fallback_count,
+                    profile_bee_common::LEGACY_MAX_DWARF_STACK_DEPTH,
+                );
+            } else {
+                tracing::info!(
+                    "DWARF tail-call unwinding: all samples used tail-call path (165 frames)"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -792,7 +816,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 fn uprobe_pid_as_u32(uprobe_pid: Option<i32>) -> Result<Option<u32>, anyhow::Error> {
     uprobe_pid
         .map(|p| {
-            u32::try_from(p).map_err(|_| anyhow::anyhow!("--uprobe-pid must be non-negative, got {}", p))
+            u32::try_from(p)
+                .map_err(|_| anyhow::anyhow!("--uprobe-pid must be non-negative, got {}", p))
         })
         .transpose()
 }
@@ -880,15 +905,15 @@ fn setup_process_to_profile(
     if !command.is_empty() {
         let program = &command[0];
         let args: Vec<&str> = command[1..].iter().map(|s| s.as_str()).collect();
-        
+
         println!("Running command: {} {}", program, args.join(" "));
-        
+
         let (child, stopper) = SpawnProcess::spawn(program, &args)?;
         println!("Profiling PID {}..", child.pid());
-        
+
         return Ok((Some(stopper), Some(child)));
     }
-    
+
     // Fall back to old --cmd format for backward compatibility
     if let Some(cmd) = cmd {
         eprintln!("Warning: --cmd is deprecated. Use '-- <command> <args>' instead.");
@@ -896,7 +921,7 @@ fn setup_process_to_profile(
 
         // todo: use shelltools
         let args: Vec<_> = cmd.split(' ').collect();
-        let (child, stopper) = SpawnProcess::spawn(&args[0], &args[1..])?;
+        let (child, stopper) = SpawnProcess::spawn(args[0], &args[1..])?;
 
         println!("Profiling PID {}..", child.pid());
 
@@ -1033,10 +1058,10 @@ fn dwarf_refresh_loop(
                 tracked_pids.push(new_tgid);
                 // Immediately load the new process
                 if let Ok(new_shard_ids) = manager.refresh_process(new_tgid) {
-                    if !new_shard_ids.is_empty() {
-                        if send_refresh(&manager, &tx, new_shard_ids).is_err() {
-                            return;
-                        }
+                    if !new_shard_ids.is_empty()
+                        && send_refresh(&manager, &tx, new_shard_ids).is_err()
+                    {
+                        return;
                     }
                 }
             }
@@ -1047,10 +1072,9 @@ fn dwarf_refresh_loop(
         // Periodic rescan of all tracked processes for dlopen'd libraries
         for &pid in &tracked_pids {
             if let Ok(new_shard_ids) = manager.refresh_process(pid) {
-                if !new_shard_ids.is_empty() {
-                    if send_refresh(&manager, &tx, new_shard_ids).is_err() {
-                        return;
-                    }
+                if !new_shard_ids.is_empty() && send_refresh(&manager, &tx, new_shard_ids).is_err()
+                {
+                    return;
                 }
             }
         }
@@ -1070,20 +1094,18 @@ fn send_refresh(
         }
     }
 
-    let proc_info: Vec<(u32, ProcInfo)> = manager
-        .proc_info
-        .iter()
-        .map(|(&t, &p)| (t, p))
-        .collect();
+    let proc_info: Vec<(u32, ProcInfo)> = manager.proc_info.iter().map(|(&t, &p)| (t, p)).collect();
     let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
     tracing::debug!(
         "DWARF refresh: {} new shards with {} total entries",
-        new_shard_ids.len(), total_entries,
+        new_shard_ids.len(),
+        total_entries,
     );
     tx.send(PerfWork::DwarfRefresh(DwarfRefreshUpdate {
         shard_updates,
         proc_info,
-    })).map_err(|_| ())
+    }))
+    .map_err(|_| ())
 }
 
 /// Apply incremental DWARF unwind table updates to eBPF maps
@@ -1120,7 +1142,9 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
                 // Insert the inner map FD into the outer ArrayOfMaps via BPF_MAP_UPDATE_ELEM
                 use std::os::fd::AsRawFd;
                 let ret = profile_bee::ebpf::bpf_map_update_fd(
-                    outer_raw_fd, *shard_id as u32, inner_fd.as_raw_fd()
+                    outer_raw_fd,
+                    *shard_id as u32,
+                    inner_fd.as_raw_fd(),
                 );
                 if ret < 0 {
                     tracing::warn!(
@@ -1140,7 +1164,10 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
     if let Some(map) = bpf.map_mut("proc_info") {
         if let Ok(mut hm) = HashMap::<&mut MapData, ProcInfoKeyPod, ProcInfoPod>::try_from(map) {
             for (tgid, pi) in &update.proc_info {
-                let key = ProcInfoKeyPod(ProcInfoKey { tgid: *tgid, _pad: 0 });
+                let key = ProcInfoKeyPod(ProcInfoKey {
+                    tgid: *tgid,
+                    _pad: 0,
+                });
                 let _ = hm.insert(key, ProcInfoPod(*pi), 0);
             }
         }
@@ -1148,6 +1175,7 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
 }
 
 // Processes the profiling data collected from eBPF
+#[allow(clippy::too_many_arguments)]
 fn process_profiling_data(
     counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
     stack_traces: &StackTraceMap<MapData>,
@@ -1200,18 +1228,18 @@ fn process_profiling_data(
                     if *trace == 1 {
                         let _combined = profiler.get_exp_stacked_frames(
                             &stack,
-                            &stack_traces,
+                            stack_traces,
                             group_by_cpu,
-                            &stacked_pointers,
+                            stacked_pointers,
                         );
                     }
                 } else {
                     // Kernel counts are authoritative; only prime symbol cache
                     let _combined = profiler.get_exp_stacked_frames(
                         &stack,
-                        &stack_traces,
+                        stack_traces,
                         group_by_cpu,
-                        &stacked_pointers,
+                        stacked_pointers,
                     );
                 }
             }
@@ -1282,6 +1310,7 @@ fn process_profiling_data(
 /// Streaming variant of process_profiling_data for --serve mode.
 /// Collects samples for up to `timeout` then returns whatever has accumulated.
 /// Sets `stopped = true` when a Stop/ProcessExit message is received.
+#[allow(clippy::too_many_arguments)]
 fn process_profiling_data_streaming(
     counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
     stack_traces: &StackTraceMap<MapData>,
@@ -1330,10 +1359,20 @@ fn process_profiling_data_streaming(
                     let trace = trace_count.entry(stack).or_insert(0);
                     *trace += 1;
                     if *trace == 1 {
-                        profiler.get_exp_stacked_frames(&stack, stack_traces, group_by_cpu, stacked_pointers);
+                        profiler.get_exp_stacked_frames(
+                            &stack,
+                            stack_traces,
+                            group_by_cpu,
+                            stacked_pointers,
+                        );
                     }
                 } else {
-                    profiler.get_exp_stacked_frames(&stack, stack_traces, group_by_cpu, stacked_pointers);
+                    profiler.get_exp_stacked_frames(
+                        &stack,
+                        stack_traces,
+                        group_by_cpu,
+                        stacked_pointers,
+                    );
                 }
             }
             Ok(PerfWork::DwarfRefresh(update)) => {
@@ -1358,19 +1397,43 @@ fn process_profiling_data_streaming(
         }
     }
 
-    tracing::debug!("process_profiling_data_streaming: processed {} events", queue_processed);
+    tracing::debug!(
+        "process_profiling_data_streaming: processed {} events",
+        queue_processed
+    );
 
     let mut stacks = Vec::new();
     if local_counting {
-        process_local_counting(trace_count, profiler, stack_traces, group_by_cpu, &mut samples, &mut stacks, stacked_pointers);
+        process_local_counting(
+            trace_count,
+            profiler,
+            stack_traces,
+            group_by_cpu,
+            &mut samples,
+            &mut stacks,
+            stacked_pointers,
+        );
     } else {
-        process_kernel_counting(counts, profiler, stack_traces, group_by_cpu, &mut samples, &mut stacks, stacked_pointers);
+        process_kernel_counting(
+            counts,
+            profiler,
+            stack_traces,
+            group_by_cpu,
+            &mut samples,
+            &mut stacks,
+            stacked_pointers,
+        );
     }
 
     let mut out = stacks
         .into_iter()
         .map(|frames| {
-            let key = frames.frames.iter().map(|s| s.fmt_symbol()).collect::<Vec<_>>().join(";");
+            let key = frames
+                .frames
+                .iter()
+                .map(|s| s.fmt_symbol())
+                .collect::<Vec<_>>()
+                .join(";");
             format!("{} {}", &key, frames.count)
         })
         .collect::<Vec<_>>();
@@ -1389,7 +1452,8 @@ fn process_local_counting(
     stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
 ) {
     for (stack, value) in trace_count.iter() {
-        let combined = profiler.get_exp_stacked_frames(stack, stack_traces, group_by_cpu, stacked_pointers);
+        let combined =
+            profiler.get_exp_stacked_frames(stack, stack_traces, group_by_cpu, stacked_pointers);
 
         *samples += *value as u64;
         stacks.push(FrameCount {
@@ -1415,7 +1479,8 @@ fn process_kernel_counting(
 
         *samples += value;
 
-        let combined = profiler.get_exp_stacked_frames(&stack, stack_traces, group_by_cpu, stacked_pointers);
+        let combined =
+            profiler.get_exp_stacked_frames(&stack, stack_traces, group_by_cpu, stacked_pointers);
 
         stacks.push(FrameCount {
             frames: combined,
@@ -1454,16 +1519,11 @@ fn output_results(
             } else {
                 format!(
                     "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
-                    opt.time.unwrap_or(10000), opt.frequency
+                    opt.time.unwrap_or(10000),
+                    opt.frequency
                 )
             };
-            output_svg(
-                svg,
-                stacks,
-                title,
-                opt.off_cpu,
-            )
-            .map_err(|e| {
+            output_svg(svg, stacks, title, opt.off_cpu).map_err(|e| {
                 println!("Failed to write svg file {:?} - {:?}", e, svg);
                 e
             })?;
@@ -1487,9 +1547,15 @@ fn output_results(
         }
 
         if let Err(e) = tx.send(json) {
-            tracing::warn!("output_results: broadcast send failed (no receivers?): {:?}", e);
+            tracing::warn!(
+                "output_results: broadcast send failed (no receivers?): {:?}",
+                e
+            );
         } else {
-            tracing::debug!("output_results: broadcast sent to {} receivers", tx.receiver_count());
+            tracing::debug!(
+                "output_results: broadcast sent to {} receivers",
+                tx.receiver_count()
+            );
         }
     }
 
@@ -1524,10 +1590,7 @@ fn output_svg(path: &PathBuf, str: &[String], title: String, off_cpu: bool) -> a
 
 /// Builds a `ProfilerConfig` from CLI options, resolving smart uprobe specs.
 #[cfg(feature = "tui")]
-fn build_profiler_config(
-    opt: &Opt,
-    pid: Option<u32>,
-) -> Result<ProfilerConfig, anyhow::Error> {
+fn build_profiler_config(opt: &Opt, pid: Option<u32>) -> Result<ProfilerConfig, anyhow::Error> {
     let smart_uprobe = if !opt.uprobe.is_empty() {
         Some(resolve_uprobe_specs(&opt.uprobe, pid, opt.uprobe_pid)?)
     } else {
@@ -1559,6 +1622,7 @@ fn build_profiler_config(
 /// Sets up the eBPF profiler, ring buffer, DWARF unwinding (if enabled),
 /// and target-PID filtering.  Returns everything the profiling thread needs.
 #[cfg(feature = "tui")]
+#[allow(clippy::type_complexity)]
 fn setup_ebpf_and_dwarf(
     config: &mut ProfilerConfig,
     perf_tx: &mpsc::Sender<PerfWork>,
@@ -1577,17 +1641,6 @@ fn setup_ebpf_and_dwarf(
 
     // Load DWARF unwind tables and start the background refresh thread
     let tgid_request_tx = if dwarf {
-        // Set up tail-call unwinding for deep stacks (up to 165 frames)
-        match ebpf_profiler.setup_tail_call_unwinding() {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!(
-                    "Warning: tail-call unwinding setup failed, falling back to 21-frame limit: {:?}",
-                    e
-                );
-            }
-        }
-
         let mut dwarf_manager = DwarfUnwindManager::new();
         if let Some(target_pid) = pid {
             println!("Loading DWARF unwind tables for pid {}...", target_pid);
@@ -1634,6 +1687,7 @@ fn setup_ebpf_and_dwarf(
 ///
 /// `web_tx` — pass `Some(sender)` for combined mode, `None` for TUI-only.
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_profiling_thread(
     ebpf_profiler: EbpfProfiler,
     perf_rx: mpsc::Receiver<PerfWork>,
@@ -1667,8 +1721,8 @@ fn spawn_profiling_thread(
             let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
             // Process incoming events with timeout to update periodically
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis(tui_refresh_ms);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(tui_refresh_ms);
             while std::time::Instant::now() < deadline {
                 match perf_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(PerfWork::StackInfo(stack)) => {
@@ -1717,7 +1771,7 @@ fn spawn_profiling_thread(
             let mut stacks = Vec::new();
 
             // Apply update mode logic
-            let current_mode = update_mode_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let current_mode = *update_mode_handle.lock().unwrap_or_else(|e| e.into_inner());
             match current_mode {
                 profile_bee_tui::state::UpdateMode::Reset => {
                     // Reset mode: clear trace_count each interval
@@ -1787,8 +1841,7 @@ fn spawn_profiling_thread(
             // Update TUI app with new flamegraph data
             let data = out.join("\n");
             let tic = std::time::Instant::now();
-            let flamegraph =
-                profile_bee_tui::flame::FlameGraph::from_string(data, true);
+            let flamegraph = profile_bee_tui::flame::FlameGraph::from_string(data, true);
             let parsed = profile_bee_tui::app::ParsedFlameGraph {
                 flamegraph,
                 elapsed: tic.elapsed(),
@@ -1800,9 +1853,7 @@ fn spawn_profiling_thread(
 
             // Optionally feed the web server
             if let Some(ref tx) = web_tx {
-                let json = collapse_to_json(
-                    &out.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
-                );
+                let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
                 let _ = tx.send(json);
             }
         }
@@ -1822,12 +1873,12 @@ fn run_tui_event_loop(
     };
     use std::io;
 
-    let backend =
-        profile_bee_tui::ratatui::backend::CrosstermBackend::new(io::stderr());
+    let backend = profile_bee_tui::ratatui::backend::CrosstermBackend::new(io::stderr());
     let terminal = profile_bee_tui::ratatui::Terminal::new(backend)?;
     let events = EventHandler::new(250);
     let mut tui = Tui::new(terminal, events);
-    tui.init(mouse_enabled).map_err(|e| anyhow::anyhow!("{e}"))?;
+    tui.init(mouse_enabled)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     while app.running {
         if app.dirty {
@@ -1838,14 +1889,12 @@ fn run_tui_event_loop(
         match tui.events.next().map_err(|e| anyhow::anyhow!("{e}"))? {
             Event::Tick => app.tick(),
             Event::Key(key_event) => {
-                handle_key_events(key_event, app)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                handle_key_events(key_event, app).map_err(|e| anyhow::anyhow!("{e}"))?;
                 app.dirty = true;
             }
             Event::Mouse(mouse_event) => {
                 if mouse_enabled {
-                    handle_mouse_events(mouse_event, app)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    handle_mouse_events(mouse_event, app).map_err(|e| anyhow::anyhow!("{e}"))?;
                     app.dirty = true;
                 }
             }
@@ -1884,7 +1933,7 @@ async fn run_combined_mode(
     let pid = if let Some(cmd) = &spawn {
         Some(cmd.pid())
     } else {
-        opt.pid.clone()
+        opt.pid
     };
 
     // Shared infrastructure
@@ -1900,7 +1949,7 @@ async fn run_combined_mode(
     let update_mode_handle = app.get_update_mode_handle();
 
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
-    let external_pid = if spawn.is_none() { opt.pid.clone() } else { None };
+    let external_pid = if spawn.is_none() { opt.pid } else { None };
     setup_stopping_mechanisms(
         opt.time.unwrap_or(0),
         perf_tx.clone(),
@@ -1949,7 +1998,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     let pid = if let Some(cmd) = &spawn {
         Some(cmd.pid())
     } else {
-        opt.pid.clone()
+        opt.pid
     };
 
     // Shared infrastructure

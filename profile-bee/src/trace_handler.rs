@@ -21,7 +21,7 @@ impl SymbolFormatter {
             Symbolized::Sym(sym) => sym,
             Symbolized::Unknown(_reason) => {
                 return StackFrameInfo {
-                    symbol: Some(format!("[unknown]")), // {reason}
+                    symbol: Some("[unknown]".to_string()), // {reason}
                     ..Default::default()
                 };
             }
@@ -39,7 +39,7 @@ impl SymbolFormatter {
             Symbolized::Sym(sym) => sym,
             Symbolized::Unknown(_reason) => {
                 return StackFrameInfo {
-                    symbol: Some(format!("[unknown]")), // {reason}
+                    symbol: Some("[unknown]".to_string()), // {reason}
                     ..Default::default()
                 };
             }
@@ -63,6 +63,12 @@ pub struct TraceHandler {
     cache: PointerStackFramesCache,
 }
 
+impl Default for TraceHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TraceHandler {
     pub fn new() -> Self {
         TraceHandler {
@@ -80,7 +86,7 @@ impl TraceHandler {
         let src = Source::Kernel(Kernel::default());
         let syms = self
             .symbolizer
-            .symbolize(&src, Input::AbsAddr(&addrs))
+            .symbolize(&src, Input::AbsAddr(addrs))
             .map_err(|e| {
                 tracing::error!("Failed to symbolize {:?}", e);
                 "failed to run symbolize"
@@ -121,12 +127,12 @@ impl TraceHandler {
     ) -> Vec<StackFrameInfo> {
         let (kernel_stack, fp_user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
 
-        let key = StackInfoPod(stack_info.clone());
+        let key = StackInfoPod(*stack_info);
 
         // Try to use DWARF-unwound frame pointers from eBPF
         let user_stack = if let Ok(pointers) = stacked_pointers.get(&key, 0) {
             let pointers = pointers.0;
-            let len = (pointers.len as usize).min(pointers.pointers.len());
+            let len = pointers.len.min(pointers.pointers.len());
             let fp_len = fp_user_stack.as_ref().map_or(0, |v| v.len());
             if len > fp_len {
                 let addrs: Vec<u64> = pointers.pointers[..len].to_vec();
@@ -143,9 +149,7 @@ impl TraceHandler {
             fp_user_stack
         };
 
-        let stacks = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);
-
-        stacks
+        self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu)
     }
 
     /// Converts stacks traces into StackFrameInfo structs
@@ -156,8 +160,7 @@ impl TraceHandler {
         group_by_cpu: bool,
     ) -> Vec<StackFrameInfo> {
         let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
-        let stacks = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);
-        stacks
+        self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu)
     }
 
     // /// Converts stacks traces into StackFrameInfo structs
@@ -191,16 +194,11 @@ impl TraceHandler {
 
         let kernel_stack = if ktrace_id > -1 {
             stack_traces.get(&(ktrace_id as u32), 0).ok().map(|stack| {
-                let addrs: Vec<Addr> = stack
+                stack
                     .frames()
                     .iter()
-                    .map(|frame| {
-                        let instruction_pointer = frame.ip;
-                        instruction_pointer
-                    })
-                    .collect();
-
-                addrs
+                    .map(|frame| frame.ip)
+                    .collect::<Vec<Addr>>()
             })
         } else {
             None
@@ -264,10 +262,7 @@ impl TraceHandler {
             .ok()
             .unwrap_or_default();
 
-        let mut combined = kernel_syms
-            .into_iter()
-            .chain(user_syms.into_iter())
-            .collect::<Vec<_>>();
+        let mut combined = kernel_syms.into_iter().chain(user_syms).collect::<Vec<_>>();
 
         let pid_info = StackFrameInfo::process_only(stack_info);
         combined.push(pid_info);

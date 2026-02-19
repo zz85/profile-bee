@@ -102,7 +102,7 @@ impl SpawnProcess {
         }
     }
 
-    /// Spawn new thread to monitor output in real-time
+    // Spawn new thread to monitor output in real-time
     // pub fn monitor(&mut self) {
     //     if let Some(stdout) = self.child.stdout.take() {
     //         std::thread::spawn(move || {
@@ -158,6 +158,6 @@ impl SpawnProcess {
 
 impl Drop for SpawnProcess {
     fn drop(&mut self) {
-        let _ = self.kill();
+        drop(self.kill());
     }
 }

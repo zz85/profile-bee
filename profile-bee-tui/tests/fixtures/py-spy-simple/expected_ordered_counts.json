@@ -1,0 +1,63 @@
+{
+  "entries": [
+    {
+      "name": "work (long_running.py:8)",
+      "count": {
+        "total": 421,
+        "own": 421
+      },
+      "visible": true
+    },
+    {
+      "name": "work (long_running.py:7)",
+      "count": {
+        "total": 218,
+        "own": 218
+      },
+      "visible": true
+    },
+    {
+      "name": "quick_work (long_running.py:17)",
+      "count": {
+        "total": 10,
+        "own": 10
+      },
+      "visible": true
+    },
+    {
+      "name": "quick_work (long_running.py:16)",
+      "count": {
+        "total": 7,
+        "own": 7
+      },
+      "visible": true
+    },
+    {
+      "name": "<module> (long_running.py:26)",
+      "count": {
+        "total": 1,
+        "own": 1
+      },
+      "visible": true
+    },
+    {
+      "name": "<module> (long_running.py:25)",
+      "count": {
+        "total": 639,
+        "own": 0
+      },
+      "visible": true
+    },
+    {
+      "name": "<module> (long_running.py:24)",
+      "count": {
+        "total": 17,
+        "own": 0
+      },
+      "visible": true
+    }
+  ],
+  "num_rows": 7,
+  "sorted_column": "Own",
+  "search_pattern_ignored_because_of_no_match": false
+}

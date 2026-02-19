@@ -52,7 +52,7 @@ fn main() {
         )
     });
 
-    let label = if source == &prebuilt {
+    let label = if source == prebuilt {
         "prebuilt"
     } else {
         "freshly-built"

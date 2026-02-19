@@ -287,7 +287,7 @@ pub fn generate_unwind_table_from_bytes(
                     let ra_rule = row.register(X86_64_RA);
                     let is_signal_frame = cfa_type == CFA_REG_DEREF_RSP;
                     match ra_rule {
-                        RegisterRule::Offset(offset) if offset == -8 => {}
+                        RegisterRule::Offset(-8) => {}
                         // Signal frames: RA is an expression (breg7+168).
                         // We hardcode the ucontext_t offsets in eBPF.
                         RegisterRule::Expression(_) if is_signal_frame => {}
@@ -318,7 +318,7 @@ pub fn generate_unwind_table_from_bytes(
 
                     entries.push(UnwindEntry {
                         pc: pc32,
-                        cfa_offset: cfa_offset as i16,
+                        cfa_offset,
                         rbp_offset,
                         cfa_type,
                         rbp_type,
@@ -363,7 +363,7 @@ pub struct DwarfUnwindManager {
     /// - Faster lookups via direct indexing (O(1) vs hash computation)
     /// - Better cache locality for sequential access
     /// - Natural enforcement of MAX_UNWIND_SHARDS limit
-    /// Each Vec<UnwindEntry> is the unwind table for one binary/shard.
+    ///   Each Vec<UnwindEntry> is the unwind table for one binary/shard.
     pub binary_tables: Vec<Vec<UnwindEntry>>,
     /// Per-process mapping information
     pub proc_info: HashMap<u32, ProcInfo>,
@@ -376,6 +376,12 @@ pub struct DwarfUnwindManager {
     binary_cache: HashMap<BuildId, u8>, // build_id -> shard_id
     /// Fallback cache for binaries without build IDs (keyed by path)
     path_cache: HashMap<std::path::PathBuf, u8>, // path -> shard_id
+}
+
+impl Default for DwarfUnwindManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DwarfUnwindManager {

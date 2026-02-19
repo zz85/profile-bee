@@ -534,7 +534,7 @@ mod tests {
     }
 
     impl FlameGraph {
-        pub fn to_readable_stacks(&self) -> Vec<StackInfoReadable> {
+        pub fn to_readable_stacks(&self) -> Vec<StackInfoReadable<'_>> {
             self.stacks
                 .iter()
                 .map(|stack| StackInfoReadable {
@@ -556,6 +556,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::assertions_on_constants)]
     fn check_result<P: AsRef<std::path::Path>>(data_filename: P) -> FlameGraph {
         let content = std::fs::read_to_string(&data_filename).unwrap();
         let fg = FlameGraph::from_string(content, true);
@@ -589,7 +590,7 @@ mod tests {
         let expected = std::fs::read_to_string(&filename).unwrap();
         assert_eq!(serialized, expected);
 
-        assert_eq!(UPDATE_FIXTURES, false, "Set UPDATE_FIXTURES to false");
+        assert!(!UPDATE_FIXTURES, "Set UPDATE_FIXTURES to false");
         fg
     }
 

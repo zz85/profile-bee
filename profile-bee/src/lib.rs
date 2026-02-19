@@ -11,10 +11,8 @@ pub mod types;
 
 pub mod dwarf_unwind;
 
-pub mod probe_spec;
 pub mod probe_resolver;
+pub mod probe_spec;
 
 mod trace_handler;
 pub use trace_handler::*;
-
-
