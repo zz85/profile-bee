@@ -268,7 +268,7 @@ test_dwarf_deepstack() {
     max_depth=$(awk -F';' '{print NF}' "$file" | sort -rn | head -1)
 
     # With tail-call unwinding (perf_event), expect 20+ frames from 50-level recursion.
-    # Legacy path (kprobe/uprobe) would give ~16 frames.
+    # Legacy path (kprobe/uprobe) would give ~4 frames.
     if [[ "$max_depth" -ge 16 ]]; then
         return 0
     else
