@@ -505,28 +505,28 @@ impl EbpfProfiler {
             return Ok(());
         }
 
-        // Create and populate a new inner Array map with exactly the right size
-        let inner_fd = create_and_populate_inner_map(shard_id, entries)?;
+        // Create and populate a new inner Array map via aya's typed API.
+        // Uses MAX_SHARD_ENTRIES to match the eBPF-side template (required on kernel <5.14).
+        let inner_array = create_and_populate_inner_map(shard_id, entries)?;
 
-        // Get the outer ArrayOfMaps FD
-        use std::os::fd::{AsFd, AsRawFd};
-        let outer_raw_fd = match self.bpf.map("unwind_shards") {
-            Some(aya::maps::Map::ArrayOfMaps(map_data)) => map_data.fd().as_fd().as_raw_fd(),
-            Some(_) => return Err(anyhow!("unwind_shards is not ArrayOfMaps")),
-            None => return Err(anyhow!("unwind_shards map not found")),
-        };
+        // Get the outer ArrayOfMaps and insert the inner map's FD
+        let mut outer: aya::maps::ArrayOfMaps<&mut MapData> = aya::maps::ArrayOfMaps::try_from(
+            self.bpf
+                .map_mut("unwind_shards")
+                .ok_or(anyhow!("unwind_shards map not found"))?,
+        )?;
 
-        // Insert the inner map's FD into the outer ArrayOfMaps
-        let ret = bpf_map_update_fd(outer_raw_fd, shard_id as u32, inner_fd.as_raw_fd());
-        if ret < 0 {
-            return Err(anyhow!(
-                "failed to insert shard_{} into outer ArrayOfMaps: {}",
-                shard_id,
-                std::io::Error::last_os_error()
-            ));
-        }
+        outer
+            .set(shard_id as u32, inner_array.fd(), 0)
+            .map_err(|e| {
+                anyhow!(
+                    "failed to insert shard_{} into outer ArrayOfMaps: {}",
+                    shard_id,
+                    e
+                )
+            })?;
 
-        // inner_fd is dropped here — the kernel holds a reference to the inner map
+        // inner_array is dropped here — the kernel holds a reference to the inner map
         // via the outer ArrayOfMaps, so the inner map stays alive.
         Ok(())
     }
@@ -602,13 +602,13 @@ impl EbpfProfiler {
 }
 
 /// Create a new BPF_MAP_TYPE_ARRAY map suitable as an inner map for the
-/// unwind_shards ArrayOfMaps. The map holds `MAX_SHARD_ENTRIES` UnwindEntry slots.
+/// unwind_shards ArrayOfMaps, and populate it with the provided entries.
 ///
-/// Uses the raw bpf() syscall to create the map, then populates it with the
-/// provided entries. The map is always created with `MAX_SHARD_ENTRIES` slots
-/// (matching the eBPF-side template) because kernel <5.14 requires inner maps
-/// to have exactly the same `max_entries` as the template used when creating
-/// the outer ArrayOfMaps.
+/// Uses aya's typed `Array::create()` API instead of raw bpf() syscalls.
+/// The map is always created with `MAX_SHARD_ENTRIES` slots (matching the
+/// eBPF-side template) because kernel <5.14 requires inner maps to have
+/// exactly the same `max_entries` as the template used when creating the
+/// outer ArrayOfMaps.
 ///
 /// TODO: On kernel 5.14+ the max_entries restriction is relaxed (commit 134fede4eecf).
 /// A runtime feature probe could detect this: create a throwaway ArrayOfMaps with
@@ -617,127 +617,29 @@ impl EbpfProfiler {
 /// map is allocated at the fixed maximum size.
 ///
 /// The kernel only needs the inner map's FD to persist as long as it's
-/// referenced from the outer ArrayOfMaps; once inserted there, the returned FD
-/// can be closed (the kernel holds its own reference).
+/// referenced from the outer ArrayOfMaps; once inserted there, the returned
+/// Array handle (and its FD) can be dropped (the kernel holds its own reference).
 pub fn create_and_populate_inner_map(
     shard_id: u8,
     entries: &[UnwindEntry],
-) -> Result<std::os::fd::OwnedFd, anyhow::Error> {
-    use std::os::fd::{FromRawFd, OwnedFd};
-
+) -> Result<aya::maps::Array<MapData, UnwindEntryPod>, anyhow::Error> {
     if entries.is_empty() {
         return Err(anyhow!("cannot create inner map with zero entries"));
     }
 
     // Always use fixed size to match the eBPF-side template (required on kernel <5.14).
     let max_entries = profile_bee_common::MAX_SHARD_ENTRIES;
-    let key_size = std::mem::size_of::<u32>() as u32;
-    let value_size = std::mem::size_of::<UnwindEntry>() as u32;
 
-    // BPF_MAP_CREATE = 0, BPF_MAP_TYPE_ARRAY = 2
-    #[repr(C)]
-    #[derive(Default)]
-    struct BpfAttrMapCreate {
-        map_type: u32,
-        key_size: u32,
-        value_size: u32,
-        max_entries: u32,
-        map_flags: u32,
-    }
+    let mut inner: aya::maps::Array<MapData, UnwindEntryPod> =
+        aya::maps::Array::create(max_entries, 0)
+            .map_err(|e| anyhow!("failed to create inner Array for shard_{}: {}", shard_id, e))?;
 
-    let attr = BpfAttrMapCreate {
-        map_type: 2, // BPF_MAP_TYPE_ARRAY
-        key_size,
-        value_size,
-        max_entries,
-        ..Default::default()
-    };
-
-    // SYS_bpf = 321 on x86_64, BPF_MAP_CREATE = 0
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_bpf,
-            0u32, // BPF_MAP_CREATE
-            &attr as *const _ as *const libc::c_void,
-            std::mem::size_of::<BpfAttrMapCreate>(),
-        )
-    };
-    if fd < 0 {
-        return Err(anyhow!(
-            "bpf(BPF_MAP_CREATE) for shard_{} failed: {}",
-            shard_id,
-            std::io::Error::last_os_error()
-        ));
-    }
-    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
-
-    // Populate the inner map with unwind entries using BPF_MAP_UPDATE_ELEM
-    #[repr(C)]
-    struct BpfAttrMapUpdate {
-        map_fd: u32,
-        key: u64,
-        value: u64,
-        flags: u64,
-    }
-
-    use std::os::fd::AsRawFd;
-    let map_raw_fd = owned_fd.as_raw_fd() as u32;
-
+    // Populate the inner map with unwind entries
     for (idx, entry) in entries.iter().enumerate() {
-        let key = idx as u32;
-        let attr = BpfAttrMapUpdate {
-            map_fd: map_raw_fd,
-            key: &key as *const u32 as u64,
-            value: entry as *const UnwindEntry as u64,
-            flags: 0, // BPF_ANY
-        };
-
-        // BPF_MAP_UPDATE_ELEM = 2
-        let ret = unsafe {
-            libc::syscall(
-                libc::SYS_bpf,
-                2u32, // BPF_MAP_UPDATE_ELEM
-                &attr as *const _ as *const libc::c_void,
-                std::mem::size_of::<BpfAttrMapUpdate>(),
-            )
-        };
-        if ret < 0 {
-            return Err(anyhow!(
-                "bpf(BPF_MAP_UPDATE_ELEM) for shard_{} index {} failed: {}",
-                shard_id,
-                idx,
-                std::io::Error::last_os_error()
-            ));
-        }
+        inner
+            .set(idx as u32, UnwindEntryPod(*entry), 0)
+            .map_err(|e| anyhow!("failed to populate shard_{} index {}: {}", shard_id, idx, e))?;
     }
 
-    Ok(owned_fd)
-}
-
-/// Helper: insert a map FD as a value into an outer map at the given key index.
-/// Used for BPF_MAP_TYPE_ARRAY_OF_MAPS: the "value" is the inner map's FD.
-pub fn bpf_map_update_fd(outer_map_fd: i32, key: u32, inner_map_fd: i32) -> i64 {
-    #[repr(C)]
-    struct BpfAttrMapUpdate {
-        map_fd: u32,
-        key: u64,
-        value: u64,
-        flags: u64,
-    }
-
-    let attr = BpfAttrMapUpdate {
-        map_fd: outer_map_fd as u32,
-        key: &key as *const u32 as u64,
-        value: &inner_map_fd as *const i32 as u64,
-        flags: 0,
-    };
-
-    unsafe {
-        libc::syscall(
-            libc::SYS_bpf,
-            2u32, // BPF_MAP_UPDATE_ELEM
-            &attr as *const _ as *const libc::c_void,
-            std::mem::size_of::<BpfAttrMapUpdate>(),
-        )
-    }
+    Ok(inner)
 }
