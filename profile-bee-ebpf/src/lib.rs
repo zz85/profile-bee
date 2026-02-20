@@ -4,13 +4,11 @@
 /// different ebpf applications.
 ///
 use aya_ebpf::{
-    bindings::{
-        bpf_map_type::BPF_MAP_TYPE_ARRAY, bpf_raw_tracepoint_args, pt_regs, BPF_F_USER_STACK,
-    },
+    bindings::{bpf_raw_tracepoint_args, pt_regs, BPF_F_USER_STACK},
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_current_task_btf, bpf_get_smp_processor_id,
-        bpf_ktime_get_ns, bpf_map_lookup_elem, bpf_probe_read, bpf_probe_read_kernel,
-        bpf_probe_read_user, bpf_task_pt_regs,
+        bpf_ktime_get_ns, bpf_probe_read, bpf_probe_read_kernel, bpf_probe_read_user,
+        bpf_task_pt_regs,
     },
     macros::map,
     maps::{Array, ArrayOfMaps, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
@@ -139,25 +137,22 @@ static RING_BUF_PROCESS_EXIT: RingBuf = RingBuf::with_byte_size(4096, 0);
 
 #[map(name = "stack_traces")]
 pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
-
 // DWARF unwind maps — single outer ArrayOfMaps containing per-binary inner Array maps.
 // Each inner map holds UnwindEntry values, keyed by u32 index.
 // The outer map is indexed by shard_id (0..MAX_UNWIND_SHARDS-1).
 // Userspace creates inner maps of the exact size needed per binary, then inserts
 // their FDs into this outer map. This eliminates the old 8-shard / 65K-entry caps.
 
-#[map(name = "unwind_shards")]
-pub static UNWIND_SHARDS: ArrayOfMaps = ArrayOfMaps::with_max_entries(
-    MAX_UNWIND_SHARDS as u32, // outer: up to MAX_UNWIND_SHARDS inner maps
-    BPF_MAP_TYPE_ARRAY,       // inner map type
-    core::mem::size_of::<u32>() as u32, // inner key_size
-    core::mem::size_of::<UnwindEntry>() as u32, // inner value_size
-    MAX_SHARD_ENTRIES,        // inner max_entries — must match what userspace creates
-    // (kernel <5.14 requires exact match between template and
-    // inserted inner maps; on 5.14+ this could be relaxed to
-    // allow variable-sized inner maps via runtime feature probe)
-    0, // flags
-);
+#[map(name = "unwind_shards", inner = "UNWIND_SHARD_TEMPLATE")]
+pub static UNWIND_SHARDS: ArrayOfMaps<Array<UnwindEntry>> =
+    ArrayOfMaps::with_max_entries(MAX_UNWIND_SHARDS as u32, 0);
+
+/// Inner map template for the UNWIND_SHARDS ArrayOfMaps.
+/// This template defines the shape (key/value sizes, max_entries) that all inner
+/// maps must match (required on kernel <5.14). Userspace creates inner Array maps
+/// matching this template and inserts their FDs into UNWIND_SHARDS.
+#[map]
+static UNWIND_SHARD_TEMPLATE: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
 
 /// Per-process unwind info: maps tgid to ProcInfo (exec mappings)
 #[map(name = "proc_info")]
@@ -1091,25 +1086,19 @@ unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
 
 /// Look up an UnwindEntry from the array-of-maps by shard_id and index.
 ///
-/// 1. Look up shard_id in the outer UNWIND_SHARDS → get pointer to inner map
-/// 2. Look up idx in the inner map → get pointer to UnwindEntry
+/// 1. Look up shard_id in the outer UNWIND_SHARDS → get typed &Array<UnwindEntry>
+/// 2. Look up idx in the inner Array → get &UnwindEntry
 ///
-/// Two bpf_map_lookup_elem calls replace the old 8-way static match.
+/// The new typed ArrayOfMaps API handles both lookups with safe accessors.
 #[inline(always)]
 unsafe fn shard_lookup(shard_id: u8, idx: u32) -> Option<UnwindEntry> {
-    // Step 1: look up the inner map in the outer array-of-maps
-    let inner_map_ptr = UNWIND_SHARDS.get(shard_id as u32)?;
+    // Step 1: look up the inner Array in the outer ArrayOfMaps
+    let inner_array: &Array<UnwindEntry> = UNWIND_SHARDS.get(shard_id as u32)?;
 
-    // Step 2: look up the entry in the inner map
-    let entry_ptr = bpf_map_lookup_elem(
-        inner_map_ptr,
-        &idx as *const u32 as *const core::ffi::c_void,
-    );
-    if entry_ptr.is_null() {
-        return None;
-    }
-    // SAFETY: the inner map value_size matches sizeof(UnwindEntry) (enforced at map creation)
-    Some(core::ptr::read_unaligned(entry_ptr as *const UnwindEntry))
+    // Step 2: look up the entry in the inner Array (typed, no raw pointers)
+    let entry: &UnwindEntry = inner_array.get(idx)?;
+
+    Some(*entry)
 }
 
 #[inline(always)]
