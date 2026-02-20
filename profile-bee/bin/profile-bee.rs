@@ -1135,24 +1135,22 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
         // Then, get the outer ArrayOfMaps and insert all inner maps
         if !created_maps.is_empty() {
             match bpf.map_mut("unwind_shards") {
-                Some(map) => {
-                    match aya::maps::ArrayOfMaps::try_from(map) {
-                        Ok(mut outer) => {
-                            for (shard_id, inner_array) in &created_maps {
-                                if let Err(e) = outer.set(*shard_id as u32, inner_array.fd(), 0) {
-                                    tracing::warn!(
-                                        "DWARF refresh: failed to insert shard_{} into outer map: {}",
-                                        shard_id,
-                                        e
-                                    );
-                                }
+                Some(map) => match aya::maps::ArrayOfMaps::try_from(map) {
+                    Ok(mut outer) => {
+                        for (shard_id, inner_array) in &created_maps {
+                            if let Err(e) = outer.set(*shard_id as u32, inner_array.fd(), 0) {
+                                tracing::warn!(
+                                    "DWARF refresh: failed to insert shard_{} into outer map: {}",
+                                    shard_id,
+                                    e
+                                );
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("DWARF refresh: unwind_shards is not ArrayOfMaps: {}", e);
-                        }
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!("DWARF refresh: unwind_shards is not ArrayOfMaps: {}", e);
+                    }
+                },
                 None => {
                     tracing::warn!("DWARF refresh: unwind_shards map not found");
                 }
