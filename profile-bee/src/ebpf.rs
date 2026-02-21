@@ -605,7 +605,8 @@ impl EbpfProfiler {
 }
 
 /// BPF command number for BPF_MAP_UPDATE_BATCH (kernel 5.6+).
-const BPF_MAP_UPDATE_BATCH: libc::c_ulong = 24;
+/// Note: 24=LOOKUP_BATCH, 25=LOOKUP_AND_DELETE_BATCH, 26=UPDATE_BATCH, 27=DELETE_BATCH
+const BPF_MAP_UPDATE_BATCH: libc::c_ulong = 26;
 
 /// Try to batch-populate a BPF array map using BPF_MAP_UPDATE_BATCH.
 /// Returns Ok(()) on success, Err on failure (e.g., kernel < 5.6).
