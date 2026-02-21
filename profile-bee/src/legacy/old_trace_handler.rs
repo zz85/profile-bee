@@ -1,6 +1,5 @@
 use crate::{
-    cache::PointerStackFramesCache, legacy::symbols::StackInfoExt, legacy::symbols::SymbolFinder,
-    StackFrameInfo, StackInfo,
+    legacy::symbols::StackInfoExt, legacy::symbols::SymbolFinder, StackFrameInfo, StackInfo,
 };
 
 use aya::maps::MapData;
@@ -8,21 +7,18 @@ use aya::maps::StackTraceMap;
 
 pub struct TraceHandlerOld {
     symbols: SymbolFinder,
-    cache: PointerStackFramesCache,
 }
 
 impl TraceHandlerOld {
     pub fn new() -> Self {
         TraceHandlerOld {
             symbols: SymbolFinder::new(),
-            cache: Default::default(),
         }
     }
 
     pub fn print_stats(&self) {
         println!("{}", self.symbols.process_cache.stats());
         println!("{}", self.symbols.addr_cache.stats());
-        println!("{}", self.cache.stats());
     }
 
     pub fn get_stack(
@@ -31,18 +27,7 @@ impl TraceHandlerOld {
         stack_traces: &StackTraceMap<MapData>,
         group_by_cpu: bool,
     ) -> Vec<StackFrameInfo> {
-        let ktrace_id = stack_info.kernel_stack_id;
-        let utrace_id = stack_info.user_stack_id;
-
-        if let Some(stacks) = self.cache.get(ktrace_id, utrace_id) {
-            return stacks;
-        }
-
-        let stacks = self.format_stack_trace(stack_info, stack_traces, group_by_cpu);
-
-        self.cache.insert(ktrace_id, utrace_id, stacks.clone());
-
-        stacks
+        self.format_stack_trace(stack_info, stack_traces, group_by_cpu)
     }
 
     /// converts pointers from bpf to usable, symbol resolved stack information

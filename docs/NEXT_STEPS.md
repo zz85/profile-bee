@@ -34,6 +34,8 @@ Clean up the public API surface, add documentation, and consider splitting or re
 
 `process_profiling_data` blocks the collection loop during symbolization. Moving to an async pipeline where collection and symbolization happen concurrently would reduce overhead at high sampling frequencies.
 
+Self-profiling shows the DWARF subsystem accounts for ~70% of probee's active CPU time. The top bottlenecks are per-entry BPF map syscalls (24%), ELF read page fault storms (25%), and `/proc/kallsyms` iteration on BPF-heavy systems (10%). See [docs/dwarf_performance.md](dwarf_performance.md) for the full analysis and improvement plan.
+
 ## 9. Interpreted / JIT Stack Support
 
 Support perf map files (`/tmp/perf-<pid>.map`) that runtimes like Java, Node.js, and Python emit. Well-established convention that would broaden the user base significantly.

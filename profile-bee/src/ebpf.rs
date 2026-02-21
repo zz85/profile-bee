@@ -1,3 +1,5 @@
+use std::os::fd::{AsFd, AsRawFd};
+
 use anyhow::anyhow;
 use aya::maps::{
     Array, HashMap, InnerMap, MapData, PerCpuArray, PerCpuValues, ProgramArray, RingBuf,
@@ -602,6 +604,74 @@ impl EbpfProfiler {
     }
 }
 
+/// BPF command number for BPF_MAP_UPDATE_BATCH (kernel 5.6+).
+/// Note: 24=LOOKUP_BATCH, 25=LOOKUP_AND_DELETE_BATCH, 26=UPDATE_BATCH, 27=DELETE_BATCH
+const BPF_MAP_UPDATE_BATCH: libc::c_ulong = 26;
+
+/// Try to batch-populate a BPF array map using BPF_MAP_UPDATE_BATCH.
+/// Returns Ok(()) on success, Err on failure (e.g., kernel < 5.6).
+fn batch_populate_inner_map(
+    inner: &aya::maps::Array<MapData, UnwindEntryPod>,
+    entries: &[UnwindEntry],
+) -> Result<(), anyhow::Error> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let fd = inner.fd().as_fd().as_raw_fd();
+
+    // Build contiguous key array [0, 1, 2, ..., n-1]
+    let keys: Vec<u32> = (0..entries.len() as u32).collect();
+
+    // Build contiguous value array (UnwindEntryPod is #[repr(transparent)])
+    let values: Vec<UnwindEntryPod> = entries.iter().map(|e| UnwindEntryPod(*e)).collect();
+
+    let count = entries.len() as u32;
+
+    // bpf_attr for batch update — matches the kernel's union bpf_attr { struct { batch } }.
+    #[repr(C)]
+    #[derive(Default)]
+    struct BpfAttrBatch {
+        in_batch: u64,   // NULL for update
+        out_batch: u64,  // unused for update
+        keys: u64,       // pointer to keys array
+        values: u64,     // pointer to values array
+        count: u32,      // in: number of entries to update, out: number updated
+        map_fd: u32,     // fd of the map
+        elem_flags: u64, // BPF_ANY = 0
+        flags: u64,      // 0
+    }
+
+    let mut attr = BpfAttrBatch {
+        keys: keys.as_ptr() as u64,
+        values: values.as_ptr() as u64,
+        count,
+        map_fd: fd as u32,
+        ..Default::default()
+    };
+
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_UPDATE_BATCH,
+            &mut attr as *mut BpfAttrBatch,
+            std::mem::size_of::<BpfAttrBatch>(),
+        )
+    };
+
+    if ret < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(anyhow!(
+            "BPF_MAP_UPDATE_BATCH failed: errno={} (updated {} of {} entries)",
+            errno,
+            attr.count,
+            count,
+        ));
+    }
+
+    Ok(())
+}
+
 /// Create a new BPF_MAP_TYPE_ARRAY map suitable as an inner map for the
 /// unwind_shards ArrayOfMaps, and populate it with the provided entries.
 ///
@@ -610,6 +680,9 @@ impl EbpfProfiler {
 /// eBPF-side template) because kernel <5.14 requires inner maps to have
 /// exactly the same `max_entries` as the template used when creating the
 /// outer ArrayOfMaps.
+///
+/// Population uses BPF_MAP_UPDATE_BATCH (single syscall, kernel 5.6+) with
+/// automatic fallback to per-entry updates for older kernels.
 ///
 /// TODO: On kernel 5.14+ the max_entries restriction is relaxed (commit 134fede4eecf).
 /// A runtime feature probe could detect this: create a throwaway ArrayOfMaps with
@@ -635,11 +708,30 @@ pub fn create_and_populate_inner_map(
         aya::maps::Array::create(max_entries, 0)
             .map_err(|e| anyhow!("failed to create inner Array for shard_{}: {}", shard_id, e))?;
 
-    // Populate the inner map with unwind entries
-    for (idx, entry) in entries.iter().enumerate() {
-        inner
-            .set(idx as u32, UnwindEntryPod(*entry), 0)
-            .map_err(|e| anyhow!("failed to populate shard_{} index {}: {}", shard_id, idx, e))?;
+    // Try batch update first (single syscall, kernel 5.6+)
+    match batch_populate_inner_map(&inner, entries) {
+        Ok(()) => {
+            tracing::debug!(
+                "shard_{}: batch-loaded {} entries in single syscall",
+                shard_id,
+                entries.len()
+            );
+        }
+        Err(batch_err) => {
+            // Fall back to per-entry updates (kernel < 5.6)
+            tracing::debug!(
+                "shard_{}: batch update unavailable ({}), falling back to per-entry",
+                shard_id,
+                batch_err,
+            );
+            for (idx, entry) in entries.iter().enumerate() {
+                inner
+                    .set(idx as u32, UnwindEntryPod(*entry), 0)
+                    .map_err(|e| {
+                        anyhow!("failed to populate shard_{} index {}: {}", shard_id, idx, e)
+                    })?;
+            }
+        }
     }
 
     Ok(inner)
