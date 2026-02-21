@@ -117,11 +117,13 @@ impl Default for PointerStackFramesCache {
 
 impl PointerStackFramesCache {
     pub fn new(capacity: usize) -> Self {
+        // SAFETY: DEFAULT_CACHE_CAPACITY is a non-zero constant
+        let cap = std::num::NonZeroUsize::new(capacity).unwrap_or(
+            std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY)
+                .expect("DEFAULT_CACHE_CAPACITY is non-zero"),
+        );
         PointerStackFramesCache {
-            map: lru::LruCache::new(
-                std::num::NonZeroUsize::new(capacity)
-                    .unwrap_or(std::num::NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).unwrap()),
-            ),
+            map: lru::LruCache::new(cap),
             total: 0,
             miss: 0,
         }

@@ -1054,6 +1054,16 @@ fn dwarf_refresh_loop(
     let mut tracked_pids: Vec<u32> = initial_pid.into_iter().collect();
     let mut last_maps_mtime: HashMap<u32, Option<std::time::SystemTime>> = HashMap::new();
 
+    // Record initial mtime for pre-loaded PIDs so the first retain cycle
+    // doesn't redundantly call refresh_process on them.
+    for &pid in &tracked_pids {
+        let maps_path = format!("/proc/{}/maps", pid);
+        let mtime = std::fs::metadata(&maps_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        last_maps_mtime.insert(pid, mtime);
+    }
+
     loop {
         // Drain all pending tgid requests (non-blocking)
         while let Ok(new_tgid) = tgid_rx.try_recv() {
@@ -1080,17 +1090,25 @@ fn dwarf_refresh_loop(
 
         // Periodic rescan of all tracked processes for dlopen'd libraries.
         // Prune exited PIDs to avoid stat'ing non-existent /proc entries.
+        let mut channel_closed = false;
         tracked_pids.retain(|&pid| {
-            let maps_path = format!("/proc/{}/maps", pid);
-            let current_mtime = std::fs::metadata(&maps_path)
-                .ok()
-                .and_then(|m| m.modified().ok());
-
-            // Process exited — /proc/[pid]/maps no longer exists
-            if current_mtime.is_none() {
-                last_maps_mtime.remove(&pid);
-                return false; // remove from tracked_pids
+            if channel_closed {
+                return true; // stop processing, will exit after retain
             }
+
+            let maps_path = format!("/proc/{}/maps", pid);
+            let current_mtime = match std::fs::metadata(&maps_path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Process exited — /proc/[pid]/maps no longer exists
+                    last_maps_mtime.remove(&pid);
+                    return false; // remove from tracked_pids
+                }
+                Err(_) => {
+                    // Other I/O error (permission, etc.) — keep PID, skip this cycle
+                    return true;
+                }
+                Ok(metadata) => metadata.modified().ok(),
+            };
 
             // Skip rescan if /proc/[pid]/maps hasn't changed
             if let Some(Some(last_ts)) = last_maps_mtime.get(&pid) {
@@ -1102,14 +1120,16 @@ fn dwarf_refresh_loop(
             if let Ok(new_shard_ids) = manager.refresh_process(pid) {
                 if !new_shard_ids.is_empty() && send_refresh(&manager, &tx, new_shard_ids).is_err()
                 {
-                    // Channel closed — caller will detect via send_refresh returning Err
-                    // We cannot return from inside retain, so just stop refreshing.
-                    // The outer loop will exit on the next send_refresh failure.
+                    channel_closed = true;
                 }
             }
             last_maps_mtime.insert(pid, current_mtime);
             true // keep PID
         });
+
+        if channel_closed {
+            return;
+        }
     }
 }
 
