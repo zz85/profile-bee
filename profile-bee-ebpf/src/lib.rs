@@ -7,8 +7,8 @@ use aya_ebpf::{
     bindings::{bpf_raw_tracepoint_args, pt_regs, BPF_F_USER_STACK},
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_current_task_btf, bpf_get_smp_processor_id,
-        bpf_ktime_get_ns, bpf_probe_read, bpf_probe_read_kernel, bpf_probe_read_user,
-        bpf_task_pt_regs,
+        bpf_ktime_get_ns, bpf_map_lookup_elem, bpf_probe_read, bpf_probe_read_kernel,
+        bpf_probe_read_user, bpf_task_pt_regs,
     },
     macros::map,
     maps::{Array, ArrayOfMaps, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
@@ -1086,19 +1086,25 @@ unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
 
 /// Look up an UnwindEntry from the array-of-maps by shard_id and index.
 ///
-/// 1. Look up shard_id in the outer UNWIND_SHARDS → get typed &Array<UnwindEntry>
-/// 2. Look up idx in the inner Array → get &UnwindEntry
+/// 1. Look up shard_id in the outer UNWIND_SHARDS → get pointer to inner map
+/// 2. Look up idx in the inner map via raw bpf_map_lookup_elem
 ///
-/// The new typed ArrayOfMaps API handles both lookups with safe accessors.
+/// Uses the typed ArrayOfMaps for the outer lookup but raw helper for the inner
+/// lookup to avoid verifier complexity from the typed Array::get() code path.
 #[inline(always)]
 unsafe fn shard_lookup(shard_id: u8, idx: u32) -> Option<UnwindEntry> {
-    // Step 1: look up the inner Array in the outer ArrayOfMaps
-    let inner_array: &Array<UnwindEntry> = UNWIND_SHARDS.get(shard_id as u32)?;
+    // Step 1: look up the inner map in the outer array-of-maps
+    let inner_map_ptr = UNWIND_SHARDS.get(shard_id as u32)?;
 
-    // Step 2: look up the entry in the inner Array (typed, no raw pointers)
-    let entry: &UnwindEntry = inner_array.get(idx)?;
-
-    Some(*entry)
+    // Step 2: look up the entry in the inner map using raw helper
+    let entry_ptr = bpf_map_lookup_elem(
+        inner_map_ptr as *const _ as *mut core::ffi::c_void,
+        &idx as *const u32 as *const core::ffi::c_void,
+    );
+    if entry_ptr.is_null() {
+        return None;
+    }
+    Some(core::ptr::read_unaligned(entry_ptr as *const UnwindEntry))
 }
 
 #[inline(always)]
