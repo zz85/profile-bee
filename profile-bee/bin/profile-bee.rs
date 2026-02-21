@@ -1051,6 +1051,7 @@ fn dwarf_refresh_loop(
     tx: mpsc::Sender<PerfWork>,
 ) {
     let mut tracked_pids: Vec<u32> = initial_pid.into_iter().collect();
+    let mut last_maps_mtime: HashMap<u32, Option<std::time::SystemTime>> = HashMap::new();
 
     loop {
         // Drain all pending tgid requests (non-blocking)
@@ -1065,6 +1066,12 @@ fn dwarf_refresh_loop(
                         return;
                     }
                 }
+                // Record initial mtime after first scan
+                let maps_path = format!("/proc/{}/maps", new_tgid);
+                let mtime = std::fs::metadata(&maps_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                last_maps_mtime.insert(new_tgid, mtime);
             }
         }
 
@@ -1072,12 +1079,25 @@ fn dwarf_refresh_loop(
 
         // Periodic rescan of all tracked processes for dlopen'd libraries
         for &pid in &tracked_pids {
+            // Skip rescan if /proc/[pid]/maps hasn't changed
+            let maps_path = format!("/proc/{}/maps", pid);
+            let current_mtime = std::fs::metadata(&maps_path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+
+            if let Some(last_mtime) = last_maps_mtime.get(&pid) {
+                if *last_mtime == current_mtime {
+                    continue; // mtime unchanged, skip rescan
+                }
+            }
+
             if let Ok(new_shard_ids) = manager.refresh_process(pid) {
                 if !new_shard_ids.is_empty() && send_refresh(&manager, &tx, new_shard_ids).is_err()
                 {
                     return;
                 }
             }
+            last_maps_mtime.insert(pid, current_mtime);
         }
     }
 }

@@ -247,7 +247,9 @@ pub fn generate_unwind_table_from_bytes(
 
     let bases = BaseAddresses::default().set_eh_frame(eh_frame_addr);
 
-    let mut entries = Vec::new();
+    // Pre-allocate: ~1 unwind entry per 24 bytes of .eh_frame (approximate FDE size)
+    let estimated_entries = eh_frame_data.len() / 24;
+    let mut entries = Vec::with_capacity(estimated_entries);
     let mut ctx = gimli::UnwindContext::new();
     let mut cies = HashMap::new();
 
