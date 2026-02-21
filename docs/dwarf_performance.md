@@ -36,7 +36,7 @@ The profiling data confirms this: 11 samples in `map_update_elem` kernel-side wo
 
 Worse, `apply_dwarf_refresh` runs **synchronously on the main processing thread** inside the `perf_rx.recv()` loop (`profile-bee.rs:1247`), so all sample processing is blocked during shard population.
 
-```
+```text
 probee::process_profiling_data
   → probee::apply_dwarf_refresh         ← blocks recv loop
     → create_and_populate_inner_map     ← 65K syscalls per shard
@@ -75,7 +75,7 @@ Requires kernel 5.6+. For older kernels, fall back to the current per-entry path
 On cache miss, `scan_and_update` reads the entire ELF binary into a `Vec<u8>` via `fs::read()`. This copies the full file contents into userspace memory, triggering demand-paged anonymous memory allocation. The kernel must zero-fill each new page (`clear_page_erms_k`), which dominates the I/O cost.
 
 The profiling stacks show the chain clearly:
-```
+```text
 probee;__libc_read
   → generic_file_buffered_read
     → copy_user_enhanced_fast_string     ← 12 direct samples
@@ -127,7 +127,7 @@ let mut entries = Vec::with_capacity(estimated_entries);
 
 When blazesym initializes its kernel symbol resolver (`KsymResolver::load_from_reader`), it reads `/proc/kallsyms` sequentially. The kernel generates this file on-the-fly, and for each BPF program, calls `bpf_get_kallsym_k` which iterates the BPF program list. On this system with CrowdStrike Falcon (many BPF programs), 16-17 of the 20 samples land in `bpf_get_kallsym_k`.
 
-```
+```text
 probee;__libc_read
   → proc_reg_read → seq_read_iter
     → s_next → update_iter_mod → bpf_get_kallsym_k   ← 16 samples
