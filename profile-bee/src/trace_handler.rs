@@ -117,7 +117,14 @@ impl TraceHandler {
     }
 
     /// Converts stacks traces into StackFrameInfo structs
-    /// Uses DWARF-unwound frame pointers from eBPF when available
+    /// Uses DWARF-unwound frame pointers from eBPF when available.
+    /// Results are cached by (tgid, kernel_stack_id, user_stack_id) to avoid
+    /// redundant BPF map lookups and blazesym symbolization on repeated stacks.
+    ///
+    /// Caching is only safe when both stack IDs are non-negative, meaning
+    /// `bpf_get_stackid` succeeded and the IDs are actual hashes of the stack
+    /// frames. When negative (FP walking failed), the ID is an error code and
+    /// many distinct stacks share the same value — caching would be incorrect.
     pub fn get_exp_stacked_frames(
         &mut self,
         stack_info: &StackInfo,
@@ -125,6 +132,21 @@ impl TraceHandler {
         group_by_cpu: bool,
         stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     ) -> Vec<StackFrameInfo> {
+        let tgid = stack_info.tgid;
+        let ktrace_id = stack_info.kernel_stack_id;
+        let utrace_id = stack_info.user_stack_id;
+
+        // Only cache when both stack IDs are valid hashes (non-negative).
+        // Negative IDs are error codes from bpf_get_stackid — many different
+        // stacks map to the same negative value, so caching would be incorrect.
+        let cacheable = ktrace_id >= 0 && utrace_id >= 0;
+
+        if cacheable {
+            if let Some(cached) = self.cache.get(tgid, ktrace_id, utrace_id) {
+                return cached.clone();
+            }
+        }
+
         let (kernel_stack, fp_user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
 
         let key = StackInfoPod(*stack_info);
@@ -149,7 +171,14 @@ impl TraceHandler {
             fp_user_stack
         };
 
-        self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu)
+        let result = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);
+
+        if cacheable {
+            self.cache
+                .insert(tgid, ktrace_id, utrace_id, result.clone());
+        }
+
+        result
     }
 
     /// Converts stacks traces into StackFrameInfo structs
@@ -162,26 +191,6 @@ impl TraceHandler {
         let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
         self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu)
     }
-
-    // /// Converts stacks traces into StackFrameInfo structs
-    // pub fn cached_stacked_frames(
-    //     &mut self,
-    //     stack_info: &StackInfo,
-    //     stack_traces: &StackTraceMap<MapData>,
-    //     group_by_cpu: bool,
-    // ) -> Vec<StackFrameInfo> {
-    //     let ktrace_id = stack_info.kernel_stack_id;
-    //     let utrace_id = stack_info.user_stack_id;
-    //     if let Some(stacks) = self.cache.get(ktrace_id, utrace_id) {
-    //         return stacks;
-    //     }
-
-    //     let stacks = self.get_stacked_frames(stack_info, stack_traces, group_by_cpu);
-
-    //     self.cache.insert(ktrace_id, utrace_id, stacks.clone());
-
-    //     stacks
-    // }
 
     /// Extract stacks from StackTraceMaps (kernel's implementation only support FP unwinding)
     pub fn get_instruction_pointers(
