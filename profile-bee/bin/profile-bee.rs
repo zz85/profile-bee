@@ -22,6 +22,7 @@ use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use profile_bee::types::FrameCount;
@@ -37,7 +38,7 @@ enum PerfWork {
 /// Incremental DWARF unwind table update
 /// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
 struct DwarfRefreshUpdate {
-    shard_updates: Vec<(u8, Vec<UnwindEntry>)>, // (shard_id, entries) for new shards
+    shard_updates: Vec<(u8, Arc<Vec<UnwindEntry>>)>, // (shard_id, entries) for new shards
     proc_info: Vec<(u32, ProcInfo)>,
 }
 
@@ -711,6 +712,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let stacked_pointers = &ebpf_profiler.stacked_pointers;
 
     let mut profiler = TraceHandler::new();
+    profiler.prewarm_kernel_symbols();
 
     // Set up stopping mechanisms
     // CLI defaults to 10s profiling windows;
@@ -1050,12 +1052,29 @@ fn dwarf_refresh_loop(
     tx: mpsc::Sender<PerfWork>,
 ) {
     let mut tracked_pids: Vec<u32> = initial_pid.into_iter().collect();
+    let mut last_maps_mtime: HashMap<u32, Option<std::time::SystemTime>> = HashMap::new();
+
+    // Record initial mtime for pre-loaded PIDs so the first retain cycle
+    // doesn't redundantly call refresh_process on them.
+    for &pid in &tracked_pids {
+        let maps_path = format!("/proc/{}/maps", pid);
+        let mtime = std::fs::metadata(&maps_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        last_maps_mtime.insert(pid, mtime);
+    }
 
     loop {
         // Drain all pending tgid requests (non-blocking)
         while let Ok(new_tgid) = tgid_rx.try_recv() {
             if !tracked_pids.contains(&new_tgid) {
                 tracked_pids.push(new_tgid);
+                // Record mtime before refresh so a concurrent dlopen between
+                // refresh_process and metadata() doesn't go undetected.
+                let maps_path = format!("/proc/{}/maps", new_tgid);
+                let pre_refresh_mtime = std::fs::metadata(&maps_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
                 // Immediately load the new process
                 if let Ok(new_shard_ids) = manager.refresh_process(new_tgid) {
                     if !new_shard_ids.is_empty()
@@ -1064,19 +1083,53 @@ fn dwarf_refresh_loop(
                         return;
                     }
                 }
+                last_maps_mtime.insert(new_tgid, pre_refresh_mtime);
             }
         }
 
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        // Periodic rescan of all tracked processes for dlopen'd libraries
-        for &pid in &tracked_pids {
+        // Periodic rescan of all tracked processes for dlopen'd libraries.
+        // Prune exited PIDs to avoid stat'ing non-existent /proc entries.
+        let mut channel_closed = false;
+        tracked_pids.retain(|&pid| {
+            if channel_closed {
+                return true; // stop processing, will exit after retain
+            }
+
+            let maps_path = format!("/proc/{}/maps", pid);
+            let current_mtime = match std::fs::metadata(&maps_path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Process exited — /proc/[pid]/maps no longer exists
+                    last_maps_mtime.remove(&pid);
+                    return false; // remove from tracked_pids
+                }
+                Err(_) => {
+                    // Other I/O error (permission, etc.) — keep PID, skip this cycle
+                    return true;
+                }
+                Ok(metadata) => metadata.modified().ok(),
+            };
+
+            // Skip rescan if /proc/[pid]/maps hasn't changed
+            if let Some(Some(last_ts)) = last_maps_mtime.get(&pid) {
+                if current_mtime.as_ref() == Some(last_ts) {
+                    return true; // keep PID, skip rescan
+                }
+            }
+
             if let Ok(new_shard_ids) = manager.refresh_process(pid) {
                 if !new_shard_ids.is_empty() && send_refresh(&manager, &tx, new_shard_ids).is_err()
                 {
-                    return;
+                    channel_closed = true;
                 }
             }
+            last_maps_mtime.insert(pid, current_mtime);
+            true // keep PID
+        });
+
+        if channel_closed {
+            return;
         }
     }
 }
@@ -1090,7 +1143,7 @@ fn send_refresh(
     let mut shard_updates = Vec::new();
     for &shard_id in &new_shard_ids {
         if let Some(entries) = manager.binary_tables.get(shard_id as usize) {
-            shard_updates.push((shard_id, entries.clone()));
+            shard_updates.push((shard_id, Arc::clone(entries)));
         }
     }
 
@@ -1697,6 +1750,7 @@ fn spawn_profiling_thread(
 ) {
     std::thread::spawn(move || {
         let mut profiler = TraceHandler::new();
+        profiler.prewarm_kernel_symbols();
         let mut counts = ebpf_profiler.counts;
         let stack_traces = ebpf_profiler.stack_traces;
         let stacked_pointers = ebpf_profiler.stacked_pointers;
