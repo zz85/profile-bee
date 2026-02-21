@@ -1,6 +1,6 @@
 [package]
 name = "profile-bee-tui"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "MIT"
 description = "Terminal-based flamegraph viewer for profile-bee (forked from flamelens)"

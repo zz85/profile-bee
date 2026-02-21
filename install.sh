@@ -109,6 +109,9 @@ download_and_install() {
     chmod +x "${INSTALL_DIR}/probee"
     chmod +x "${INSTALL_DIR}/pbee"
 
+    # Create profibee symlink
+    ln -sf "${INSTALL_DIR}/probee" "${INSTALL_DIR}/profibee"
+
     # Cleanup
     rm -rf "$temp_dir"
 
