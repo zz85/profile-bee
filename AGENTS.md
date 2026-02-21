@@ -267,7 +267,7 @@ sudo tests/run_e2e.sh --filter dwarf
 ### BPF Verifier
 - All loops MUST be bounded (`for _ in 0..CONST`). No `while`, no dynamic bounds.
 - Map accesses must be bounds-checked. The verifier tracks these statically.
-- `shard_lookup()` uses an 8-way static `match` — dynamic array indexing fails verification.
+- `shard_lookup()` uses `ArrayOfMaps::get_value()` (from the Brskt/aya `hashmapofmaps-new` branch) which fuses the outer and inner `bpf_map_lookup_elem` into a single call without intermediate struct indirection. Using the two-step approach (`get()` then `Array::get()`) causes verifier state explosion (~10s vs ~400ms). The fused `get_value()` is the required pattern.
 - The eBPF crate uses extreme optimization (`opt-level=3, lto, codegen-units=1`) even in debug — required for verifier to accept the code.
 - Adding code to `collect_trace` can push it over the verifier instruction limit. The DWARF inline path (21 iterations × 8 mappings × 16 binary search steps) is near the edge.
 
