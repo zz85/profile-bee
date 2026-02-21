@@ -22,6 +22,7 @@ use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use profile_bee::types::FrameCount;
@@ -37,7 +38,7 @@ enum PerfWork {
 /// Incremental DWARF unwind table update
 /// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
 struct DwarfRefreshUpdate {
-    shard_updates: Vec<(u8, Vec<UnwindEntry>)>, // (shard_id, entries) for new shards
+    shard_updates: Vec<(u8, Arc<Vec<UnwindEntry>>)>, // (shard_id, entries) for new shards
     proc_info: Vec<(u32, ProcInfo)>,
 }
 
@@ -1090,7 +1091,7 @@ fn send_refresh(
     let mut shard_updates = Vec::new();
     for &shard_id in &new_shard_ids {
         if let Some(entries) = manager.binary_tables.get(shard_id as usize) {
-            shard_updates.push((shard_id, entries.clone()));
+            shard_updates.push((shard_id, Arc::clone(entries)));
         }
     }
 

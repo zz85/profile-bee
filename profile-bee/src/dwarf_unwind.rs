@@ -6,7 +6,11 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
+
+use memmap2::Mmap;
 
 use gimli::{BaseAddresses, CfaRule, EhFrame, NativeEndian, Register, RegisterRule, UnwindSection};
 use object::{Object, ObjectSection};
@@ -16,6 +20,24 @@ use profile_bee_common::{
     CFA_REG_RBP, CFA_REG_RSP, MAX_PROC_MAPS, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET,
     REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED, SHARD_NONE,
 };
+
+/// Holds binary data either as a memory-mapped file or a heap-allocated buffer (for vdso).
+/// Using mmap avoids copying the entire ELF binary into userspace heap memory,
+/// eliminating page fault storms from anonymous page allocation + zeroing.
+enum BinaryData {
+    Mmap(Mmap),
+    Vec(Vec<u8>),
+}
+
+impl std::ops::Deref for BinaryData {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            BinaryData::Mmap(m) => m,
+            BinaryData::Vec(v) => v,
+        }
+    }
+}
 
 /// Build ID for uniquely identifying ELF binaries
 pub type BuildId = Vec<u8>;
@@ -364,7 +386,7 @@ pub struct DwarfUnwindManager {
     /// - Better cache locality for sequential access
     /// - Natural enforcement of MAX_UNWIND_SHARDS limit
     ///   Each Vec<UnwindEntry> is the unwind table for one binary/shard.
-    pub binary_tables: Vec<Vec<UnwindEntry>>,
+    pub binary_tables: Vec<Arc<Vec<UnwindEntry>>>,
     /// Per-process mapping information
     pub proc_info: HashMap<u32, ProcInfo>,
     /// Next shard_id to assign to a new binary
@@ -553,10 +575,15 @@ impl DwarfUnwindManager {
                     (sid, tc)
                 } else {
                     // Cold path: metadata cache miss - need to read binary
-                    let binary_data = if is_vdso {
-                        read_vdso(tgid, start_addr, end_addr).ok()
+                    let binary_data: Option<BinaryData> = if is_vdso {
+                        read_vdso(tgid, start_addr, end_addr)
+                            .ok()
+                            .map(BinaryData::Vec)
                     } else {
-                        fs::read(&resolved_path).ok()
+                        File::open(&resolved_path)
+                            .ok()
+                            .and_then(|f| unsafe { Mmap::map(&f) }.ok())
+                            .map(BinaryData::Mmap)
                     };
 
                     let cache_hit = if let Some(ref data) = binary_data {
@@ -658,7 +685,7 @@ impl DwarfUnwindManager {
                         // The index of this element will be the shard_id
                         // Invariant: next_shard_id always equals binary_tables.len() before push
                         debug_assert_eq!(sid as usize, self.binary_tables.len());
-                        self.binary_tables.push(unwind_entries);
+                        self.binary_tables.push(Arc::new(unwind_entries));
 
                         // Cache using build ID if available, otherwise use path
                         if let Some(build_id) = build_id_opt {
