@@ -77,6 +77,23 @@ impl TraceHandler {
         }
     }
 
+    /// Pre-warm kernel symbol resolution by triggering the initial parse of
+    /// `/proc/kallsyms`. This avoids a latency spike when the first kernel
+    /// stack is symbolized. The parsed data is cached internally by blazesym's
+    /// `FileCache` for all subsequent calls.
+    pub fn prewarm_kernel_symbols(&self) {
+        let start = std::time::Instant::now();
+        let src = Source::Kernel(Kernel::default());
+        match self.symbolizer.symbolize(&src, Input::AbsAddr(&[])) {
+            Ok(_) => {
+                tracing::debug!("Pre-warmed kernel symbol resolver in {:?}", start.elapsed());
+            }
+            Err(e) => {
+                tracing::warn!("Failed to pre-warm kernel symbols: {:?}", e);
+            }
+        }
+    }
+
     pub fn print_stats(&self) {
         println!("{}", self.cache.stats());
     }

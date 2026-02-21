@@ -712,6 +712,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let stacked_pointers = &ebpf_profiler.stacked_pointers;
 
     let mut profiler = TraceHandler::new();
+    profiler.prewarm_kernel_symbols();
 
     // Set up stopping mechanisms
     // CLI defaults to 10s profiling windows;
@@ -1718,6 +1719,7 @@ fn spawn_profiling_thread(
 ) {
     std::thread::spawn(move || {
         let mut profiler = TraceHandler::new();
+        profiler.prewarm_kernel_symbols();
         let mut counts = ebpf_profiler.counts;
         let stack_traces = ebpf_profiler.stack_traces;
         let stacked_pointers = ebpf_profiler.stacked_pointers;
