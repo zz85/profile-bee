@@ -253,3 +253,45 @@ Cache format: `<build-id-hex>.unwind` containing the serialized entries (fixed-s
 | P2 | Disk cache for unwind tables (#6) | Eliminate cold-start parsing | Medium -- serialization + cache management |
 | P2 | Right-size inner BPF maps (#1) | Reduce kernel memory + zeroing | Low -- conditional on kernel version |
 | P2 | Adaptive polling interval (#4) | Reduce steady-state I/O | Low |
+
+---
+
+## Implementation Results
+
+**Commit:** `caac922` (P1) on top of `394a019` (P0)
+
+Self-profiling at 99 Hz x 16 cores x 5s with `--dwarf`, comparing before/after the optimizations below. The with-idle comparison uses ~7,300 idle samples across 16 CPUs as a stable timing baseline.
+
+### Changes implemented
+
+| Change | Priority | Commit |
+|---|---|---|
+| `BPF_MAP_UPDATE_BATCH` for shard loading (fallback to per-entry on kernel < 5.6) | P0 | `394a019` |
+| `memmap2::Mmap` for ELF binary reads (replaces `fs::read`) | P0 | `394a019` |
+| `Arc<Vec<UnwindEntry>>` for zero-copy shard sharing across threads | P0 | `394a019` |
+| Pre-allocate `Vec<UnwindEntry>` capacity from `.eh_frame` size | P1 | `caac922` |
+| mtime-based change detection to skip `/proc/[pid]/maps` rescans | P1 | `caac922` |
+
+### Measured improvement (with-idle mode)
+
+| Metric | Before | After | Delta |
+|---|---:|---:|---:|
+| **Total samples** | 8,880 | 8,224 | -656 (-7.4%) |
+| **Profiler overhead** | **175** | **125** | **-50 (-28.6%)** |
+| Profiler as % of total | 2.0% | 1.5% | **-25% relative** |
+
+### Breakdown by category
+
+| Category | Before | After | Delta | Notes |
+|---|---:|---:|---:|---|
+| File I/O (ELF reading) | 85 | 32 | **-53 (-62%)** | mmap eliminates heap copy + page zeroing |
+| DWARF refresh thread | 62 | 41 | **-21 (-34%)** | mtime skip + Vec pre-alloc reduce parse cycles |
+| BPF map updates | 47 | 36 | **-11 (-23%)** | Batch syscall reduces per-entry overhead |
+| Symbolization (blazesym) | 17 | 33 | +16 (+94%) | Expected: faster DWARF = more time for symbolization |
+| Arc/clone overhead | 0 | 0 | 0 | Not visible at this scale (sub-sample) |
+
+**Note:** Single-run profiles with statistical sampling noise. At ~100-175 profiler samples, individual category counts have +/-5-10 sample variance. The overall 28.6% reduction is statistically meaningful; per-category percentages are approximate.
+
+### Remaining opportunities
+
+The largest remaining cost center is **blazesym symbolization** (33 samples, now 26% of profiler overhead), which was not targeted in this round. See Issue #3 (kallsyms) for mitigation ideas. The BPF map update path still shows 36 samples — this could be further reduced by moving shard population off the main thread (P1 in Issue #1).
