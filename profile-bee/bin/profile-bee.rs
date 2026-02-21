@@ -1069,6 +1069,12 @@ fn dwarf_refresh_loop(
         while let Ok(new_tgid) = tgid_rx.try_recv() {
             if !tracked_pids.contains(&new_tgid) {
                 tracked_pids.push(new_tgid);
+                // Record mtime before refresh so a concurrent dlopen between
+                // refresh_process and metadata() doesn't go undetected.
+                let maps_path = format!("/proc/{}/maps", new_tgid);
+                let pre_refresh_mtime = std::fs::metadata(&maps_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
                 // Immediately load the new process
                 if let Ok(new_shard_ids) = manager.refresh_process(new_tgid) {
                     if !new_shard_ids.is_empty()
@@ -1077,12 +1083,7 @@ fn dwarf_refresh_loop(
                         return;
                     }
                 }
-                // Record initial mtime after first scan
-                let maps_path = format!("/proc/{}/maps", new_tgid);
-                let mtime = std::fs::metadata(&maps_path)
-                    .ok()
-                    .and_then(|m| m.modified().ok());
-                last_maps_mtime.insert(new_tgid, mtime);
+                last_maps_mtime.insert(new_tgid, pre_refresh_mtime);
             }
         }
 
