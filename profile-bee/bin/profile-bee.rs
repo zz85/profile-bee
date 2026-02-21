@@ -1078,28 +1078,38 @@ fn dwarf_refresh_loop(
 
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        // Periodic rescan of all tracked processes for dlopen'd libraries
-        for &pid in &tracked_pids {
-            // Skip rescan if /proc/[pid]/maps hasn't changed
+        // Periodic rescan of all tracked processes for dlopen'd libraries.
+        // Prune exited PIDs to avoid stat'ing non-existent /proc entries.
+        tracked_pids.retain(|&pid| {
             let maps_path = format!("/proc/{}/maps", pid);
             let current_mtime = std::fs::metadata(&maps_path)
                 .ok()
                 .and_then(|m| m.modified().ok());
 
+            // Process exited — /proc/[pid]/maps no longer exists
+            if current_mtime.is_none() {
+                last_maps_mtime.remove(&pid);
+                return false; // remove from tracked_pids
+            }
+
+            // Skip rescan if /proc/[pid]/maps hasn't changed
             if let Some(Some(last_ts)) = last_maps_mtime.get(&pid) {
                 if current_mtime.as_ref() == Some(last_ts) {
-                    continue; // mtime unchanged, skip rescan
+                    return true; // keep PID, skip rescan
                 }
             }
 
             if let Ok(new_shard_ids) = manager.refresh_process(pid) {
                 if !new_shard_ids.is_empty() && send_refresh(&manager, &tx, new_shard_ids).is_err()
                 {
-                    return;
+                    // Channel closed — caller will detect via send_refresh returning Err
+                    // We cannot return from inside retain, so just stop refreshing.
+                    // The outer loop will exit on the next send_refresh failure.
                 }
             }
             last_maps_mtime.insert(pid, current_mtime);
-        }
+            true // keep PID
+        });
     }
 }
 

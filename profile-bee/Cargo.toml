@@ -45,6 +45,7 @@ libc = "0.2.86"
 procmaps = "0.4.1"
 regex = "1"
 memmap2 = "0.9"
+lru = "0.12"
 
 [features]
 default = ["tui"]
