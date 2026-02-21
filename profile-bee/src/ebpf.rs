@@ -513,21 +513,22 @@ impl EbpfProfiler {
         let inner_array = create_and_populate_inner_map(shard_id, entries)?;
 
         // Get the outer ArrayOfMaps and insert the inner map's FD
-        let mut outer: aya::maps::ArrayOfMaps<&mut MapData> = aya::maps::ArrayOfMaps::try_from(
+        let mut outer: aya::maps::ArrayOfMaps<
+            &mut MapData,
+            aya::maps::Array<MapData, UnwindEntryPod>,
+        > = aya::maps::ArrayOfMaps::try_from(
             self.bpf
                 .map_mut("unwind_shards")
                 .ok_or(anyhow!("unwind_shards map not found"))?,
         )?;
 
-        outer
-            .set(shard_id as u32, inner_array.fd(), 0)
-            .map_err(|e| {
-                anyhow!(
-                    "failed to insert shard_{} into outer ArrayOfMaps: {}",
-                    shard_id,
-                    e
-                )
-            })?;
+        outer.set(shard_id as u32, &inner_array, 0).map_err(|e| {
+            anyhow!(
+                "failed to insert shard_{} into outer ArrayOfMaps: {}",
+                shard_id,
+                e
+            )
+        })?;
 
         // inner_array is dropped here — the kernel holds a reference to the inner map
         // via the outer ArrayOfMaps, so the inner map stays alive.

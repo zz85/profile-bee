@@ -1,4 +1,4 @@
-use aya::maps::{InnerMap, MapData, RingBuf, StackTraceMap};
+use aya::maps::{MapData, RingBuf, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
@@ -1191,11 +1191,14 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
                 let map = bpf.map_mut("unwind_shards").ok_or_else(|| {
                     tracing::warn!("DWARF refresh: unwind_shards map not found");
                 })?;
-                let mut outer = aya::maps::ArrayOfMaps::try_from(map).map_err(|e| {
+                let mut outer: aya::maps::ArrayOfMaps<
+                    &mut aya::maps::MapData,
+                    aya::maps::Array<aya::maps::MapData, profile_bee::ebpf::UnwindEntryPod>,
+                > = aya::maps::ArrayOfMaps::try_from(map).map_err(|e| {
                     tracing::warn!("DWARF refresh: unwind_shards is not ArrayOfMaps: {}", e);
                 })?;
                 for (shard_id, inner_array) in &created_maps {
-                    if let Err(e) = outer.set(*shard_id as u32, inner_array.fd(), 0) {
+                    if let Err(e) = outer.set(*shard_id as u32, inner_array, 0) {
                         tracing::warn!(
                             "DWARF refresh: failed to insert shard_{} into outer map: {}",
                             shard_id,
