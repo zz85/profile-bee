@@ -1085,8 +1085,8 @@ fn dwarf_refresh_loop(
                 .ok()
                 .and_then(|m| m.modified().ok());
 
-            if let Some(last_mtime) = last_maps_mtime.get(&pid) {
-                if *last_mtime == current_mtime {
+            if let Some(Some(last_ts)) = last_maps_mtime.get(&pid) {
+                if current_mtime.as_ref() == Some(last_ts) {
                     continue; // mtime unchanged, skip rescan
                 }
             }
