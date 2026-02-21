@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use aya::maps::{
-    Array, HashMap, MapData, PerCpuArray, PerCpuValues, ProgramArray, RingBuf, StackTraceMap,
+    Array, HashMap, InnerMap, MapData, PerCpuArray, PerCpuValues, ProgramArray, RingBuf,
+    StackTraceMap,
 };
 use aya::programs::{
     perf_event::{PerfEventConfig, PerfEventScope, SamplePolicy, SoftwareEvent},
