@@ -1,4 +1,4 @@
-use aya::maps::{MapData, RingBuf, StackTraceMap};
+use aya::maps::{InnerMap, MapData, RingBuf, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
