@@ -301,7 +301,7 @@ sudo tests/run_e2e.sh --filter dwarf
 |---|---|---|
 | Max frame depth | 165 (tail-call) / 21 (legacy) | Kernel 33 tail-call limit; legacy for kprobe/uprobe |
 | Mappings per process | 8 (`MAX_PROC_MAPS`) | eBPF array size limit |
-| Unwind shards | 8 (`MAX_UNWIND_SHARDS`) | Max 8 unique binaries with tables loaded |
+| Unwind shards | 512 (`MAX_UNWIND_SHARDS`) | Max unique binaries with DWARF tables loaded |
 | Entries per shard | 65,536 (`MAX_SHARD_ENTRIES`) | Very large binaries truncated |
 | CFA registers | RSP, RBP only | Other registers skipped |
 | DWARF expressions | Unsupported | Except PLT-stub and signal-frame patterns |

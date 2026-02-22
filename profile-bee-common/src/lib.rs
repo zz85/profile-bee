@@ -122,7 +122,7 @@ pub const MAX_PROC_MAPS: usize = 8;
 
 /// Maximum number of inner shard maps in the outer ArrayOfMaps.
 /// With array-of-maps, unused slots cost nothing (no pre-allocated kernel memory).
-pub const MAX_UNWIND_SHARDS: usize = 64;
+pub const MAX_UNWIND_SHARDS: usize = 512;
 /// Maximum unwind entries per inner shard map.
 /// With array-of-maps, each inner map is sized to the actual binary's table,
 /// but we need an upper bound for the binary search depth (17 iterations covers 2^17 = 128K).
@@ -130,7 +130,7 @@ pub const MAX_SHARD_ENTRIES: u32 = 131_072;
 /// Binary search iterations needed: ceil(log2(MAX_SHARD_ENTRIES)) = 17
 pub const MAX_BIN_SEARCH_DEPTH: u32 = 17;
 /// Sentinel value: no shard assigned to this mapping
-pub const SHARD_NONE: u8 = 0xFF;
+pub const SHARD_NONE: u16 = 0xFFFF;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(C)]
@@ -145,8 +145,8 @@ pub struct ExecMapping {
     pub begin: u64,
     pub end: u64,
     pub load_bias: u64,
-    pub shard_id: u8, // Which shard Array to search (0..MAX_UNWIND_SHARDS-1, or SHARD_NONE)
-    pub _pad1: [u8; 3],
+    pub shard_id: u16, // Which shard Array to search (0..MAX_UNWIND_SHARDS-1, or SHARD_NONE)
+    pub _pad1: [u8; 2],
     pub table_count: u32, // Number of entries in this shard for this binary
 }
 
