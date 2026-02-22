@@ -497,13 +497,13 @@ impl EbpfProfiler {
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
     ) -> Result<(), anyhow::Error> {
         // Load all shards - using array indexing pattern
-        let all_shard_ids: Vec<u8> = (0..manager.binary_tables.len() as u8).collect();
+        let all_shard_ids: Vec<u16> = (0..manager.binary_tables.len() as u16).collect();
         self.update_dwarf_tables(manager, &all_shard_ids)
     }
 
     /// Load a single shard's unwind entries by creating a new inner Array map
     /// and inserting it into the outer ArrayOfMaps at `shard_id`.
-    fn load_shard(&mut self, shard_id: u8, entries: &[UnwindEntry]) -> Result<(), anyhow::Error> {
+    fn load_shard(&mut self, shard_id: u16, entries: &[UnwindEntry]) -> Result<(), anyhow::Error> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -540,7 +540,7 @@ impl EbpfProfiler {
     pub fn update_dwarf_tables(
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
-        new_shard_ids: &[u8],
+        new_shard_ids: &[u16],
     ) -> Result<(), anyhow::Error> {
         if !new_shard_ids.is_empty() {
             let mut total_entries = 0usize;
@@ -695,7 +695,7 @@ fn batch_populate_inner_map(
 /// referenced from the outer ArrayOfMaps; once inserted there, the returned
 /// Array handle (and its FD) can be dropped (the kernel holds its own reference).
 pub fn create_and_populate_inner_map(
-    shard_id: u8,
+    shard_id: u16,
     entries: &[UnwindEntry],
 ) -> Result<aya::maps::Array<MapData, UnwindEntryPod>, anyhow::Error> {
     if entries.is_empty() {

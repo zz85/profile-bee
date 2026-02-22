@@ -38,7 +38,7 @@ enum PerfWork {
 /// Incremental DWARF unwind table update
 /// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
 struct DwarfRefreshUpdate {
-    shard_updates: Vec<(u8, Arc<Vec<UnwindEntry>>)>, // (shard_id, entries) for new shards
+    shard_updates: Vec<(u16, Arc<Vec<UnwindEntry>>)>, // (shard_id, entries) for new shards
     proc_info: Vec<(u32, ProcInfo)>,
 }
 
@@ -1137,7 +1137,7 @@ fn dwarf_refresh_loop(
 fn send_refresh(
     manager: &DwarfUnwindManager,
     tx: &mpsc::Sender<PerfWork>,
-    new_shard_ids: Vec<u8>,
+    new_shard_ids: Vec<u16>,
 ) -> Result<(), ()> {
     // Only clone the new shards (not the entire binary_tables)
     let mut shard_updates = Vec::new();

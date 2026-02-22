@@ -619,7 +619,7 @@ unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState, proc_info: &ProcI
 
     // Find the mapping that contains current_ip
     let mut found_mapping = false;
-    let mut shard_id: u8 = SHARD_NONE;
+    let mut shard_id: u16 = SHARD_NONE;
     let mut table_count: u32 = 0;
     let mut load_bias: u64 = 0;
 
@@ -780,7 +780,7 @@ unsafe fn dwarf_copy_stack_regs(
 
         // Find the mapping that contains current_ip
         let mut found_mapping = false;
-        let mut shard_id: u8 = SHARD_NONE;
+        let mut shard_id: u16 = SHARD_NONE;
         let mut table_count: u32 = 0;
         let mut load_bias: u64 = 0;
 
@@ -1091,14 +1091,14 @@ unsafe fn try_fp_step(bp: u64) -> Option<(u64, u64)> {
 /// This avoids verifier state explosion that occurs when the two lookups
 /// are separated by typed wrapper code (MapDef::as_ptr() on the inner map).
 #[inline(always)]
-unsafe fn shard_lookup(shard_id: u8, idx: u32) -> Option<UnwindEntry> {
+unsafe fn shard_lookup(shard_id: u16, idx: u32) -> Option<UnwindEntry> {
     let entry: &UnwindEntry = UNWIND_SHARDS.get_value(shard_id as u32, &idx)?;
     Some(*entry)
 }
 
 #[inline(always)]
 unsafe fn binary_search_unwind_entry(
-    shard_id: u8,
+    shard_id: u16,
     table_count: u32,
     relative_pc: u32,
 ) -> Option<UnwindEntry> {

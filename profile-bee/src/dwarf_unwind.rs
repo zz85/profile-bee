@@ -392,14 +392,14 @@ pub struct DwarfUnwindManager {
     /// Per-process mapping information
     pub proc_info: HashMap<u32, ProcInfo>,
     /// Next shard_id to assign to a new binary
-    next_shard_id: u8,
+    next_shard_id: u16,
     /// Fast metadata-based cache for hot path lookups (stat-based)
-    metadata_cache: HashMap<FileMetadata, u8>, // metadata -> shard_id
+    metadata_cache: HashMap<FileMetadata, u16>, // metadata -> shard_id
     /// Cache of parsed ELF binary shard IDs, keyed by build ID
     /// Falls back to path-based caching for binaries without build IDs
-    binary_cache: HashMap<BuildId, u8>, // build_id -> shard_id
+    binary_cache: HashMap<BuildId, u16>, // build_id -> shard_id
     /// Fallback cache for binaries without build IDs (keyed by path)
-    path_cache: HashMap<std::path::PathBuf, u8>, // path -> shard_id
+    path_cache: HashMap<std::path::PathBuf, u16>, // path -> shard_id
 }
 
 impl Default for DwarfUnwindManager {
@@ -445,12 +445,12 @@ impl DwarfUnwindManager {
 
     /// Rescan a process's memory mappings and load any new ones.
     /// Returns the list of new shard IDs added (for incremental eBPF updates).
-    pub fn refresh_process(&mut self, tgid: u32) -> Result<Vec<u8>, String> {
+    pub fn refresh_process(&mut self, tgid: u32) -> Result<Vec<u16>, String> {
         // Track number of shards before update
         let old_len = self.binary_tables.len();
         self.scan_and_update(tgid)?;
         // Find new shards: those added after old_len
-        let new_shard_ids: Vec<u8> = (old_len as u8..self.binary_tables.len() as u8).collect();
+        let new_shard_ids: Vec<u16> = (old_len as u16..self.binary_tables.len() as u16).collect();
         Ok(new_shard_ids)
     }
 
@@ -498,7 +498,7 @@ impl DwarfUnwindManager {
                 end: 0,
                 load_bias: 0,
                 shard_id: SHARD_NONE,
-                _pad1: [0; 3],
+                _pad1: [0; 2],
                 table_count: 0,
             }; MAX_PROC_MAPS],
         });
@@ -714,7 +714,7 @@ impl DwarfUnwindManager {
                 end: end_addr,
                 load_bias,
                 shard_id,
-                _pad1: [0; 3],
+                _pad1: [0; 2],
                 table_count,
             };
             proc_info.mapping_count += 1;
