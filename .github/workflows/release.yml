@@ -20,9 +20,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             name: linux-x86_64
+            strip: strip
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-gnu
             name: linux-aarch64
+            strip: aarch64-linux-gnu-strip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -40,19 +42,17 @@ jobs:
       - name: Install bpf-linker
         run: cargo install bpf-linker
 
-      - name: Install musl tools
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
       - name: Install cross-compilation tools (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
-          # Install aarch64 musl cross-compiler
-          wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar -xzf aarch64-linux-musl-cross.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -67,21 +67,17 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build profile-bee (aarch64 musl)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
+      - name: Build profile-bee (aarch64 static)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Strip binaries
         run: |
-          STRIP=strip
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            STRIP=aarch64-linux-musl-strip
-          fi
-          $STRIP target/${{ matrix.target }}/release/probee
-          $STRIP target/${{ matrix.target }}/release/pbee
+          ${{ matrix.strip }} target/${{ matrix.target }}/release/probee
+          ${{ matrix.strip }} target/${{ matrix.target }}/release/pbee
 
       - name: Show binary info
         run: |
