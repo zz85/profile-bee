@@ -1,6 +1,7 @@
 use std::os::fd::{AsFd, AsRawFd};
 
 use anyhow::anyhow;
+use aya::maps::lpm_trie::{Key as LpmKey, LpmTrie};
 use aya::maps::{
     Array, HashMap, InnerMap, MapData, PerCpuArray, PerCpuValues, ProgramArray, RingBuf,
     StackTraceMap,
@@ -14,7 +15,7 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 
 use aya::Pod;
-use profile_bee_common::{ProcInfo, ProcInfoKey, ProcessExitEvent, UnwindEntry};
+use profile_bee_common::{ExecMapping, ExecMappingKey, ProcessExitEvent, UnwindEntry};
 
 // Create a newtype wrapper around StackInfo
 #[repr(transparent)]
@@ -34,13 +35,13 @@ unsafe impl Pod for UnwindEntryPod {}
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
-pub struct ProcInfoKeyPod(pub ProcInfoKey);
-unsafe impl Pod for ProcInfoKeyPod {}
+pub struct ExecMappingKeyPod(pub ExecMappingKey);
+unsafe impl Pod for ExecMappingKeyPod {}
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct ProcInfoPod(pub ProcInfo);
-unsafe impl Pod for ProcInfoPod {}
+pub struct ExecMappingPod(pub ExecMapping);
+unsafe impl Pod for ExecMappingPod {}
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
@@ -536,7 +537,7 @@ impl EbpfProfiler {
     }
 
     /// Incrementally update eBPF maps with new unwind shard entries,
-    /// and refresh all proc_info entries.
+    /// and refresh exec_mappings LPM trie for all processes.
     pub fn update_dwarf_tables(
         &mut self,
         manager: &crate::dwarf_unwind::DwarfUnwindManager,
@@ -560,24 +561,38 @@ impl EbpfProfiler {
             );
         }
 
-        let mut proc_info_map: HashMap<&mut MapData, ProcInfoKeyPod, ProcInfoPod> =
-            HashMap::try_from(
-                self.bpf
-                    .map_mut("proc_info")
-                    .ok_or(anyhow!("proc_info map not found"))?,
-            )?;
+        // Populate exec_mappings LPM trie for all processes
+        let mut trie: LpmTrie<&mut MapData, ExecMappingKeyPod, ExecMappingPod> = LpmTrie::try_from(
+            self.bpf
+                .map_mut("exec_mappings")
+                .ok_or(anyhow!("exec_mappings map not found"))?,
+        )?;
 
-        for (&tgid, proc_info) in &manager.proc_info {
-            let key = ProcInfoKeyPod(ProcInfoKey { tgid, _pad: 0 });
-            let value = ProcInfoPod(*proc_info);
-            proc_info_map.insert(key, value, 0)?;
-
-            tracing::info!(
-                "Loaded process info for tgid {} ({} mappings)",
-                tgid,
-                proc_info.mapping_count,
-            );
+        let mut total_lpm_entries = 0usize;
+        for (&tgid, mappings) in &manager.proc_mappings {
+            for mapping in mappings {
+                for block in crate::dwarf_unwind::summarize_address_range(
+                    mapping.begin,
+                    mapping.end.saturating_sub(1),
+                ) {
+                    let key = LpmKey::new(
+                        32 + block.prefix_len,
+                        ExecMappingKeyPod(ExecMappingKey {
+                            tgid: tgid.to_be(),
+                            address: block.addr.to_be(),
+                        }),
+                    );
+                    trie.insert(&key, ExecMappingPod(*mapping), 0)?;
+                    total_lpm_entries += 1;
+                }
+            }
         }
+
+        tracing::info!(
+            "Loaded {} LPM trie entries for {} processes",
+            total_lpm_entries,
+            manager.proc_mappings.len(),
+        );
 
         Ok(())
     }

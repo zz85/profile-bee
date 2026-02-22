@@ -16,9 +16,9 @@ use gimli::{BaseAddresses, CfaRule, EhFrame, NativeEndian, Register, RegisterRul
 use object::{Object, ObjectSection};
 use procfs::process::{MMapPath, Process};
 use profile_bee_common::{
-    ExecMapping, ProcInfo, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_PLT,
-    CFA_REG_RBP, CFA_REG_RSP, MAX_PROC_MAPS, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET,
-    REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED, SHARD_NONE,
+    ExecMapping, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_PLT, CFA_REG_RBP,
+    CFA_REG_RSP, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
+    REG_RULE_UNDEFINED,
 };
 
 /// Holds binary data either as a memory-mapped file or a heap-allocated buffer (for vdso).
@@ -67,6 +67,44 @@ impl FileMetadata {
             mtime_nsec: metadata.mtime_nsec(),
         })
     }
+}
+
+/// Result of decomposing an address range into LPM trie prefix blocks.
+#[derive(Debug, PartialEq)]
+pub struct AddressBlockRange {
+    pub addr: u64,
+    pub prefix_len: u32,
+}
+
+/// Decompose an address range [low, high] (inclusive) into the minimal set of
+/// aligned power-of-2 blocks for LPM trie insertion.
+///
+/// Each block is expressed as (base_address, prefix_len) where prefix_len is
+/// the number of significant bits in the 64-bit address. The LPM trie will
+/// match any address within the block using longest-prefix matching.
+///
+/// This is the same algorithm used in CIDR route summarization. Ported from
+/// lightswitch's `summarize_address_range`.
+pub fn summarize_address_range(low: u64, high: u64) -> Vec<AddressBlockRange> {
+    let mut res = Vec::new();
+    let mut curr = low;
+
+    while curr <= high {
+        let number_of_bits = std::cmp::min(
+            curr.trailing_zeros(),
+            (64 - (high - curr + 1).leading_zeros()) - 1,
+        );
+        res.push(AddressBlockRange {
+            addr: curr,
+            prefix_len: 64 - number_of_bits,
+        });
+        curr += 1 << number_of_bits;
+        if curr.wrapping_sub(1) == u64::MAX {
+            break;
+        }
+    }
+
+    res
 }
 
 // x86_64 register numbers in DWARF
@@ -389,8 +427,8 @@ pub struct DwarfUnwindManager {
     /// - Natural enforcement of MAX_UNWIND_SHARDS limit
     ///   Each Vec<UnwindEntry> is the unwind table for one binary/shard.
     pub binary_tables: Vec<Arc<Vec<UnwindEntry>>>,
-    /// Per-process mapping information
-    pub proc_info: HashMap<u32, ProcInfo>,
+    /// Per-process exec mappings (no per-process limit; LPM trie handles all lookups)
+    pub proc_mappings: HashMap<u32, Vec<ExecMapping>>,
     /// Next shard_id to assign to a new binary
     next_shard_id: u16,
     /// Fast metadata-based cache for hot path lookups (stat-based)
@@ -414,7 +452,7 @@ impl DwarfUnwindManager {
             // Initialize as empty Vec with capacity for MAX_UNWIND_SHARDS
             // Using Vec instead of HashMap for the "array of maps" pattern
             binary_tables: Vec::with_capacity(MAX_UNWIND_SHARDS),
-            proc_info: HashMap::new(),
+            proc_mappings: HashMap::new(),
             next_shard_id: 0,
             metadata_cache: HashMap::new(),
             binary_cache: HashMap::new(),
@@ -425,7 +463,7 @@ impl DwarfUnwindManager {
     /// Load unwind information for a process by scanning its memory mappings.
     /// Returns Ok(()) if the process was loaded (or already loaded).
     pub fn load_process(&mut self, tgid: u32) -> Result<(), String> {
-        if self.proc_info.contains_key(&tgid) {
+        if self.proc_mappings.contains_key(&tgid) {
             return Ok(());
         }
         // Wait for the dynamic linker to finish mapping shared libraries.
@@ -481,35 +519,16 @@ impl DwarfUnwindManager {
             .map_err(|e| format!("Failed to read maps for {}: {}", tgid, e))?;
 
         // Collect existing mapping addresses so we can skip them
-        let existing = self.proc_info.get(&tgid);
+        let existing = self.proc_mappings.get(&tgid);
         let existing_ranges: Vec<(u64, u64)> = existing
-            .map(|pi| {
-                (0..pi.mapping_count as usize)
-                    .map(|i| (pi.mappings[i].begin, pi.mappings[i].end))
-                    .collect()
-            })
+            .map(|mappings| mappings.iter().map(|m| (m.begin, m.end)).collect())
             .unwrap_or_default();
 
-        let mut proc_info = existing.copied().unwrap_or(ProcInfo {
-            mapping_count: 0,
-            _pad: 0,
-            mappings: [ExecMapping {
-                begin: 0,
-                end: 0,
-                load_bias: 0,
-                shard_id: SHARD_NONE,
-                _pad1: [0; 2],
-                table_count: 0,
-            }; MAX_PROC_MAPS],
-        });
+        let mut mappings: Vec<ExecMapping> = existing.cloned().unwrap_or_default();
 
         let root_path = format!("/proc/{}/root", tgid);
 
         for map in maps.iter() {
-            if proc_info.mapping_count as usize >= MAX_PROC_MAPS {
-                break;
-            }
-
             let perms = &map.perms;
             use procfs::process::MMPermissions;
             if !perms.contains(MMPermissions::EXECUTE) || !perms.contains(MMPermissions::READ) {
@@ -708,19 +727,17 @@ impl DwarfUnwindManager {
                 }
             };
 
-            let idx = proc_info.mapping_count as usize;
-            proc_info.mappings[idx] = ExecMapping {
+            mappings.push(ExecMapping {
                 begin: start_addr,
                 end: end_addr,
                 load_bias,
                 shard_id,
                 _pad1: [0; 2],
                 table_count,
-            };
-            proc_info.mapping_count += 1;
+            });
         }
 
-        self.proc_info.insert(tgid, proc_info);
+        self.proc_mappings.insert(tgid, mappings);
 
         Ok(())
     }
@@ -790,7 +807,7 @@ mod tests {
     fn test_dwarf_manager_new() {
         let manager = DwarfUnwindManager::new();
         assert_eq!(manager.total_entries(), 0);
-        assert!(manager.proc_info.is_empty());
+        assert!(manager.proc_mappings.is_empty());
     }
 
     #[test]
@@ -826,12 +843,12 @@ mod tests {
             "Expected non-empty unwind table for current process"
         );
         assert!(
-            manager.proc_info.contains_key(&pid),
-            "Expected proc_info entry for current process"
+            manager.proc_mappings.contains_key(&pid),
+            "Expected proc_mappings entry for current process"
         );
-        let info = &manager.proc_info[&pid];
+        let mappings = &manager.proc_mappings[&pid];
         assert!(
-            info.mapping_count > 0,
+            !mappings.is_empty(),
             "Expected at least one executable mapping"
         );
     }

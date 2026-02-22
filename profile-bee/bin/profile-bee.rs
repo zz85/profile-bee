@@ -15,7 +15,7 @@ use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, Resolve
 use profile_bee::probe_spec::parse_probe_spec;
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
-use profile_bee_common::{ProcInfo, ProcessExitEvent, StackInfo, UnwindEntry, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{ExecMapping, ProcessExitEvent, StackInfo, UnwindEntry, EVENT_TRACE_ALWAYS};
 use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -39,7 +39,7 @@ enum PerfWork {
 /// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
 struct DwarfRefreshUpdate {
     shard_updates: Vec<(u16, Arc<Vec<UnwindEntry>>)>, // (shard_id, entries) for new shards
-    proc_info: Vec<(u32, ProcInfo)>,
+    proc_mappings: Vec<(u32, Vec<ExecMapping>)>,
 }
 
 #[derive(Debug, Parser)]
@@ -1147,7 +1147,7 @@ fn send_refresh(
         }
     }
 
-    let proc_info: Vec<(u32, ProcInfo)> = manager.proc_info.iter().map(|(&t, &p)| (t, p)).collect();
+    let proc_mappings: Vec<(u32, Vec<ExecMapping>)> = manager.proc_mappings.iter().map(|(&t, m)| (t, m.clone())).collect();
     let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
     tracing::debug!(
         "DWARF refresh: {} new shards with {} total entries",
@@ -1156,16 +1156,13 @@ fn send_refresh(
     );
     tx.send(PerfWork::DwarfRefresh(DwarfRefreshUpdate {
         shard_updates,
-        proc_info,
+        proc_mappings,
     }))
     .map_err(|_| ())
 }
 
 /// Apply incremental DWARF unwind table updates to eBPF maps
 fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
-    use aya::maps::HashMap;
-    use profile_bee::ebpf::{ProcInfoKeyPod, ProcInfoPod};
-    use profile_bee_common::ProcInfoKey;
 
     // Create inner maps and insert them into the outer ArrayOfMaps
     if !update.shard_updates.is_empty() {
@@ -1213,14 +1210,35 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
         // created_maps dropped; kernel holds references via the outer map
     }
 
-    if let Some(map) = bpf.map_mut("proc_info") {
-        if let Ok(mut hm) = HashMap::<&mut MapData, ProcInfoKeyPod, ProcInfoPod>::try_from(map) {
-            for (tgid, pi) in &update.proc_info {
-                let key = ProcInfoKeyPod(ProcInfoKey {
-                    tgid: *tgid,
-                    _pad: 0,
-                });
-                let _ = hm.insert(key, ProcInfoPod(*pi), 0);
+    if let Some(map) = bpf.map_mut("exec_mappings") {
+        if let Ok(mut trie) = aya::maps::lpm_trie::LpmTrie::<
+            &mut aya::maps::MapData,
+            profile_bee::ebpf::ExecMappingKeyPod,
+            profile_bee::ebpf::ExecMappingPod,
+        >::try_from(map)
+        {
+            for (tgid, mappings) in &update.proc_mappings {
+                for mapping in mappings {
+                    for block in profile_bee::dwarf_unwind::summarize_address_range(
+                        mapping.begin,
+                        mapping.end.saturating_sub(1),
+                    ) {
+                        let key = aya::maps::lpm_trie::Key::new(
+                            32 + block.prefix_len,
+                            profile_bee::ebpf::ExecMappingKeyPod(
+                                profile_bee_common::ExecMappingKey {
+                                    tgid: tgid.to_be(),
+                                    address: block.addr.to_be(),
+                                },
+                            ),
+                        );
+                        let _ = trie.insert(
+                            &key,
+                            profile_bee::ebpf::ExecMappingPod(*mapping),
+                            0,
+                        );
+                    }
+                }
             }
         }
     }
