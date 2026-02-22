@@ -18,10 +18,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             name: linux-x86_64
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             name: linux-aarch64
     runs-on: ${{ matrix.os }}
     steps:
@@ -40,11 +40,19 @@ jobs:
       - name: Install bpf-linker
         run: cargo install bpf-linker
 
-      - name: Install cross-compilation tools (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install musl tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross-compilation tools (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
+          # Install aarch64 musl cross-compiler
+          wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
+          tar -xzf aarch64-linux-musl-cross.tgz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -55,15 +63,30 @@ jobs:
       - name: Build eBPF
         run: cargo +nightly build --release -Z build-std=core --target bpfel-unknown-none --manifest-path profile-bee-ebpf/Cargo.toml
 
-      - name: Build profile-bee (native)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Build profile-bee (x86_64 musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build profile-bee (cross-compile aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Build profile-bee (aarch64 musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binaries
+        run: |
+          STRIP=strip
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            STRIP=aarch64-linux-musl-strip
+          fi
+          $STRIP target/${{ matrix.target }}/release/probee
+          $STRIP target/${{ matrix.target }}/release/pbee
+
+      - name: Show binary info
+        run: |
+          ls -lh target/${{ matrix.target }}/release/probee
+          file target/${{ matrix.target }}/release/probee
 
       - name: Create tarball
         run: |
