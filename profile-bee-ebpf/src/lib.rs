@@ -163,6 +163,13 @@ static UNWIND_SHARD_TEMPLATE: Array<UnwindEntry> = Array::with_max_entries(MAX_S
 pub static EXEC_MAPPINGS: LpmTrie<ExecMappingKey, ExecMapping> =
     LpmTrie::with_max_entries(MAX_EXEC_MAPPING_ENTRIES, 0);
 
+/// Tracks which tgids have DWARF unwind data loaded.
+/// Userspace inserts (tgid, 1) when loading DWARF mappings for a process.
+/// The BPF process-exit handler checks this map to decide whether to send
+/// a cleanup event — avoids firing for every process exit on the system.
+#[map(name = "dwarf_tgids")]
+pub static DWARF_TGIDS: HashMap<u32, u8> = HashMap::with_max_entries(4096, 0);
+
 /// Per-CPU state for DWARF tail-call unwinding
 #[map(name = "unwind_state")]
 pub static UNWIND_STATE: PerCpuArray<DwarfUnwindState> = PerCpuArray::with_max_entries(1, 0);
@@ -1373,7 +1380,9 @@ unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
 }
 
 /// Handle sched_process_exit tracepoint for process exit monitoring.
-/// Notifies userspace when the monitored PID exits.
+/// Sends a ProcessExitEvent when:
+/// - The monitored PID exits (--pid mode: stops profiling), OR
+/// - A DWARF-tracked process exits (cleanup LPM trie entries).
 #[inline(always)]
 pub unsafe fn handle_process_exit<C: EbpfContext>(ctx: C) {
     use profile_bee_common::ProcessExitEvent;
@@ -1381,13 +1390,15 @@ pub unsafe fn handle_process_exit<C: EbpfContext>(ctx: C) {
     let tgid = ctx.tgid();
     let monitor_pid = monitor_exit_pid();
 
-    // Only send notification if this is the PID we're monitoring
-    if monitor_pid != 0 && tgid == monitor_pid {
-        // Send exit notification to userspace
+    // Send notification if this is either the monitored PID or a DWARF-tracked process
+    let is_monitored = monitor_pid != 0 && tgid == monitor_pid;
+    let is_dwarf_tracked = unsafe { DWARF_TGIDS.get(&tgid).is_some() };
+
+    if is_monitored || is_dwarf_tracked {
         if let Some(mut entry) = RING_BUF_PROCESS_EXIT.reserve::<ProcessExitEvent>(0) {
             let exit_event = ProcessExitEvent {
                 pid: tgid,
-                exit_code: 0, // Exit code is not easily accessible from sched_process_exit
+                exit_code: 0,
             };
             let _writable = entry.write(exit_event);
             entry.submit(0);

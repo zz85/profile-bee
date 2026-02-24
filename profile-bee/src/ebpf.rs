@@ -602,6 +602,17 @@ impl EbpfProfiler {
             manager.proc_mappings.len(),
         );
 
+        // Populate dwarf_tgids map so BPF exit handler knows which processes to track
+        if let Some(map) = self.bpf.map_mut("dwarf_tgids") {
+            if let Ok(mut dwarf_tgids) =
+                aya::maps::HashMap::<&mut aya::maps::MapData, u32, u8>::try_from(map)
+            {
+                for &tgid in manager.proc_mappings.keys() {
+                    let _ = dwarf_tgids.insert(tgid, 1, 0);
+                }
+            }
+        }
+
         Ok(())
     }
 

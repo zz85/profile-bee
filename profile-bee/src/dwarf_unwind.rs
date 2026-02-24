@@ -76,6 +76,21 @@ pub struct AddressBlockRange {
     pub prefix_len: u32,
 }
 
+/// Diff between old and new exec mappings for a single process.
+/// Used to send only changed entries to the eBPF LPM trie.
+#[derive(Debug, Default)]
+pub struct MappingsDiff {
+    pub tgid: u32,
+    pub added: Vec<ExecMapping>,
+    pub removed: Vec<ExecMapping>,
+}
+
+impl MappingsDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
 /// Decompose an address range [low, high] (inclusive) into the minimal set of
 /// aligned power-of-2 blocks for LPM trie insertion.
 ///
@@ -492,18 +507,18 @@ impl DwarfUnwindManager {
             prev_count = count;
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        self.scan_and_update(tgid)
+        self.scan_and_update(tgid).map(|_| ())
     }
 
     /// Rescan a process's memory mappings and load any new ones.
-    /// Returns the list of new shard IDs added (for incremental eBPF updates).
-    pub fn refresh_process(&mut self, tgid: u32) -> Result<Vec<u16>, String> {
+    /// Returns the list of new shard IDs and the mappings diff.
+    pub fn refresh_process(&mut self, tgid: u32) -> Result<(Vec<u16>, MappingsDiff), String> {
         // Track number of shards before update
         let old_len = self.binary_tables.len();
-        self.scan_and_update(tgid)?;
+        let diff = self.scan_and_update(tgid)?;
         // Find new shards: those added after old_len
         let new_shard_ids: Vec<u16> = (old_len as u16..self.binary_tables.len() as u16).collect();
-        Ok(new_shard_ids)
+        Ok((new_shard_ids, diff))
     }
 
     /// Count executable memory mappings for a process (fast, no file I/O).
@@ -524,7 +539,7 @@ impl DwarfUnwindManager {
             .count()
     }
 
-    fn scan_and_update(&mut self, tgid: u32) -> Result<(), String> {
+    fn scan_and_update(&mut self, tgid: u32) -> Result<MappingsDiff, String> {
         let process = Process::new(tgid as i32)
             .map_err(|e| format!("Failed to open process {}: {}", tgid, e))?;
 
@@ -742,15 +757,52 @@ impl DwarfUnwindManager {
             });
         }
 
+        // Compute diff between old and new mappings using (begin, end) as identity.
+        let old_mappings = self.proc_mappings.get(&tgid);
+        let old_set: std::collections::HashSet<(u64, u64)> = old_mappings
+            .map(|ms| ms.iter().map(|m| (m.begin, m.end)).collect())
+            .unwrap_or_default();
+        let new_set: std::collections::HashSet<(u64, u64)> =
+            mappings.iter().map(|m| (m.begin, m.end)).collect();
+
+        let removed: Vec<ExecMapping> = old_mappings
+            .into_iter()
+            .flat_map(|ms| ms.iter())
+            .filter(|m| !new_set.contains(&(m.begin, m.end)))
+            .copied()
+            .collect();
+        let added: Vec<ExecMapping> = mappings
+            .iter()
+            .filter(|m| !old_set.contains(&(m.begin, m.end)))
+            .copied()
+            .collect();
+
+        let diff = MappingsDiff {
+            tgid,
+            added,
+            removed,
+        };
+
         self.proc_mappings.insert(tgid, mappings);
 
-        Ok(())
+        Ok(diff)
     }
 
     /// Returns the total number of table entries across all binaries
     pub fn total_entries(&self) -> usize {
         // Array of maps pattern: iterate over all elements in the Vec
         self.binary_tables.iter().map(|t| t.len()).sum()
+    }
+
+    /// Remove a process from tracking and return a removal diff for LPM trie cleanup.
+    pub fn remove_process(&mut self, tgid: u32) -> Option<MappingsDiff> {
+        self.proc_mappings
+            .remove(&tgid)
+            .map(|old_mappings| MappingsDiff {
+                tgid,
+                added: Vec::new(),
+                removed: old_mappings,
+            })
     }
 }
 
@@ -937,7 +989,7 @@ mod tests {
         );
 
         // Refresh the same process - should use metadata cache for fast lookups
-        let new_shards = manager.refresh_process(pid).unwrap();
+        let (new_shards, _diff) = manager.refresh_process(pid).unwrap();
 
         // Since the binaries haven't changed, we shouldn't have new shards
         assert_eq!(new_shards.len(), 0, "Expected no new shards on refresh");
@@ -1024,7 +1076,7 @@ mod tests {
 
         // Test refresh_process returns correct new shard IDs
         let old_len = manager.binary_tables.len();
-        let new_shards = manager.refresh_process(pid).unwrap();
+        let (new_shards, _diff) = manager.refresh_process(pid).unwrap();
 
         // On refresh without new libraries, should have no new shards
         assert_eq!(new_shards.len(), 0, "Expected no new shards on refresh");
