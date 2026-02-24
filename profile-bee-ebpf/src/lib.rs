@@ -21,9 +21,9 @@ use aya_ebpf::{
 use profile_bee_common::{
     DwarfUnwindState, ExecMapping, ExecMappingKey, FramePointers, StackInfo, UnwindEntry,
     CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
-    FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH, MAX_BIN_SEARCH_DEPTH,
-    MAX_DWARF_STACK_DEPTH, MAX_EXEC_MAPPING_ENTRIES, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS,
-    REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
+    EXEC_MAPPING_KEY_BITS, FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH,
+    MAX_BIN_SEARCH_DEPTH, MAX_DWARF_STACK_DEPTH, MAX_EXEC_MAPPING_ENTRIES, MAX_SHARD_ENTRIES,
+    MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -625,7 +625,7 @@ unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState) -> bool {
 
     // LPM trie lookup: find the exec mapping containing (tgid, current_ip)
     let key = LpmKey::new(
-        128,
+        EXEC_MAPPING_KEY_BITS,
         ExecMappingKey {
             tgid: state.tgid.to_be(),
             _pad: 0,
@@ -770,7 +770,7 @@ unsafe fn dwarf_copy_stack_regs(
     // Quick check: try LPM for initial IP. If no mapping found,
     // this process likely has no DWARF info — use full FP unwinding.
     let first_key = LpmKey::new(
-        128,
+        EXEC_MAPPING_KEY_BITS,
         ExecMappingKey {
             tgid: tgid.to_be(),
             _pad: 0,
@@ -796,7 +796,7 @@ unsafe fn dwarf_copy_stack_regs(
 
         // LPM trie lookup for this frame's IP
         let key = LpmKey::new(
-            128,
+            EXEC_MAPPING_KEY_BITS,
             ExecMappingKey {
                 tgid: tgid.to_be(),
                 _pad: 0,

@@ -5,12 +5,14 @@
 ### Improvements
 
 - **Replace PROC_INFO HashMap with EXEC_MAPPINGS LPM trie** — O(log n) address-to-mapping lookups replace O(n) linear scan, removing the per-process 8-mapping limit. Supports up to 200K total LPM entries across all processes.
-- **Fix ExecMappingKey alignment** — changed from `#[repr(C, packed)]` to `#[repr(C)]` with explicit padding to avoid unaligned 64-bit access in eBPF and userspace.
-- **Fix overflow in `summarize_address_range`** — use u128 arithmetic to prevent wrap when address ranges approach `u64::MAX`.
-- **Fix stale DWARF mappings on refresh** — rebuild process mappings from scratch each scan instead of cloning and skipping existing ranges, preventing stale shard/load_bias data when memory ranges are reused.
-- **Optimize DWARF refresh channel** — `send_refresh` now only clones the changed process's mappings instead of all tracked processes.
-- **Log LPM trie insert failures** — replaced silent `let _ = trie.insert(...)` with explicit error logging including tgid, mapping range, and block details.
-- **Add debug_assert for invalid mapping ranges** — catches corrupted begin/end values before LPM trie population.
+- **Correct ExecMappingKey alignment** — changed from `#[repr(C, packed)]` to `#[repr(C)]` with explicit padding to avoid unaligned 64-bit access in eBPF and userspace.
+- **Prevent overflow in `summarize_address_range`** — use u128 arithmetic so range-length computation cannot wrap when address ranges approach `u64::MAX`.
+- **DWARF mapping refresh rebuilds from scratch** — process mappings are recomputed each scan instead of cloning and skipping existing ranges, preventing stale shard/load_bias data when memory ranges are reused.
+- **Always propagate exec mapping updates to eBPF** — `send_refresh` is now called after every successful `refresh_process`, not only when new shards are created, ensuring dlopen'd libraries with cached binaries get LPM trie entries (matches lightswitch's approach of unconditionally writing mappings to BPF).
+- **Reduce refresh channel overhead** — `send_refresh` now only clones the changed process's mappings instead of all tracked processes.
+- **Surface LPM trie insert failures** — replaced silent `let _ = trie.insert(...)` with explicit error logging including tgid, mapping range, and block details.
+- **Guard against invalid mapping ranges** — added `debug_assert` to catch corrupted begin/end values before LPM trie population.
+- **Derive LPM key bit-width from struct size** — replaced magic `128` in `LpmKey::new` calls with `EXEC_MAPPING_KEY_BITS` constant derived from `size_of::<ExecMappingKey>()`.
 
 ### Tests
 

@@ -1077,9 +1077,10 @@ fn dwarf_refresh_loop(
                     .and_then(|m| m.modified().ok());
                 // Immediately load the new process
                 if let Ok(new_shard_ids) = manager.refresh_process(new_tgid) {
-                    if !new_shard_ids.is_empty()
-                        && send_refresh(&manager, &tx, new_tgid, new_shard_ids).is_err()
-                    {
+                    // Always send the refresh — even when no new shards were
+                    // created (cached binary), the LPM trie still needs the
+                    // new process's exec mapping entries.
+                    if send_refresh(&manager, &tx, new_tgid, new_shard_ids).is_err() {
                         return;
                     }
                 }
@@ -1119,8 +1120,9 @@ fn dwarf_refresh_loop(
             }
 
             if let Ok(new_shard_ids) = manager.refresh_process(pid) {
-                if !new_shard_ids.is_empty() && send_refresh(&manager, &tx, pid, new_shard_ids).is_err()
-                {
+                // Always send — mapping changes (e.g. dlopen of a cached
+                // binary) need LPM trie updates even without new shards.
+                if send_refresh(&manager, &tx, pid, new_shard_ids).is_err() {
                     channel_closed = true;
                 }
             }

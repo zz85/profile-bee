@@ -140,6 +140,8 @@ pub const MAX_EXEC_MAPPING_ENTRIES: u32 = 200_000;
 /// bits.
 ///
 /// Full match prefix_len = 128 (32 bits tgid + 32 bits padding + 64 bits address).
+///
+/// Use `EXEC_MAPPING_KEY_BITS` instead of hard-coding 128 at LPM trie call sites.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(C)]
 pub struct ExecMappingKey {
@@ -147,6 +149,10 @@ pub struct ExecMappingKey {
     pub _pad: u32,    // must be 0
     pub address: u64, // big-endian
 }
+
+/// Total bit-width of `ExecMappingKey` for LPM trie full-match prefix_len.
+/// Derived from the struct size so it stays correct if the layout changes.
+pub const EXEC_MAPPING_KEY_BITS: u32 = (size_of::<ExecMappingKey>() * 8) as u32;
 
 /// Maximum number of inner shard maps in the outer ArrayOfMaps.
 /// With array-of-maps, unused slots cost nothing (no pre-allocated kernel memory).
