@@ -83,6 +83,10 @@ pub struct MappingsDiff {
     pub tgid: u32,
     pub added: Vec<ExecMapping>,
     pub removed: Vec<ExecMapping>,
+    /// True when the diff represents a full process exit (remove_process),
+    /// as opposed to a partial mapping change (e.g. dlclose).
+    /// Controls whether the tgid is removed from the dwarf_tgids BPF map.
+    pub is_exit: bool,
 }
 
 impl MappingsDiff {
@@ -757,23 +761,32 @@ impl DwarfUnwindManager {
             });
         }
 
-        // Compute diff between old and new mappings using (begin, end) as identity.
+        // Compute diff between old and new mappings.
+        // Identity includes metadata (load_bias, shard_id, table_count) so that
+        // a mapping at the same address range but with different content (e.g.
+        // dlclose + dlopen of a different library at the same address) is treated
+        // as a removal of the old entry plus an addition of the new one.
+        type MappingId = (u64, u64, u64, u16, u32); // (begin, end, load_bias, shard_id, table_count)
+        let mapping_id = |m: &ExecMapping| -> MappingId {
+            (m.begin, m.end, m.load_bias, m.shard_id, m.table_count)
+        };
+
         let old_mappings = self.proc_mappings.get(&tgid);
-        let old_set: std::collections::HashSet<(u64, u64)> = old_mappings
-            .map(|ms| ms.iter().map(|m| (m.begin, m.end)).collect())
+        let old_set: std::collections::HashSet<MappingId> = old_mappings
+            .map(|ms| ms.iter().map(&mapping_id).collect())
             .unwrap_or_default();
-        let new_set: std::collections::HashSet<(u64, u64)> =
-            mappings.iter().map(|m| (m.begin, m.end)).collect();
+        let new_set: std::collections::HashSet<MappingId> =
+            mappings.iter().map(&mapping_id).collect();
 
         let removed: Vec<ExecMapping> = old_mappings
             .into_iter()
             .flat_map(|ms| ms.iter())
-            .filter(|m| !new_set.contains(&(m.begin, m.end)))
+            .filter(|m| !new_set.contains(&mapping_id(m)))
             .copied()
             .collect();
         let added: Vec<ExecMapping> = mappings
             .iter()
-            .filter(|m| !old_set.contains(&(m.begin, m.end)))
+            .filter(|m| !old_set.contains(&mapping_id(m)))
             .copied()
             .collect();
 
@@ -781,6 +794,7 @@ impl DwarfUnwindManager {
             tgid,
             added,
             removed,
+            is_exit: false,
         };
 
         self.proc_mappings.insert(tgid, mappings);
@@ -802,6 +816,7 @@ impl DwarfUnwindManager {
                 tgid,
                 added: Vec::new(),
                 removed: old_mappings,
+                is_exit: true,
             })
     }
 }

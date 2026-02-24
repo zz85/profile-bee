@@ -1323,8 +1323,8 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
                     // Process has (new) DWARF data — register for exit tracking
                     let _ = dwarf_tgids.insert(diff.tgid, 1, 0);
                 }
-                if !diff.removed.is_empty() && diff.added.is_empty() {
-                    // Process fully removed (exit cleanup) — stop tracking
+                if diff.is_exit {
+                    // Process exited — stop tracking for exit notifications
                     let _ = dwarf_tgids.remove(&diff.tgid);
                 }
             }
@@ -1410,6 +1410,8 @@ fn process_profiling_data(
                 if let Some(tx) = tgid_request_tx {
                     let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
                 }
+                // Allow PID reuse to trigger a fresh LoadProcess
+                known_tgids.remove(&exit_event.pid);
                 // Only stop profiling if this is the monitored target process
                 if Some(exit_event.pid) == monitor_exit_pid {
                     tracing::info!("target process {} exited, stopping", exit_event.pid);
@@ -1549,6 +1551,7 @@ fn process_profiling_data_streaming(
                 if let Some(tx) = tgid_request_tx {
                     let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
                 }
+                known_tgids.remove(&exit_event.pid);
                 if Some(exit_event.pid) == monitor_exit_pid {
                     tracing::info!("target process {} exited, stopping", exit_event.pid);
                     *stopped = true;
@@ -1936,6 +1939,8 @@ fn spawn_profiling_thread(
                         if let Some(tx) = &tgid_request_tx {
                             let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
                         }
+                        // Allow PID reuse to trigger a fresh LoadProcess
+                        known_tgids.remove(&exit_event.pid);
                         // Only stop profiling if this is the monitored target process
                         if Some(exit_event.pid) == monitor_exit_pid {
                             tracing::info!(
