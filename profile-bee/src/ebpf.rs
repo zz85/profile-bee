@@ -571,14 +571,22 @@ impl EbpfProfiler {
         let mut total_lpm_entries = 0usize;
         for (&tgid, mappings) in &manager.proc_mappings {
             for mapping in mappings {
+                debug_assert!(
+                    mapping.end > mapping.begin,
+                    "Invalid mapping range for tgid {}: begin={:#x} end={:#x}",
+                    tgid,
+                    mapping.begin,
+                    mapping.end,
+                );
                 for block in crate::dwarf_unwind::summarize_address_range(
                     mapping.begin,
                     mapping.end.saturating_sub(1),
                 ) {
                     let key = LpmKey::new(
-                        32 + block.prefix_len,
+                        64 + block.prefix_len,
                         ExecMappingKeyPod(ExecMappingKey {
                             tgid: tgid.to_be(),
+                            _pad: 0,
                             address: block.addr.to_be(),
                         }),
                     );

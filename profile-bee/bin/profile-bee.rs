@@ -1078,7 +1078,7 @@ fn dwarf_refresh_loop(
                 // Immediately load the new process
                 if let Ok(new_shard_ids) = manager.refresh_process(new_tgid) {
                     if !new_shard_ids.is_empty()
-                        && send_refresh(&manager, &tx, new_shard_ids).is_err()
+                        && send_refresh(&manager, &tx, new_tgid, new_shard_ids).is_err()
                     {
                         return;
                     }
@@ -1119,7 +1119,7 @@ fn dwarf_refresh_loop(
             }
 
             if let Ok(new_shard_ids) = manager.refresh_process(pid) {
-                if !new_shard_ids.is_empty() && send_refresh(&manager, &tx, new_shard_ids).is_err()
+                if !new_shard_ids.is_empty() && send_refresh(&manager, &tx, pid, new_shard_ids).is_err()
                 {
                     channel_closed = true;
                 }
@@ -1137,6 +1137,7 @@ fn dwarf_refresh_loop(
 fn send_refresh(
     manager: &DwarfUnwindManager,
     tx: &mpsc::Sender<PerfWork>,
+    tgid: u32,
     new_shard_ids: Vec<u16>,
 ) -> Result<(), ()> {
     // Only clone the new shards (not the entire binary_tables)
@@ -1147,12 +1148,19 @@ fn send_refresh(
         }
     }
 
-    let proc_mappings: Vec<(u32, Vec<ExecMapping>)> = manager.proc_mappings.iter().map(|(&t, m)| (t, m.clone())).collect();
+    // Only clone the changed tgid's mappings instead of all proc_mappings.
+    let proc_mappings: Vec<(u32, Vec<ExecMapping>)> = manager
+        .proc_mappings
+        .get(&tgid)
+        .map(|m| vec![(tgid, m.clone())])
+        .unwrap_or_default();
     let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
     tracing::debug!(
-        "DWARF refresh: {} new shards with {} total entries",
+        "DWARF refresh: tgid={}, {} new shards with {} total entries, {} mapping entries",
+        tgid,
         new_shard_ids.len(),
         total_entries,
+        proc_mappings.first().map_or(0, |(_, m)| m.len()),
     );
     tx.send(PerfWork::DwarfRefresh(DwarfRefreshUpdate {
         shard_updates,
@@ -1224,19 +1232,32 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
                         mapping.end.saturating_sub(1),
                     ) {
                         let key = aya::maps::lpm_trie::Key::new(
-                            32 + block.prefix_len,
+                            64 + block.prefix_len,
                             profile_bee::ebpf::ExecMappingKeyPod(
                                 profile_bee_common::ExecMappingKey {
                                     tgid: tgid.to_be(),
+                                    _pad: 0,
                                     address: block.addr.to_be(),
                                 },
                             ),
                         );
-                        let _ = trie.insert(
+                        if let Err(e) = trie.insert(
                             &key,
                             profile_bee::ebpf::ExecMappingPod(*mapping),
                             0,
-                        );
+                        ) {
+                            tracing::warn!(
+                                "LPM trie insert failed: tgid={}, mapping=[{:#x},{:#x}), block addr={:#x} prefix_len={}: {}",
+                                tgid,
+                                mapping.begin,
+                                mapping.end,
+                                block.addr,
+                                block.prefix_len,
+                                e,
+                            );
+                            // Continue attempting other entries — a single failure
+                            // (e.g. map full) shouldn't prevent loading the rest.
+                        }
                     }
                 }
             }

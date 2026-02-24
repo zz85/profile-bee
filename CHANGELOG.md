@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.5
+
+### Improvements
+
+- **Replace PROC_INFO HashMap with EXEC_MAPPINGS LPM trie** — O(log n) address-to-mapping lookups replace O(n) linear scan, removing the per-process 8-mapping limit. Supports up to 200K total LPM entries across all processes.
+- **Fix ExecMappingKey alignment** — changed from `#[repr(C, packed)]` to `#[repr(C)]` with explicit padding to avoid unaligned 64-bit access in eBPF and userspace.
+- **Fix overflow in `summarize_address_range`** — use u128 arithmetic to prevent wrap when address ranges approach `u64::MAX`.
+- **Fix stale DWARF mappings on refresh** — rebuild process mappings from scratch each scan instead of cloning and skipping existing ranges, preventing stale shard/load_bias data when memory ranges are reused.
+- **Optimize DWARF refresh channel** — `send_refresh` now only clones the changed process's mappings instead of all tracked processes.
+- **Log LPM trie insert failures** — replaced silent `let _ = trie.insert(...)` with explicit error logging including tgid, mapping range, and block details.
+- **Add debug_assert for invalid mapping ranges** — catches corrupted begin/end values before LPM trie population.
+
+### Tests
+
+- Added 7 unit tests for `summarize_address_range` edge cases (empty range, single address, power-of-two boundaries, near `u64::MAX`, full address space).
+
+### Documentation
+
+- Updated DWARF design docs to reflect LPM trie architecture (replaces old PROC_INFO references).
+
 ## v0.3.2
 
 ### New Features

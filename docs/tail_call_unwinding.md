@@ -116,11 +116,11 @@ fn dwarf_copy_stack_init(ctx: &PerfEventContext, tgid: u32) {
 #[perf_event]
 fn dwarf_unwind_step(ctx: PerfEventContext) {
     let state = UNWIND_STATE.get_ptr_mut(0).unwrap();
-    let proc_info = PROC_INFO.get(&ProcInfoKey { tgid: state.tgid, _pad: 0 }).unwrap();
 
     // Unwind up to FRAMES_PER_TAIL_CALL frames
+    // (each frame does an LPM trie lookup to find its exec mapping)
     for _ in 0..FRAMES_PER_TAIL_CALL {
-        if !dwarf_unwind_one_frame(state, proc_info) {
+        if !dwarf_unwind_one_frame(state) {
             // Done unwinding
             return;
         }
@@ -134,8 +134,8 @@ fn dwarf_unwind_step(ctx: PerfEventContext) {
 #### 4. Single Frame Unwind
 
 ```rust
-fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState, proc_info: &ProcInfo) -> bool {
-    // Find mapping containing current_ip
+fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState) -> bool {
+    // LPM trie lookup for exec mapping containing current_ip
     // Binary search unwind table
     // Compute CFA
     // Read return address

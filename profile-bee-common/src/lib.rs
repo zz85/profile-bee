@@ -128,17 +128,23 @@ pub const MAX_EXEC_MAPPING_ENTRIES: u32 = 200_000;
 
 /// Data portion of the LPM trie key for exec mapping lookups.
 /// Combined with aya's Key<T> which prepends a u32 prefix_len field.
-/// Total key: { prefix_len: u32, tgid: u32, address: u64 } = 16 bytes.
+/// Total key: { prefix_len: u32, tgid: u32, _pad: u32, address: u64 } = 20 bytes.
 ///
 /// Both fields are stored in **big-endian** because the LPM trie matches
 /// bits from most-significant to least-significant. Big-endian ensures the
 /// MSBs of the values are physically first in memory.
 ///
-/// Full match prefix_len = 96 (32 bits tgid + 64 bits address).
+/// The explicit `_pad` field ensures `address` is 8-byte aligned (avoiding
+/// unaligned 64-bit access from `#[repr(C, packed)]`). It must always be
+/// set to 0 so the LPM trie bit-matching is consistent across the 32 padding
+/// bits.
+///
+/// Full match prefix_len = 128 (32 bits tgid + 32 bits padding + 64 bits address).
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-#[repr(C, packed)]
+#[repr(C)]
 pub struct ExecMappingKey {
     pub tgid: u32,    // big-endian
+    pub _pad: u32,    // must be 0
     pub address: u64, // big-endian
 }
 

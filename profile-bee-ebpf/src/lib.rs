@@ -625,9 +625,10 @@ unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState) -> bool {
 
     // LPM trie lookup: find the exec mapping containing (tgid, current_ip)
     let key = LpmKey::new(
-        96,
+        128,
         ExecMappingKey {
             tgid: state.tgid.to_be(),
+            _pad: 0,
             address: current_ip.to_be(),
         },
     );
@@ -769,9 +770,10 @@ unsafe fn dwarf_copy_stack_regs(
     // Quick check: try LPM for initial IP. If no mapping found,
     // this process likely has no DWARF info — use full FP unwinding.
     let first_key = LpmKey::new(
-        96,
+        128,
         ExecMappingKey {
             tgid: tgid.to_be(),
+            _pad: 0,
             address: ip.to_be(),
         },
     );
@@ -794,9 +796,10 @@ unsafe fn dwarf_copy_stack_regs(
 
         // LPM trie lookup for this frame's IP
         let key = LpmKey::new(
-            96,
+            128,
             ExecMappingKey {
                 tgid: tgid.to_be(),
+                _pad: 0,
                 address: current_ip.to_be(),
             },
         );

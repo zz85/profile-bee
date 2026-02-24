@@ -85,22 +85,36 @@ pub struct AddressBlockRange {
 ///
 /// This is the same algorithm used in CIDR route summarization. Ported from
 /// lightswitch's `summarize_address_range`.
+///
+/// Uses u128 arithmetic for the range-length computation to avoid overflow
+/// when `high` is near `u64::MAX`.
 pub fn summarize_address_range(low: u64, high: u64) -> Vec<AddressBlockRange> {
     let mut res = Vec::new();
     let mut curr = low;
 
     while curr <= high {
-        let number_of_bits = std::cmp::min(
-            curr.trailing_zeros(),
-            (64 - (high - curr + 1).leading_zeros()) - 1,
-        );
+        // Compute range length in u128 to avoid overflow when high is near u64::MAX.
+        // range_len is in [1, 2^64], always fits in u128.
+        let range_len: u128 = (high as u128) - (curr as u128) + 1;
+        // floor(log2(range_len)) — the largest power-of-2 block that fits.
+        // range_len >= 1, so leading_zeros <= 127, and this won't underflow.
+        let bits_from_range = 127 - range_len.leading_zeros();
+
+        let number_of_bits = std::cmp::min(curr.trailing_zeros(), bits_from_range);
+
         res.push(AddressBlockRange {
             addr: curr,
             prefix_len: 64 - number_of_bits,
         });
-        curr += 1 << number_of_bits;
-        if curr.wrapping_sub(1) == u64::MAX {
+
+        // If the block covers the remaining 64-bit address space (number_of_bits == 64),
+        // we can't represent the step as a u64 shift. We're done.
+        if number_of_bits >= 64 {
             break;
+        }
+        match curr.checked_add(1u64 << number_of_bits) {
+            Some(next) => curr = next,
+            None => break, // wrapped past u64::MAX — all addresses covered
         }
     }
 
@@ -518,13 +532,12 @@ impl DwarfUnwindManager {
             .maps()
             .map_err(|e| format!("Failed to read maps for {}: {}", tgid, e))?;
 
-        // Collect existing mapping addresses so we can skip them
-        let existing = self.proc_mappings.get(&tgid);
-        let existing_ranges: Vec<(u64, u64)> = existing
-            .map(|mappings| mappings.iter().map(|m| (m.begin, m.end)).collect())
-            .unwrap_or_default();
-
-        let mut mappings: Vec<ExecMapping> = existing.cloned().unwrap_or_default();
+        // Rebuild mappings from scratch each scan to avoid retaining stale
+        // shard_id / load_bias / table_count when address ranges are reused
+        // (e.g. after munmap+mmap or library upgrades). The caches
+        // (metadata_cache / binary_cache / path_cache) still prevent expensive
+        // re-parsing of unchanged binaries.
+        let mut mappings: Vec<ExecMapping> = Vec::new();
 
         let root_path = format!("/proc/{}/root", tgid);
 
@@ -545,14 +558,6 @@ impl DwarfUnwindManager {
             let end_addr = map.address.1;
             let file_offset = map.offset;
             let is_vdso = matches!(&map.pathname, MMapPath::Vdso);
-
-            // Skip mappings we already have
-            if existing_ranges
-                .iter()
-                .any(|&(b, e)| b == start_addr && e == end_addr)
-            {
-                continue;
-            }
 
             let resolved_path = if is_vdso {
                 file_path.clone()
@@ -1028,5 +1033,74 @@ mod tests {
             old_len,
             "binary_tables length should not change on refresh without new libs"
         );
+    }
+
+    #[test]
+    fn test_summarize_empty_range() {
+        // When low > high the range is empty — should produce no blocks.
+        let blocks = summarize_address_range(10, 5);
+        assert!(blocks.is_empty(), "Expected empty result for low > high");
+    }
+
+    #[test]
+    fn test_summarize_single_address() {
+        // A single-address range [x, x] should yield exactly one block
+        // with prefix_len = 64 (all 64 bits significant).
+        let blocks = summarize_address_range(42, 42);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].addr, 42);
+        assert_eq!(blocks[0].prefix_len, 64);
+    }
+
+    #[test]
+    fn test_summarize_power_of_two_boundary() {
+        // Range [0x1000, 0x1FFF] is exactly a 4096-byte aligned block
+        // → one block with prefix_len = 64 - 12 = 52.
+        let blocks = summarize_address_range(0x1000, 0x1FFF);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].addr, 0x1000);
+        assert_eq!(blocks[0].prefix_len, 52); // 64 - 12
+    }
+
+    #[test]
+    fn test_summarize_spanning_boundary() {
+        // Range that spans a power-of-two boundary requires multiple blocks.
+        let blocks = summarize_address_range(0x0FFF, 0x1001);
+        assert!(
+            blocks.len() > 1,
+            "Range spanning a boundary should decompose into multiple blocks"
+        );
+        // Verify the blocks cover the full range: first addr = low,
+        // and the union should cover [0x0FFF, 0x1001].
+        assert_eq!(blocks.first().unwrap().addr, 0x0FFF);
+    }
+
+    #[test]
+    fn test_summarize_near_u64_max() {
+        // Regression test: high near u64::MAX must not overflow.
+        let high = u64::MAX;
+        let low = high - 255; // 256-entry range ending at u64::MAX
+        let blocks = summarize_address_range(low, high);
+        assert!(
+            !blocks.is_empty(),
+            "Should produce blocks for range near u64::MAX"
+        );
+        // Verify last block reaches u64::MAX
+        let last = blocks.last().unwrap();
+        let block_size = 1u128 << (64 - last.prefix_len);
+        let block_end = last.addr as u128 + block_size - 1;
+        assert!(
+            block_end >= high as u128,
+            "Last block should cover up to u64::MAX"
+        );
+    }
+
+    #[test]
+    fn test_summarize_full_u64_range() {
+        // The entire u64 address space [0, u64::MAX]
+        let blocks = summarize_address_range(0, u64::MAX);
+        assert_eq!(blocks.len(), 1, "Full u64 range should be a single block");
+        assert_eq!(blocks[0].addr, 0);
+        assert_eq!(blocks[0].prefix_len, 0); // 0 significant bits = match all
     }
 }

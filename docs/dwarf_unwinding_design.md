@@ -11,7 +11,7 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 │  1. Read /proc/[pid]/maps → find executable mappings                │
 │  2. Parse .eh_frame from each ELF binary (gimli)                    │
 │  3. Pre-evaluate DWARF CFI → flat UnwindEntry table                 │
-│  4. Load into BPF maps: UNWIND_TABLE (array), PROC_INFO (hashmap)  │
+│  4. Load into BPF maps: unwind shards (ArrayOfMaps), EXEC_MAPPINGS (LPM trie)  │
 │  5. Set DWARF_ENABLED=1 in .rodata                                  │
 └─────────────────────────────────────────────────────────────────────┘
                               │
@@ -27,7 +27,7 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 │       ├─ DWARF_ENABLED? ──YES──▶ dwarf_copy_stack()                 │
 │       │                              │                              │
 │       │                              ├─ Read RIP, RSP, RBP          │
-│       │                              ├─ Lookup PROC_INFO by tgid    │
+│       │                              ├─ LPM trie lookup by (tgid, IP)│
 │       │                              ├─ For each frame (flat loop): │
 │       │                              │   ├─ Find mapping for IP     │
 │       │                              │   ├─ relative_pc = IP - bias │
@@ -115,7 +115,7 @@ pub struct ExecMapping {
 | Map | Type | Size | Purpose |
 |-----|------|------|---------|
 | `unwind_tables` | HashMap | 500K entries × 20B = 10 MB max | Sharded per-binary unwind tables (table_id, index) → UnwindEntry |
-| `proc_info` | HashMap | 1024 entries | Per-process mapping info |
+| `exec_mappings` | LPM Trie | 200K entries | Per-process exec mapping lookup by (tgid, address) |
 | `stacked_pointers` | HashMap | 2048 entries | DWARF-unwound frame pointers per stack |
 
 ## How Unwind Tables Are Generated
