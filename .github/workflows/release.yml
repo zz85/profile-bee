@@ -74,10 +74,10 @@ jobs:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Strip binaries
+      - name: Strip debug info (preserves symbol table for profiling)
         run: |
-          ${{ matrix.strip }} target/${{ matrix.target }}/release/probee
-          ${{ matrix.strip }} target/${{ matrix.target }}/release/pbee
+          ${{ matrix.strip }} --strip-debug target/${{ matrix.target }}/release/probee
+          ${{ matrix.strip }} --strip-debug target/${{ matrix.target }}/release/pbee
 
       - name: Show binary info
         run: |
