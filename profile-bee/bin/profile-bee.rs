@@ -1048,7 +1048,7 @@ async fn setup_process_exit_ring_buffer_task(
             let ring_buf = inner.get_mut();
             while let Some(item) = ring_buf.next() {
                 let exit_event: ProcessExitEvent = unsafe { *item.as_ptr().cast() };
-                println!("eBPF detected: PID {} has exited", exit_event.pid);
+                tracing::debug!("eBPF detected: PID {} has exited", exit_event.pid);
                 let _ = perf_tx.send(PerfWork::ProcessExit(exit_event));
             }
             Ok(())

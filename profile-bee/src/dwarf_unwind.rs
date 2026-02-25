@@ -91,7 +91,7 @@ pub struct MappingsDiff {
 
 impl MappingsDiff {
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty()
+        self.added.is_empty() && self.removed.is_empty() && !self.is_exit
     }
 }
 
