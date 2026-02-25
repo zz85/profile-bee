@@ -16,9 +16,9 @@ use gimli::{BaseAddresses, CfaRule, EhFrame, NativeEndian, Register, RegisterRul
 use object::{Object, ObjectSection};
 use procfs::process::{MMapPath, Process};
 use profile_bee_common::{
-    ExecMapping, ProcInfo, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_PLT,
-    CFA_REG_RBP, CFA_REG_RSP, MAX_PROC_MAPS, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET,
-    REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED, SHARD_NONE,
+    ExecMapping, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_PLT, CFA_REG_RBP,
+    CFA_REG_RSP, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
+    REG_RULE_UNDEFINED,
 };
 
 /// Holds binary data either as a memory-mapped file or a heap-allocated buffer (for vdso).
@@ -67,6 +67,77 @@ impl FileMetadata {
             mtime_nsec: metadata.mtime_nsec(),
         })
     }
+}
+
+/// Result of decomposing an address range into LPM trie prefix blocks.
+#[derive(Debug, PartialEq)]
+pub struct AddressBlockRange {
+    pub addr: u64,
+    pub prefix_len: u32,
+}
+
+/// Diff between old and new exec mappings for a single process.
+/// Used to send only changed entries to the eBPF LPM trie.
+#[derive(Debug, Default)]
+pub struct MappingsDiff {
+    pub tgid: u32,
+    pub added: Vec<ExecMapping>,
+    pub removed: Vec<ExecMapping>,
+    /// True when the diff represents a full process exit (remove_process),
+    /// as opposed to a partial mapping change (e.g. dlclose).
+    /// Controls whether the tgid is removed from the dwarf_tgids BPF map.
+    pub is_exit: bool,
+}
+
+impl MappingsDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && !self.is_exit
+    }
+}
+
+/// Decompose an address range [low, high] (inclusive) into the minimal set of
+/// aligned power-of-2 blocks for LPM trie insertion.
+///
+/// Each block is expressed as (base_address, prefix_len) where prefix_len is
+/// the number of significant bits in the 64-bit address. The LPM trie will
+/// match any address within the block using longest-prefix matching.
+///
+/// This is the same algorithm used in CIDR route summarization. Ported from
+/// lightswitch's `summarize_address_range`.
+///
+/// Uses u128 arithmetic for the range-length computation to avoid overflow
+/// when `high` is near `u64::MAX`.
+pub fn summarize_address_range(low: u64, high: u64) -> Vec<AddressBlockRange> {
+    let mut res = Vec::new();
+    let mut curr = low;
+
+    while curr <= high {
+        // Compute range length in u128 to avoid overflow when high is near u64::MAX.
+        // range_len is in [1, 2^64], always fits in u128.
+        let range_len: u128 = (high as u128) - (curr as u128) + 1;
+        // floor(log2(range_len)) — the largest power-of-2 block that fits.
+        // range_len >= 1, so leading_zeros <= 127, and this won't underflow.
+        let bits_from_range = 127 - range_len.leading_zeros();
+
+        let number_of_bits = std::cmp::min(curr.trailing_zeros(), bits_from_range);
+
+        res.push(AddressBlockRange {
+            addr: curr,
+            prefix_len: 64 - number_of_bits,
+        });
+
+        // If the block covers the remaining 64-bit address space (number_of_bits == 64),
+        // we can't represent the step as a u64 shift. We're done.
+        if number_of_bits >= 64 {
+            break;
+        }
+        match curr.checked_add(1u64 << number_of_bits) {
+            Some(next) => curr = next,
+            None => break, // wrapped past u64::MAX — all addresses covered
+        }
+    }
+
+    res
 }
 
 // x86_64 register numbers in DWARF
@@ -389,8 +460,8 @@ pub struct DwarfUnwindManager {
     /// - Natural enforcement of MAX_UNWIND_SHARDS limit
     ///   Each Vec<UnwindEntry> is the unwind table for one binary/shard.
     pub binary_tables: Vec<Arc<Vec<UnwindEntry>>>,
-    /// Per-process mapping information
-    pub proc_info: HashMap<u32, ProcInfo>,
+    /// Per-process exec mappings (no per-process limit; LPM trie handles all lookups)
+    pub proc_mappings: HashMap<u32, Vec<ExecMapping>>,
     /// Next shard_id to assign to a new binary
     next_shard_id: u16,
     /// Fast metadata-based cache for hot path lookups (stat-based)
@@ -414,7 +485,7 @@ impl DwarfUnwindManager {
             // Initialize as empty Vec with capacity for MAX_UNWIND_SHARDS
             // Using Vec instead of HashMap for the "array of maps" pattern
             binary_tables: Vec::with_capacity(MAX_UNWIND_SHARDS),
-            proc_info: HashMap::new(),
+            proc_mappings: HashMap::new(),
             next_shard_id: 0,
             metadata_cache: HashMap::new(),
             binary_cache: HashMap::new(),
@@ -425,7 +496,7 @@ impl DwarfUnwindManager {
     /// Load unwind information for a process by scanning its memory mappings.
     /// Returns Ok(()) if the process was loaded (or already loaded).
     pub fn load_process(&mut self, tgid: u32) -> Result<(), String> {
-        if self.proc_info.contains_key(&tgid) {
+        if self.proc_mappings.contains_key(&tgid) {
             return Ok(());
         }
         // Wait for the dynamic linker to finish mapping shared libraries.
@@ -440,18 +511,18 @@ impl DwarfUnwindManager {
             prev_count = count;
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        self.scan_and_update(tgid)
+        self.scan_and_update(tgid).map(|_| ())
     }
 
     /// Rescan a process's memory mappings and load any new ones.
-    /// Returns the list of new shard IDs added (for incremental eBPF updates).
-    pub fn refresh_process(&mut self, tgid: u32) -> Result<Vec<u16>, String> {
+    /// Returns the list of new shard IDs and the mappings diff.
+    pub fn refresh_process(&mut self, tgid: u32) -> Result<(Vec<u16>, MappingsDiff), String> {
         // Track number of shards before update
         let old_len = self.binary_tables.len();
-        self.scan_and_update(tgid)?;
+        let diff = self.scan_and_update(tgid)?;
         // Find new shards: those added after old_len
         let new_shard_ids: Vec<u16> = (old_len as u16..self.binary_tables.len() as u16).collect();
-        Ok(new_shard_ids)
+        Ok((new_shard_ids, diff))
     }
 
     /// Count executable memory mappings for a process (fast, no file I/O).
@@ -472,7 +543,7 @@ impl DwarfUnwindManager {
             .count()
     }
 
-    fn scan_and_update(&mut self, tgid: u32) -> Result<(), String> {
+    fn scan_and_update(&mut self, tgid: u32) -> Result<MappingsDiff, String> {
         let process = Process::new(tgid as i32)
             .map_err(|e| format!("Failed to open process {}: {}", tgid, e))?;
 
@@ -480,36 +551,16 @@ impl DwarfUnwindManager {
             .maps()
             .map_err(|e| format!("Failed to read maps for {}: {}", tgid, e))?;
 
-        // Collect existing mapping addresses so we can skip them
-        let existing = self.proc_info.get(&tgid);
-        let existing_ranges: Vec<(u64, u64)> = existing
-            .map(|pi| {
-                (0..pi.mapping_count as usize)
-                    .map(|i| (pi.mappings[i].begin, pi.mappings[i].end))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut proc_info = existing.copied().unwrap_or(ProcInfo {
-            mapping_count: 0,
-            _pad: 0,
-            mappings: [ExecMapping {
-                begin: 0,
-                end: 0,
-                load_bias: 0,
-                shard_id: SHARD_NONE,
-                _pad1: [0; 2],
-                table_count: 0,
-            }; MAX_PROC_MAPS],
-        });
+        // Rebuild mappings from scratch each scan to avoid retaining stale
+        // shard_id / load_bias / table_count when address ranges are reused
+        // (e.g. after munmap+mmap or library upgrades). The caches
+        // (metadata_cache / binary_cache / path_cache) still prevent expensive
+        // re-parsing of unchanged binaries.
+        let mut mappings: Vec<ExecMapping> = Vec::new();
 
         let root_path = format!("/proc/{}/root", tgid);
 
         for map in maps.iter() {
-            if proc_info.mapping_count as usize >= MAX_PROC_MAPS {
-                break;
-            }
-
             let perms = &map.perms;
             use procfs::process::MMPermissions;
             if !perms.contains(MMPermissions::EXECUTE) || !perms.contains(MMPermissions::READ) {
@@ -526,14 +577,6 @@ impl DwarfUnwindManager {
             let end_addr = map.address.1;
             let file_offset = map.offset;
             let is_vdso = matches!(&map.pathname, MMapPath::Vdso);
-
-            // Skip mappings we already have
-            if existing_ranges
-                .iter()
-                .any(|&(b, e)| b == start_addr && e == end_addr)
-            {
-                continue;
-            }
 
             let resolved_path = if is_vdso {
                 file_path.clone()
@@ -708,27 +751,73 @@ impl DwarfUnwindManager {
                 }
             };
 
-            let idx = proc_info.mapping_count as usize;
-            proc_info.mappings[idx] = ExecMapping {
+            mappings.push(ExecMapping {
                 begin: start_addr,
                 end: end_addr,
                 load_bias,
                 shard_id,
                 _pad1: [0; 2],
                 table_count,
-            };
-            proc_info.mapping_count += 1;
+            });
         }
 
-        self.proc_info.insert(tgid, proc_info);
+        // Compute diff between old and new mappings.
+        // Identity includes metadata (load_bias, shard_id, table_count) so that
+        // a mapping at the same address range but with different content (e.g.
+        // dlclose + dlopen of a different library at the same address) is treated
+        // as a removal of the old entry plus an addition of the new one.
+        type MappingId = (u64, u64, u64, u16, u32); // (begin, end, load_bias, shard_id, table_count)
+        let mapping_id = |m: &ExecMapping| -> MappingId {
+            (m.begin, m.end, m.load_bias, m.shard_id, m.table_count)
+        };
 
-        Ok(())
+        let old_mappings = self.proc_mappings.get(&tgid);
+        let old_set: std::collections::HashSet<MappingId> = old_mappings
+            .map(|ms| ms.iter().map(&mapping_id).collect())
+            .unwrap_or_default();
+        let new_set: std::collections::HashSet<MappingId> =
+            mappings.iter().map(&mapping_id).collect();
+
+        let removed: Vec<ExecMapping> = old_mappings
+            .into_iter()
+            .flat_map(|ms| ms.iter())
+            .filter(|m| !new_set.contains(&mapping_id(m)))
+            .copied()
+            .collect();
+        let added: Vec<ExecMapping> = mappings
+            .iter()
+            .filter(|m| !old_set.contains(&mapping_id(m)))
+            .copied()
+            .collect();
+
+        let diff = MappingsDiff {
+            tgid,
+            added,
+            removed,
+            is_exit: false,
+        };
+
+        self.proc_mappings.insert(tgid, mappings);
+
+        Ok(diff)
     }
 
     /// Returns the total number of table entries across all binaries
     pub fn total_entries(&self) -> usize {
         // Array of maps pattern: iterate over all elements in the Vec
         self.binary_tables.iter().map(|t| t.len()).sum()
+    }
+
+    /// Remove a process from tracking and return a removal diff for LPM trie cleanup.
+    pub fn remove_process(&mut self, tgid: u32) -> Option<MappingsDiff> {
+        self.proc_mappings
+            .remove(&tgid)
+            .map(|old_mappings| MappingsDiff {
+                tgid,
+                added: Vec::new(),
+                removed: old_mappings,
+                is_exit: true,
+            })
     }
 }
 
@@ -790,7 +879,7 @@ mod tests {
     fn test_dwarf_manager_new() {
         let manager = DwarfUnwindManager::new();
         assert_eq!(manager.total_entries(), 0);
-        assert!(manager.proc_info.is_empty());
+        assert!(manager.proc_mappings.is_empty());
     }
 
     #[test]
@@ -826,12 +915,12 @@ mod tests {
             "Expected non-empty unwind table for current process"
         );
         assert!(
-            manager.proc_info.contains_key(&pid),
-            "Expected proc_info entry for current process"
+            manager.proc_mappings.contains_key(&pid),
+            "Expected proc_mappings entry for current process"
         );
-        let info = &manager.proc_info[&pid];
+        let mappings = &manager.proc_mappings[&pid];
         assert!(
-            info.mapping_count > 0,
+            !mappings.is_empty(),
             "Expected at least one executable mapping"
         );
     }
@@ -915,7 +1004,7 @@ mod tests {
         );
 
         // Refresh the same process - should use metadata cache for fast lookups
-        let new_shards = manager.refresh_process(pid).unwrap();
+        let (new_shards, _diff) = manager.refresh_process(pid).unwrap();
 
         // Since the binaries haven't changed, we shouldn't have new shards
         assert_eq!(new_shards.len(), 0, "Expected no new shards on refresh");
@@ -1002,7 +1091,7 @@ mod tests {
 
         // Test refresh_process returns correct new shard IDs
         let old_len = manager.binary_tables.len();
-        let new_shards = manager.refresh_process(pid).unwrap();
+        let (new_shards, _diff) = manager.refresh_process(pid).unwrap();
 
         // On refresh without new libraries, should have no new shards
         assert_eq!(new_shards.len(), 0, "Expected no new shards on refresh");
@@ -1011,5 +1100,74 @@ mod tests {
             old_len,
             "binary_tables length should not change on refresh without new libs"
         );
+    }
+
+    #[test]
+    fn test_summarize_empty_range() {
+        // When low > high the range is empty — should produce no blocks.
+        let blocks = summarize_address_range(10, 5);
+        assert!(blocks.is_empty(), "Expected empty result for low > high");
+    }
+
+    #[test]
+    fn test_summarize_single_address() {
+        // A single-address range [x, x] should yield exactly one block
+        // with prefix_len = 64 (all 64 bits significant).
+        let blocks = summarize_address_range(42, 42);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].addr, 42);
+        assert_eq!(blocks[0].prefix_len, 64);
+    }
+
+    #[test]
+    fn test_summarize_power_of_two_boundary() {
+        // Range [0x1000, 0x1FFF] is exactly a 4096-byte aligned block
+        // → one block with prefix_len = 64 - 12 = 52.
+        let blocks = summarize_address_range(0x1000, 0x1FFF);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].addr, 0x1000);
+        assert_eq!(blocks[0].prefix_len, 52); // 64 - 12
+    }
+
+    #[test]
+    fn test_summarize_spanning_boundary() {
+        // Range that spans a power-of-two boundary requires multiple blocks.
+        let blocks = summarize_address_range(0x0FFF, 0x1001);
+        assert!(
+            blocks.len() > 1,
+            "Range spanning a boundary should decompose into multiple blocks"
+        );
+        // Verify the blocks cover the full range: first addr = low,
+        // and the union should cover [0x0FFF, 0x1001].
+        assert_eq!(blocks.first().unwrap().addr, 0x0FFF);
+    }
+
+    #[test]
+    fn test_summarize_near_u64_max() {
+        // Regression test: high near u64::MAX must not overflow.
+        let high = u64::MAX;
+        let low = high - 255; // 256-entry range ending at u64::MAX
+        let blocks = summarize_address_range(low, high);
+        assert!(
+            !blocks.is_empty(),
+            "Should produce blocks for range near u64::MAX"
+        );
+        // Verify last block reaches u64::MAX
+        let last = blocks.last().unwrap();
+        let block_size = 1u128 << (64 - last.prefix_len);
+        let block_end = last.addr as u128 + block_size - 1;
+        assert!(
+            block_end >= high as u128,
+            "Last block should cover up to u64::MAX"
+        );
+    }
+
+    #[test]
+    fn test_summarize_full_u64_range() {
+        // The entire u64 address space [0, u64::MAX]
+        let blocks = summarize_address_range(0, u64::MAX);
+        assert_eq!(blocks.len(), 1, "Full u64 range should be a single block");
+        assert_eq!(blocks[0].addr, 0);
+        assert_eq!(blocks[0].prefix_len, 0); // 0 significant bits = match all
     }
 }

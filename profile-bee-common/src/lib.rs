@@ -120,6 +120,40 @@ pub const LEGACY_MAX_DWARF_STACK_DEPTH: usize = 4;
 
 pub const MAX_PROC_MAPS: usize = 8;
 
+/// Maximum entries in the LPM trie for exec mappings.
+/// Each memory mapping decomposes into ~10-20 LPM prefix entries.
+/// 200K entries covers ~200 processes × ~50 mappings × ~20 entries each.
+/// BPF_F_NO_PREALLOC means only inserted entries consume memory.
+pub const MAX_EXEC_MAPPING_ENTRIES: u32 = 200_000;
+
+/// Data portion of the LPM trie key for exec mapping lookups.
+/// Combined with aya's Key<T> which prepends a u32 prefix_len field.
+/// Total key: { prefix_len: u32, tgid: u32, _pad: u32, address: u64 } = 20 bytes.
+///
+/// Both fields are stored in **big-endian** because the LPM trie matches
+/// bits from most-significant to least-significant. Big-endian ensures the
+/// MSBs of the values are physically first in memory.
+///
+/// The explicit `_pad` field ensures `address` is 8-byte aligned (avoiding
+/// unaligned 64-bit access from `#[repr(C, packed)]`). It must always be
+/// set to 0 so the LPM trie bit-matching is consistent across the 32 padding
+/// bits.
+///
+/// Full match prefix_len = 128 (32 bits tgid + 32 bits padding + 64 bits address).
+///
+/// Use `EXEC_MAPPING_KEY_BITS` instead of hard-coding 128 at LPM trie call sites.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[repr(C)]
+pub struct ExecMappingKey {
+    pub tgid: u32,    // big-endian
+    pub _pad: u32,    // must be 0
+    pub address: u64, // big-endian
+}
+
+/// Total bit-width of `ExecMappingKey` for LPM trie full-match prefix_len.
+/// Derived from the struct size so it stays correct if the layout changes.
+pub const EXEC_MAPPING_KEY_BITS: u32 = (size_of::<ExecMappingKey>() * 8) as u32;
+
 /// Maximum number of inner shard maps in the outer ArrayOfMaps.
 /// With array-of-maps, unused slots cost nothing (no pre-allocated kernel memory).
 pub const MAX_UNWIND_SHARDS: usize = 512;

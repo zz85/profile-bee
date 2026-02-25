@@ -38,19 +38,18 @@ fn test_dwarf_manager_loads_current_process() {
 
     assert!(manager.total_entries() > 0, "Should have unwind entries");
     assert!(
-        manager.proc_info.contains_key(&pid),
-        "Should have proc_info for current PID"
+        manager.proc_mappings.contains_key(&pid),
+        "Should have proc_mappings for current PID"
     );
 
-    let info = &manager.proc_info[&pid];
+    let mappings = &manager.proc_mappings[&pid];
     assert!(
-        info.mapping_count > 0,
+        !mappings.is_empty(),
         "Should have at least one executable mapping"
     );
 
     // Verify mappings have valid address ranges
-    for i in 0..info.mapping_count as usize {
-        let m = &info.mappings[i];
+    for m in mappings {
         assert!(m.begin < m.end, "Mapping begin >= end");
         assert!(m.table_count > 0, "Mapping should have unwind entries");
     }

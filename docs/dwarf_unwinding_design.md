@@ -11,7 +11,7 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 │  1. Read /proc/[pid]/maps → find executable mappings                │
 │  2. Parse .eh_frame from each ELF binary (gimli)                    │
 │  3. Pre-evaluate DWARF CFI → flat UnwindEntry table                 │
-│  4. Load into BPF maps: UNWIND_TABLE (array), PROC_INFO (hashmap)  │
+│  4. Load into BPF maps: unwind shards (ArrayOfMaps), EXEC_MAPPINGS (LPM trie)  │
 │  5. Set DWARF_ENABLED=1 in .rodata                                  │
 └─────────────────────────────────────────────────────────────────────┘
                               │
@@ -27,7 +27,7 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 │       ├─ DWARF_ENABLED? ──YES──▶ dwarf_copy_stack()                 │
 │       │                              │                              │
 │       │                              ├─ Read RIP, RSP, RBP          │
-│       │                              ├─ Lookup PROC_INFO by tgid    │
+│       │                              ├─ LPM trie lookup by (tgid, IP)│
 │       │                              ├─ For each frame (flat loop): │
 │       │                              │   ├─ Find mapping for IP     │
 │       │                              │   ├─ relative_pc = IP - bias │
@@ -57,13 +57,13 @@ Profile-bee uses **eBPF-based DWARF unwinding** to profile binaries compiled wit
 |------|------|
 | `profile-bee/src/dwarf_unwind.rs` | Userspace: parse `.eh_frame`, generate `UnwindEntry` table, load into BPF maps |
 | `profile-bee-ebpf/src/lib.rs` | eBPF: `dwarf_copy_stack()`, `binary_search_unwind_entry()`, `collect_trace()` |
-| `profile-bee-common/src/lib.rs` | Shared types: `UnwindEntry`, `ProcInfo`, `ExecMapping`, constants |
+| `profile-bee-common/src/lib.rs` | Shared types: `UnwindEntry`, `ExecMappingKey`, `ExecMapping`, constants |
 | `profile-bee/src/ebpf.rs` | `EbpfProfiler`: loads eBPF program, sets `DWARF_ENABLED`, loads maps |
 | `profile-bee/src/trace_handler.rs` | Picks DWARF stack vs FP stack (whichever is deeper) |
 
 ## Data Structures
 
-### UnwindEntry (12 bytes, stored in BPF HashMap map)
+### UnwindEntry (12 bytes, stored in per-binary Array maps)
 
 ```rust
 pub struct UnwindEntry {
@@ -84,29 +84,33 @@ CFA types:
 
 Return address is always at CFA-8 on x86_64, so RA rule/offset are not stored.
 
-### UnwindTableKey (8 bytes, key for sharded tables)
+### ExecMappingKey (16 bytes, LPM trie key data)
 
 ```rust
-pub struct UnwindTableKey {
-    pub table_id: u32,   // Unique ID for each binary
-    pub index: u32,      // Index within that binary's table
+pub struct ExecMappingKey {
+    pub tgid: u32,    // big-endian (LPM trie matches MSB-first)
+    pub _pad: u32,    // must be 0 (ensures 8-byte alignment for address)
+    pub address: u64, // big-endian
 }
 ```
 
-### ProcInfo (per-process, stored in BPF HashMap)
+Combined with aya's `Key<T>` which prepends a `u32 prefix_len` field, the full
+LPM trie key is 20 bytes. Full-match prefix_len = 128 (32 + 32 + 64 bits).
+
+Userspace decomposes each exec mapping's address range `[begin, end)` into
+aligned power-of-2 blocks (the same algorithm as CIDR route summarization) and
+inserts each block as a separate LPM trie entry.
+
+### ExecMapping (per-mapping, LPM trie value)
 
 ```rust
-pub struct ProcInfo {
-    pub mapping_count: u32,
-    pub mappings: [ExecMapping; 8],  // MAX_PROC_MAPS
-}
-
 pub struct ExecMapping {
     pub begin: u64,        // Virtual address range start
     pub end: u64,          // Virtual address range end
     pub load_bias: u64,    // Subtract from IP to get file-relative PC
-    pub table_id: u32,     // ID of the unwind table for this mapping
-    pub table_count: u32,  // Number of entries for this mapping
+    pub shard_id: u16,     // Which shard Array to search (0..MAX_UNWIND_SHARDS-1, or SHARD_NONE)
+    pub _pad1: [u8; 2],
+    pub table_count: u32,  // Number of entries in this shard for this binary
 }
 ```
 
@@ -114,8 +118,9 @@ pub struct ExecMapping {
 
 | Map | Type | Size | Purpose |
 |-----|------|------|---------|
-| `unwind_tables` | HashMap | 500K entries × 20B = 10 MB max | Sharded per-binary unwind tables (table_id, index) → UnwindEntry |
-| `proc_info` | HashMap | 1024 entries | Per-process mapping info |
+| `unwind_shards` | ArrayOfMaps\<Array\<UnwindEntry\>\> | 512 outer slots × 131K max entries/shard | Per-binary unwind tables (shard_id → Array, indexed by entry offset) |
+| `exec_mappings` | LPM Trie | 200K entries max | Exec mapping lookup by (tgid, address) → ExecMapping via longest-prefix match |
+| `dwarf_tgids` | HashMap\<u32, u8\> | 4096 entries max | Tracks which tgids have DWARF data loaded (for process exit cleanup) |
 | `stacked_pointers` | HashMap | 2048 entries | DWARF-unwound frame pointers per stack |
 
 ## How Unwind Tables Are Generated
@@ -148,9 +153,9 @@ sp = RSP, bp = RBP, current_ip = RIP
 
 // Per tail-call invocation (dwarf_unwind_step):
 for _ in 0..FRAMES_PER_TAIL_CALL:
-    mapping = find_mapping(current_ip)        // linear scan, max 16
+    mapping = EXEC_MAPPINGS.get(tgid, current_ip)  // LPM trie O(key_bits)
     relative_pc = current_ip - mapping.load_bias
-    entry = binary_search(mapping.table_id, relative_pc)  // max 19 iterations
+    entry = binary_search(mapping.shard_id, relative_pc)  // max 17 iterations
 
     cfa = (entry.cfa_type == RSP) ? sp + entry.cfa_offset
                                   : bp + entry.cfa_offset
@@ -172,9 +177,9 @@ for _ in 0..FRAMES_PER_TAIL_CALL:
 
 The eBPF code is structured to pass the BPF verifier:
 - All loops use bounded `for _ in 0..CONST` ranges
-- Binary search uses `for _ in 0..19` (not `while`)
-- Mapping scan uses `for m in 0..16` with early break
-- **Tail-call chaining** via `PROG_ARRAY` achieves `MAX_DWARF_STACK_DEPTH = 165` frames (5 frames × 33 tail calls). Each tail call resets the verifier's instruction budget, so the per-invocation complexity stays low (~5 × (8 mapping + 16 binary search) ≈ 600 instructions). The `dwarf_unwind_step` program unwinds `FRAMES_PER_TAIL_CALL` (5) frames then tail-calls itself.
+- Binary search uses `for _ in 0..17` (max depth for 131K entries per shard)
+- Mapping lookup uses LPM trie (`EXEC_MAPPINGS.get()`) — O(key_bits), no loop
+- **Tail-call chaining** via `PROG_ARRAY` achieves `MAX_DWARF_STACK_DEPTH = 165` frames (5 frames × 33 tail calls). Each tail call resets the verifier's instruction budget, so the per-invocation complexity stays low (~5 × (1 LPM lookup + 17 binary search) ≈ 400 instructions). The `dwarf_unwind_step` program unwinds `FRAMES_PER_TAIL_CALL` (5) frames then tail-calls itself.
 - **Legacy fallback**: a flat loop of `LEGACY_MAX_DWARF_STACK_DEPTH = 21` frames is used when tail calls are unavailable (kprobe/uprobe contexts, or if `PROG_ARRAY` registration fails)
 - Functions are `#[inline(always)]` to avoid BPF function call overhead
 - Sharded tables reduce verifier complexity by keeping per-binary tables smaller
@@ -183,14 +188,14 @@ The eBPF code is structured to pass the BPF verifier:
 
 ### Memory
 - Typical process (binary + libc + ld): ~23K entries × 12B = **~270 KB**
-- **Sharded design**: Each binary gets its own table (max 500K entries per binary)
-- Maximum: 64 binaries × 500K entries × 20B (key + value) = **~600 MB** total capacity
-- Build-ID based deduplication: Same binary across multiple processes reuses the same table_id
-- ProcInfo per process: ~200 bytes
+- **Array-of-maps design**: Each binary gets its own inner Array map (max 131K entries per shard)
+- Maximum: 512 shards × 131K entries × 12B = **~770 MB** total capacity (unused slots cost nothing)
+- Build-ID based deduplication: Same binary across multiple processes reuses the same shard
+- LPM trie entries per mapping: ~10-20 prefix blocks per address range
 
 ### CPU (per sample, when DWARF enabled)
-- Mapping lookup: O(n) where n ≤ 16
-- Binary search: O(log n) where n ≤ 500K per binary, max 19 iterations
+- Mapping lookup: O(key_bits) via LPM trie (replaces old O(n) linear scan)
+- Binary search: O(log n) where n ≤ 131K per shard, max 17 iterations
 - `bpf_probe_read_user`: 1-2 calls per frame (return address + optional RBP restore)
 - Compared to FP unwinding (1 `bpf_probe_read` per frame), DWARF is ~10-20x more instructions per frame
 - In practice, the overhead is negligible at typical sampling rates (99-999 Hz)
@@ -202,10 +207,10 @@ The eBPF code is structured to pass the BPF verifier:
 ## Limitations
 
 - **No hot-reload**: dlopen'd libraries after startup won't have unwind tables (but periodic rescanning is supported)
-- **MAX_PROC_MAPS = 16**: processes with very many shared libraries may exceed this
 - **165 frame depth**: achieved via tail-call chaining through `PROG_ARRAY` (5 frames per tail call × 33 tail calls). Legacy flat-loop fallback limited to ~21 frames when tail calls are unavailable (kprobe/uprobe contexts, older kernels).
-- **MAX_UNWIND_TABLE_SIZE = 500K per binary**: very large binaries (Chrome, Firefox) with >500K unwind entries will be truncated
-- **MAX_UNWIND_TABLES = 64**: system-wide profiling limited to 64 unique binaries
+- **MAX_SHARD_ENTRIES = 131K per binary**: very large binaries (Chrome, Firefox) with >131K unwind entries will be truncated
+- **MAX_UNWIND_SHARDS = 512**: system-wide profiling limited to 512 unique binaries
+- **MAX_EXEC_MAPPING_ENTRIES = 200K**: LPM trie entries across all processes; typically ~10-20 entries per mapping
 - **No signal trampolines**: unwinding through signal handlers may stop early on kernels where the vDSO lacks `.eh_frame` entries for `__restore_rt` (libc's `__restore_rt` is handled)
 - **x86_64 only**: register rules are hardcoded for x86_64 (RSP, RBP, RA)
 

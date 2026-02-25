@@ -11,6 +11,7 @@ use aya_ebpf::{
         bpf_task_pt_regs,
     },
     macros::map,
+    maps::lpm_trie::{Key as LpmKey, LpmTrie},
     maps::{Array, ArrayOfMaps, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
     programs::RawTracePointContext,
     EbpfContext,
@@ -18,11 +19,11 @@ use aya_ebpf::{
 
 // use aya_log_ebpf::info;
 use profile_bee_common::{
-    DwarfUnwindState, FramePointers, ProcInfo, ProcInfoKey, StackInfo, UnwindEntry,
+    DwarfUnwindState, ExecMapping, ExecMappingKey, FramePointers, StackInfo, UnwindEntry,
     CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
-    FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH, MAX_BIN_SEARCH_DEPTH,
-    MAX_DWARF_STACK_DEPTH, MAX_PROC_MAPS, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET,
-    REG_RULE_SAME_VALUE, SHARD_NONE,
+    EXEC_MAPPING_KEY_BITS, FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH,
+    MAX_BIN_SEARCH_DEPTH, MAX_DWARF_STACK_DEPTH, MAX_EXEC_MAPPING_ENTRIES, MAX_SHARD_ENTRIES,
+    MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -154,9 +155,20 @@ pub static UNWIND_SHARDS: ArrayOfMaps<Array<UnwindEntry>> =
 #[map]
 static UNWIND_SHARD_TEMPLATE: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
 
-/// Per-process unwind info: maps tgid to ProcInfo (exec mappings)
-#[map(name = "proc_info")]
-pub static PROC_INFO: HashMap<ProcInfoKey, ProcInfo> = HashMap::with_max_entries(1024, 0);
+/// LPM trie for exec mapping lookups: maps (tgid, virtual_address) → ExecMapping.
+/// Replaces the old proc_info HashMap + linear scan with O(log n) longest prefix match.
+/// Userspace decomposes each memory mapping's address range into aligned power-of-2
+/// blocks and inserts each as a separate LPM trie entry.
+#[map(name = "exec_mappings")]
+pub static EXEC_MAPPINGS: LpmTrie<ExecMappingKey, ExecMapping> =
+    LpmTrie::with_max_entries(MAX_EXEC_MAPPING_ENTRIES, 0);
+
+/// Tracks which tgids have DWARF unwind data loaded.
+/// Userspace inserts (tgid, 1) when loading DWARF mappings for a process.
+/// The BPF process-exit handler checks this map to decide whether to send
+/// a cleanup event — avoids firing for every process exit on the system.
+#[map(name = "dwarf_tgids")]
+pub static DWARF_TGIDS: HashMap<u32, u8> = HashMap::with_max_entries(4096, 0);
 
 /// Per-CPU state for DWARF tail-call unwinding
 #[map(name = "unwind_state")]
@@ -603,8 +615,9 @@ const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
 
 /// Perform one frame of DWARF unwinding, updating state in place.
 /// Returns true if unwinding should continue, false if done.
+/// Uses LPM trie lookup to find the exec mapping containing current_ip.
 #[inline(always)]
-unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState, proc_info: &ProcInfo) -> bool {
+unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState) -> bool {
     let current_ip = state.current_ip;
     let sp = state.sp;
     let bp = state.bp;
@@ -617,27 +630,34 @@ unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState, proc_info: &ProcI
         return false;
     }
 
-    // Find the mapping that contains current_ip
-    let mut found_mapping = false;
-    let mut shard_id: u16 = SHARD_NONE;
-    let mut table_count: u32 = 0;
-    let mut load_bias: u64 = 0;
-
-    for m in 0..MAX_PROC_MAPS {
-        if m >= state.mapping_count as usize {
-            break;
+    // LPM trie lookup: find the exec mapping containing (tgid, current_ip)
+    let key = LpmKey::new(
+        EXEC_MAPPING_KEY_BITS,
+        ExecMappingKey {
+            tgid: state.tgid.to_be(),
+            _pad: 0,
+            address: current_ip.to_be(),
+        },
+    );
+    let (shard_id, table_count, load_bias) = match EXEC_MAPPINGS.get(&key) {
+        Some(mapping) if current_ip >= mapping.begin && current_ip < mapping.end => {
+            (mapping.shard_id, mapping.table_count, mapping.load_bias)
         }
-        let mapping = &proc_info.mappings[m];
-        if current_ip >= mapping.begin && current_ip < mapping.end {
-            shard_id = mapping.shard_id;
-            table_count = mapping.table_count;
-            load_bias = mapping.load_bias;
-            found_mapping = true;
-            break;
+        _ => {
+            // No mapping found or LPM prefix extends beyond actual range — FP fallback
+            if let Some((ra, nbp)) = try_fp_step(bp) {
+                state.pointers[frame_idx] = ra;
+                state.frame_count = frame_idx + 1;
+                state.current_ip = ra;
+                state.sp = bp + 16;
+                state.bp = nbp;
+                return true;
+            }
+            return false;
         }
-    }
+    };
 
-    if !found_mapping || table_count == 0 || shard_id == SHARD_NONE {
+    if table_count == 0 || shard_id == SHARD_NONE {
         // No DWARF info — try FP-based step as fallback
         if let Some((ra, nbp)) = try_fp_step(bp) {
             state.pointers[frame_idx] = ra;
@@ -754,20 +774,23 @@ unsafe fn dwarf_copy_stack_regs(
 
     pointers[0] = ip;
 
-    // Look up the process's unwind information
-    let proc_key = ProcInfoKey { tgid, _pad: 0 };
-    let proc_info = match PROC_INFO.get(&proc_key) {
-        Some(info) => info,
-        None => {
-            let (ip, bp, len, _sp) = copy_stack_regs(regs, pointers);
-            return (ip, bp, len);
-        }
-    };
+    // Quick check: try LPM for initial IP. If no mapping found,
+    // this process likely has no DWARF info — use full FP unwinding.
+    let first_key = LpmKey::new(
+        EXEC_MAPPING_KEY_BITS,
+        ExecMappingKey {
+            tgid: tgid.to_be(),
+            _pad: 0,
+            address: ip.to_be(),
+        },
+    );
+    if EXEC_MAPPINGS.get(&first_key).is_none() {
+        let (ip, bp, len, _sp) = copy_stack_regs(regs, pointers);
+        return (ip, bp, len);
+    }
 
     let mut current_ip = ip;
     let mut len = 1usize;
-
-    let mapping_count = proc_info.mapping_count as usize;
 
     let mut i = 1usize;
     for _ in 1..LEGACY_MAX_DWARF_STACK_DEPTH {
@@ -778,27 +801,35 @@ unsafe fn dwarf_copy_stack_regs(
             break;
         }
 
-        // Find the mapping that contains current_ip
-        let mut found_mapping = false;
-        let mut shard_id: u16 = SHARD_NONE;
-        let mut table_count: u32 = 0;
-        let mut load_bias: u64 = 0;
-
-        for m in 0..MAX_PROC_MAPS {
-            if m >= mapping_count {
+        // LPM trie lookup for this frame's IP
+        let key = LpmKey::new(
+            EXEC_MAPPING_KEY_BITS,
+            ExecMappingKey {
+                tgid: tgid.to_be(),
+                _pad: 0,
+                address: current_ip.to_be(),
+            },
+        );
+        let (shard_id, table_count, load_bias) = match EXEC_MAPPINGS.get(&key) {
+            Some(mapping) if current_ip >= mapping.begin && current_ip < mapping.end => {
+                (mapping.shard_id, mapping.table_count, mapping.load_bias)
+            }
+            _ => {
+                // No mapping — FP fallback for this frame
+                if let Some((ra, nbp)) = try_fp_step(bp) {
+                    pointers[i] = ra;
+                    len = i + 1;
+                    current_ip = ra;
+                    sp = bp + 16;
+                    bp = nbp;
+                    i += 1;
+                    continue;
+                }
                 break;
             }
-            let mapping = &proc_info.mappings[m];
-            if current_ip >= mapping.begin && current_ip < mapping.end {
-                shard_id = mapping.shard_id;
-                table_count = mapping.table_count;
-                load_bias = mapping.load_bias;
-                found_mapping = true;
-                break;
-            }
-        }
+        };
 
-        if !found_mapping || table_count == 0 || shard_id == SHARD_NONE {
+        if table_count == 0 || shard_id == SHARD_NONE {
             // No DWARF info — try FP-based step as fallback
             if let Some((ra, nbp)) = try_fp_step(bp) {
                 pointers[i] = ra;
@@ -941,7 +972,7 @@ unsafe fn dwarf_try_tail_call<C: EbpfContext>(
     (*state).sp = regs.rsp;
     (*state).bp = regs.rbp;
     (*state).tgid = tgid;
-    (*state).mapping_count = 0; // Step program reads from PROC_INFO directly
+    (*state).mapping_count = 0; // Unused with LPM trie, kept for struct layout compat
 
     // Save finalization context so the step program can complete the work
     (*state).user_stack_id = user_stack_id;
@@ -1017,20 +1048,8 @@ pub unsafe fn dwarf_unwind_step_impl<C: EbpfContext>(ctx: C) {
     };
     let state = &mut *state;
 
-    let proc_key = ProcInfoKey {
-        tgid: state.tgid,
-        _pad: 0,
-    };
-    let Some(proc_info) = PROC_INFO.get(&proc_key) else {
-        // No proc info found — finalize with whatever frames we have
-        dwarf_finalize_stack(state);
-        return;
-    };
-
-    // Set mapping_count from proc_info (not stored during init to save verifier budget)
-    state.mapping_count = proc_info.mapping_count;
-
-    // Unwind up to FRAMES_PER_TAIL_CALL frames per tail-call invocation
+    // Unwind up to FRAMES_PER_TAIL_CALL frames per tail-call invocation.
+    // Each frame does its own LPM trie lookup — no proc_info needed.
     let mut did_unwind = false;
     for _ in 0..FRAMES_PER_TAIL_CALL {
         if state.frame_count >= MAX_DWARF_STACK_DEPTH {
@@ -1039,7 +1058,7 @@ pub unsafe fn dwarf_unwind_step_impl<C: EbpfContext>(ctx: C) {
         if state.frame_count >= state.pointers.len() {
             break;
         }
-        if !dwarf_unwind_one_frame(state, proc_info) {
+        if !dwarf_unwind_one_frame(state) {
             // Unwinding complete or failed — finalize
             dwarf_finalize_stack(state);
             return;
@@ -1361,7 +1380,9 @@ unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
 }
 
 /// Handle sched_process_exit tracepoint for process exit monitoring.
-/// Notifies userspace when the monitored PID exits.
+/// Sends a ProcessExitEvent when:
+/// - The monitored PID exits (--pid mode: stops profiling), OR
+/// - A DWARF-tracked process exits (cleanup LPM trie entries).
 #[inline(always)]
 pub unsafe fn handle_process_exit<C: EbpfContext>(ctx: C) {
     use profile_bee_common::ProcessExitEvent;
@@ -1369,13 +1390,15 @@ pub unsafe fn handle_process_exit<C: EbpfContext>(ctx: C) {
     let tgid = ctx.tgid();
     let monitor_pid = monitor_exit_pid();
 
-    // Only send notification if this is the PID we're monitoring
-    if monitor_pid != 0 && tgid == monitor_pid {
-        // Send exit notification to userspace
+    // Send notification if this is either the monitored PID or a DWARF-tracked process
+    let is_monitored = monitor_pid != 0 && tgid == monitor_pid;
+    let is_dwarf_tracked = unsafe { DWARF_TGIDS.get(&tgid).is_some() };
+
+    if is_monitored || is_dwarf_tracked {
         if let Some(mut entry) = RING_BUF_PROCESS_EXIT.reserve::<ProcessExitEvent>(0) {
             let exit_event = ProcessExitEvent {
                 pid: tgid,
-                exit_code: 0, // Exit code is not easily accessible from sched_process_exit
+                exit_code: 0,
             };
             let _writable = entry.write(exit_event);
             entry.submit(0);

@@ -3,6 +3,7 @@ use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
+use profile_bee::dwarf_unwind::MappingsDiff;
 use profile_bee::ebpf::{
     attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
 };
@@ -15,7 +16,7 @@ use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, Resolve
 use profile_bee::probe_spec::parse_probe_spec;
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
-use profile_bee_common::{ProcInfo, ProcessExitEvent, StackInfo, UnwindEntry, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{ProcessExitEvent, StackInfo, UnwindEntry, EVENT_TRACE_ALWAYS};
 use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -35,11 +36,19 @@ enum PerfWork {
     Stop,
 }
 
+/// Message type for the DWARF background thread
+enum DwarfThreadMsg {
+    /// New process to load DWARF data for
+    LoadProcess(u32),
+    /// Process exited — clean up mappings and LPM trie entries
+    ProcessExited(u32),
+}
+
 /// Incremental DWARF unwind table update
 /// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
 struct DwarfRefreshUpdate {
     shard_updates: Vec<(u16, Arc<Vec<UnwindEntry>>)>, // (shard_id, entries) for new shards
-    proc_info: Vec<(u32, ProcInfo)>,
+    mapping_diffs: Vec<MappingsDiff>,                 // per-process added/removed mappings
 }
 
 #[derive(Debug, Parser)]
@@ -660,8 +669,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             }
         }
 
-        // Channel for requesting new tgid loads (multi-process / dlopen support)
-        let (tgid_tx, tgid_rx) = mpsc::channel::<u32>();
+        // Channel for DWARF thread messages (new process loads + exit cleanup)
+        let (tgid_tx, tgid_rx) = mpsc::channel::<DwarfThreadMsg>();
         let refresh_tx = perf_tx.clone();
         let initial_pid = pid;
         std::thread::spawn(move || {
@@ -683,14 +692,21 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // Take ownership of ring buffer map after DWARF loading
     let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
 
-    // Set up process exit monitoring for external PIDs (--pid, not spawned)
+    // Set up process exit monitoring:
+    // - For external PIDs (--pid): detects when the target process exits to stop profiling.
+    // - For DWARF mode: detects when any tracked process exits to clean up LPM trie entries.
     let external_pid = if spawn.is_none() { opt.pid } else { None };
-    if let Some(pid_to_monitor) = external_pid {
+    let dwarf_enabled = opt.dwarf.unwrap_or(false);
+    let monitor_exit_pid: Option<u32> = external_pid;
+
+    if external_pid.is_some() || dwarf_enabled {
         // Attach the sched_process_exit tracepoint
         attach_process_exit_tracepoint(&mut ebpf_profiler.bpf)?;
 
-        // Set the PID to monitor in the eBPF map
-        ebpf_profiler.set_monitor_exit_pid(pid_to_monitor)?;
+        // Set the PID to monitor for stop-on-exit (0 = don't stop, just DWARF cleanup)
+        if let Some(pid_to_monitor) = external_pid {
+            ebpf_profiler.set_monitor_exit_pid(pid_to_monitor)?;
+        }
 
         // Set up the ring buffer for process exit events
         let exit_ring_buf = setup_process_exit_ring_buffer(&mut ebpf_profiler.bpf)?;
@@ -701,10 +717,12 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             }
         });
 
-        println!(
-            "eBPF-based exit monitoring enabled for PID {}",
-            pid_to_monitor
-        );
+        if let Some(pid_to_monitor) = external_pid {
+            println!(
+                "eBPF-based exit monitoring enabled for PID {}",
+                pid_to_monitor
+            );
+        }
     }
 
     let counts = &mut ebpf_profiler.counts;
@@ -757,6 +775,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 &tgid_request_tx,
                 flush_interval,
                 &mut stopped,
+                monitor_exit_pid,
                 &mut trace_count,
                 &mut known_tgids,
             );
@@ -780,6 +799,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             stacked_pointers,
             &mut ebpf_profiler.bpf,
             &tgid_request_tx,
+            monitor_exit_pid,
         );
         tracing::debug!(
             "batch mode: process_profiling_data returned {} stacks",
@@ -1028,7 +1048,7 @@ async fn setup_process_exit_ring_buffer_task(
             let ring_buf = inner.get_mut();
             while let Some(item) = ring_buf.next() {
                 let exit_event: ProcessExitEvent = unsafe { *item.as_ptr().cast() };
-                println!("eBPF detected: PID {} has exited", exit_event.pid);
+                tracing::debug!("eBPF detected: PID {} has exited", exit_event.pid);
                 let _ = perf_tx.send(PerfWork::ProcessExit(exit_event));
             }
             Ok(())
@@ -1048,7 +1068,7 @@ async fn setup_process_exit_ring_buffer_task(
 fn dwarf_refresh_loop(
     mut manager: DwarfUnwindManager,
     initial_pid: Option<u32>,
-    tgid_rx: mpsc::Receiver<u32>,
+    tgid_rx: mpsc::Receiver<DwarfThreadMsg>,
     tx: mpsc::Sender<PerfWork>,
 ) {
     let mut tracked_pids: Vec<u32> = initial_pid.into_iter().collect();
@@ -1065,25 +1085,34 @@ fn dwarf_refresh_loop(
     }
 
     loop {
-        // Drain all pending tgid requests (non-blocking)
-        while let Ok(new_tgid) = tgid_rx.try_recv() {
-            if !tracked_pids.contains(&new_tgid) {
-                tracked_pids.push(new_tgid);
-                // Record mtime before refresh so a concurrent dlopen between
-                // refresh_process and metadata() doesn't go undetected.
-                let maps_path = format!("/proc/{}/maps", new_tgid);
-                let pre_refresh_mtime = std::fs::metadata(&maps_path)
-                    .ok()
-                    .and_then(|m| m.modified().ok());
-                // Immediately load the new process
-                if let Ok(new_shard_ids) = manager.refresh_process(new_tgid) {
-                    if !new_shard_ids.is_empty()
-                        && send_refresh(&manager, &tx, new_shard_ids).is_err()
-                    {
-                        return;
+        // Drain all pending messages (non-blocking)
+        while let Ok(msg) = tgid_rx.try_recv() {
+            match msg {
+                DwarfThreadMsg::LoadProcess(new_tgid) => {
+                    if !tracked_pids.contains(&new_tgid) {
+                        tracked_pids.push(new_tgid);
+                        let maps_path = format!("/proc/{}/maps", new_tgid);
+                        let pre_refresh_mtime = std::fs::metadata(&maps_path)
+                            .ok()
+                            .and_then(|m| m.modified().ok());
+                        if let Ok((new_shard_ids, diff)) = manager.refresh_process(new_tgid) {
+                            if send_refresh(&manager, &tx, new_shard_ids, diff).is_err() {
+                                return;
+                            }
+                        }
+                        last_maps_mtime.insert(new_tgid, pre_refresh_mtime);
                     }
                 }
-                last_maps_mtime.insert(new_tgid, pre_refresh_mtime);
+                DwarfThreadMsg::ProcessExited(tgid) => {
+                    tracing::debug!("DWARF thread: process {} exited, cleaning up", tgid);
+                    if let Some(removal_diff) = manager.remove_process(tgid) {
+                        if send_refresh(&manager, &tx, vec![], removal_diff).is_err() {
+                            return;
+                        }
+                    }
+                    tracked_pids.retain(|&p| p != tgid);
+                    last_maps_mtime.remove(&tgid);
+                }
             }
         }
 
@@ -1118,9 +1147,10 @@ fn dwarf_refresh_loop(
                 }
             }
 
-            if let Ok(new_shard_ids) = manager.refresh_process(pid) {
-                if !new_shard_ids.is_empty() && send_refresh(&manager, &tx, new_shard_ids).is_err()
-                {
+            if let Ok((new_shard_ids, diff)) = manager.refresh_process(pid) {
+                // Always send — mapping changes (e.g. dlopen of a cached
+                // binary) need LPM trie updates even without new shards.
+                if send_refresh(&manager, &tx, new_shard_ids, diff).is_err() {
                     channel_closed = true;
                 }
             }
@@ -1138,6 +1168,7 @@ fn send_refresh(
     manager: &DwarfUnwindManager,
     tx: &mpsc::Sender<PerfWork>,
     new_shard_ids: Vec<u16>,
+    diff: MappingsDiff,
 ) -> Result<(), ()> {
     // Only clone the new shards (not the entire binary_tables)
     let mut shard_updates = Vec::new();
@@ -1147,26 +1178,29 @@ fn send_refresh(
         }
     }
 
-    let proc_info: Vec<(u32, ProcInfo)> = manager.proc_info.iter().map(|(&t, &p)| (t, p)).collect();
     let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
     tracing::debug!(
-        "DWARF refresh: {} new shards with {} total entries",
+        "DWARF refresh: tgid={}, {} new shards ({} entries), +{} -{} mappings",
+        diff.tgid,
         new_shard_ids.len(),
         total_entries,
+        diff.added.len(),
+        diff.removed.len(),
     );
+
+    if shard_updates.is_empty() && diff.is_empty() {
+        return Ok(()); // Nothing to do
+    }
+
     tx.send(PerfWork::DwarfRefresh(DwarfRefreshUpdate {
         shard_updates,
-        proc_info,
+        mapping_diffs: vec![diff],
     }))
     .map_err(|_| ())
 }
 
 /// Apply incremental DWARF unwind table updates to eBPF maps
 fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
-    use aya::maps::HashMap;
-    use profile_bee::ebpf::{ProcInfoKeyPod, ProcInfoPod};
-    use profile_bee_common::ProcInfoKey;
-
     // Create inner maps and insert them into the outer ArrayOfMaps
     if !update.shard_updates.is_empty() {
         // First, create all inner maps (doesn't borrow bpf)
@@ -1213,14 +1247,86 @@ fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
         // created_maps dropped; kernel holds references via the outer map
     }
 
-    if let Some(map) = bpf.map_mut("proc_info") {
-        if let Ok(mut hm) = HashMap::<&mut MapData, ProcInfoKeyPod, ProcInfoPod>::try_from(map) {
-            for (tgid, pi) in &update.proc_info {
-                let key = ProcInfoKeyPod(ProcInfoKey {
-                    tgid: *tgid,
-                    _pad: 0,
-                });
-                let _ = hm.insert(key, ProcInfoPod(*pi), 0);
+    if let Some(map) = bpf.map_mut("exec_mappings") {
+        if let Ok(mut trie) = aya::maps::lpm_trie::LpmTrie::<
+            &mut aya::maps::MapData,
+            profile_bee::ebpf::ExecMappingKeyPod,
+            profile_bee::ebpf::ExecMappingPod,
+        >::try_from(map)
+        {
+            for diff in &update.mapping_diffs {
+                let tgid = diff.tgid;
+
+                // Remove stale entries first
+                for mapping in &diff.removed {
+                    for block in profile_bee::dwarf_unwind::summarize_address_range(
+                        mapping.begin,
+                        mapping.end.saturating_sub(1),
+                    ) {
+                        let key = aya::maps::lpm_trie::Key::new(
+                            64 + block.prefix_len,
+                            profile_bee::ebpf::ExecMappingKeyPod(
+                                profile_bee_common::ExecMappingKey {
+                                    tgid: tgid.to_be(),
+                                    _pad: 0,
+                                    address: block.addr.to_be(),
+                                },
+                            ),
+                        );
+                        // Removal failure is non-fatal (entry may already be gone)
+                        let _ = trie.remove(&key);
+                    }
+                }
+
+                // Insert new entries
+                for mapping in &diff.added {
+                    for block in profile_bee::dwarf_unwind::summarize_address_range(
+                        mapping.begin,
+                        mapping.end.saturating_sub(1),
+                    ) {
+                        let key = aya::maps::lpm_trie::Key::new(
+                            64 + block.prefix_len,
+                            profile_bee::ebpf::ExecMappingKeyPod(
+                                profile_bee_common::ExecMappingKey {
+                                    tgid: tgid.to_be(),
+                                    _pad: 0,
+                                    address: block.addr.to_be(),
+                                },
+                            ),
+                        );
+                        if let Err(e) =
+                            trie.insert(&key, profile_bee::ebpf::ExecMappingPod(*mapping), 0)
+                        {
+                            tracing::warn!(
+                                "LPM trie insert failed: tgid={}, mapping=[{:#x},{:#x}), block addr={:#x} prefix_len={}: {}",
+                                tgid,
+                                mapping.begin,
+                                mapping.end,
+                                block.addr,
+                                block.prefix_len,
+                                e,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Update dwarf_tgids BPF map: add tgids with new mappings, remove exited tgids
+    if let Some(map) = bpf.map_mut("dwarf_tgids") {
+        if let Ok(mut dwarf_tgids) =
+            aya::maps::HashMap::<&mut aya::maps::MapData, u32, u8>::try_from(map)
+        {
+            for diff in &update.mapping_diffs {
+                if !diff.added.is_empty() {
+                    // Process has (new) DWARF data — register for exit tracking
+                    let _ = dwarf_tgids.insert(diff.tgid, 1, 0);
+                }
+                if diff.is_exit {
+                    // Process exited — stop tracking for exit notifications
+                    let _ = dwarf_tgids.remove(&diff.tgid);
+                }
             }
         }
     }
@@ -1237,7 +1343,8 @@ fn process_profiling_data(
     group_by_cpu: bool,
     stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     bpf: &mut Ebpf,
-    tgid_request_tx: &Option<mpsc::Sender<u32>>,
+    tgid_request_tx: &Option<mpsc::Sender<DwarfThreadMsg>>,
+    monitor_exit_pid: Option<u32>,
 ) -> Vec<String> {
     // Local counting
     let mut trace_count = HashMap::<StackInfo, usize>::new();
@@ -1268,7 +1375,7 @@ fn process_profiling_data(
                 // Request DWARF loading for newly seen processes
                 if let Some(tx) = tgid_request_tx {
                     if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
-                        let _ = tx.send(stack.tgid);
+                        let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
                     }
                 }
 
@@ -1298,10 +1405,19 @@ fn process_profiling_data(
             PerfWork::DwarfRefresh(update) => {
                 apply_dwarf_refresh(bpf, update);
             }
-            PerfWork::ProcessExit(_exit_event) => {
-                tracing::info!("process_profiling_data: received ProcessExit, breaking recv loop");
-                // Process exit detected by eBPF - stop profiling
-                break;
+            PerfWork::ProcessExit(exit_event) => {
+                // Forward to DWARF thread for LPM trie cleanup
+                if let Some(tx) = tgid_request_tx {
+                    let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
+                }
+                // Allow PID reuse to trigger a fresh LoadProcess
+                known_tgids.remove(&exit_event.pid);
+                // Only stop profiling if this is the monitored target process
+                if Some(exit_event.pid) == monitor_exit_pid {
+                    tracing::info!("target process {} exited, stopping", exit_event.pid);
+                    break;
+                }
+                tracing::debug!("DWARF-tracked process {} exited", exit_event.pid);
             }
             PerfWork::Stop => {
                 tracing::info!("process_profiling_data: received Stop, breaking recv loop");
@@ -1372,9 +1488,10 @@ fn process_profiling_data_streaming(
     group_by_cpu: bool,
     stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     bpf: &mut Ebpf,
-    tgid_request_tx: &Option<mpsc::Sender<u32>>,
+    tgid_request_tx: &Option<mpsc::Sender<DwarfThreadMsg>>,
     timeout: std::time::Duration,
     stopped: &mut bool,
+    monitor_exit_pid: Option<u32>,
     trace_count: &mut HashMap<StackInfo, usize>,
     known_tgids: &mut std::collections::HashSet<u32>,
 ) -> Vec<String> {
@@ -1404,7 +1521,7 @@ fn process_profiling_data_streaming(
                 }
                 if let Some(tx) = tgid_request_tx {
                     if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
-                        let _ = tx.send(stack.tgid);
+                        let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
                     }
                 }
                 if local_counting {
@@ -1430,10 +1547,16 @@ fn process_profiling_data_streaming(
             Ok(PerfWork::DwarfRefresh(update)) => {
                 apply_dwarf_refresh(bpf, update);
             }
-            Ok(PerfWork::ProcessExit(_)) => {
-                tracing::info!("process_profiling_data_streaming: ProcessExit received");
-                *stopped = true;
-                break;
+            Ok(PerfWork::ProcessExit(exit_event)) => {
+                if let Some(tx) = tgid_request_tx {
+                    let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
+                }
+                known_tgids.remove(&exit_event.pid);
+                if Some(exit_event.pid) == monitor_exit_pid {
+                    tracing::info!("target process {} exited, stopping", exit_event.pid);
+                    *stopped = true;
+                    break;
+                }
             }
             Ok(PerfWork::Stop) => {
                 tracing::info!("process_profiling_data_streaming: Stop received");
@@ -1684,7 +1807,7 @@ fn setup_ebpf_and_dwarf(
     (
         EbpfProfiler,
         aya::maps::RingBuf<aya::maps::MapData>,
-        Option<mpsc::Sender<u32>>,
+        Option<mpsc::Sender<DwarfThreadMsg>>,
     ),
     anyhow::Error,
 > {
@@ -1713,7 +1836,7 @@ fn setup_ebpf_and_dwarf(
             }
         }
 
-        let (tgid_tx, tgid_rx) = mpsc::channel::<u32>();
+        let (tgid_tx, tgid_rx) = mpsc::channel::<DwarfThreadMsg>();
         let refresh_tx = perf_tx.clone();
         let initial_pid = pid;
         std::thread::spawn(move || {
@@ -1743,13 +1866,14 @@ fn setup_ebpf_and_dwarf(
 fn spawn_profiling_thread(
     ebpf_profiler: EbpfProfiler,
     perf_rx: mpsc::Receiver<PerfWork>,
-    tgid_request_tx: Option<mpsc::Sender<u32>>,
+    tgid_request_tx: Option<mpsc::Sender<DwarfThreadMsg>>,
     update_handle: std::sync::Arc<std::sync::Mutex<Option<profile_bee_tui::app::ParsedFlameGraph>>>,
     update_mode_handle: std::sync::Arc<std::sync::Mutex<profile_bee_tui::state::UpdateMode>>,
     web_tx: Option<tokio::sync::broadcast::Sender<String>>,
     stream_mode: u8,
     group_by_cpu: bool,
     tui_refresh_ms: u64,
+    monitor_exit_pid: Option<u32>,
 ) {
     std::thread::spawn(move || {
         let mut profiler = TraceHandler::new();
@@ -1781,7 +1905,7 @@ fn spawn_profiling_thread(
                     Ok(PerfWork::StackInfo(stack)) => {
                         if let Some(tx) = &tgid_request_tx {
                             if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
-                                let _ = tx.send(stack.tgid);
+                                let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
                             }
                         }
 
@@ -1810,9 +1934,21 @@ fn spawn_profiling_thread(
                     Ok(PerfWork::DwarfRefresh(update)) => {
                         apply_dwarf_refresh(&mut bpf, update);
                     }
-                    Ok(PerfWork::ProcessExit(_exit_event)) => {
-                        // Process exit detected by eBPF - stop profiling
-                        return;
+                    Ok(PerfWork::ProcessExit(exit_event)) => {
+                        // Forward to DWARF thread for LPM trie cleanup
+                        if let Some(tx) = &tgid_request_tx {
+                            let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
+                        }
+                        // Allow PID reuse to trigger a fresh LoadProcess
+                        known_tgids.remove(&exit_event.pid);
+                        // Only stop profiling if this is the monitored target process
+                        if Some(exit_event.pid) == monitor_exit_pid {
+                            tracing::info!(
+                                "target process {} exited, stopping TUI",
+                                exit_event.pid
+                            );
+                            return;
+                        }
                     }
                     Ok(PerfWork::Stop) => return,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
@@ -2029,6 +2165,7 @@ async fn run_combined_mode(
         opt.stream_mode,
         opt.group_by_cpu,
         opt.tui_refresh_ms,
+        external_pid,
     );
 
     // TUI event loop
@@ -2094,6 +2231,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         opt.stream_mode,
         opt.group_by_cpu,
         opt.tui_refresh_ms,
+        external_pid,
     );
 
     // TUI event loop

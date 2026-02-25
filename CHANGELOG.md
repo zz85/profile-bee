@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.3.5
+
+### Improvements
+
+- **Replace PROC_INFO HashMap with EXEC_MAPPINGS LPM trie** — O(log n) address-to-mapping lookups replace O(n) linear scan, removing the per-process 8-mapping limit. Supports up to 200K total LPM entries across all processes.
+- **Correct ExecMappingKey alignment** — changed from `#[repr(C, packed)]` to `#[repr(C)]` with explicit padding to avoid unaligned 64-bit access in eBPF and userspace.
+- **Prevent overflow in `summarize_address_range`** — use u128 arithmetic so range-length computation cannot wrap when address ranges approach `u64::MAX`.
+- **DWARF mapping refresh rebuilds from scratch** — process mappings are recomputed each scan instead of cloning and skipping existing ranges, preventing stale shard/load_bias data when memory ranges are reused.
+- **Always propagate exec mapping updates to eBPF** — `send_refresh` is now called after every successful `refresh_process`, not only when new shards are created, ensuring dlopen'd libraries with cached binaries get LPM trie entries (matches lightswitch's approach of unconditionally writing mappings to BPF).
+- **Reduce refresh channel overhead** — `send_refresh` now only clones the changed process's mappings instead of all tracked processes.
+- **Surface LPM trie insert failures** — replaced silent `let _ = trie.insert(...)` with explicit error logging including tgid, mapping range, and block details.
+- **Guard against invalid mapping ranges** — added `debug_assert` to catch corrupted begin/end values before LPM trie population.
+- **Derive LPM key bit-width from struct size** — replaced magic `128` in `LpmKey::new` calls with `EXEC_MAPPING_KEY_BITS` constant derived from `size_of::<ExecMappingKey>()`.
+
+### Tests
+
+- Added 7 unit tests for `summarize_address_range` edge cases (empty range, single address, power-of-two boundaries, near `u64::MAX`, full address space).
+
+### Documentation
+
+- Updated DWARF design docs to reflect LPM trie architecture (replaces old PROC_INFO references).
+
 ## v0.3.2
 
 ### New Features
