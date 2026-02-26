@@ -660,11 +660,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                         target_pid,
                     );
                     if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
-                        eprintln!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
+                        tracing::error!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to load DWARF info for pid {}: {}", target_pid, e);
+                    tracing::error!("Failed to load DWARF info: {}", e);
                 }
             }
         }
@@ -1827,11 +1827,11 @@ fn setup_ebpf_and_dwarf(
                         target_pid,
                     );
                     if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
-                        eprintln!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
+                        tracing::error!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to load DWARF info for pid {}: {}", target_pid, e);
+                    tracing::error!("Failed to load DWARF info: {}", e);
                 }
             }
         }
@@ -2089,8 +2089,8 @@ fn run_tui_event_loop(
             }
             Event::Mouse(mouse_event) => {
                 if mouse_enabled {
-                    let changed =
-                        handle_mouse_events(mouse_event, app).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let changed = handle_mouse_events(mouse_event, app)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     if changed {
                         app.dirty = true;
                     }
