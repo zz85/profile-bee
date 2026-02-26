@@ -1897,11 +1897,17 @@ fn spawn_profiling_thread(
             // Compute local_counting before the loop to avoid double-counting
             let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
-            // Process incoming events with timeout to update periodically
+            // Process incoming events until the refresh deadline, so we
+            // batch samples over the full tui_refresh_ms window instead of
+            // rebuilding the flamegraph on every brief gap in events.
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_millis(tui_refresh_ms);
-            while std::time::Instant::now() < deadline {
-                match perf_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match perf_rx.recv_timeout(remaining) {
                     Ok(PerfWork::StackInfo(stack)) => {
                         if let Some(tx) = &tgid_request_tx {
                             if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
@@ -2083,8 +2089,11 @@ fn run_tui_event_loop(
             }
             Event::Mouse(mouse_event) => {
                 if mouse_enabled {
-                    handle_mouse_events(mouse_event, app).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    app.dirty = true;
+                    let changed =
+                        handle_mouse_events(mouse_event, app).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if changed {
+                        app.dirty = true;
+                    }
                 }
             }
             Event::Resize(_, _) => {

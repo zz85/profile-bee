@@ -190,13 +190,14 @@ pub fn handle_input_buffer(key_event: KeyEvent, app: &mut App) -> AppResult<()> 
 }
 
 /// Handles mouse events and updates the state of [`App`].
-pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<()> {
+/// Returns `Ok(true)` if the event caused a state change requiring a redraw.
+pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<bool> {
     // Only handle mouse events in flamegraph view
     if app.flamegraph_state().view_kind != ViewKind::FlameGraph {
-        return Ok(());
+        return Ok(false);
     }
 
-    match mouse_event.kind {
+    let handled = match mouse_event.kind {
         MouseEventKind::Down(button) => {
             // Handle mouse clicks
             use crossterm::event::MouseButton;
@@ -232,6 +233,7 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
                         // Record this click for double-click detection
                         app.last_click = Some((now, x, y));
                     }
+                    true
                 }
                 MouseButton::Right => {
                     // Right click: zoom into the stack at this position
@@ -241,20 +243,23 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
                         app.flamegraph_view.select_id(&stack_id);
                         app.flamegraph_view.set_zoom();
                     }
+                    true
                 }
-                _ => {}
+                _ => false,
             }
         }
         MouseEventKind::ScrollDown => {
             // Scroll down - move to child stack
             app.flamegraph_view.to_child_stack();
+            true
         }
         MouseEventKind::ScrollUp => {
             // Scroll up - move to parent stack
             app.flamegraph_view.to_parent_stack();
+            true
         }
-        _ => {}
-    }
+        _ => false,
+    };
 
-    Ok(())
+    Ok(handled)
 }

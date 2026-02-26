@@ -462,9 +462,17 @@ impl<'a> FlamelensWidget<'a> {
             name.hash(&mut hasher);
             hasher.finish() as f64 / u64::MAX as f64
         }
+        fn hash_name_seeded(name: &str) -> f64 {
+            let mut hasher = DefaultHasher::new();
+            name.hash(&mut hasher);
+            // Feed an extra constant to produce a second independent hash,
+            // avoiding the `format!("{}#2", name)` allocation per stack.
+            0x517c_c1b7_2722_0a95_u64.hash(&mut hasher);
+            hasher.finish() as f64 / u64::MAX as f64
+        }
         let full_name = self.app.flamegraph().get_stack_full_name_from_info(stack);
         let v1 = hash_name(full_name);
-        let v2 = hash_name(&format!("{}#2", full_name));
+        let v2 = hash_name_seeded(full_name);
         let mut r;
         let mut g;
         let mut b;
