@@ -1900,8 +1900,9 @@ fn spawn_profiling_thread(
             // Process incoming events until the refresh deadline, so we
             // batch samples over the full tui_refresh_ms window instead of
             // rebuilding the flamegraph on every brief gap in events.
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(tui_refresh_ms);
+            // Clamp to 1ms minimum to prevent hot-spinning when tui_refresh_ms == 0.
+            let refresh_ms = tui_refresh_ms.max(1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(refresh_ms);
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
