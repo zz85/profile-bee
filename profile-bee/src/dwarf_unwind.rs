@@ -7,10 +7,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
+use thiserror::Error;
 
 use gimli::{BaseAddresses, CfaRule, EhFrame, NativeEndian, Register, RegisterRule, UnwindSection};
 use object::{Object, ObjectSection};
@@ -20,6 +21,40 @@ use profile_bee_common::{
     CFA_REG_RSP, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
     REG_RULE_UNDEFINED,
 };
+
+/// Errors from the DWARF unwind subsystem.
+#[derive(Error, Debug)]
+pub enum DwarfUnwindError {
+    #[error("failed to stat {path}: {source}")]
+    FileStat {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("failed to read {path}: {source}")]
+    FileRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse ELF: {source}")]
+    ElfParse { source: object::Error },
+
+    #[error("no .eh_frame section in binary")]
+    MissingEhFrame,
+
+    #[error("failed to open process {pid}: {source}")]
+    ProcessOpen { pid: u32, source: procfs::ProcError },
+
+    #[error("failed to read maps for process {pid}: {source}")]
+    ProcessMaps { pid: u32, source: procfs::ProcError },
+
+    #[error("failed to read vDSO for pid {pid}: {source}")]
+    VdsoRead { pid: u32, source: std::io::Error },
+
+    #[error("invalid vDSO address range")]
+    VdsoInvalidRange,
+}
 
 /// Holds binary data either as a memory-mapped file or a heap-allocated buffer (for vdso).
 /// Using mmap avoids copying the entire ELF binary into userspace heap memory,
@@ -55,10 +90,12 @@ struct FileMetadata {
 
 impl FileMetadata {
     /// Extract metadata from a file path using stat()
-    fn from_path(path: &Path) -> Result<Self, String> {
+    fn from_path(path: &Path) -> Result<Self, DwarfUnwindError> {
         use std::os::unix::fs::MetadataExt;
-        let metadata =
-            fs::metadata(path).map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
+        let metadata = fs::metadata(path).map_err(|e| DwarfUnwindError::FileStat {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
         Ok(Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -148,9 +185,11 @@ const X86_64_RA: Register = Register(16);
 /// Generates a compact unwind table from an ELF binary's .eh_frame section
 pub fn generate_unwind_table(
     elf_path: &Path,
-) -> Result<(Vec<UnwindEntry>, Option<BuildId>), String> {
-    let data =
-        fs::read(elf_path).map_err(|e| format!("Failed to read {}: {}", elf_path.display(), e))?;
+) -> Result<(Vec<UnwindEntry>, Option<BuildId>), DwarfUnwindError> {
+    let data = fs::read(elf_path).map_err(|e| DwarfUnwindError::FileRead {
+        path: elf_path.to_path_buf(),
+        source: e,
+    })?;
     generate_unwind_table_from_bytes(&data)
 }
 
@@ -218,19 +257,20 @@ fn classify_cfa_expression(
     }
 }
 
-fn read_vdso(tgid: u32, start: u64, end: u64) -> Result<Vec<u8>, String> {
+fn read_vdso(tgid: u32, start: u64, end: u64) -> Result<Vec<u8>, DwarfUnwindError> {
     use std::io::{Read, Seek, SeekFrom};
     if end <= start {
-        return Err("Invalid vDSO address range".to_string());
+        return Err(DwarfUnwindError::VdsoInvalidRange);
     }
-    let mut f = std::fs::File::open(format!("/proc/{}/mem", tgid))
-        .map_err(|e| format!("Failed to open /proc/{}/mem: {}", tgid, e))?;
-    f.seek(SeekFrom::Start(start))
-        .map_err(|e| format!("Failed to seek to vDSO: {}", e))?;
+    let map_err = |e| DwarfUnwindError::VdsoRead {
+        pid: tgid,
+        source: e,
+    };
+    let mut f = std::fs::File::open(format!("/proc/{}/mem", tgid)).map_err(map_err)?;
+    f.seek(SeekFrom::Start(start)).map_err(map_err)?;
     let len = (end - start) as usize;
     let mut buf = vec![0u8; len];
-    f.read_exact(&mut buf)
-        .map_err(|e| format!("Failed to read vDSO: {}", e))?;
+    f.read_exact(&mut buf).map_err(map_err)?;
     Ok(buf)
 }
 
@@ -287,10 +327,10 @@ fn extract_build_id(data: &[u8]) -> Option<BuildId> {
 
 pub fn generate_unwind_table_from_bytes(
     data: &[u8],
-) -> Result<(Vec<UnwindEntry>, Option<BuildId>), String> {
+) -> Result<(Vec<UnwindEntry>, Option<BuildId>), DwarfUnwindError> {
     use object::ObjectSegment;
 
-    let obj = object::File::parse(data).map_err(|e| format!("Failed to parse ELF: {}", e))?;
+    let obj = object::File::parse(data).map_err(|source| DwarfUnwindError::ElfParse { source })?;
 
     // Extract build ID first
     let build_id = extract_build_id(data);
@@ -306,11 +346,11 @@ pub fn generate_unwind_table_from_bytes(
 
     let eh_frame_section = obj
         .section_by_name(".eh_frame")
-        .ok_or_else(|| "No .eh_frame section found".to_string())?;
+        .ok_or(DwarfUnwindError::MissingEhFrame)?;
 
     let eh_frame_data = eh_frame_section
         .data()
-        .map_err(|e| format!("Failed to read .eh_frame data: {}", e))?;
+        .map_err(|source| DwarfUnwindError::ElfParse { source })?;
 
     let eh_frame_addr = eh_frame_section.address();
 
@@ -495,7 +535,7 @@ impl DwarfUnwindManager {
 
     /// Load unwind information for a process by scanning its memory mappings.
     /// Returns Ok(()) if the process was loaded (or already loaded).
-    pub fn load_process(&mut self, tgid: u32) -> Result<(), String> {
+    pub fn load_process(&mut self, tgid: u32) -> Result<(), DwarfUnwindError> {
         if self.proc_mappings.contains_key(&tgid) {
             return Ok(());
         }
@@ -516,7 +556,10 @@ impl DwarfUnwindManager {
 
     /// Rescan a process's memory mappings and load any new ones.
     /// Returns the list of new shard IDs and the mappings diff.
-    pub fn refresh_process(&mut self, tgid: u32) -> Result<(Vec<u16>, MappingsDiff), String> {
+    pub fn refresh_process(
+        &mut self,
+        tgid: u32,
+    ) -> Result<(Vec<u16>, MappingsDiff), DwarfUnwindError> {
         // Track number of shards before update
         let old_len = self.binary_tables.len();
         let diff = self.scan_and_update(tgid)?;
@@ -543,13 +586,13 @@ impl DwarfUnwindManager {
             .count()
     }
 
-    fn scan_and_update(&mut self, tgid: u32) -> Result<MappingsDiff, String> {
+    fn scan_and_update(&mut self, tgid: u32) -> Result<MappingsDiff, DwarfUnwindError> {
         let process = Process::new(tgid as i32)
-            .map_err(|e| format!("Failed to open process {}: {}", tgid, e))?;
+            .map_err(|source| DwarfUnwindError::ProcessOpen { pid: tgid, source })?;
 
         let maps = process
             .maps()
-            .map_err(|e| format!("Failed to read maps for {}: {}", tgid, e))?;
+            .map_err(|source| DwarfUnwindError::ProcessMaps { pid: tgid, source })?;
 
         // Rebuild mappings from scratch each scan to avoid retaining stale
         // shard_id / load_bias / table_count when address ranges are reused

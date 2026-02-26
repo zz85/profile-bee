@@ -292,8 +292,8 @@ sudo tests/run_e2e.sh --filter dwarf
 ### Frame Pointers Everywhere
 - `.cargo/config.toml` sets `force-frame-pointers=yes` globally. All workspace crates are built with frame pointers for self-profiling support.
 
-### Three Proc-Maps Libraries
-- The codebase uses `procfs`, `procmaps`, and `proc-maps` for `/proc/pid/maps` parsing — legacy debt, not intentional.
+### Proc-Maps Library
+- The codebase uses `procfs` for all `/proc/pid/maps` parsing.
 
 ## Known Limitations (DWARF)
 

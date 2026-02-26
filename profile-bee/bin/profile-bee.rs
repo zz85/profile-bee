@@ -660,11 +660,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                         target_pid,
                     );
                     if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
-                        eprintln!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
+                        tracing::error!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to load DWARF info for pid {}: {}", target_pid, e);
+                    tracing::error!("Failed to load DWARF info: {}", e);
                 }
             }
         }
@@ -1827,11 +1827,11 @@ fn setup_ebpf_and_dwarf(
                         target_pid,
                     );
                     if let Err(e) = ebpf_profiler.load_dwarf_unwind_tables(&dwarf_manager) {
-                        eprintln!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
+                        tracing::error!("Failed to load DWARF unwind tables into eBPF: {:?}", e);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to load DWARF info for pid {}: {}", target_pid, e);
+                    tracing::error!("Failed to load DWARF info: {}", e);
                 }
             }
         }
@@ -1897,11 +1897,18 @@ fn spawn_profiling_thread(
             // Compute local_counting before the loop to avoid double-counting
             let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
-            // Process incoming events with timeout to update periodically
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(tui_refresh_ms);
-            while std::time::Instant::now() < deadline {
-                match perf_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            // Process incoming events until the refresh deadline, so we
+            // batch samples over the full tui_refresh_ms window instead of
+            // rebuilding the flamegraph on every brief gap in events.
+            // Clamp to 1ms minimum to prevent hot-spinning when tui_refresh_ms == 0.
+            let refresh_ms = tui_refresh_ms.max(1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(refresh_ms);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match perf_rx.recv_timeout(remaining) {
                     Ok(PerfWork::StackInfo(stack)) => {
                         if let Some(tx) = &tgid_request_tx {
                             if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
@@ -2083,8 +2090,11 @@ fn run_tui_event_loop(
             }
             Event::Mouse(mouse_event) => {
                 if mouse_enabled {
-                    handle_mouse_events(mouse_event, app).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    app.dirty = true;
+                    let changed = handle_mouse_events(mouse_event, app)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if changed {
+                        app.dirty = true;
+                    }
                 }
             }
             Event::Resize(_, _) => {

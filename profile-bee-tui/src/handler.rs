@@ -190,13 +190,14 @@ pub fn handle_input_buffer(key_event: KeyEvent, app: &mut App) -> AppResult<()> 
 }
 
 /// Handles mouse events and updates the state of [`App`].
-pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<()> {
+/// Returns `Ok(true)` if the event caused a state change requiring a redraw.
+pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<bool> {
     // Only handle mouse events in flamegraph view
     if app.flamegraph_state().view_kind != ViewKind::FlameGraph {
-        return Ok(());
+        return Ok(false);
     }
 
-    match mouse_event.kind {
+    let handled = match mouse_event.kind {
         MouseEventKind::Down(button) => {
             // Handle mouse clicks
             use crossterm::event::MouseButton;
@@ -216,45 +217,67 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
                         false
                     };
 
+                    let mut changed = false;
                     if is_double_click {
                         // Double-click: zoom into the stack (like pressing Enter)
                         if let Some(stack_id) = app.find_stack_at_position(x, y) {
+                            let prev_selected = app.flamegraph_view.state.selected;
+                            let prev_zoom_id =
+                                app.flamegraph_view.state.zoom.as_ref().map(|z| z.stack_id);
                             app.flamegraph_view.select_id(&stack_id);
                             app.flamegraph_view.set_zoom();
+                            let new_zoom_id =
+                                app.flamegraph_view.state.zoom.as_ref().map(|z| z.stack_id);
+                            changed = prev_selected != app.flamegraph_view.state.selected
+                                || prev_zoom_id != new_zoom_id;
                         }
                         // Clear the last click to prevent triple-click issues
                         app.last_click = None;
                     } else {
                         // Single click: select the stack
                         if let Some(stack_id) = app.find_stack_at_position(x, y) {
+                            let prev_selected = app.flamegraph_view.state.selected;
                             app.flamegraph_view.select_id(&stack_id);
+                            changed = prev_selected != app.flamegraph_view.state.selected;
                         }
                         // Record this click for double-click detection
                         app.last_click = Some((now, x, y));
                     }
+                    changed
                 }
                 MouseButton::Right => {
                     // Right click: zoom into the stack at this position
                     let x = mouse_event.column;
                     let y = mouse_event.row;
+                    let mut changed = false;
                     if let Some(stack_id) = app.find_stack_at_position(x, y) {
+                        let prev_selected = app.flamegraph_view.state.selected;
+                        let prev_zoom_id =
+                            app.flamegraph_view.state.zoom.as_ref().map(|z| z.stack_id);
                         app.flamegraph_view.select_id(&stack_id);
                         app.flamegraph_view.set_zoom();
+                        let new_zoom_id =
+                            app.flamegraph_view.state.zoom.as_ref().map(|z| z.stack_id);
+                        changed = prev_selected != app.flamegraph_view.state.selected
+                            || prev_zoom_id != new_zoom_id;
                     }
+                    changed
                 }
-                _ => {}
+                _ => false,
             }
         }
         MouseEventKind::ScrollDown => {
             // Scroll down - move to child stack
             app.flamegraph_view.to_child_stack();
+            true
         }
         MouseEventKind::ScrollUp => {
             // Scroll up - move to parent stack
             app.flamegraph_view.to_parent_stack();
+            true
         }
-        _ => {}
-    }
+        _ => false,
+    };
 
-    Ok(())
+    Ok(handled)
 }
