@@ -17,6 +17,8 @@ use aya::{Btf, Ebpf, EbpfLoader};
 use aya::Pod;
 use profile_bee_common::{ExecMapping, ExecMappingKey, ProcessExitEvent, UnwindEntry};
 
+use crate::dwarf_unwind::{summarize_address_range, DwarfUnwindManager, MappingsDiff};
+
 // Create a newtype wrapper around StackInfo
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
@@ -770,4 +772,173 @@ pub fn create_and_populate_inner_map(
     }
 
     Ok(inner)
+}
+
+/// Incremental DWARF unwind table update.
+/// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
+pub struct DwarfRefreshUpdate {
+    pub shard_updates: Vec<(u16, std::sync::Arc<Vec<UnwindEntry>>)>,
+    pub mapping_diffs: Vec<MappingsDiff>,
+}
+
+/// Build a `DwarfRefreshUpdate` from new shard IDs and a mapping diff,
+/// cloning only the new shard entries (not the entire binary_tables).
+///
+/// Returns `Ok(())` if nothing changed, or sends the update on `tx`.
+/// Returns `Err(())` if the channel is disconnected.
+pub fn build_dwarf_refresh(
+    manager: &DwarfUnwindManager,
+    new_shard_ids: &[u16],
+    diff: MappingsDiff,
+) -> Option<DwarfRefreshUpdate> {
+    let mut shard_updates = Vec::new();
+    for &shard_id in new_shard_ids {
+        if let Some(entries) = manager.binary_tables.get(shard_id as usize) {
+            shard_updates.push((shard_id, std::sync::Arc::clone(entries)));
+        }
+    }
+
+    let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
+    tracing::debug!(
+        "DWARF refresh: tgid={}, {} new shards ({} entries), +{} -{} mappings",
+        diff.tgid,
+        new_shard_ids.len(),
+        total_entries,
+        diff.added.len(),
+        diff.removed.len(),
+    );
+
+    if shard_updates.is_empty() && diff.is_empty() {
+        return None; // Nothing to do
+    }
+
+    Some(DwarfRefreshUpdate {
+        shard_updates,
+        mapping_diffs: vec![diff],
+    })
+}
+
+/// Apply incremental DWARF unwind table updates to eBPF maps.
+///
+/// Updates three maps:
+/// 1. `unwind_shards` ArrayOfMaps — creates inner arrays, inserts into outer map
+/// 2. `exec_mappings` LPM trie — removes stale entries, inserts new ones
+/// 3. `dwarf_tgids` HashMap — registers/unregisters processes for exit tracking
+pub fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
+    // Create inner maps and insert them into the outer ArrayOfMaps
+    if !update.shard_updates.is_empty() {
+        // First, create all inner maps (doesn't borrow bpf)
+        let mut created_maps = Vec::new();
+        for (shard_id, entries) in &update.shard_updates {
+            if entries.is_empty() {
+                continue;
+            }
+            match create_and_populate_inner_map(*shard_id, entries) {
+                Ok(inner_array) => {
+                    created_maps.push((*shard_id, inner_array));
+                }
+                Err(e) => {
+                    tracing::warn!("DWARF refresh: failed to create shard_{}: {}", shard_id, e);
+                }
+            }
+        }
+
+        // Then, get the outer ArrayOfMaps and insert all inner maps
+        if !created_maps.is_empty() {
+            let mut insert = || -> Result<(), ()> {
+                let map = bpf.map_mut("unwind_shards").ok_or_else(|| {
+                    tracing::warn!("DWARF refresh: unwind_shards map not found");
+                })?;
+                let mut outer: aya::maps::ArrayOfMaps<
+                    &mut MapData,
+                    Array<MapData, UnwindEntryPod>,
+                > = aya::maps::ArrayOfMaps::try_from(map).map_err(|e| {
+                    tracing::warn!("DWARF refresh: unwind_shards is not ArrayOfMaps: {}", e);
+                })?;
+                for (shard_id, inner_array) in &created_maps {
+                    if let Err(e) = outer.set(*shard_id as u32, inner_array, 0) {
+                        tracing::warn!(
+                            "DWARF refresh: failed to insert shard_{} into outer map: {}",
+                            shard_id,
+                            e
+                        );
+                    }
+                }
+                Ok(())
+            };
+            let _ = insert();
+        }
+        // created_maps dropped; kernel holds references via the outer map
+    }
+
+    if let Some(map) = bpf.map_mut("exec_mappings") {
+        if let Ok(mut trie) =
+            LpmTrie::<&mut MapData, ExecMappingKeyPod, ExecMappingPod>::try_from(map)
+        {
+            for diff in &update.mapping_diffs {
+                let tgid = diff.tgid;
+
+                // Remove stale entries first
+                for mapping in &diff.removed {
+                    for block in
+                        summarize_address_range(mapping.begin, mapping.end.saturating_sub(1))
+                    {
+                        let key = LpmKey::new(
+                            64 + block.prefix_len,
+                            ExecMappingKeyPod(ExecMappingKey {
+                                tgid: tgid.to_be(),
+                                _pad: 0,
+                                address: block.addr.to_be(),
+                            }),
+                        );
+                        // Removal failure is non-fatal (entry may already be gone)
+                        let _ = trie.remove(&key);
+                    }
+                }
+
+                // Insert new entries
+                for mapping in &diff.added {
+                    for block in
+                        summarize_address_range(mapping.begin, mapping.end.saturating_sub(1))
+                    {
+                        let key = LpmKey::new(
+                            64 + block.prefix_len,
+                            ExecMappingKeyPod(ExecMappingKey {
+                                tgid: tgid.to_be(),
+                                _pad: 0,
+                                address: block.addr.to_be(),
+                            }),
+                        );
+                        if let Err(e) = trie.insert(&key, ExecMappingPod(*mapping), 0) {
+                            tracing::warn!(
+                                "LPM trie insert failed: tgid={}, mapping=[{:#x},{:#x}), block addr={:#x} prefix_len={}: {}",
+                                tgid,
+                                mapping.begin,
+                                mapping.end,
+                                block.addr,
+                                block.prefix_len,
+                                e,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Update dwarf_tgids BPF map: add tgids with new mappings, remove exited tgids
+    if let Some(map) = bpf.map_mut("dwarf_tgids") {
+        if let Ok(mut dwarf_tgids) = HashMap::<&mut MapData, u32, u8>::try_from(map) {
+            for diff in &update.mapping_diffs {
+                if !diff.added.is_empty() {
+                    // Process has (new) DWARF data — register for exit tracking
+                    let _ = dwarf_tgids.insert(diff.tgid, 1, 0);
+                }
+                if diff.is_exit {
+                    // Process exited — stop tracking for exit notifications
+                    let _ = dwarf_tgids.remove(&diff.tgid);
+                }
+            }
+        }
+    }
 }

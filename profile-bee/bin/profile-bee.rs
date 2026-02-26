@@ -8,22 +8,21 @@ use profile_bee::ebpf::{
     attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
 };
 use profile_bee::ebpf::{
-    setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig, SmartUProbeConfig,
-    StackInfoPod,
+    apply_dwarf_refresh, build_dwarf_refresh, setup_ebpf_profiler, setup_ring_buffer,
+    DwarfRefreshUpdate, EbpfProfiler, ProfilerConfig, SmartUProbeConfig, StackInfoPod,
 };
 use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, ResolvedProbe};
 use profile_bee::probe_spec::parse_probe_spec;
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
-use profile_bee_common::{ProcessExitEvent, StackInfo, UnwindEntry, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{ProcessExitEvent, StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Instant;
 
 use profile_bee::types::FrameCount;
@@ -42,13 +41,6 @@ enum DwarfThreadMsg {
     LoadProcess(u32),
     /// Process exited — clean up mappings and LPM trie entries
     ProcessExited(u32),
-}
-
-/// Incremental DWARF unwind table update
-/// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
-struct DwarfRefreshUpdate {
-    shard_updates: Vec<(u16, Arc<Vec<UnwindEntry>>)>, // (shard_id, entries) for new shards
-    mapping_diffs: Vec<MappingsDiff>,                 // per-process added/removed mappings
 }
 
 #[derive(Debug, Parser)]
@@ -1170,165 +1162,10 @@ fn send_refresh(
     new_shard_ids: Vec<u16>,
     diff: MappingsDiff,
 ) -> Result<(), ()> {
-    // Only clone the new shards (not the entire binary_tables)
-    let mut shard_updates = Vec::new();
-    for &shard_id in &new_shard_ids {
-        if let Some(entries) = manager.binary_tables.get(shard_id as usize) {
-            shard_updates.push((shard_id, Arc::clone(entries)));
-        }
-    }
-
-    let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
-    tracing::debug!(
-        "DWARF refresh: tgid={}, {} new shards ({} entries), +{} -{} mappings",
-        diff.tgid,
-        new_shard_ids.len(),
-        total_entries,
-        diff.added.len(),
-        diff.removed.len(),
-    );
-
-    if shard_updates.is_empty() && diff.is_empty() {
-        return Ok(()); // Nothing to do
-    }
-
-    tx.send(PerfWork::DwarfRefresh(DwarfRefreshUpdate {
-        shard_updates,
-        mapping_diffs: vec![diff],
-    }))
-    .map_err(|_| ())
-}
-
-/// Apply incremental DWARF unwind table updates to eBPF maps
-fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
-    // Create inner maps and insert them into the outer ArrayOfMaps
-    if !update.shard_updates.is_empty() {
-        // First, create all inner maps (doesn't borrow bpf)
-        let mut created_maps = Vec::new();
-        for (shard_id, entries) in &update.shard_updates {
-            if entries.is_empty() {
-                continue;
-            }
-            match profile_bee::ebpf::create_and_populate_inner_map(*shard_id, entries) {
-                Ok(inner_array) => {
-                    created_maps.push((*shard_id, inner_array));
-                }
-                Err(e) => {
-                    tracing::warn!("DWARF refresh: failed to create shard_{}: {}", shard_id, e);
-                }
-            }
-        }
-
-        // Then, get the outer ArrayOfMaps and insert all inner maps
-        if !created_maps.is_empty() {
-            let mut insert = || -> Result<(), ()> {
-                let map = bpf.map_mut("unwind_shards").ok_or_else(|| {
-                    tracing::warn!("DWARF refresh: unwind_shards map not found");
-                })?;
-                let mut outer: aya::maps::ArrayOfMaps<
-                    &mut aya::maps::MapData,
-                    aya::maps::Array<aya::maps::MapData, profile_bee::ebpf::UnwindEntryPod>,
-                > = aya::maps::ArrayOfMaps::try_from(map).map_err(|e| {
-                    tracing::warn!("DWARF refresh: unwind_shards is not ArrayOfMaps: {}", e);
-                })?;
-                for (shard_id, inner_array) in &created_maps {
-                    if let Err(e) = outer.set(*shard_id as u32, inner_array, 0) {
-                        tracing::warn!(
-                            "DWARF refresh: failed to insert shard_{} into outer map: {}",
-                            shard_id,
-                            e
-                        );
-                    }
-                }
-                Ok(())
-            };
-            let _ = insert();
-        }
-        // created_maps dropped; kernel holds references via the outer map
-    }
-
-    if let Some(map) = bpf.map_mut("exec_mappings") {
-        if let Ok(mut trie) = aya::maps::lpm_trie::LpmTrie::<
-            &mut aya::maps::MapData,
-            profile_bee::ebpf::ExecMappingKeyPod,
-            profile_bee::ebpf::ExecMappingPod,
-        >::try_from(map)
-        {
-            for diff in &update.mapping_diffs {
-                let tgid = diff.tgid;
-
-                // Remove stale entries first
-                for mapping in &diff.removed {
-                    for block in profile_bee::dwarf_unwind::summarize_address_range(
-                        mapping.begin,
-                        mapping.end.saturating_sub(1),
-                    ) {
-                        let key = aya::maps::lpm_trie::Key::new(
-                            64 + block.prefix_len,
-                            profile_bee::ebpf::ExecMappingKeyPod(
-                                profile_bee_common::ExecMappingKey {
-                                    tgid: tgid.to_be(),
-                                    _pad: 0,
-                                    address: block.addr.to_be(),
-                                },
-                            ),
-                        );
-                        // Removal failure is non-fatal (entry may already be gone)
-                        let _ = trie.remove(&key);
-                    }
-                }
-
-                // Insert new entries
-                for mapping in &diff.added {
-                    for block in profile_bee::dwarf_unwind::summarize_address_range(
-                        mapping.begin,
-                        mapping.end.saturating_sub(1),
-                    ) {
-                        let key = aya::maps::lpm_trie::Key::new(
-                            64 + block.prefix_len,
-                            profile_bee::ebpf::ExecMappingKeyPod(
-                                profile_bee_common::ExecMappingKey {
-                                    tgid: tgid.to_be(),
-                                    _pad: 0,
-                                    address: block.addr.to_be(),
-                                },
-                            ),
-                        );
-                        if let Err(e) =
-                            trie.insert(&key, profile_bee::ebpf::ExecMappingPod(*mapping), 0)
-                        {
-                            tracing::warn!(
-                                "LPM trie insert failed: tgid={}, mapping=[{:#x},{:#x}), block addr={:#x} prefix_len={}: {}",
-                                tgid,
-                                mapping.begin,
-                                mapping.end,
-                                block.addr,
-                                block.prefix_len,
-                                e,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Update dwarf_tgids BPF map: add tgids with new mappings, remove exited tgids
-    if let Some(map) = bpf.map_mut("dwarf_tgids") {
-        if let Ok(mut dwarf_tgids) =
-            aya::maps::HashMap::<&mut aya::maps::MapData, u32, u8>::try_from(map)
-        {
-            for diff in &update.mapping_diffs {
-                if !diff.added.is_empty() {
-                    // Process has (new) DWARF data — register for exit tracking
-                    let _ = dwarf_tgids.insert(diff.tgid, 1, 0);
-                }
-                if diff.is_exit {
-                    // Process exited — stop tracking for exit notifications
-                    let _ = dwarf_tgids.remove(&diff.tgid);
-                }
-            }
-        }
+    if let Some(update) = build_dwarf_refresh(manager, &new_shard_ids, diff) {
+        tx.send(PerfWork::DwarfRefresh(update)).map_err(|_| ())
+    } else {
+        Ok(())
     }
 }
 
