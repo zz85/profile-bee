@@ -3,15 +3,15 @@ use aya::Ebpf;
 use clap::Parser;
 use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
-use profile_bee::dwarf_unwind::MappingsDiff;
+use profile_bee::ebpf::{
+    apply_dwarf_refresh, setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig,
+    SmartUProbeConfig, StackInfoPod,
+};
 use profile_bee::ebpf::{
     attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
 };
-use profile_bee::ebpf::{
-    apply_dwarf_refresh, build_dwarf_refresh, setup_ebpf_profiler, setup_ring_buffer,
-    DwarfRefreshUpdate, EbpfProfiler, ProfilerConfig, SmartUProbeConfig, StackInfoPod,
-};
 use profile_bee::html::{collapse_to_json, generate_html_file};
+use profile_bee::pipeline::{dwarf_refresh_loop, DwarfThreadMsg, PerfWork};
 use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, ResolvedProbe};
 use profile_bee::probe_spec::parse_probe_spec;
 use profile_bee::spawn::{SpawnProcess, StopHandler};
@@ -26,22 +26,6 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use profile_bee::types::FrameCount;
-
-/// Message type for the profiler's communication channel
-enum PerfWork {
-    StackInfo(StackInfo),
-    DwarfRefresh(DwarfRefreshUpdate),
-    ProcessExit(ProcessExitEvent),
-    Stop,
-}
-
-/// Message type for the DWARF background thread
-enum DwarfThreadMsg {
-    /// New process to load DWARF data for
-    LoadProcess(u32),
-    /// Process exited — clean up mappings and LPM trie entries
-    ProcessExited(u32),
-}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1054,119 +1038,6 @@ async fn setup_process_exit_ring_buffer_task(
     }
 
     Ok(())
-}
-
-/// Background thread: handles dlopen rescans and new process DWARF loading
-fn dwarf_refresh_loop(
-    mut manager: DwarfUnwindManager,
-    initial_pid: Option<u32>,
-    tgid_rx: mpsc::Receiver<DwarfThreadMsg>,
-    tx: mpsc::Sender<PerfWork>,
-) {
-    let mut tracked_pids: Vec<u32> = initial_pid.into_iter().collect();
-    let mut last_maps_mtime: HashMap<u32, Option<std::time::SystemTime>> = HashMap::new();
-
-    // Record initial mtime for pre-loaded PIDs so the first retain cycle
-    // doesn't redundantly call refresh_process on them.
-    for &pid in &tracked_pids {
-        let maps_path = format!("/proc/{}/maps", pid);
-        let mtime = std::fs::metadata(&maps_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        last_maps_mtime.insert(pid, mtime);
-    }
-
-    loop {
-        // Drain all pending messages (non-blocking)
-        while let Ok(msg) = tgid_rx.try_recv() {
-            match msg {
-                DwarfThreadMsg::LoadProcess(new_tgid) => {
-                    if !tracked_pids.contains(&new_tgid) {
-                        tracked_pids.push(new_tgid);
-                        let maps_path = format!("/proc/{}/maps", new_tgid);
-                        let pre_refresh_mtime = std::fs::metadata(&maps_path)
-                            .ok()
-                            .and_then(|m| m.modified().ok());
-                        if let Ok((new_shard_ids, diff)) = manager.refresh_process(new_tgid) {
-                            if send_refresh(&manager, &tx, new_shard_ids, diff).is_err() {
-                                return;
-                            }
-                        }
-                        last_maps_mtime.insert(new_tgid, pre_refresh_mtime);
-                    }
-                }
-                DwarfThreadMsg::ProcessExited(tgid) => {
-                    tracing::debug!("DWARF thread: process {} exited, cleaning up", tgid);
-                    if let Some(removal_diff) = manager.remove_process(tgid) {
-                        if send_refresh(&manager, &tx, vec![], removal_diff).is_err() {
-                            return;
-                        }
-                    }
-                    tracked_pids.retain(|&p| p != tgid);
-                    last_maps_mtime.remove(&tgid);
-                }
-            }
-        }
-
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
-        // Periodic rescan of all tracked processes for dlopen'd libraries.
-        // Prune exited PIDs to avoid stat'ing non-existent /proc entries.
-        let mut channel_closed = false;
-        tracked_pids.retain(|&pid| {
-            if channel_closed {
-                return true; // stop processing, will exit after retain
-            }
-
-            let maps_path = format!("/proc/{}/maps", pid);
-            let current_mtime = match std::fs::metadata(&maps_path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Process exited — /proc/[pid]/maps no longer exists
-                    last_maps_mtime.remove(&pid);
-                    return false; // remove from tracked_pids
-                }
-                Err(_) => {
-                    // Other I/O error (permission, etc.) — keep PID, skip this cycle
-                    return true;
-                }
-                Ok(metadata) => metadata.modified().ok(),
-            };
-
-            // Skip rescan if /proc/[pid]/maps hasn't changed
-            if let Some(Some(last_ts)) = last_maps_mtime.get(&pid) {
-                if current_mtime.as_ref() == Some(last_ts) {
-                    return true; // keep PID, skip rescan
-                }
-            }
-
-            if let Ok((new_shard_ids, diff)) = manager.refresh_process(pid) {
-                // Always send — mapping changes (e.g. dlopen of a cached
-                // binary) need LPM trie updates even without new shards.
-                if send_refresh(&manager, &tx, new_shard_ids, diff).is_err() {
-                    channel_closed = true;
-                }
-            }
-            last_maps_mtime.insert(pid, current_mtime);
-            true // keep PID
-        });
-
-        if channel_closed {
-            return;
-        }
-    }
-}
-
-fn send_refresh(
-    manager: &DwarfUnwindManager,
-    tx: &mpsc::Sender<PerfWork>,
-    new_shard_ids: Vec<u16>,
-    diff: MappingsDiff,
-) -> Result<(), ()> {
-    if let Some(update) = build_dwarf_refresh(manager, &new_shard_ids, diff) {
-        tx.send(PerfWork::DwarfRefresh(update)).map_err(|_| ())
-    } else {
-        Ok(())
-    }
 }
 
 // Processes the profiling data collected from eBPF
