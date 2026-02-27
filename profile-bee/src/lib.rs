@@ -11,6 +11,7 @@ pub mod types;
 
 pub mod dwarf_unwind;
 
+pub mod output;
 pub mod pipeline;
 
 pub mod probe_resolver;

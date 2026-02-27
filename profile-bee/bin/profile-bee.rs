@@ -1,16 +1,18 @@
 use aya::maps::{MapData, RingBuf, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
-use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
+use profile_bee::ebpf::{
+    attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
+};
 use profile_bee::ebpf::{
     apply_dwarf_refresh, setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig,
     SmartUProbeConfig, StackInfoPod,
 };
-use profile_bee::ebpf::{
-    attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
+use profile_bee::html::collapse_to_json;
+use profile_bee::output::{
+    CollapseSink, HtmlSink, JsonFileSink, MultiplexSink, OutputSink, SvgSink, WebBroadcastSink,
 };
-use profile_bee::html::{collapse_to_json, generate_html_file};
 use profile_bee::pipeline::{dwarf_refresh_loop, DwarfThreadMsg, PerfWork};
 use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, ResolvedProbe};
 use profile_bee::probe_spec::parse_probe_spec;
@@ -728,6 +730,37 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let started = Instant::now();
 
+    // Build output sink from CLI options
+    let mut sinks: Vec<Box<dyn OutputSink>> = Vec::new();
+    if let Some(svg_path) = &opt.svg {
+        let title = if opt.off_cpu {
+            format!(
+                "Off-CPU Time Flame Graph ({}ms, finish_task_switch)",
+                opt.time.unwrap_or(10000)
+            )
+        } else {
+            format!(
+                "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
+                opt.time.unwrap_or(10000),
+                opt.frequency
+            )
+        };
+        sinks.push(Box::new(SvgSink::new(svg_path.clone(), title, opt.off_cpu)));
+    }
+    if let Some(html_path) = &opt.html {
+        sinks.push(Box::new(HtmlSink::new(html_path.clone())));
+    }
+    if let Some(json_path) = &opt.json {
+        sinks.push(Box::new(JsonFileSink::new(json_path.clone())));
+    }
+    if let Some(collapse_path) = &opt.collapse {
+        sinks.push(Box::new(CollapseSink::new(collapse_path.clone())));
+    }
+    if opt.serve {
+        sinks.push(Box::new(WebBroadcastSink::new(tx)));
+    }
+    let mut sink = MultiplexSink::new(sinks);
+
     if opt.serve {
         // Serve mode: periodically flush data to the web server instead of
         // blocking until Stop. This ensures the web UI gets live updates.
@@ -736,6 +769,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         let mut stopped = false;
         let mut trace_count = HashMap::<StackInfo, usize>::new();
         let mut known_tgids = std::collections::HashSet::<u32>::new();
+        let mut last_stacks = Vec::new();
 
         while !stopped {
             tracing::debug!("serve loop: collecting samples for {:?}", flush_interval);
@@ -760,8 +794,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 stacks.len(),
                 stopped
             );
-            output_results(&opt, &stacks, &tx, stopped)?;
+            sink.write_batch(&stacks)?;
+            last_stacks = stacks;
         }
+        sink.finish(&last_stacks)?;
     } else {
         // Non-serve mode: block until Stop, output once, exit.
         tracing::debug!("batch mode: calling process_profiling_data (blocks until Stop)");
@@ -781,7 +817,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             "batch mode: process_profiling_data returned {} stacks",
             stacks.len()
         );
-        output_results(&opt, &stacks, &tx, true)?;
+        sink.write_batch(&stacks)?;
+        sink.finish(&stacks)?;
     }
 
     drop(stopper);
@@ -1382,89 +1419,6 @@ fn parse_update_mode(mode: &str) -> profile_bee_tui::state::UpdateMode {
         "decay" => UpdateMode::Decay,
         _ => UpdateMode::Accumulate, // default
     }
-}
-
-/// Outputs the results in the requested formats
-fn output_results(
-    opt: &Opt,
-    stacks: &[String],
-    tx: &tokio::sync::broadcast::Sender<String>,
-    final_flush: bool,
-) -> anyhow::Result<()> {
-    // Generate SVG if requested (only on final flush)
-    if final_flush {
-        if let Some(svg) = &opt.svg {
-            let title = if opt.off_cpu {
-                format!(
-                    "Off-CPU Time Flame Graph ({}ms, finish_task_switch)",
-                    opt.time.unwrap_or(10000)
-                )
-            } else {
-                format!(
-                    "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
-                    opt.time.unwrap_or(10000),
-                    opt.frequency
-                )
-            };
-            output_svg(svg, stacks, title, opt.off_cpu).map_err(|e| {
-                println!("Failed to write svg file {:?} - {:?}", e, svg);
-                e
-            })?;
-        }
-    }
-
-    // Generate HTML/JSON if requested
-    if opt.html.is_some() || opt.json.is_some() || opt.serve {
-        let json = collapse_to_json(&stacks.iter().map(|v| v.as_str()).collect::<Vec<_>>());
-        tracing::debug!("output_results: generated JSON ({} bytes)", json.len());
-
-        if final_flush {
-            if let Some(json_path) = &opt.json {
-                std::fs::write(json_path, &json)
-                    .map_err(|e| anyhow::anyhow!("Unable to write JSON file: {}", e))?;
-            }
-
-            if let Some(html_path) = &opt.html {
-                generate_html_file(html_path, &json);
-            }
-        }
-
-        if let Err(e) = tx.send(json) {
-            tracing::warn!(
-                "output_results: broadcast send failed (no receivers?): {:?}",
-                e
-            );
-        } else {
-            tracing::debug!(
-                "output_results: broadcast sent to {} receivers",
-                tx.receiver_count()
-            );
-        }
-    }
-
-    // Write collapsed stacks if requested (only on final flush)
-    if final_flush {
-        if let Some(name) = &opt.collapse {
-            println!("Writing to file: {}", name.display());
-            std::fs::write(name, stacks.join("\n"))
-                .map_err(|e| anyhow::anyhow!("Unable to write stack collapsed file: {}", e))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Creates a flamegraph svg file using the inferno-flamegraph lib
-fn output_svg(path: &PathBuf, str: &[String], title: String, off_cpu: bool) -> anyhow::Result<()> {
-    let mut svg_opts = Options::default();
-    svg_opts.title = title;
-    if off_cpu {
-        svg_opts.count_name = "us".to_string();
-    }
-    let mut svg_file = std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(path)?);
-    flamegraph::from_lines(&mut svg_opts, str.iter().map(|v| v.as_str()), &mut svg_file)?;
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
