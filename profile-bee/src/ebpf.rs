@@ -1,6 +1,6 @@
 use std::os::fd::{AsFd, AsRawFd};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Result};
 use aya::maps::lpm_trie::{Key as LpmKey, LpmTrie};
 use aya::maps::{
     Array, HashMap, InnerMap, MapData, PerCpuArray, PerCpuValues, ProgramArray, RingBuf,
@@ -827,7 +827,9 @@ pub fn build_dwarf_refresh(
 /// 1. `unwind_shards` ArrayOfMaps — creates inner arrays, inserts into outer map
 /// 2. `exec_mappings` LPM trie — removes stale entries, inserts new ones
 /// 3. `dwarf_tgids` HashMap — registers/unregisters processes for exit tracking
-pub fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
+pub fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) -> Result<()> {
+    let mut failures: usize = 0;
+
     // Create inner maps and insert them into the outer ArrayOfMaps
     if !update.shard_updates.is_empty() {
         // First, create all inner maps (doesn't borrow bpf)
@@ -842,34 +844,40 @@ pub fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
                 }
                 Err(e) => {
                     tracing::warn!("DWARF refresh: failed to create shard_{}: {}", shard_id, e);
+                    failures += 1;
                 }
             }
         }
 
         // Then, get the outer ArrayOfMaps and insert all inner maps
         if !created_maps.is_empty() {
-            let mut insert = || -> Result<(), ()> {
-                let map = bpf.map_mut("unwind_shards").ok_or_else(|| {
-                    tracing::warn!("DWARF refresh: unwind_shards map not found");
-                })?;
-                let mut outer: aya::maps::ArrayOfMaps<
+            if let Some(map) = bpf.map_mut("unwind_shards") {
+                match aya::maps::ArrayOfMaps::<
                     &mut MapData,
                     Array<MapData, UnwindEntryPod>,
-                > = aya::maps::ArrayOfMaps::try_from(map).map_err(|e| {
-                    tracing::warn!("DWARF refresh: unwind_shards is not ArrayOfMaps: {}", e);
-                })?;
-                for (shard_id, inner_array) in &created_maps {
-                    if let Err(e) = outer.set(*shard_id as u32, inner_array, 0) {
-                        tracing::warn!(
-                            "DWARF refresh: failed to insert shard_{} into outer map: {}",
-                            shard_id,
-                            e
-                        );
+                >::try_from(map)
+                {
+                    Ok(mut outer) => {
+                        for (shard_id, inner_array) in &created_maps {
+                            if let Err(e) = outer.set(*shard_id as u32, inner_array, 0) {
+                                tracing::warn!(
+                                    "DWARF refresh: failed to insert shard_{} into outer map: {}",
+                                    shard_id,
+                                    e
+                                );
+                                failures += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("DWARF refresh: unwind_shards is not ArrayOfMaps: {}", e);
+                        failures += created_maps.len();
                     }
                 }
-                Ok(())
-            };
-            let _ = insert();
+            } else {
+                tracing::warn!("DWARF refresh: unwind_shards map not found");
+                failures += created_maps.len();
+            }
         }
         // created_maps dropped; kernel holds references via the outer map
     }
@@ -922,11 +930,18 @@ pub fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
                                 block.prefix_len,
                                 e,
                             );
+                            failures += 1;
                         }
                     }
                 }
             }
+        } else {
+            tracing::warn!("DWARF refresh: exec_mappings is not LpmTrie");
+            failures += 1;
         }
+    } else if update.mapping_diffs.iter().any(|d| !d.is_empty()) {
+        tracing::warn!("DWARF refresh: exec_mappings map not found");
+        failures += 1;
     }
 
     // Update dwarf_tgids BPF map: add tgids with new mappings, remove exited tgids
@@ -942,6 +957,21 @@ pub fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
                     let _ = dwarf_tgids.remove(&diff.tgid);
                 }
             }
+        } else {
+            tracing::warn!("DWARF refresh: dwarf_tgids is not HashMap");
+            failures += 1;
         }
+    } else if update
+        .mapping_diffs
+        .iter()
+        .any(|d| !d.added.is_empty() || d.is_exit)
+    {
+        tracing::warn!("DWARF refresh: dwarf_tgids map not found");
+        failures += 1;
     }
+
+    if failures > 0 {
+        anyhow::bail!("DWARF refresh completed with {} failure(s)", failures);
+    }
+    Ok(())
 }

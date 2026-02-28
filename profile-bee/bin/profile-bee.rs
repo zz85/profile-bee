@@ -1181,7 +1181,9 @@ fn collect_and_format_stacks(
                 }
             }
             PerfWork::DwarfRefresh(update) => {
-                apply_dwarf_refresh(bpf, update);
+                if let Err(e) = apply_dwarf_refresh(bpf, update) {
+                    tracing::warn!("{:#}", e);
+                }
             }
             PerfWork::ProcessExit(exit_event) => {
                 if let Some(tx) = tgid_request_tx {
@@ -1435,7 +1437,9 @@ fn spawn_profiling_thread(
                         }
                     }
                     Ok(PerfWork::DwarfRefresh(update)) => {
-                        apply_dwarf_refresh(&mut bpf, update);
+                        if let Err(e) = apply_dwarf_refresh(&mut bpf, update) {
+                            tracing::warn!("{:#}", e);
+                        }
                     }
                     Ok(PerfWork::ProcessExit(exit_event)) => {
                         // Forward to DWARF thread for LPM trie cleanup

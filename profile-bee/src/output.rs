@@ -43,17 +43,35 @@ impl MultiplexSink {
 
 impl OutputSink for MultiplexSink {
     fn write_batch(&mut self, stacks: &[String]) -> Result<()> {
+        let mut first_err: Option<anyhow::Error> = None;
         for sink in &mut self.sinks {
-            sink.write_batch(stacks)?;
+            if let Err(e) = sink.write_batch(stacks) {
+                tracing::warn!("MultiplexSink: write_batch error: {:#}", e);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
+        let mut first_err: Option<anyhow::Error> = None;
         for sink in &mut self.sinks {
-            sink.finish(final_stacks)?;
+            if let Err(e) = sink.finish(final_stacks) {
+                tracing::warn!("MultiplexSink: finish error: {:#}", e);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
