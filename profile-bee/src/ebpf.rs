@@ -784,8 +784,11 @@ pub struct DwarfRefreshUpdate {
 /// Build a `DwarfRefreshUpdate` from new shard IDs and a mapping diff,
 /// cloning only the new shard entries (not the entire binary_tables).
 ///
-/// Returns `Ok(())` if nothing changed, or sends the update on `tx`.
-/// Returns `Err(())` if the channel is disconnected.
+/// Uses the [`DwarfUnwindManager`]'s `binary_tables`, `new_shard_ids`, and
+/// [`MappingsDiff`] to construct a [`DwarfRefreshUpdate`].
+///
+/// Returns `Some(DwarfRefreshUpdate)` when there is a change, or `None`
+/// when nothing changed (no new shards and the diff is empty).
 pub fn build_dwarf_refresh(
     manager: &DwarfUnwindManager,
     new_shard_ids: &[u16],

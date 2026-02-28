@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use inferno::flamegraph::{self, Options};
 
 use crate::html::{collapse_to_json, generate_html_file};
@@ -110,7 +110,7 @@ impl HtmlSink {
 impl OutputSink for HtmlSink {
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
         let json = collapse_to_json(&final_stacks.iter().map(|v| v.as_str()).collect::<Vec<_>>());
-        generate_html_file(&self.path, &json);
+        generate_html_file(&self.path, &json).context("Unable to write HTML flamegraph file")?;
         Ok(())
     }
 }
@@ -129,8 +129,7 @@ impl JsonFileSink {
 impl OutputSink for JsonFileSink {
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
         let json = collapse_to_json(&final_stacks.iter().map(|v| v.as_str()).collect::<Vec<_>>());
-        std::fs::write(&self.path, &json)
-            .map_err(|e| anyhow::anyhow!("Unable to write JSON file: {}", e))?;
+        std::fs::write(&self.path, &json).context("Unable to write JSON file")?;
         Ok(())
     }
 }
@@ -148,9 +147,9 @@ impl CollapseSink {
 
 impl OutputSink for CollapseSink {
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
-        println!("Writing to file: {}", self.path.display());
+        tracing::info!("Writing to file: {}", self.path.display());
         std::fs::write(&self.path, final_stacks.join("\n"))
-            .map_err(|e| anyhow::anyhow!("Unable to write stack collapsed file: {}", e))?;
+            .context("Unable to write stack collapsed file")?;
         Ok(())
     }
 }
@@ -182,5 +181,10 @@ impl OutputSink for WebBroadcastSink {
             );
         }
         Ok(())
+    }
+
+    fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
+        // Forward the final batch so web clients see the last data snapshot.
+        self.write_batch(final_stacks)
     }
 }

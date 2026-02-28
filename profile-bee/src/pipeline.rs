@@ -91,8 +91,11 @@ pub fn dwarf_refresh_loop(
                             if !send_refresh(&manager, &tx, new_shard_ids, diff) {
                                 return;
                             }
+                            // Only record mtime after a successful refresh/send so
+                            // failed refreshes will be retried when /proc/<pid>/maps
+                            // mtime changes on the next periodic rescan.
+                            last_maps_mtime.insert(new_tgid, pre_refresh_mtime);
                         }
-                        last_maps_mtime.insert(new_tgid, pre_refresh_mtime);
                     }
                 }
                 DwarfThreadMsg::ProcessExited(tgid) => {
@@ -121,7 +124,13 @@ pub fn dwarf_refresh_loop(
             let maps_path = format!("/proc/{}/maps", pid);
             let current_mtime = match std::fs::metadata(&maps_path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Process exited — /proc/[pid]/maps no longer exists
+                    // Process exited — /proc/[pid]/maps no longer exists.
+                    // Clean up DWARF/LPM state for this process.
+                    if let Some(removal_diff) = manager.remove_process(pid) {
+                        if !send_refresh(&manager, &tx, vec![], removal_diff) {
+                            channel_closed = true;
+                        }
+                    }
                     last_maps_mtime.remove(&pid);
                     return false; // remove from tracked_pids
                 }
@@ -145,8 +154,10 @@ pub fn dwarf_refresh_loop(
                 if !send_refresh(&manager, &tx, new_shard_ids, diff) {
                     channel_closed = true;
                 }
+                // Only record mtime after a successful refresh so failed
+                // refreshes are retried on the next cycle.
+                last_maps_mtime.insert(pid, current_mtime);
             }
-            last_maps_mtime.insert(pid, current_mtime);
             true // keep PID
         });
 

@@ -5,7 +5,7 @@ introducing a `Collector`/`OutputSink` trait pattern that decouples profiling fr
 
 ## Current Structure
 
-```
+```text
 bin/profile-bee.rs (2,252 lines)
 ├── Types: PerfWork, DwarfThreadMsg, DwarfRefreshUpdate, Opt       (32-238)
 ├── Helpers: parse syscalls, uprobe resolution, process setup      (280-954)

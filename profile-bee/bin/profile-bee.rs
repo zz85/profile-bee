@@ -3,11 +3,11 @@ use aya::Ebpf;
 use clap::Parser;
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
 use profile_bee::ebpf::{
-    attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
-};
-use profile_bee::ebpf::{
     apply_dwarf_refresh, setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig,
     SmartUProbeConfig, StackInfoPod,
+};
+use profile_bee::ebpf::{
+    attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
 };
 use profile_bee::html::collapse_to_json;
 use profile_bee::output::{
@@ -795,7 +795,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 stopped
             );
             sink.write_batch(&stacks)?;
-            last_stacks = stacks;
+            if !stacks.is_empty() {
+                last_stacks = stacks;
+            }
         }
         sink.finish(&last_stacks)?;
     } else {
@@ -1109,7 +1111,10 @@ fn collect_and_format_stacks(
     let mut queue_processed = 0u64;
     let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
-    // Clear eBPF counts map to prevent it filling up
+    // Drain the eBPF counts map.  In streaming/serve mode the map is
+    // intentionally emptied each invocation so that samples are transferred
+    // into the caller-owned `trace_count` for accumulation — clearing here
+    // avoids double-counting and keeps the kernel-side map from filling up.
     let keys = counts.keys().flatten().collect::<Vec<_>>();
     for k in keys {
         let _ = counts.remove(&k);
@@ -1203,35 +1208,23 @@ fn collect_and_format_stacks(
         queue_processed
     );
 
-    // Build collapse-format output from trace counts or kernel counts
-    let mut stacks = Vec::new();
-    if local_counting {
-        for (stack, value) in trace_count.iter() {
-            let combined = profiler.get_exp_stacked_frames(
-                stack,
-                stack_traces,
-                group_by_cpu,
-                stacked_pointers,
-            );
-            stacks.push(FrameCount {
-                frames: combined,
-                count: *value as u64,
-            });
-        }
+    // Build collapse-format output from trace counts or kernel counts.
+    // Both sources are unified into (StackInfo, u64) pairs so a single loop
+    // can drive symbolization and FrameCount construction.
+    let sources: Vec<(StackInfo, u64)> = if local_counting {
+        trace_count.iter().map(|(&s, &v)| (s, v as u64)).collect()
     } else {
-        for (key, value) in counts.iter().flatten() {
-            let stack: StackInfo = key.0;
-            let combined = profiler.get_exp_stacked_frames(
-                &stack,
-                stack_traces,
-                group_by_cpu,
-                stacked_pointers,
-            );
-            stacks.push(FrameCount {
-                frames: combined,
-                count: value,
-            });
-        }
+        counts.iter().flatten().map(|(k, v)| (k.0, v)).collect()
+    };
+
+    let mut stacks = Vec::new();
+    for (stack, count) in &sources {
+        let combined =
+            profiler.get_exp_stacked_frames(stack, stack_traces, group_by_cpu, stacked_pointers);
+        stacks.push(FrameCount {
+            frames: combined,
+            count: *count,
+        });
     }
 
     let mut out: Vec<String> = stacks
