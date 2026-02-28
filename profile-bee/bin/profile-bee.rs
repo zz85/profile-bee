@@ -1,55 +1,33 @@
 use aya::maps::{MapData, RingBuf, StackTraceMap};
 use aya::Ebpf;
 use clap::Parser;
-use inferno::flamegraph::{self, Options};
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
-use profile_bee::dwarf_unwind::MappingsDiff;
+use profile_bee::ebpf::{
+    apply_dwarf_refresh, setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig,
+    SmartUProbeConfig, StackInfoPod,
+};
 use profile_bee::ebpf::{
     attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
 };
-use profile_bee::ebpf::{
-    setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig, SmartUProbeConfig,
-    StackInfoPod,
+use profile_bee::html::collapse_to_json;
+use profile_bee::output::{
+    CollapseSink, HtmlSink, JsonFileSink, MultiplexSink, OutputSink, SvgSink, WebBroadcastSink,
 };
-use profile_bee::html::{collapse_to_json, generate_html_file};
+use profile_bee::pipeline::{dwarf_refresh_loop, DwarfThreadMsg, PerfWork};
 use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, ResolvedProbe};
 use profile_bee::probe_spec::parse_probe_spec;
 use profile_bee::spawn::{SpawnProcess, StopHandler};
 use profile_bee::TraceHandler;
-use profile_bee_common::{ProcessExitEvent, StackInfo, UnwindEntry, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{ProcessExitEvent, StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Instant;
 
 use profile_bee::types::FrameCount;
-
-/// Message type for the profiler's communication channel
-enum PerfWork {
-    StackInfo(StackInfo),
-    DwarfRefresh(DwarfRefreshUpdate),
-    ProcessExit(ProcessExitEvent),
-    Stop,
-}
-
-/// Message type for the DWARF background thread
-enum DwarfThreadMsg {
-    /// New process to load DWARF data for
-    LoadProcess(u32),
-    /// Process exited — clean up mappings and LPM trie entries
-    ProcessExited(u32),
-}
-
-/// Incremental DWARF unwind table update
-/// Each shard update is a (shard_id, entries) pair for a newly-loaded binary.
-struct DwarfRefreshUpdate {
-    shard_updates: Vec<(u16, Arc<Vec<UnwindEntry>>)>, // (shard_id, entries) for new shards
-    mapping_diffs: Vec<MappingsDiff>,                 // per-process added/removed mappings
-}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -752,6 +730,37 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let started = Instant::now();
 
+    // Build output sink from CLI options
+    let mut sinks: Vec<Box<dyn OutputSink>> = Vec::new();
+    if let Some(svg_path) = &opt.svg {
+        let title = if opt.off_cpu {
+            format!(
+                "Off-CPU Time Flame Graph ({}ms, finish_task_switch)",
+                opt.time.unwrap_or(10000)
+            )
+        } else {
+            format!(
+                "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
+                opt.time.unwrap_or(10000),
+                opt.frequency
+            )
+        };
+        sinks.push(Box::new(SvgSink::new(svg_path.clone(), title, opt.off_cpu)));
+    }
+    if let Some(html_path) = &opt.html {
+        sinks.push(Box::new(HtmlSink::new(html_path.clone())));
+    }
+    if let Some(json_path) = &opt.json {
+        sinks.push(Box::new(JsonFileSink::new(json_path.clone())));
+    }
+    if let Some(collapse_path) = &opt.collapse {
+        sinks.push(Box::new(CollapseSink::new(collapse_path.clone())));
+    }
+    if opt.serve {
+        sinks.push(Box::new(WebBroadcastSink::new(tx)));
+    }
+    let mut sink = MultiplexSink::new(sinks);
+
     if opt.serve {
         // Serve mode: periodically flush data to the web server instead of
         // blocking until Stop. This ensures the web UI gets live updates.
@@ -760,10 +769,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         let mut stopped = false;
         let mut trace_count = HashMap::<StackInfo, usize>::new();
         let mut known_tgids = std::collections::HashSet::<u32>::new();
+        let mut last_stacks = Vec::new();
 
         while !stopped {
             tracing::debug!("serve loop: collecting samples for {:?}", flush_interval);
-            let stacks = process_profiling_data_streaming(
+            let stacks = collect_and_format_stacks(
                 counts,
                 stack_traces,
                 &perf_rx,
@@ -773,7 +783,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 stacked_pointers,
                 &mut ebpf_profiler.bpf,
                 &tgid_request_tx,
-                flush_interval,
+                Some(flush_interval),
                 &mut stopped,
                 monitor_exit_pid,
                 &mut trace_count,
@@ -784,12 +794,19 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 stacks.len(),
                 stopped
             );
-            output_results(&opt, &stacks, &tx, stopped)?;
+            sink.write_batch(&stacks)?;
+            if !stacks.is_empty() {
+                last_stacks = stacks;
+            }
         }
+        sink.finish(&last_stacks)?;
     } else {
         // Non-serve mode: block until Stop, output once, exit.
-        tracing::debug!("batch mode: calling process_profiling_data (blocks until Stop)");
-        let stacks = process_profiling_data(
+        tracing::debug!("batch mode: collecting samples (blocks until Stop)");
+        let mut trace_count = HashMap::<StackInfo, usize>::new();
+        let mut known_tgids = std::collections::HashSet::<u32>::new();
+        let mut stopped = false;
+        let stacks = collect_and_format_stacks(
             counts,
             stack_traces,
             &perf_rx,
@@ -799,13 +816,15 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             stacked_pointers,
             &mut ebpf_profiler.bpf,
             &tgid_request_tx,
+            None, // block indefinitely
+            &mut stopped,
             monitor_exit_pid,
+            &mut trace_count,
+            &mut known_tgids,
         );
-        tracing::debug!(
-            "batch mode: process_profiling_data returned {} stacks",
-            stacks.len()
-        );
-        output_results(&opt, &stacks, &tx, true)?;
+        tracing::debug!("batch mode: collected {} stacks", stacks.len());
+        sink.write_batch(&stacks)?;
+        sink.finish(&stacks)?;
     }
 
     drop(stopper);
@@ -1064,277 +1083,16 @@ async fn setup_process_exit_ring_buffer_task(
     Ok(())
 }
 
-/// Background thread: handles dlopen rescans and new process DWARF loading
-fn dwarf_refresh_loop(
-    mut manager: DwarfUnwindManager,
-    initial_pid: Option<u32>,
-    tgid_rx: mpsc::Receiver<DwarfThreadMsg>,
-    tx: mpsc::Sender<PerfWork>,
-) {
-    let mut tracked_pids: Vec<u32> = initial_pid.into_iter().collect();
-    let mut last_maps_mtime: HashMap<u32, Option<std::time::SystemTime>> = HashMap::new();
-
-    // Record initial mtime for pre-loaded PIDs so the first retain cycle
-    // doesn't redundantly call refresh_process on them.
-    for &pid in &tracked_pids {
-        let maps_path = format!("/proc/{}/maps", pid);
-        let mtime = std::fs::metadata(&maps_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        last_maps_mtime.insert(pid, mtime);
-    }
-
-    loop {
-        // Drain all pending messages (non-blocking)
-        while let Ok(msg) = tgid_rx.try_recv() {
-            match msg {
-                DwarfThreadMsg::LoadProcess(new_tgid) => {
-                    if !tracked_pids.contains(&new_tgid) {
-                        tracked_pids.push(new_tgid);
-                        let maps_path = format!("/proc/{}/maps", new_tgid);
-                        let pre_refresh_mtime = std::fs::metadata(&maps_path)
-                            .ok()
-                            .and_then(|m| m.modified().ok());
-                        if let Ok((new_shard_ids, diff)) = manager.refresh_process(new_tgid) {
-                            if send_refresh(&manager, &tx, new_shard_ids, diff).is_err() {
-                                return;
-                            }
-                        }
-                        last_maps_mtime.insert(new_tgid, pre_refresh_mtime);
-                    }
-                }
-                DwarfThreadMsg::ProcessExited(tgid) => {
-                    tracing::debug!("DWARF thread: process {} exited, cleaning up", tgid);
-                    if let Some(removal_diff) = manager.remove_process(tgid) {
-                        if send_refresh(&manager, &tx, vec![], removal_diff).is_err() {
-                            return;
-                        }
-                    }
-                    tracked_pids.retain(|&p| p != tgid);
-                    last_maps_mtime.remove(&tgid);
-                }
-            }
-        }
-
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
-        // Periodic rescan of all tracked processes for dlopen'd libraries.
-        // Prune exited PIDs to avoid stat'ing non-existent /proc entries.
-        let mut channel_closed = false;
-        tracked_pids.retain(|&pid| {
-            if channel_closed {
-                return true; // stop processing, will exit after retain
-            }
-
-            let maps_path = format!("/proc/{}/maps", pid);
-            let current_mtime = match std::fs::metadata(&maps_path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Process exited — /proc/[pid]/maps no longer exists
-                    last_maps_mtime.remove(&pid);
-                    return false; // remove from tracked_pids
-                }
-                Err(_) => {
-                    // Other I/O error (permission, etc.) — keep PID, skip this cycle
-                    return true;
-                }
-                Ok(metadata) => metadata.modified().ok(),
-            };
-
-            // Skip rescan if /proc/[pid]/maps hasn't changed
-            if let Some(Some(last_ts)) = last_maps_mtime.get(&pid) {
-                if current_mtime.as_ref() == Some(last_ts) {
-                    return true; // keep PID, skip rescan
-                }
-            }
-
-            if let Ok((new_shard_ids, diff)) = manager.refresh_process(pid) {
-                // Always send — mapping changes (e.g. dlopen of a cached
-                // binary) need LPM trie updates even without new shards.
-                if send_refresh(&manager, &tx, new_shard_ids, diff).is_err() {
-                    channel_closed = true;
-                }
-            }
-            last_maps_mtime.insert(pid, current_mtime);
-            true // keep PID
-        });
-
-        if channel_closed {
-            return;
-        }
-    }
-}
-
-fn send_refresh(
-    manager: &DwarfUnwindManager,
-    tx: &mpsc::Sender<PerfWork>,
-    new_shard_ids: Vec<u16>,
-    diff: MappingsDiff,
-) -> Result<(), ()> {
-    // Only clone the new shards (not the entire binary_tables)
-    let mut shard_updates = Vec::new();
-    for &shard_id in &new_shard_ids {
-        if let Some(entries) = manager.binary_tables.get(shard_id as usize) {
-            shard_updates.push((shard_id, Arc::clone(entries)));
-        }
-    }
-
-    let total_entries: usize = shard_updates.iter().map(|(_, v)| v.len()).sum();
-    tracing::debug!(
-        "DWARF refresh: tgid={}, {} new shards ({} entries), +{} -{} mappings",
-        diff.tgid,
-        new_shard_ids.len(),
-        total_entries,
-        diff.added.len(),
-        diff.removed.len(),
-    );
-
-    if shard_updates.is_empty() && diff.is_empty() {
-        return Ok(()); // Nothing to do
-    }
-
-    tx.send(PerfWork::DwarfRefresh(DwarfRefreshUpdate {
-        shard_updates,
-        mapping_diffs: vec![diff],
-    }))
-    .map_err(|_| ())
-}
-
-/// Apply incremental DWARF unwind table updates to eBPF maps
-fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) {
-    // Create inner maps and insert them into the outer ArrayOfMaps
-    if !update.shard_updates.is_empty() {
-        // First, create all inner maps (doesn't borrow bpf)
-        let mut created_maps = Vec::new();
-        for (shard_id, entries) in &update.shard_updates {
-            if entries.is_empty() {
-                continue;
-            }
-            match profile_bee::ebpf::create_and_populate_inner_map(*shard_id, entries) {
-                Ok(inner_array) => {
-                    created_maps.push((*shard_id, inner_array));
-                }
-                Err(e) => {
-                    tracing::warn!("DWARF refresh: failed to create shard_{}: {}", shard_id, e);
-                }
-            }
-        }
-
-        // Then, get the outer ArrayOfMaps and insert all inner maps
-        if !created_maps.is_empty() {
-            let mut insert = || -> Result<(), ()> {
-                let map = bpf.map_mut("unwind_shards").ok_or_else(|| {
-                    tracing::warn!("DWARF refresh: unwind_shards map not found");
-                })?;
-                let mut outer: aya::maps::ArrayOfMaps<
-                    &mut aya::maps::MapData,
-                    aya::maps::Array<aya::maps::MapData, profile_bee::ebpf::UnwindEntryPod>,
-                > = aya::maps::ArrayOfMaps::try_from(map).map_err(|e| {
-                    tracing::warn!("DWARF refresh: unwind_shards is not ArrayOfMaps: {}", e);
-                })?;
-                for (shard_id, inner_array) in &created_maps {
-                    if let Err(e) = outer.set(*shard_id as u32, inner_array, 0) {
-                        tracing::warn!(
-                            "DWARF refresh: failed to insert shard_{} into outer map: {}",
-                            shard_id,
-                            e
-                        );
-                    }
-                }
-                Ok(())
-            };
-            let _ = insert();
-        }
-        // created_maps dropped; kernel holds references via the outer map
-    }
-
-    if let Some(map) = bpf.map_mut("exec_mappings") {
-        if let Ok(mut trie) = aya::maps::lpm_trie::LpmTrie::<
-            &mut aya::maps::MapData,
-            profile_bee::ebpf::ExecMappingKeyPod,
-            profile_bee::ebpf::ExecMappingPod,
-        >::try_from(map)
-        {
-            for diff in &update.mapping_diffs {
-                let tgid = diff.tgid;
-
-                // Remove stale entries first
-                for mapping in &diff.removed {
-                    for block in profile_bee::dwarf_unwind::summarize_address_range(
-                        mapping.begin,
-                        mapping.end.saturating_sub(1),
-                    ) {
-                        let key = aya::maps::lpm_trie::Key::new(
-                            64 + block.prefix_len,
-                            profile_bee::ebpf::ExecMappingKeyPod(
-                                profile_bee_common::ExecMappingKey {
-                                    tgid: tgid.to_be(),
-                                    _pad: 0,
-                                    address: block.addr.to_be(),
-                                },
-                            ),
-                        );
-                        // Removal failure is non-fatal (entry may already be gone)
-                        let _ = trie.remove(&key);
-                    }
-                }
-
-                // Insert new entries
-                for mapping in &diff.added {
-                    for block in profile_bee::dwarf_unwind::summarize_address_range(
-                        mapping.begin,
-                        mapping.end.saturating_sub(1),
-                    ) {
-                        let key = aya::maps::lpm_trie::Key::new(
-                            64 + block.prefix_len,
-                            profile_bee::ebpf::ExecMappingKeyPod(
-                                profile_bee_common::ExecMappingKey {
-                                    tgid: tgid.to_be(),
-                                    _pad: 0,
-                                    address: block.addr.to_be(),
-                                },
-                            ),
-                        );
-                        if let Err(e) =
-                            trie.insert(&key, profile_bee::ebpf::ExecMappingPod(*mapping), 0)
-                        {
-                            tracing::warn!(
-                                "LPM trie insert failed: tgid={}, mapping=[{:#x},{:#x}), block addr={:#x} prefix_len={}: {}",
-                                tgid,
-                                mapping.begin,
-                                mapping.end,
-                                block.addr,
-                                block.prefix_len,
-                                e,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Update dwarf_tgids BPF map: add tgids with new mappings, remove exited tgids
-    if let Some(map) = bpf.map_mut("dwarf_tgids") {
-        if let Ok(mut dwarf_tgids) =
-            aya::maps::HashMap::<&mut aya::maps::MapData, u32, u8>::try_from(map)
-        {
-            for diff in &update.mapping_diffs {
-                if !diff.added.is_empty() {
-                    // Process has (new) DWARF data — register for exit tracking
-                    let _ = dwarf_tgids.insert(diff.tgid, 1, 0);
-                }
-                if diff.is_exit {
-                    // Process exited — stop tracking for exit notifications
-                    let _ = dwarf_tgids.remove(&diff.tgid);
-                }
-            }
-        }
-    }
-}
-
-// Processes the profiling data collected from eBPF
+// Processes profiling data collected from eBPF.
+//
+// Unified event loop for batch and streaming modes:
+// - `timeout = None` → blocks on `recv()` until Stop/exit (batch mode)
+// - `timeout = Some(d)` → drains events for up to `d` then returns (streaming mode)
+//
+// `trace_count` and `known_tgids` are owned by the caller so state can persist
+// across calls in streaming mode.
 #[allow(clippy::too_many_arguments)]
-fn process_profiling_data(
+fn collect_and_format_stacks(
     counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
     stack_traces: &StackTraceMap<MapData>,
     perf_rx: &mpsc::Receiver<PerfWork>,
@@ -1344,32 +1102,55 @@ fn process_profiling_data(
     stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     bpf: &mut Ebpf,
     tgid_request_tx: &Option<mpsc::Sender<DwarfThreadMsg>>,
+    timeout: Option<std::time::Duration>,
+    stopped: &mut bool,
     monitor_exit_pid: Option<u32>,
+    trace_count: &mut HashMap<StackInfo, usize>,
+    known_tgids: &mut std::collections::HashSet<u32>,
 ) -> Vec<String> {
-    // Local counting
-    let mut trace_count = HashMap::<StackInfo, usize>::new();
-    let mut queue_processed = 0;
-    let mut samples = 0;
-    let mut known_tgids = std::collections::HashSet::<u32>::new();
-
-    // Determine counting strategy before the recv loop so the StackInfo
-    // handler knows whether to accumulate into trace_count (local counting)
-    // or only prime the symbol cache (kernel counting).
+    let mut queue_processed = 0u64;
     let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
 
-    // Clear "counts" hashmap
+    // Drain the eBPF counts map.  In streaming/serve mode the map is
+    // intentionally emptied each invocation so that samples are transferred
+    // into the caller-owned `trace_count` for accumulation — clearing here
+    // avoids double-counting and keeps the kernel-side map from filling up.
     let keys = counts.keys().flatten().collect::<Vec<_>>();
     for k in keys {
         let _ = counts.remove(&k);
     }
 
-    /* Perf mpsc RX loop */
-    while let Ok(work) = perf_rx.recv() {
+    // Compute deadline for streaming mode; batch mode uses recv() directly
+    let deadline = timeout.map(|d| Instant::now() + d);
+
+    loop {
+        let work = if let Some(dl) = deadline {
+            let remaining = dl.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match perf_rx.recv_timeout(remaining) {
+                Ok(w) => w,
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    tracing::warn!("collect_and_format_stacks: channel disconnected");
+                    *stopped = true;
+                    break;
+                }
+            }
+        } else {
+            // Batch mode: block indefinitely
+            match perf_rx.recv() {
+                Ok(w) => w,
+                Err(_) => break,
+            }
+        };
+
         match work {
             PerfWork::StackInfo(stack) => {
                 queue_processed += 1;
                 if queue_processed == 1 {
-                    tracing::debug!("process_profiling_data: received first StackInfo event");
+                    tracing::debug!("collect_and_format_stacks: received first StackInfo event");
                 }
 
                 // Request DWARF loading for newly seen processes
@@ -1379,151 +1160,6 @@ fn process_profiling_data(
                     }
                 }
 
-                if local_counting {
-                    // User space counting — accumulate into trace_count
-                    let trace = trace_count.entry(stack).or_insert(0);
-                    *trace += 1;
-
-                    if *trace == 1 {
-                        let _combined = profiler.get_exp_stacked_frames(
-                            &stack,
-                            stack_traces,
-                            group_by_cpu,
-                            stacked_pointers,
-                        );
-                    }
-                } else {
-                    // Kernel counts are authoritative; only prime symbol cache
-                    let _combined = profiler.get_exp_stacked_frames(
-                        &stack,
-                        stack_traces,
-                        group_by_cpu,
-                        stacked_pointers,
-                    );
-                }
-            }
-            PerfWork::DwarfRefresh(update) => {
-                apply_dwarf_refresh(bpf, update);
-            }
-            PerfWork::ProcessExit(exit_event) => {
-                // Forward to DWARF thread for LPM trie cleanup
-                if let Some(tx) = tgid_request_tx {
-                    let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
-                }
-                // Allow PID reuse to trigger a fresh LoadProcess
-                known_tgids.remove(&exit_event.pid);
-                // Only stop profiling if this is the monitored target process
-                if Some(exit_event.pid) == monitor_exit_pid {
-                    tracing::info!("target process {} exited, stopping", exit_event.pid);
-                    break;
-                }
-                tracing::debug!("DWARF-tracked process {} exited", exit_event.pid);
-            }
-            PerfWork::Stop => {
-                tracing::info!("process_profiling_data: received Stop, breaking recv loop");
-                break;
-            }
-        }
-    }
-
-    println!("Processed {} queue events", queue_processed);
-    println!("Processing stacks...");
-
-    let mut stacks = Vec::new();
-
-    if local_counting {
-        process_local_counting(
-            &trace_count,
-            profiler,
-            stack_traces,
-            group_by_cpu,
-            &mut samples,
-            &mut stacks,
-            stacked_pointers,
-        );
-    } else {
-        process_kernel_counting(
-            counts,
-            profiler,
-            stack_traces,
-            group_by_cpu,
-            &mut samples,
-            &mut stacks,
-            stacked_pointers,
-        );
-    }
-
-    // TODO stack processing can be expensive, so consider moving into a separate task
-    // to avoid blocking the collection loop
-    println!("Total value: {} (samples or us off-CPU time)", samples);
-
-    let mut out = stacks
-        .into_iter()
-        .map(|frames| {
-            let key = frames
-                .frames
-                .iter()
-                .map(|s| s.fmt_symbol())
-                .collect::<Vec<_>>()
-                .join(";");
-            let count = frames.count;
-            format!("{} {}", &key, count)
-        })
-        .collect::<Vec<_>>();
-    out.sort();
-
-    out
-}
-
-/// Streaming variant of process_profiling_data for --serve mode.
-/// Collects samples for up to `timeout` then returns whatever has accumulated.
-/// Sets `stopped = true` when a Stop/ProcessExit message is received.
-#[allow(clippy::too_many_arguments)]
-fn process_profiling_data_streaming(
-    counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
-    stack_traces: &StackTraceMap<MapData>,
-    perf_rx: &mpsc::Receiver<PerfWork>,
-    profiler: &mut TraceHandler,
-    stream_mode: u8,
-    group_by_cpu: bool,
-    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
-    bpf: &mut Ebpf,
-    tgid_request_tx: &Option<mpsc::Sender<DwarfThreadMsg>>,
-    timeout: std::time::Duration,
-    stopped: &mut bool,
-    monitor_exit_pid: Option<u32>,
-    trace_count: &mut HashMap<StackInfo, usize>,
-    known_tgids: &mut std::collections::HashSet<u32>,
-) -> Vec<String> {
-    let mut queue_processed = 0;
-    let mut samples = 0;
-    let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
-
-    let keys = counts.keys().flatten().collect::<Vec<_>>();
-    for k in keys {
-        let _ = counts.remove(&k);
-    }
-
-    let deadline = Instant::now() + timeout;
-
-    // Drain events until timeout or Stop
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        match perf_rx.recv_timeout(remaining) {
-            Ok(PerfWork::StackInfo(stack)) => {
-                queue_processed += 1;
-                if queue_processed == 1 {
-                    tracing::debug!("process_profiling_data_streaming: received first StackInfo");
-                }
-                if let Some(tx) = tgid_request_tx {
-                    if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
-                        let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
-                    }
-                }
                 if local_counting {
                     let trace = trace_count.entry(stack).or_insert(0);
                     *trace += 1;
@@ -1544,10 +1180,12 @@ fn process_profiling_data_streaming(
                     );
                 }
             }
-            Ok(PerfWork::DwarfRefresh(update)) => {
-                apply_dwarf_refresh(bpf, update);
+            PerfWork::DwarfRefresh(update) => {
+                if let Err(e) = apply_dwarf_refresh(bpf, update) {
+                    tracing::warn!("{:#}", e);
+                }
             }
-            Ok(PerfWork::ProcessExit(exit_event)) => {
+            PerfWork::ProcessExit(exit_event) => {
                 if let Some(tx) = tgid_request_tx {
                     let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
                 }
@@ -1557,15 +1195,10 @@ fn process_profiling_data_streaming(
                     *stopped = true;
                     break;
                 }
+                tracing::debug!("DWARF-tracked process {} exited", exit_event.pid);
             }
-            Ok(PerfWork::Stop) => {
-                tracing::info!("process_profiling_data_streaming: Stop received");
-                *stopped = true;
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::warn!("process_profiling_data_streaming: channel disconnected");
+            PerfWork::Stop => {
+                tracing::info!("collect_and_format_stacks: received Stop");
                 *stopped = true;
                 break;
             }
@@ -1573,34 +1206,30 @@ fn process_profiling_data_streaming(
     }
 
     tracing::debug!(
-        "process_profiling_data_streaming: processed {} events",
+        "collect_and_format_stacks: processed {} events",
         queue_processed
     );
 
-    let mut stacks = Vec::new();
-    if local_counting {
-        process_local_counting(
-            trace_count,
-            profiler,
-            stack_traces,
-            group_by_cpu,
-            &mut samples,
-            &mut stacks,
-            stacked_pointers,
-        );
+    // Build collapse-format output from trace counts or kernel counts.
+    // Both sources are unified into (StackInfo, u64) pairs so a single loop
+    // can drive symbolization and FrameCount construction.
+    let sources: Vec<(StackInfo, u64)> = if local_counting {
+        trace_count.iter().map(|(&s, &v)| (s, v as u64)).collect()
     } else {
-        process_kernel_counting(
-            counts,
-            profiler,
-            stack_traces,
-            group_by_cpu,
-            &mut samples,
-            &mut stacks,
-            stacked_pointers,
-        );
+        counts.iter().flatten().map(|(k, v)| (k.0, v)).collect()
+    };
+
+    let mut stacks = Vec::new();
+    for (stack, count) in &sources {
+        let combined =
+            profiler.get_exp_stacked_frames(stack, stack_traces, group_by_cpu, stacked_pointers);
+        stacks.push(FrameCount {
+            frames: combined,
+            count: *count,
+        });
     }
 
-    let mut out = stacks
+    let mut out: Vec<String> = stacks
         .into_iter()
         .map(|frames| {
             let key = frames
@@ -1611,57 +1240,9 @@ fn process_profiling_data_streaming(
                 .join(";");
             format!("{} {}", &key, frames.count)
         })
-        .collect::<Vec<_>>();
+        .collect();
     out.sort();
     out
-}
-
-/// Process stack traces counted in user space
-fn process_local_counting(
-    trace_count: &HashMap<StackInfo, usize>,
-    profiler: &mut TraceHandler,
-    stack_traces: &StackTraceMap<MapData>,
-    group_by_cpu: bool,
-    samples: &mut u64,
-    stacks: &mut Vec<FrameCount>,
-    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
-) {
-    for (stack, value) in trace_count.iter() {
-        let combined =
-            profiler.get_exp_stacked_frames(stack, stack_traces, group_by_cpu, stacked_pointers);
-
-        *samples += *value as u64;
-        stacks.push(FrameCount {
-            frames: combined,
-            count: *value as u64,
-        });
-    }
-}
-
-/// Process stack traces counted in kernel space
-fn process_kernel_counting(
-    counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
-
-    profiler: &mut TraceHandler,
-    stack_traces: &aya::maps::StackTraceMap<MapData>,
-    group_by_cpu: bool,
-    samples: &mut u64,
-    stacks: &mut Vec<FrameCount>,
-    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
-) {
-    for (key, value) in counts.iter().flatten() {
-        let stack: StackInfo = key.0;
-
-        *samples += value;
-
-        let combined =
-            profiler.get_exp_stacked_frames(&stack, stack_traces, group_by_cpu, stacked_pointers);
-
-        stacks.push(FrameCount {
-            frames: combined,
-            count: value,
-        });
-    }
 }
 
 /// Parse update mode from string
@@ -1674,89 +1255,6 @@ fn parse_update_mode(mode: &str) -> profile_bee_tui::state::UpdateMode {
         "decay" => UpdateMode::Decay,
         _ => UpdateMode::Accumulate, // default
     }
-}
-
-/// Outputs the results in the requested formats
-fn output_results(
-    opt: &Opt,
-    stacks: &[String],
-    tx: &tokio::sync::broadcast::Sender<String>,
-    final_flush: bool,
-) -> anyhow::Result<()> {
-    // Generate SVG if requested (only on final flush)
-    if final_flush {
-        if let Some(svg) = &opt.svg {
-            let title = if opt.off_cpu {
-                format!(
-                    "Off-CPU Time Flame Graph ({}ms, finish_task_switch)",
-                    opt.time.unwrap_or(10000)
-                )
-            } else {
-                format!(
-                    "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
-                    opt.time.unwrap_or(10000),
-                    opt.frequency
-                )
-            };
-            output_svg(svg, stacks, title, opt.off_cpu).map_err(|e| {
-                println!("Failed to write svg file {:?} - {:?}", e, svg);
-                e
-            })?;
-        }
-    }
-
-    // Generate HTML/JSON if requested
-    if opt.html.is_some() || opt.json.is_some() || opt.serve {
-        let json = collapse_to_json(&stacks.iter().map(|v| v.as_str()).collect::<Vec<_>>());
-        tracing::debug!("output_results: generated JSON ({} bytes)", json.len());
-
-        if final_flush {
-            if let Some(json_path) = &opt.json {
-                std::fs::write(json_path, &json)
-                    .map_err(|e| anyhow::anyhow!("Unable to write JSON file: {}", e))?;
-            }
-
-            if let Some(html_path) = &opt.html {
-                generate_html_file(html_path, &json);
-            }
-        }
-
-        if let Err(e) = tx.send(json) {
-            tracing::warn!(
-                "output_results: broadcast send failed (no receivers?): {:?}",
-                e
-            );
-        } else {
-            tracing::debug!(
-                "output_results: broadcast sent to {} receivers",
-                tx.receiver_count()
-            );
-        }
-    }
-
-    // Write collapsed stacks if requested (only on final flush)
-    if final_flush {
-        if let Some(name) = &opt.collapse {
-            println!("Writing to file: {}", name.display());
-            std::fs::write(name, stacks.join("\n"))
-                .map_err(|e| anyhow::anyhow!("Unable to write stack collapsed file: {}", e))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Creates a flamegraph svg file using the inferno-flamegraph lib
-fn output_svg(path: &PathBuf, str: &[String], title: String, off_cpu: bool) -> anyhow::Result<()> {
-    let mut svg_opts = Options::default();
-    svg_opts.title = title;
-    if off_cpu {
-        svg_opts.count_name = "us".to_string();
-    }
-    let mut svg_file = std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(path)?);
-    flamegraph::from_lines(&mut svg_opts, str.iter().map(|v| v.as_str()), &mut svg_file)?;
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1939,7 +1437,9 @@ fn spawn_profiling_thread(
                         }
                     }
                     Ok(PerfWork::DwarfRefresh(update)) => {
-                        apply_dwarf_refresh(&mut bpf, update);
+                        if let Err(e) = apply_dwarf_refresh(&mut bpf, update) {
+                            tracing::warn!("{:#}", e);
+                        }
                     }
                     Ok(PerfWork::ProcessExit(exit_event)) => {
                         // Forward to DWARF thread for LPM trie cleanup

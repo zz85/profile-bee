@@ -169,9 +169,9 @@ pub fn collapse_to_json(stacks: &[&str]) -> String {
     serde_json::to_string(&root).expect("serialization to json")
 }
 
-pub fn generate_html_file(filename: &Path, data: &str) {
+pub fn generate_html_file(filename: &Path, data: &str) -> std::io::Result<()> {
     let html = flamegraph_html(data);
-    std::fs::write(filename, html).expect("Unable to write stack html file");
+    std::fs::write(filename, html)
 }
 
 // Self-contained HTML template — no external JS/CSS dependencies
