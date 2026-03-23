@@ -2,6 +2,7 @@ use legacy::symbols::StackFrameInfo;
 use profile_bee_common::StackInfo;
 
 mod cache;
+pub mod codeguru;
 pub mod ebpf;
 pub mod event_loop;
 pub mod html;

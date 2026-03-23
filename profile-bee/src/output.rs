@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use inferno::flamegraph::{self, Options};
 
+use crate::codeguru::{collapse_to_codeguru, CodeGuruOptions};
 use crate::html::{collapse_to_json, generate_html_file};
 use crate::pprof::{collapse_to_pprof, PprofOptions};
 
@@ -236,6 +237,62 @@ impl OutputSink for PprofSink {
         let pprof_bytes = collapse_to_pprof(final_stacks, &self.options)
             .context("Failed to generate pprof output")?;
         std::fs::write(&self.path, pprof_bytes).context("Unable to write pprof file")?;
+        Ok(())
+    }
+}
+
+/// Writes an AWS CodeGuru Profiler JSON file on finish.
+///
+/// The output conforms to CodeGuru's `PostAgentProfile` API schema
+/// (`Content-Type: application/json`). Can be uploaded via:
+/// ```bash
+/// aws codeguruprofiler post-agent-profile \
+///   --profiling-group-name my-group \
+///   --agent-profile fileb://profile.codeguru.json \
+///   --content-type application/json
+/// ```
+pub struct CodeGuruSink {
+    path: PathBuf,
+    options: CodeGuruOptions,
+}
+
+impl CodeGuruSink {
+    pub fn new(path: PathBuf, frequency_hz: u64, duration_ms: u64) -> Self {
+        Self {
+            path,
+            options: CodeGuruOptions {
+                frequency_hz,
+                duration_ms,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Create with explicit fleet info for AWS environments.
+    pub fn with_fleet_info(
+        path: PathBuf,
+        frequency_hz: u64,
+        duration_ms: u64,
+        fleet_id: String,
+        fleet_type: String,
+    ) -> Self {
+        Self {
+            path,
+            options: CodeGuruOptions {
+                frequency_hz,
+                duration_ms,
+                fleet_id,
+                fleet_type,
+            },
+        }
+    }
+}
+
+impl OutputSink for CodeGuruSink {
+    fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
+        tracing::info!("Writing CodeGuru JSON to: {}", self.path.display());
+        let json = collapse_to_codeguru(final_stacks, &self.options);
+        std::fs::write(&self.path, &json).context("Unable to write CodeGuru JSON file")?;
         Ok(())
     }
 }
