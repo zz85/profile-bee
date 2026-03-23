@@ -1,24 +1,25 @@
-use aya::maps::{MapData, RingBuf, StackTraceMap};
-use aya::Ebpf;
 use clap::Parser;
 use profile_bee::dwarf_unwind::DwarfUnwindManager;
 use profile_bee::ebpf::{
-    apply_dwarf_refresh, setup_ebpf_profiler, setup_ring_buffer, EbpfProfiler, ProfilerConfig,
-    SmartUProbeConfig, StackInfoPod,
+    apply_dwarf_refresh, attach_process_exit_tracepoint, setup_ebpf_with_tp_fallback,
+    setup_process_exit_ring_buffer, setup_ring_buffer, EbpfProfiler, ProfilerConfig,
 };
-use profile_bee::ebpf::{
-    attach_process_exit_tracepoint, setup_process_exit_ring_buffer, FramePointersPod,
-};
+use profile_bee::event_loop::{EventLoopConfig, ProfilingEventLoop};
 use profile_bee::html::collapse_to_json;
 use profile_bee::output::{
     CollapseSink, HtmlSink, JsonFileSink, MultiplexSink, OutputSink, SvgSink, WebBroadcastSink,
 };
-use profile_bee::pipeline::{dwarf_refresh_loop, DwarfThreadMsg, PerfWork};
-use profile_bee::probe_resolver::{format_resolved_probes, ProbeResolver, ResolvedProbe};
+use profile_bee::pipeline::{
+    dwarf_refresh_loop, setup_ctrlc_stop, setup_process_exit_ring_buffer_task,
+    setup_ring_buffer_task, setup_timer_and_child_stop, DwarfThreadMsg, PerfWork,
+};
+use profile_bee::probe_resolver::{
+    format_resolved_probes, resolve_uprobe_specs, uprobe_pid_as_u32, ProbeResolver,
+};
 use profile_bee::probe_spec::parse_probe_spec;
-use profile_bee::spawn::{SpawnProcess, StopHandler};
+use profile_bee::spawn::setup_process_to_profile;
 use profile_bee::TraceHandler;
-use profile_bee_common::{ProcessExitEvent, StackInfo, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
 use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -244,261 +245,6 @@ impl Opt {
     }
 }
 
-/// Parse a syscall tracepoint name like "syscalls:sys_enter_write" into
-/// a raw tracepoint name ("sys_enter") and syscall NR.
-/// Returns None if this is not a syscall tracepoint.
-///
-/// Only `sys_enter_*` tracepoints are handled here because the raw
-/// tracepoint args layout exposes the syscall NR in `args[1]`, which
-/// the eBPF program uses for filtering.  `sys_exit_*` raw tracepoints
-/// put the *return value* in `args[1]` (not the NR), so routing them
-/// through the raw-tp + NR-filter path would silently break filtering.
-/// Returning None for sys_exit lets the caller fall through to the
-/// generic tracepoint / perf-event attachment path instead.
-fn parse_syscall_tracepoint(tp: &str) -> Option<(&str, i64)> {
-    let (category, name) = tp.split_once(':')?;
-
-    if category != "syscalls" {
-        return None;
-    }
-
-    // sys_enter_write -> raw_tp="sys_enter", syscall="write"
-    // sys_exit_* is intentionally NOT matched — see doc comment above.
-    let syscall_name = name.strip_prefix("sys_enter_")?;
-
-    let nr = syscall_name_to_nr(syscall_name)?;
-    Some(("sys_enter", nr))
-}
-
-/// Map x86_64 syscall name to its number.
-/// Based on Linux x86_64 syscall table (stable ABI).
-fn syscall_name_to_nr(name: &str) -> Option<i64> {
-    // Common syscalls — extend as needed
-    let nr = match name {
-        "read" => 0,
-        "write" => 1,
-        "open" => 2,
-        "close" => 3,
-        "stat" => 4,
-        "fstat" => 5,
-        "lstat" => 6,
-        "poll" => 7,
-        "lseek" => 8,
-        "mmap" => 9,
-        "mprotect" => 10,
-        "munmap" => 11,
-        "brk" => 12,
-        "ioctl" => 16,
-        "pread64" => 17,
-        "pwrite64" => 18,
-        "readv" => 19,
-        "writev" => 20,
-        "access" => 21,
-        "pipe" => 22,
-        "select" => 23,
-        "sched_yield" => 24,
-        "dup" => 32,
-        "dup2" => 33,
-        "nanosleep" => 35,
-        "getpid" => 39,
-        "socket" => 41,
-        "connect" => 42,
-        "accept" => 43,
-        "sendto" => 44,
-        "recvfrom" => 45,
-        "sendmsg" => 46,
-        "recvmsg" => 47,
-        "bind" => 49,
-        "listen" => 50,
-        "clone" => 56,
-        "fork" => 57,
-        "vfork" => 58,
-        "execve" => 59,
-        "exit" => 60,
-        "wait4" => 61,
-        "kill" => 62,
-        "fcntl" => 72,
-        "flock" => 73,
-        "fsync" => 74,
-        "fdatasync" => 75,
-        "getcwd" => 79,
-        "chdir" => 80,
-        "rename" => 82,
-        "mkdir" => 83,
-        "rmdir" => 84,
-        "creat" => 85,
-        "link" => 86,
-        "unlink" => 87,
-        "readlink" => 89,
-        "chmod" => 90,
-        "chown" => 92,
-        "getuid" => 102,
-        "getgid" => 104,
-        "geteuid" => 107,
-        "getegid" => 108,
-        "getppid" => 110,
-        "getpgrp" => 111,
-        "setsid" => 112,
-        "sigaltstack" => 131,
-        "statfs" => 137,
-        "fstatfs" => 138,
-        "prctl" => 157,
-        "arch_prctl" => 158,
-        "gettid" => 186,
-        "futex" => 202,
-        "getdents64" => 217,
-        "clock_gettime" => 228,
-        "exit_group" => 231,
-        "epoll_wait" => 232,
-        "epoll_ctl" => 233,
-        "openat" => 257,
-        "newfstatat" => 262,
-        "accept4" => 288,
-        "epoll_pwait" => 281,
-        "pipe2" => 293,
-        "preadv" => 295,
-        "pwritev" => 296,
-        "getrandom" => 318,
-        "execveat" => 322,
-        "copy_file_range" => 326,
-        "preadv2" => 327,
-        "pwritev2" => 328,
-        "io_uring_setup" => 425,
-        "io_uring_enter" => 426,
-        "io_uring_register" => 427,
-        "clone3" => 435,
-        "close_range" => 436,
-        "openat2" => 437,
-        _ => return None,
-    };
-    Some(nr)
-}
-
-/// Set up eBPF profiler with automatic raw tracepoint fallback.
-///
-/// For ALL tracepoints, this tries attaching via `RawTracePoint`
-/// (which uses `bpf_raw_tracepoint_open` and bypasses BPF LSM restrictions
-/// on `PERF_EVENT_IOC_SET_BPF`). If that fails, it falls back to the
-/// regular `TracePoint` attachment.
-///
-/// Fallback chain for non-syscall tracepoints:
-///   1. raw_tp with task pt_regs (kernel >= 5.15, full FP/DWARF unwinding)
-///   2. raw_tp generic (bpf_get_stackid only)
-///   3. perf TracePoint (legacy, may be blocked by BPF LSM)
-///
-/// For syscall tracepoints (syscalls:sys_enter_* only):
-///   1. raw_tp sys_enter with NR filtering (pt_regs from args[0], syscall NR via args[1])
-///   2. raw_tp sys_enter with task pt_regs (no per-syscall filtering, full unwinding)
-///   3. raw_tp sys_enter generic (bpf_get_stackid only)
-///   4. perf TracePoint (legacy)
-///
-/// Note: the aggregate raw tracepoint name ("sys_enter") is used for ALL
-/// raw_tp fallback attempts, since per-syscall names like "sys_enter_write"
-/// don't exist as raw tracepoints.
-/// sys_exit_* is NOT routed here — see parse_syscall_tracepoint.
-fn setup_ebpf_with_tp_fallback(config: &mut ProfilerConfig) -> Result<EbpfProfiler, anyhow::Error> {
-    if let Some(tp) = config.tracepoint.clone() {
-        // Determine the raw tracepoint name to use for fallback attempts.
-        // For syscall tracepoints (e.g. "syscalls:sys_enter_write") we must
-        // use the aggregate name ("sys_enter") — per-syscall names like
-        // "sys_enter_write" don't exist as raw tracepoints.
-        // For non-syscall tracepoints we use the event name after the colon.
-        let (raw_tp_name, syscall_info) =
-            if let Some((raw_tp, syscall_nr)) = parse_syscall_tracepoint(&tp) {
-                (raw_tp.to_string(), Some(syscall_nr))
-            } else if let Some(name) = parse_tracepoint_name(&tp) {
-                (name.to_string(), None)
-            } else {
-                // No parseable tracepoint name — skip raw_tp attempts entirely
-                return setup_ebpf_profiler(config);
-            };
-
-        // For syscall tracepoints, first try the syscall-specific raw_tp
-        // (has pt_regs in args[0], syscall NR filtering via args[1])
-        if let Some(syscall_nr) = syscall_info {
-            let tp_saved = config.tracepoint.take();
-            config.raw_tracepoint = Some(raw_tp_name.clone());
-            config.target_syscall_nr = syscall_nr;
-
-            match setup_ebpf_profiler(config) {
-                Ok(profiler) => {
-                    eprintln!(
-                        "Attached via raw tracepoint '{}' (syscall nr={})",
-                        raw_tp_name, syscall_nr
-                    );
-                    return Ok(profiler);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Raw tracepoint (syscall) failed ({}), trying task_pt_regs...",
-                        e
-                    );
-                    config.raw_tracepoint = None;
-                    config.target_syscall_nr = -1;
-                    config.tracepoint = tp_saved;
-                }
-            }
-        }
-
-        // Try raw_tp with task pt_regs (kernel >= 5.15, full unwinding)
-        {
-            let tp_saved = config.tracepoint.take();
-            config.raw_tracepoint_task_regs = Some(raw_tp_name.clone());
-
-            match setup_ebpf_profiler(config) {
-                Ok(profiler) => {
-                    eprintln!(
-                        "Attached via raw tracepoint '{}' (task pt_regs, full unwinding)",
-                        raw_tp_name
-                    );
-                    return Ok(profiler);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Raw tracepoint with task_pt_regs failed ({}), trying generic...",
-                        e
-                    );
-                    config.raw_tracepoint_task_regs = None;
-                    config.tracepoint = tp_saved;
-                }
-            }
-        }
-
-        // Try generic raw_tp (bpf_get_stackid only, no custom unwinding)
-        {
-            let tp_saved = config.tracepoint.take();
-            config.raw_tracepoint_generic = Some(raw_tp_name.clone());
-
-            match setup_ebpf_profiler(config) {
-                Ok(profiler) => {
-                    eprintln!(
-                        "Attached via generic raw tracepoint '{}' (stackid only)",
-                        raw_tp_name
-                    );
-                    return Ok(profiler);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Generic raw tracepoint failed ({}), falling back to perf tracepoint...",
-                        e
-                    );
-                    config.raw_tracepoint_generic = None;
-                    config.tracepoint = tp_saved;
-                }
-            }
-        }
-    }
-
-    // Final fallback: use config as-is (regular TracePoint or other program type)
-    setup_ebpf_profiler(config)
-}
-
-/// Extract the tracepoint name from "category:name" format for raw_tp attachment.
-/// For raw tracepoints, the name is just the event name without the category.
-fn parse_tracepoint_name(tp: &str) -> Option<&str> {
-    tp.split(':').nth(1)
-}
-
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
     let opt = Opt::parse();
@@ -703,24 +449,28 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         }
     }
 
-    let counts = &mut ebpf_profiler.counts;
-    let stack_traces = &ebpf_profiler.stack_traces;
-    let stacked_pointers = &ebpf_profiler.stacked_pointers;
-
-    let mut profiler = TraceHandler::new();
-    profiler.prewarm_kernel_symbols();
+    // Build the event loop from eBPF profiler parts
+    let event_loop_config = EventLoopConfig {
+        stream_mode: opt.stream_mode,
+        group_by_cpu: opt.group_by_cpu,
+        monitor_exit_pid,
+        tgid_request_tx,
+    };
+    let mut event_loop = ProfilingEventLoop::new(
+        ebpf_profiler.counts,
+        ebpf_profiler.stack_traces,
+        ebpf_profiler.stacked_pointers,
+        ebpf_profiler.bpf,
+        event_loop_config,
+    );
 
     // Set up stopping mechanisms
     // CLI defaults to 10s profiling windows;
     // serve mode defaults to unlimited (like TUI modes).
     let duration = opt.time.unwrap_or(if opt.serve { 0 } else { 10000 });
-    setup_stopping_mechanisms(
-        duration,
-        perf_tx.clone(),
-        stopper.clone(),
-        spawn,
-        external_pid,
-    );
+    setup_timer_and_child_stop(duration, perf_tx.clone(), spawn);
+    setup_ctrlc_stop(perf_tx.clone(), stopper.clone());
+    println!("Waiting for Ctrl-C...");
 
     task::spawn(async move {
         if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
@@ -762,80 +512,47 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let mut sink = MultiplexSink::new(sinks);
 
     if opt.serve {
-        // Serve mode: periodically flush data to the web server instead of
-        // blocking until Stop. This ensures the web UI gets live updates.
-        // trace_count and known_tgids persist across flushes so data accumulates.
+        // Serve mode: periodically flush data to the web server
         let flush_interval = std::time::Duration::from_secs(2);
-        let mut stopped = false;
-        let mut trace_count = HashMap::<StackInfo, usize>::new();
-        let mut known_tgids = std::collections::HashSet::<u32>::new();
         let mut last_stacks = Vec::new();
 
-        while !stopped {
+        loop {
             tracing::debug!("serve loop: collecting samples for {:?}", flush_interval);
-            let stacks = collect_and_format_stacks(
-                counts,
-                stack_traces,
-                &perf_rx,
-                &mut profiler,
-                opt.stream_mode,
-                opt.group_by_cpu,
-                stacked_pointers,
-                &mut ebpf_profiler.bpf,
-                &tgid_request_tx,
-                Some(flush_interval),
-                &mut stopped,
-                monitor_exit_pid,
-                &mut trace_count,
-                &mut known_tgids,
-            );
+            let result = event_loop.collect(&perf_rx, Some(flush_interval));
             tracing::debug!(
                 "serve loop: flushing {} stacks to web server (stopped={})",
-                stacks.len(),
-                stopped
+                result.stacks.len(),
+                result.stopped
             );
-            sink.write_batch(&stacks)?;
-            if !stacks.is_empty() {
-                last_stacks = stacks;
+            sink.write_batch(&result.stacks)?;
+            if !result.stacks.is_empty() {
+                last_stacks = result.stacks;
+            }
+            if result.stopped {
+                break;
             }
         }
         sink.finish(&last_stacks)?;
     } else {
         // Non-serve mode: block until Stop, output once, exit.
         tracing::debug!("batch mode: collecting samples (blocks until Stop)");
-        let mut trace_count = HashMap::<StackInfo, usize>::new();
-        let mut known_tgids = std::collections::HashSet::<u32>::new();
-        let mut stopped = false;
-        let stacks = collect_and_format_stacks(
-            counts,
-            stack_traces,
-            &perf_rx,
-            &mut profiler,
-            opt.stream_mode,
-            opt.group_by_cpu,
-            stacked_pointers,
-            &mut ebpf_profiler.bpf,
-            &tgid_request_tx,
-            None, // block indefinitely
-            &mut stopped,
-            monitor_exit_pid,
-            &mut trace_count,
-            &mut known_tgids,
-        );
-        tracing::debug!("batch mode: collected {} stacks", stacks.len());
-        sink.write_batch(&stacks)?;
-        sink.finish(&stacks)?;
+        let result = event_loop.collect(&perf_rx, None);
+        tracing::debug!("batch mode: collected {} stacks", result.stacks.len());
+        sink.write_batch(&result.stacks)?;
+        sink.finish(&result.stacks)?;
     }
 
     drop(stopper);
 
     tracing::info!("Profiler ran for {:?}", started.elapsed());
 
-    profiler.print_stats();
+    event_loop.print_stats();
 
     // Log DWARF tail-call fallback diagnostics if DWARF was enabled
     if opt.dwarf.unwrap_or(false) {
-        if let Some(fallback_count) = ebpf_profiler.read_dwarf_stats() {
+        use profile_bee::ebpf::EbpfProfiler;
+        if let Some(fallback_count) = EbpfProfiler::read_dwarf_stats_from_bpf(event_loop.bpf_mut())
+        {
             if fallback_count > 0 {
                 eprintln!(
                     "DWARF tail-call fallback: {} samples used legacy {}-frame path",
@@ -851,16 +568,6 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     Ok(())
-}
-
-/// Convert an optional i32 PID to u32, rejecting negative values.
-fn uprobe_pid_as_u32(uprobe_pid: Option<i32>) -> Result<Option<u32>, anyhow::Error> {
-    uprobe_pid
-        .map(|p| {
-            u32::try_from(p)
-                .map_err(|_| anyhow::anyhow!("--uprobe-pid must be non-negative, got {}", p))
-        })
-        .transpose()
 }
 
 /// Handle --list-probes: resolve and display matching symbols, then exit.
@@ -889,360 +596,6 @@ fn handle_list_probes(
 
     println!("{}", format_resolved_probes(&probes));
     Ok(())
-}
-
-/// Resolve uprobe spec strings into a SmartUProbeConfig ready for eBPF attachment.
-fn resolve_uprobe_specs(
-    specs: &[String],
-    pid: Option<u32>,
-    uprobe_pid: Option<i32>,
-) -> Result<SmartUProbeConfig, anyhow::Error> {
-    let resolver = ProbeResolver::new();
-    let effective_pid = pid.or(uprobe_pid_as_u32(uprobe_pid)?);
-    let mut all_probes: Vec<ResolvedProbe> = Vec::new();
-
-    for spec_str in specs {
-        let spec = parse_probe_spec(spec_str)
-            .map_err(|e| anyhow::anyhow!("invalid probe spec '{}': {}", spec_str, e))?;
-
-        eprintln!("Resolving uprobe: {}", spec);
-
-        let probes = if let Some(target_pid) = effective_pid {
-            resolver.resolve_for_pid(&spec, target_pid)
-        } else {
-            resolver.resolve_system_wide(&spec)
-        }
-        .map_err(|e| anyhow::anyhow!("failed to resolve '{}': {}", spec_str, e))?;
-
-        if probes.is_empty() {
-            return Err(anyhow::anyhow!(
-                "no symbols found matching '{}'. Use --list-probes to search.",
-                spec_str,
-            ));
-        }
-
-        eprintln!(
-            "  resolved {} match{} for '{}'",
-            probes.len(),
-            if probes.len() == 1 { "" } else { "es" },
-            spec_str,
-        );
-
-        all_probes.extend(probes);
-    }
-
-    Ok(SmartUProbeConfig {
-        probes: all_probes,
-        pid: uprobe_pid,
-    })
-}
-
-/// Sets up the process to profile if a command is provided
-fn setup_process_to_profile(
-    cmd: &Option<String>,
-    command: &[String],
-) -> anyhow::Result<(Option<StopHandler>, Option<SpawnProcess>)> {
-    // Prefer the new command format (--) over the old --cmd format
-    if !command.is_empty() {
-        let program = &command[0];
-        let args: Vec<&str> = command[1..].iter().map(|s| s.as_str()).collect();
-
-        println!("Running command: {} {}", program, args.join(" "));
-
-        let (child, stopper) = SpawnProcess::spawn(program, &args)?;
-        println!("Profiling PID {}..", child.pid());
-
-        return Ok((Some(stopper), Some(child)));
-    }
-
-    // Fall back to old --cmd format for backward compatibility
-    if let Some(cmd) = cmd {
-        eprintln!("Warning: --cmd is deprecated. Use '-- <command> <args>' instead.");
-        println!("Running cmd: {cmd}");
-
-        // todo: use shelltools
-        let args: Vec<_> = cmd.split(' ').collect();
-        let (child, stopper) = SpawnProcess::spawn(args[0], &args[1..])?;
-
-        println!("Profiling PID {}..", child.pid());
-
-        Ok((Some(stopper), Some(child)))
-    } else {
-        Ok((None, None))
-    }
-}
-
-/// Sets up the mechanisms that can stop the profiling
-fn setup_stopping_mechanisms(
-    duration: usize,
-    perf_tx: mpsc::Sender<PerfWork>,
-    stopping: Option<StopHandler>,
-    spawn: Option<SpawnProcess>,
-    _target_pid: Option<u32>,
-) {
-    // 4 ways to stop
-    // - 1. user defined duration
-    // - 2. ctrl-c received
-    // - 3. child process stops (when spawned with -- or --cmd)
-    // - 4. target PID exits (when profiling with --pid) - now handled by eBPF tracepoint
-
-    // Timer-based stopping (duration == 0 means run indefinitely)
-    if duration > 0 {
-        let time_stop_tx = perf_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
-            // Send Stop message to exit the profiling loop
-            // NOTE: Don't kill the spawned process here — it must stay alive
-            // for symbolization (reading /proc/<pid>/maps) after profiling stops.
-            // The caller kills it after processing.
-            time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
-        });
-    }
-
-    // Child process completion stopping (for spawned processes)
-    if let Some(mut child) = spawn {
-        let child_stopper_tx = perf_tx.clone();
-        tokio::spawn(async move {
-            child.work_done().await;
-            child_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
-        });
-    }
-
-    // Note: Process exit monitoring for --pid is now handled by eBPF tracepoint
-    // (sched_process_exit) instead of polling /proc. Events are delivered
-    // through the process_exit_events ring buffer.
-
-    // Ctrl-C stopping
-    let stop_tx = perf_tx.clone();
-    let stopping = stopping;
-    tokio::spawn(async move {
-        tracing::debug!("setup_stopping_mechanisms: waiting for Ctrl-C");
-        println!("Waiting for Ctrl-C...");
-        tokio::signal::ctrl_c().await.unwrap_or_default();
-        tracing::info!("setup_stopping_mechanisms: Ctrl-C received, sending Stop");
-        println!("Received Ctrl-C");
-        drop(stopping);
-        stop_tx.send(PerfWork::Stop).unwrap_or_default();
-    });
-}
-
-/// Sets up the ring buffer task to collect stack traces
-async fn setup_ring_buffer_task(
-    ring_buf: RingBuf<MapData>,
-    perf_tx: mpsc::Sender<PerfWork>,
-) -> anyhow::Result<()> {
-    use tokio::io::unix::AsyncFd;
-    let mut fd = AsyncFd::new(ring_buf)?;
-
-    while let Ok(mut guard) = fd.readable_mut().await {
-        match guard.try_io(|inner| {
-            let ring_buf = inner.get_mut();
-            while let Some(item) = ring_buf.next() {
-                let stack: StackInfo = unsafe { *item.as_ptr().cast() };
-                let _ = perf_tx.send(PerfWork::StackInfo(stack));
-            }
-            Ok(())
-        }) {
-            Ok(_) => {
-                guard.clear_ready();
-                continue;
-            }
-            Err(_would_block) => continue,
-        }
-    }
-
-    Ok(())
-}
-
-/// Sets up the ring buffer task to collect process exit events
-async fn setup_process_exit_ring_buffer_task(
-    ring_buf: RingBuf<MapData>,
-    perf_tx: mpsc::Sender<PerfWork>,
-) -> anyhow::Result<()> {
-    use tokio::io::unix::AsyncFd;
-    let mut fd = AsyncFd::new(ring_buf)?;
-
-    while let Ok(mut guard) = fd.readable_mut().await {
-        match guard.try_io(|inner| {
-            let ring_buf = inner.get_mut();
-            while let Some(item) = ring_buf.next() {
-                let exit_event: ProcessExitEvent = unsafe { *item.as_ptr().cast() };
-                tracing::debug!("eBPF detected: PID {} has exited", exit_event.pid);
-                let _ = perf_tx.send(PerfWork::ProcessExit(exit_event));
-            }
-            Ok(())
-        }) {
-            Ok(_) => {
-                guard.clear_ready();
-                continue;
-            }
-            Err(_would_block) => continue,
-        }
-    }
-
-    Ok(())
-}
-
-// Processes profiling data collected from eBPF.
-//
-// Unified event loop for batch and streaming modes:
-// - `timeout = None` → blocks on `recv()` until Stop/exit (batch mode)
-// - `timeout = Some(d)` → drains events for up to `d` then returns (streaming mode)
-//
-// `trace_count` and `known_tgids` are owned by the caller so state can persist
-// across calls in streaming mode.
-#[allow(clippy::too_many_arguments)]
-fn collect_and_format_stacks(
-    counts: &mut aya::maps::HashMap<MapData, StackInfoPod, u64>,
-    stack_traces: &StackTraceMap<MapData>,
-    perf_rx: &mpsc::Receiver<PerfWork>,
-    profiler: &mut TraceHandler,
-    stream_mode: u8,
-    group_by_cpu: bool,
-    stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
-    bpf: &mut Ebpf,
-    tgid_request_tx: &Option<mpsc::Sender<DwarfThreadMsg>>,
-    timeout: Option<std::time::Duration>,
-    stopped: &mut bool,
-    monitor_exit_pid: Option<u32>,
-    trace_count: &mut HashMap<StackInfo, usize>,
-    known_tgids: &mut std::collections::HashSet<u32>,
-) -> Vec<String> {
-    let mut queue_processed = 0u64;
-    let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
-
-    // Drain the eBPF counts map.  In streaming/serve mode the map is
-    // intentionally emptied each invocation so that samples are transferred
-    // into the caller-owned `trace_count` for accumulation — clearing here
-    // avoids double-counting and keeps the kernel-side map from filling up.
-    let keys = counts.keys().flatten().collect::<Vec<_>>();
-    for k in keys {
-        let _ = counts.remove(&k);
-    }
-
-    // Compute deadline for streaming mode; batch mode uses recv() directly
-    let deadline = timeout.map(|d| Instant::now() + d);
-
-    loop {
-        let work = if let Some(dl) = deadline {
-            let remaining = dl.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match perf_rx.recv_timeout(remaining) {
-                Ok(w) => w,
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    tracing::warn!("collect_and_format_stacks: channel disconnected");
-                    *stopped = true;
-                    break;
-                }
-            }
-        } else {
-            // Batch mode: block indefinitely
-            match perf_rx.recv() {
-                Ok(w) => w,
-                Err(_) => break,
-            }
-        };
-
-        match work {
-            PerfWork::StackInfo(stack) => {
-                queue_processed += 1;
-                if queue_processed == 1 {
-                    tracing::debug!("collect_and_format_stacks: received first StackInfo event");
-                }
-
-                // Request DWARF loading for newly seen processes
-                if let Some(tx) = tgid_request_tx {
-                    if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
-                        let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
-                    }
-                }
-
-                if local_counting {
-                    let trace = trace_count.entry(stack).or_insert(0);
-                    *trace += 1;
-                    if *trace == 1 {
-                        profiler.get_exp_stacked_frames(
-                            &stack,
-                            stack_traces,
-                            group_by_cpu,
-                            stacked_pointers,
-                        );
-                    }
-                } else {
-                    profiler.get_exp_stacked_frames(
-                        &stack,
-                        stack_traces,
-                        group_by_cpu,
-                        stacked_pointers,
-                    );
-                }
-            }
-            PerfWork::DwarfRefresh(update) => {
-                if let Err(e) = apply_dwarf_refresh(bpf, update) {
-                    tracing::warn!("{:#}", e);
-                }
-            }
-            PerfWork::ProcessExit(exit_event) => {
-                if let Some(tx) = tgid_request_tx {
-                    let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
-                }
-                known_tgids.remove(&exit_event.pid);
-                if Some(exit_event.pid) == monitor_exit_pid {
-                    tracing::info!("target process {} exited, stopping", exit_event.pid);
-                    *stopped = true;
-                    break;
-                }
-                tracing::debug!("DWARF-tracked process {} exited", exit_event.pid);
-            }
-            PerfWork::Stop => {
-                tracing::info!("collect_and_format_stacks: received Stop");
-                *stopped = true;
-                break;
-            }
-        }
-    }
-
-    tracing::debug!(
-        "collect_and_format_stacks: processed {} events",
-        queue_processed
-    );
-
-    // Build collapse-format output from trace counts or kernel counts.
-    // Both sources are unified into (StackInfo, u64) pairs so a single loop
-    // can drive symbolization and FrameCount construction.
-    let sources: Vec<(StackInfo, u64)> = if local_counting {
-        trace_count.iter().map(|(&s, &v)| (s, v as u64)).collect()
-    } else {
-        counts.iter().flatten().map(|(k, v)| (k.0, v)).collect()
-    };
-
-    let mut stacks = Vec::new();
-    for (stack, count) in &sources {
-        let combined =
-            profiler.get_exp_stacked_frames(stack, stack_traces, group_by_cpu, stacked_pointers);
-        stacks.push(FrameCount {
-            frames: combined,
-            count: *count,
-        });
-    }
-
-    let mut out: Vec<String> = stacks
-        .into_iter()
-        .map(|frames| {
-            let key = frames
-                .frames
-                .iter()
-                .map(|s| s.fmt_symbol())
-                .collect::<Vec<_>>()
-                .join(";");
-            format!("{} {}", &key, frames.count)
-        })
-        .collect();
-    out.sort();
-    out
 }
 
 /// Parse update mode from string
@@ -1649,13 +1002,8 @@ async fn run_combined_mode(
 
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
-    setup_stopping_mechanisms(
-        opt.time.unwrap_or(0),
-        perf_tx.clone(),
-        stopper.clone(),
-        spawn,
-        external_pid,
-    );
+    setup_timer_and_child_stop(opt.time.unwrap_or(0), perf_tx.clone(), spawn);
+    setup_ctrlc_stop(perf_tx.clone(), stopper.clone());
 
     // Ring buffer collection task
     task::spawn(async move {
@@ -1715,13 +1063,8 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
 
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
-    setup_stopping_mechanisms(
-        opt.time.unwrap_or(0),
-        perf_tx.clone(),
-        stopper.clone(),
-        spawn,
-        external_pid,
-    );
+    setup_timer_and_child_stop(opt.time.unwrap_or(0), perf_tx.clone(), spawn);
+    setup_ctrlc_stop(perf_tx.clone(), stopper.clone());
 
     // Ring buffer collection task
     task::spawn(async move {

@@ -15,7 +15,7 @@ pub struct StopHandler {
 
 impl StopHandler {
     fn stop(&self) {
-        println!("stopping...");
+        tracing::debug!("stopping...");
         let _ = self.tx.try_send(Nothing);
     }
 }
@@ -69,13 +69,13 @@ impl SpawnProcess {
 
     async fn kill(&mut self) -> Result<(), Error> {
         if !self.running() {
-            println!("already stopped");
+            tracing::debug!("already stopped");
             return Ok(());
         }
         self.running.store(false, Ordering::SeqCst);
-        println!("killing...");
+        tracing::debug!("killing child process...");
         let r = self.child.kill().await;
-        println!("done...");
+        tracing::debug!("child process killed");
         r
     }
 
@@ -83,18 +83,18 @@ impl SpawnProcess {
         tokio::select! {
             _ = self.child.wait() => {
                 // Listen to when process stops
-                println!("Child process stopped");
+                tracing::info!("Child process stopped");
                 self.running.store(false, Ordering::SeqCst);
             },
             stopper = self.stopper_rx.recv() => {
                 match stopper {
                     // listen on stop signals from other applications
                     Some(_) => {
-                        println!("close signal done...");
+                        tracing::debug!("close signal received, killing child");
                         let _ = self.kill().await;
                     }
                     None => {
-                        println!("Disconnected");
+                        tracing::debug!("stopper channel disconnected, killing child");
                         let _ = self.kill().await;
                     }
                 }
@@ -138,11 +138,11 @@ impl SpawnProcess {
     pub async fn close_signal(&mut self) -> Result<(), Error> {
         match self.stopper_rx.recv().await {
             Some(_) => {
-                println!("close signal done...");
+                tracing::debug!("close signal received, killing child");
                 return self.kill().await;
             }
             None => {
-                println!("Disconnected");
+                tracing::debug!("stopper channel disconnected, killing child");
                 return self.kill().await;
             }
         }
@@ -159,5 +159,43 @@ impl SpawnProcess {
 impl Drop for SpawnProcess {
     fn drop(&mut self) {
         drop(self.kill());
+    }
+}
+
+/// Sets up the process to profile if a command is provided.
+///
+/// Returns `(Option<StopHandler>, Option<SpawnProcess>)`.  When no command
+/// is given, both are `None`.
+pub fn setup_process_to_profile(
+    cmd: &Option<String>,
+    command: &[String],
+) -> anyhow::Result<(Option<StopHandler>, Option<SpawnProcess>)> {
+    // Prefer the new command format (--) over the old --cmd format
+    if !command.is_empty() {
+        let program = &command[0];
+        let args: Vec<&str> = command[1..].iter().map(|s| s.as_str()).collect();
+
+        tracing::info!("Running command: {} {}", program, args.join(" "));
+
+        let (child, stopper) = SpawnProcess::spawn(program, &args)?;
+        tracing::info!("Profiling PID {}..", child.pid());
+
+        return Ok((Some(stopper), Some(child)));
+    }
+
+    // Fall back to old --cmd format for backward compatibility
+    if let Some(cmd) = cmd {
+        tracing::warn!("--cmd is deprecated. Use '-- <command> <args>' instead.");
+        tracing::info!("Running cmd: {cmd}");
+
+        // todo: use shelltools
+        let args: Vec<_> = cmd.split(' ').collect();
+        let (child, stopper) = SpawnProcess::spawn(args[0], &args[1..])?;
+
+        tracing::info!("Profiling PID {}..", child.pid());
+
+        Ok((Some(stopper), Some(child)))
+    } else {
+        Ok((None, None))
     }
 }

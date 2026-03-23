@@ -3,7 +3,9 @@ use profile_bee_common::StackInfo;
 
 mod cache;
 pub mod ebpf;
+pub mod event_loop;
 pub mod html;
+pub mod session;
 pub mod spawn;
 
 mod legacy;

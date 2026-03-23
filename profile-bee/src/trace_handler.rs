@@ -95,7 +95,12 @@ impl TraceHandler {
     }
 
     pub fn print_stats(&self) {
-        println!("{}", self.cache.stats());
+        tracing::info!("{}", self.cache.stats());
+    }
+
+    /// Return a summary of profiling statistics as a string.
+    pub fn stats_summary(&self) -> String {
+        self.cache.stats()
     }
 
     /// converts kernel stacked frames into symbols

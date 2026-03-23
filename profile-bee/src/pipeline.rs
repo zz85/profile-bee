@@ -7,10 +7,12 @@
 use std::collections::HashMap;
 use std::sync::mpsc;
 
+use aya::maps::{MapData, RingBuf};
 use profile_bee_common::{ProcessExitEvent, StackInfo};
 
 use crate::dwarf_unwind::{DwarfUnwindManager, MappingsDiff};
 use crate::ebpf::{build_dwarf_refresh, DwarfRefreshUpdate};
+use crate::spawn::{SpawnProcess, StopHandler};
 
 /// Message type for the profiler's communication channel.
 ///
@@ -165,4 +167,113 @@ pub fn dwarf_refresh_loop(
             return;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ring buffer tasks and stopping mechanisms
+// ---------------------------------------------------------------------------
+
+/// Async task that polls the eBPF ring buffer for stack trace events and
+/// forwards them to the profiling event loop via the `PerfWork` channel.
+pub async fn setup_ring_buffer_task(
+    ring_buf: RingBuf<MapData>,
+    perf_tx: mpsc::Sender<PerfWork>,
+) -> anyhow::Result<()> {
+    use tokio::io::unix::AsyncFd;
+    let mut fd = AsyncFd::new(ring_buf)?;
+
+    while let Ok(mut guard) = fd.readable_mut().await {
+        match guard.try_io(|inner| {
+            let ring_buf = inner.get_mut();
+            while let Some(item) = ring_buf.next() {
+                let stack: StackInfo = unsafe { *item.as_ptr().cast() };
+                let _ = perf_tx.send(PerfWork::StackInfo(stack));
+            }
+            Ok(())
+        }) {
+            Ok(_) => {
+                guard.clear_ready();
+                continue;
+            }
+            Err(_would_block) => continue,
+        }
+    }
+
+    Ok(())
+}
+
+/// Async task that polls the eBPF ring buffer for process exit events and
+/// forwards them to the profiling event loop via the `PerfWork` channel.
+pub async fn setup_process_exit_ring_buffer_task(
+    ring_buf: RingBuf<MapData>,
+    perf_tx: mpsc::Sender<PerfWork>,
+) -> anyhow::Result<()> {
+    use tokio::io::unix::AsyncFd;
+    let mut fd = AsyncFd::new(ring_buf)?;
+
+    while let Ok(mut guard) = fd.readable_mut().await {
+        match guard.try_io(|inner| {
+            let ring_buf = inner.get_mut();
+            while let Some(item) = ring_buf.next() {
+                let exit_event: ProcessExitEvent = unsafe { *item.as_ptr().cast() };
+                tracing::debug!("eBPF detected: PID {} has exited", exit_event.pid);
+                let _ = perf_tx.send(PerfWork::ProcessExit(exit_event));
+            }
+            Ok(())
+        }) {
+            Ok(_) => {
+                guard.clear_ready();
+                continue;
+            }
+            Err(_would_block) => continue,
+        }
+    }
+
+    Ok(())
+}
+
+/// Set up timer-based and child-process-based stopping mechanisms.
+///
+/// This wires the non-interactive stopping mechanisms:
+/// - Timer expiry (`duration > 0` means stop after N ms; 0 = run indefinitely)
+/// - Child process completion (for `-- <command>` spawned processes)
+///
+/// Note: Ctrl-C handling is left to the caller (typically the CLI binary)
+/// since library consumers may want different signal handling.
+pub fn setup_timer_and_child_stop(
+    duration: usize,
+    perf_tx: mpsc::Sender<PerfWork>,
+    spawn: Option<SpawnProcess>,
+) {
+    // Timer-based stopping (duration == 0 means run indefinitely)
+    if duration > 0 {
+        let time_stop_tx = perf_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(duration as _)).await;
+            time_stop_tx.send(PerfWork::Stop).unwrap_or_default();
+        });
+    }
+
+    // Child process completion stopping (for spawned processes)
+    if let Some(mut child) = spawn {
+        let child_stopper_tx = perf_tx.clone();
+        tokio::spawn(async move {
+            child.work_done().await;
+            child_stopper_tx.send(PerfWork::Stop).unwrap_or_default();
+        });
+    }
+}
+
+/// Set up a Ctrl-C handler that sends `PerfWork::Stop` on the channel.
+///
+/// Separated from `setup_timer_and_child_stop` because library consumers
+/// may want their own signal handling.
+pub fn setup_ctrlc_stop(perf_tx: mpsc::Sender<PerfWork>, stopper: Option<StopHandler>) {
+    tokio::spawn(async move {
+        tracing::debug!("Ctrl-C handler: waiting for signal");
+        tokio::signal::ctrl_c().await.unwrap_or_default();
+        tracing::info!("Ctrl-C received, sending Stop");
+        drop(stopper);
+        perf_tx.send(PerfWork::Stop).unwrap_or_default();
+    });
 }
