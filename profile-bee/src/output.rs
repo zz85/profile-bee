@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use inferno::flamegraph::{self, Options};
 
 use crate::html::{collapse_to_json, generate_html_file};
+use crate::pprof::{collapse_to_pprof, PprofOptions};
 
 /// Trait for consuming profiling output.
 ///
@@ -204,5 +205,37 @@ impl OutputSink for WebBroadcastSink {
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
         // Forward the final batch so web clients see the last data snapshot.
         self.write_batch(final_stacks)
+    }
+}
+
+/// Writes a gzip-compressed pprof protobuf file on finish.
+///
+/// The output is compatible with `go tool pprof`, Grafana/Pyroscope,
+/// Speedscope, and other pprof-compatible tools.
+pub struct PprofSink {
+    path: PathBuf,
+    options: PprofOptions,
+}
+
+impl PprofSink {
+    pub fn new(path: PathBuf, frequency_hz: u64, duration_ms: u64, off_cpu: bool) -> Self {
+        Self {
+            path,
+            options: PprofOptions {
+                frequency_hz,
+                duration_ms,
+                off_cpu,
+            },
+        }
+    }
+}
+
+impl OutputSink for PprofSink {
+    fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
+        tracing::info!("Writing pprof to: {}", self.path.display());
+        let pprof_bytes = collapse_to_pprof(final_stacks, &self.options)
+            .context("Failed to generate pprof output")?;
+        std::fs::write(&self.path, pprof_bytes).context("Unable to write pprof file")?;
+        Ok(())
     }
 }

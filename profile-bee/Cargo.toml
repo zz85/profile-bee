@@ -44,6 +44,8 @@ libc = "0.2.86"
 regex = "1"
 memmap2 = "0.9"
 lru = "0.12"
+prost = "0.13"
+flate2 = "1"
 
 [features]
 default = ["tui"]

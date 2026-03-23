@@ -7,7 +7,8 @@ use profile_bee::ebpf::{
 use profile_bee::event_loop::{EventLoopConfig, ProfilingEventLoop};
 use profile_bee::html::collapse_to_json;
 use profile_bee::output::{
-    CollapseSink, HtmlSink, JsonFileSink, MultiplexSink, OutputSink, SvgSink, WebBroadcastSink,
+    CollapseSink, HtmlSink, JsonFileSink, MultiplexSink, OutputSink, PprofSink, SvgSink,
+    WebBroadcastSink,
 };
 use profile_bee::pipeline::{
     dwarf_refresh_loop, setup_ctrlc_stop, setup_process_exit_ring_buffer_task,
@@ -92,6 +93,11 @@ struct Opt {
     /// Generate json data format in d3 flamegraph format
     #[arg(long)]
     json: Option<PathBuf>,
+
+    /// Filename for pprof protobuf output (gzip-compressed, .pb.gz).
+    /// Compatible with `go tool pprof`, Grafana/Pyroscope, Speedscope, etc.
+    #[arg(long)]
+    pprof: Option<PathBuf>,
 
     /// Starts a http server to serve the html flamegraph result. Can be combined with --tui for dual interface access.
     #[arg(long)]
@@ -225,6 +231,7 @@ impl Opt {
             || self.svg.is_some()
             || self.html.is_some()
             || self.json.is_some()
+            || self.pprof.is_some()
             // Interactive modes
             || self.serve
             || { #[cfg(feature = "tui")] { self.tui } #[cfg(not(feature = "tui"))] { false } }
@@ -505,6 +512,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
     if let Some(collapse_path) = &opt.collapse {
         sinks.push(Box::new(CollapseSink::new(collapse_path.clone())));
+    }
+    if let Some(pprof_path) = &opt.pprof {
+        sinks.push(Box::new(PprofSink::new(
+            pprof_path.clone(),
+            opt.frequency,
+            opt.time.unwrap_or(10000) as u64,
+            opt.off_cpu,
+        )));
     }
     if opt.serve {
         sinks.push(Box::new(WebBroadcastSink::new(tx)));
