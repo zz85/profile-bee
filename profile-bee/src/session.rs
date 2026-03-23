@@ -36,6 +36,8 @@ pub struct SessionConfig {
     pub command: Vec<String>,
     /// Duration in ms (0 = unlimited). Only used in batch/streaming mode.
     pub duration_ms: usize,
+    /// Group samples by CPU core.
+    pub group_by_cpu: bool,
     /// Whether to set up process-exit monitoring for external PIDs.
     pub monitor_exit: bool,
 }
@@ -47,6 +49,7 @@ impl Default for SessionConfig {
             cmd: None,
             command: Vec::new(),
             duration_ms: 0,
+            group_by_cpu: false,
             monitor_exit: true,
         }
     }
@@ -109,9 +112,7 @@ impl ProfilingSession {
     /// The receiver is returned separately because it must be passed to
     /// `event_loop.collect()` — it cannot be stored in the session due
     /// to borrow conflicts.
-    pub async fn new(
-        mut config: SessionConfig,
-    ) -> Result<(Self, mpsc::Receiver<PerfWork>)> {
+    pub async fn new(mut config: SessionConfig) -> Result<(Self, mpsc::Receiver<PerfWork>)> {
         // 1. Load eBPF
         let verification_start = std::time::Instant::now();
         let mut ebpf_profiler = setup_ebpf_with_tp_fallback(&mut config.profiler)?;
@@ -212,7 +213,7 @@ impl ProfilingSession {
         // 10. Build event loop
         let event_loop_config = EventLoopConfig {
             stream_mode: config.profiler.stream_mode,
-            group_by_cpu: false, // default; caller can set via SessionConfig extension
+            group_by_cpu: config.group_by_cpu,
             monitor_exit_pid,
             tgid_request_tx,
         };

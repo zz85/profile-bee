@@ -122,7 +122,10 @@ impl ProfilingEventLoop {
                 // Batch mode: block indefinitely
                 match rx.recv() {
                     Ok(w) => w,
-                    Err(_) => break,
+                    Err(_) => {
+                        stopped = true;
+                        break;
+                    }
                 }
             };
 

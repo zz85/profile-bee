@@ -185,7 +185,10 @@ pub fn setup_process_to_profile(
 
     // Fall back to old --cmd format for backward compatibility
     if let Some(cmd) = cmd {
-        tracing::warn!("--cmd is deprecated. Use '-- <command> <args>' instead.");
+        tracing::warn!(
+            "--cmd is deprecated. Use '-- <command> <args>' instead \
+             (handles quoted and complex arguments correctly)."
+        );
         tracing::info!("Running cmd: {cmd}");
 
         // todo: use shelltools

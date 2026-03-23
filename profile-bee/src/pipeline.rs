@@ -238,6 +238,12 @@ pub async fn setup_process_exit_ring_buffer_task(
 /// - Timer expiry (`duration > 0` means stop after N ms; 0 = run indefinitely)
 /// - Child process completion (for `-- <command>` spawned processes)
 ///
+/// Both the timer and the child-exit task clone `perf_tx` and may each send
+/// `PerfWork::Stop`. Receiving multiple Stops is intentional and benign —
+/// the event loop in `ProfilingEventLoop::collect()` breaks on the first
+/// Stop, and any extra Stop remains in the channel (dropped when the
+/// receiver is dropped after `collect()` returns).
+///
 /// Note: Ctrl-C handling is left to the caller (typically the CLI binary)
 /// since library consumers may want different signal handling.
 pub fn setup_timer_and_child_stop(

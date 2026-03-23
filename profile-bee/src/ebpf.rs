@@ -1000,6 +1000,7 @@ pub fn apply_dwarf_refresh(bpf: &mut Ebpf, update: DwarfRefreshUpdate) -> Result
 /// through the raw-tp + NR-filter path would silently break filtering.
 /// Returning None for sys_exit lets the caller fall through to the
 /// generic tracepoint / perf-event attachment path instead.
+#[cfg(target_arch = "x86_64")]
 pub fn parse_syscall_tracepoint(tp: &str) -> Option<(&str, i64)> {
     let (category, name) = tp.split_once(':')?;
 
@@ -1017,6 +1018,7 @@ pub fn parse_syscall_tracepoint(tp: &str) -> Option<(&str, i64)> {
 
 /// Map x86_64 syscall name to its number.
 /// Based on Linux x86_64 syscall table (stable ABI).
+#[cfg(target_arch = "x86_64")]
 pub fn syscall_name_to_nr(name: &str) -> Option<i64> {
     // Common syscalls — extend as needed
     let nr = match name {
@@ -1117,6 +1119,18 @@ pub fn syscall_name_to_nr(name: &str) -> Option<i64> {
         _ => return None,
     };
     Some(nr)
+}
+
+/// Stub for non-x86_64 architectures — syscall NR mapping not available.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn parse_syscall_tracepoint(_tp: &str) -> Option<(&str, i64)> {
+    None
+}
+
+/// Stub for non-x86_64 architectures — syscall NR mapping not available.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn syscall_name_to_nr(_name: &str) -> Option<i64> {
+    None
 }
 
 /// Extract the tracepoint name from "category:name" format for raw_tp attachment.
