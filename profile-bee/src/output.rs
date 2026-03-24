@@ -30,6 +30,11 @@ pub trait OutputSink: Send {
     fn finish(&mut self, _final_stacks: &[String]) -> Result<()> {
         Ok(())
     }
+
+    /// Called before `finish` to update metadata with the actual profiling
+    /// duration. Sinks that embed duration in their output (pprof, CodeGuru)
+    /// should override this; others can ignore it.
+    fn set_actual_duration_ms(&mut self, _duration_ms: u64) {}
 }
 
 /// Fans out to multiple sinks.
@@ -44,6 +49,12 @@ impl MultiplexSink {
 }
 
 impl OutputSink for MultiplexSink {
+    fn set_actual_duration_ms(&mut self, duration_ms: u64) {
+        for sink in &mut self.sinks {
+            sink.set_actual_duration_ms(duration_ms);
+        }
+    }
+
     fn write_batch(&mut self, stacks: &[String]) -> Result<()> {
         let mut first_err: Option<anyhow::Error> = None;
         for sink in &mut self.sinks {
@@ -229,9 +240,19 @@ impl PprofSink {
             },
         }
     }
+
+    /// Update the duration after profiling completes so the exported
+    /// metadata reflects the actual session length, not the requested timeout.
+    pub fn set_duration_ms(&mut self, duration_ms: u64) {
+        self.options.duration_ms = duration_ms;
+    }
 }
 
 impl OutputSink for PprofSink {
+    fn set_actual_duration_ms(&mut self, duration_ms: u64) {
+        self.options.duration_ms = duration_ms;
+    }
+
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
         tracing::info!("Writing pprof to: {}", self.path.display());
         let pprof_bytes = collapse_to_pprof(final_stacks, &self.options)
@@ -268,6 +289,12 @@ impl CodeGuruSink {
         }
     }
 
+    /// Update the duration after profiling completes so the exported
+    /// metadata reflects the actual session length, not the requested timeout.
+    pub fn set_duration_ms(&mut self, duration_ms: u64) {
+        self.options.duration_ms = duration_ms;
+    }
+
     /// Create with explicit fleet info for AWS environments.
     pub fn with_fleet_info(
         path: PathBuf,
@@ -289,6 +316,10 @@ impl CodeGuruSink {
 }
 
 impl OutputSink for CodeGuruSink {
+    fn set_actual_duration_ms(&mut self, duration_ms: u64) {
+        self.options.duration_ms = duration_ms;
+    }
+
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
         tracing::info!("Writing CodeGuru JSON to: {}", self.path.display());
         let json = collapse_to_codeguru(final_stacks, &self.options);

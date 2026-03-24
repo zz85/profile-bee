@@ -288,6 +288,25 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     #[cfg(feature = "tui")]
     if opt.tui {
+        // Warn about output flags that TUI mode doesn't support
+        let unsupported: Vec<&str> = [
+            opt.pprof.as_ref().map(|_| "--pprof"),
+            opt.codeguru.as_ref().map(|_| "--codeguru"),
+            opt.svg.as_ref().map(|_| "--svg"),
+            opt.html.as_ref().map(|_| "--html"),
+            opt.json.as_ref().map(|_| "--json"),
+            opt.collapse.as_ref().map(|_| "--collapse"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !unsupported.is_empty() {
+            eprintln!(
+                "Warning: {} ignored in TUI mode (TUI has its own output pipeline)",
+                unsupported.join(", ")
+            );
+        }
+
         if opt.serve {
             // Combined TUI + serve mode
             return run_combined_mode(opt, tx).await;
@@ -560,6 +579,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 break;
             }
         }
+        sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
         sink.finish(&last_stacks)?;
     } else {
         // Non-serve mode: block until Stop, output once, exit.
@@ -567,6 +587,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         let result = event_loop.collect(&perf_rx, None);
         tracing::debug!("batch mode: collected {} stacks", result.stacks.len());
         sink.write_batch(&result.stacks)?;
+        sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
         sink.finish(&result.stacks)?;
     }
 
@@ -1019,7 +1040,7 @@ async fn run_combined_mode(
     // Shared infrastructure
     let mut config = build_profiler_config(&opt, pid)?;
     let (perf_tx, perf_rx) = mpsc::channel();
-    let (ebpf_profiler, ring_buf, tgid_request_tx) =
+    let (mut ebpf_profiler, ring_buf, tgid_request_tx) =
         setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf.unwrap_or(false))?;
 
     // TUI app + update handle
@@ -1030,6 +1051,22 @@ async fn run_combined_mode(
 
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
+
+    // Process exit monitoring (same as main batch path)
+    if external_pid.is_some() || opt.dwarf.unwrap_or(false) {
+        attach_process_exit_tracepoint(&mut ebpf_profiler.bpf)?;
+        if let Some(pid_to_monitor) = external_pid {
+            ebpf_profiler.set_monitor_exit_pid(pid_to_monitor)?;
+        }
+        let exit_ring_buf = setup_process_exit_ring_buffer(&mut ebpf_profiler.bpf)?;
+        let exit_perf_tx = perf_tx.clone();
+        task::spawn(async move {
+            if let Err(e) = setup_process_exit_ring_buffer_task(exit_ring_buf, exit_perf_tx).await {
+                eprintln!("Failed to set up process exit ring buffer: {:?}", e);
+            }
+        });
+    }
+
     setup_timer_and_child_stop(opt.time.unwrap_or(0), perf_tx.clone(), spawn);
     setup_ctrlc_stop(perf_tx.clone(), stopper.clone());
 
@@ -1080,7 +1117,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     // Shared infrastructure
     let mut config = build_profiler_config(&opt, pid)?;
     let (perf_tx, perf_rx) = mpsc::channel();
-    let (ebpf_profiler, ring_buf, tgid_request_tx) =
+    let (mut ebpf_profiler, ring_buf, tgid_request_tx) =
         setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf.unwrap_or(false))?;
 
     // TUI app + update handle
@@ -1091,6 +1128,22 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
 
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
+
+    // Process exit monitoring (same as main batch path)
+    if external_pid.is_some() || opt.dwarf.unwrap_or(false) {
+        attach_process_exit_tracepoint(&mut ebpf_profiler.bpf)?;
+        if let Some(pid_to_monitor) = external_pid {
+            ebpf_profiler.set_monitor_exit_pid(pid_to_monitor)?;
+        }
+        let exit_ring_buf = setup_process_exit_ring_buffer(&mut ebpf_profiler.bpf)?;
+        let exit_perf_tx = perf_tx.clone();
+        task::spawn(async move {
+            if let Err(e) = setup_process_exit_ring_buffer_task(exit_ring_buf, exit_perf_tx).await {
+                eprintln!("Failed to set up process exit ring buffer: {:?}", e);
+            }
+        });
+    }
+
     setup_timer_and_child_stop(opt.time.unwrap_or(0), perf_tx.clone(), spawn);
     setup_ctrlc_stop(perf_tx.clone(), stopper.clone());
 

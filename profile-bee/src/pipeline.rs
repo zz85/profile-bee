@@ -186,8 +186,19 @@ pub async fn setup_ring_buffer_task(
         match guard.try_io(|inner| {
             let ring_buf = inner.get_mut();
             while let Some(item) = ring_buf.next() {
+                if item.len() < std::mem::size_of::<StackInfo>() {
+                    tracing::warn!(
+                        "Ring buffer item too small for StackInfo ({} < {}), skipping",
+                        item.len(),
+                        std::mem::size_of::<StackInfo>()
+                    );
+                    continue;
+                }
                 let stack: StackInfo = unsafe { *item.as_ptr().cast() };
-                let _ = perf_tx.send(PerfWork::StackInfo(stack));
+                if perf_tx.send(PerfWork::StackInfo(stack)).is_err() {
+                    // Receiver dropped — event loop is done, exit task
+                    return Ok(());
+                }
             }
             Ok(())
         }) {
@@ -215,9 +226,20 @@ pub async fn setup_process_exit_ring_buffer_task(
         match guard.try_io(|inner| {
             let ring_buf = inner.get_mut();
             while let Some(item) = ring_buf.next() {
+                if item.len() < std::mem::size_of::<ProcessExitEvent>() {
+                    tracing::warn!(
+                        "Ring buffer item too small for ProcessExitEvent ({} < {}), skipping",
+                        item.len(),
+                        std::mem::size_of::<ProcessExitEvent>()
+                    );
+                    continue;
+                }
                 let exit_event: ProcessExitEvent = unsafe { *item.as_ptr().cast() };
                 tracing::debug!("eBPF detected: PID {} has exited", exit_event.pid);
-                let _ = perf_tx.send(PerfWork::ProcessExit(exit_event));
+                if perf_tx.send(PerfWork::ProcessExit(exit_event)).is_err() {
+                    // Receiver dropped — event loop is done, exit task
+                    return Ok(());
+                }
             }
             Ok(())
         }) {
@@ -277,9 +299,19 @@ pub fn setup_timer_and_child_stop(
 pub fn setup_ctrlc_stop(perf_tx: mpsc::Sender<PerfWork>, stopper: Option<StopHandler>) {
     tokio::spawn(async move {
         tracing::debug!("Ctrl-C handler: waiting for signal");
-        tokio::signal::ctrl_c().await.unwrap_or_default();
-        tracing::info!("Ctrl-C received, sending Stop");
-        drop(stopper);
-        perf_tx.send(PerfWork::Stop).unwrap_or_default();
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                tracing::info!("Ctrl-C received, sending Stop");
+                drop(stopper);
+                perf_tx.send(PerfWork::Stop).unwrap_or_default();
+            }
+            Err(e) => {
+                tracing::error!("Failed to listen for Ctrl-C signal: {}", e);
+                // Don't send Stop or drop stopper — the signal handler
+                // failed to install, so we shouldn't act as if Ctrl-C
+                // was received. Other stop mechanisms (timer, child exit)
+                // will still work.
+            }
+        }
     });
 }
