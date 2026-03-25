@@ -3,6 +3,8 @@ use profile_bee_common::StackInfo;
 
 mod cache;
 pub mod codeguru;
+#[cfg(feature = "aws")]
+pub mod codeguru_upload;
 pub mod ebpf;
 pub mod event_loop;
 pub mod html;

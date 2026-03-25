@@ -104,6 +104,18 @@ struct Opt {
     #[arg(long)]
     codeguru: Option<PathBuf>,
 
+    /// Upload profile directly to AWS CodeGuru Profiler.
+    /// Requires --profiling-group. Uses standard AWS credential chain.
+    /// Build with `--features aws` to enable.
+    #[cfg(feature = "aws")]
+    #[arg(long)]
+    codeguru_upload: bool,
+
+    /// AWS CodeGuru profiling group name (required with --codeguru-upload).
+    #[cfg(feature = "aws")]
+    #[arg(long)]
+    profiling_group: Option<String>,
+
     /// Starts a http server to serve the html flamegraph result. Can be combined with --tui for dual interface access.
     #[arg(long)]
     serve: bool,
@@ -238,6 +250,7 @@ impl Opt {
             || self.json.is_some()
             || self.pprof.is_some()
             || self.codeguru.is_some()
+            || { #[cfg(feature = "aws")] { self.codeguru_upload } #[cfg(not(feature = "aws"))] { false } }
             // Interactive modes
             || self.serve
             || { #[cfg(feature = "tui")] { self.tui } #[cfg(not(feature = "tui"))] { false } }
@@ -552,6 +565,26 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             opt.frequency,
             opt.time.unwrap_or(10000) as u64,
         )));
+    }
+    #[cfg(feature = "aws")]
+    if opt.codeguru_upload {
+        let group = opt
+            .profiling_group
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--codeguru-upload requires --profiling-group"))?;
+        let codeguru_opts = profile_bee::codeguru::CodeGuruOptions {
+            frequency_hz: opt.frequency,
+            duration_ms: opt.time.unwrap_or(10000) as u64,
+            ..Default::default()
+        };
+        sinks.push(Box::new(
+            profile_bee::codeguru_upload::CodeGuruUploadSink::new(
+                group.clone(),
+                codeguru_opts,
+                opt.codeguru.clone(), // also save locally if --codeguru was specified
+                tokio::runtime::Handle::current(),
+            ),
+        ));
     }
     if opt.serve {
         sinks.push(Box::new(WebBroadcastSink::new(tx)));

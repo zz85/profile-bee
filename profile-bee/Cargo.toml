@@ -46,10 +46,13 @@ memmap2 = "0.9"
 lru = "0.12"
 prost = "0.13"
 flate2 = "1"
+aws-sdk-codeguruprofiler = { version = "1", optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 
 [features]
 default = ["tui"]
 tui = ["dep:profile-bee-tui"]
+aws = ["dep:aws-sdk-codeguruprofiler", "dep:aws-config"]
 
 [[bin]]
 name = "probee"

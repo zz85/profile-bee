@@ -138,8 +138,10 @@ impl TraceHandler {
         Ok(syms)
     }
 
-    /// Converts stacks traces into StackFrameInfo structs
-    /// Uses DWARF-unwound frame pointers from eBPF when available.
+    /// Converts stacks traces into StackFrameInfo structs.
+    /// Prefers custom-unwound frames from the stacked_pointers eBPF map
+    /// (populated by either FP walking or DWARF unwinding) when they
+    /// contain more frames than bpf_get_stackid.
     /// Results are cached by (tgid, kernel_stack_id, user_stack_id) to avoid
     /// redundant BPF map lookups and blazesym symbolization on repeated stacks.
     ///
@@ -173,7 +175,7 @@ impl TraceHandler {
 
         let key = StackInfoPod(*stack_info);
 
-        // Try to use DWARF-unwound frame pointers from eBPF
+        // Try to use custom-unwound frame pointers from eBPF (FP or DWARF path)
         let user_stack = if let Ok(pointers) = stacked_pointers.get(&key, 0) {
             let pointers = pointers.0;
             let len = pointers.len.min(pointers.pointers.len());
@@ -181,8 +183,9 @@ impl TraceHandler {
             if len > fp_len {
                 let addrs: Vec<u64> = pointers.pointers[..len].to_vec();
                 tracing::debug!(
-                    "Using DWARF-unwound stack ({} frames) for pid {}",
+                    "Using custom-unwound stack ({} frames, vs {} from stackid) for pid {}",
                     addrs.len(),
+                    fp_len,
                     stack_info.tgid,
                 );
                 Some(addrs)
