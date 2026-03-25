@@ -36,7 +36,7 @@ pub struct CodeGuruUploadSink {
     options: CodeGuruOptions,
     /// Optional local file path to also save the JSON (for debugging).
     local_copy: Option<PathBuf>,
-    /// Tokio runtime handle for running async AWS SDK calls from sync context.
+    /// Tokio runtime handle for spawning the async upload task.
     rt_handle: tokio::runtime::Handle,
 }
 
@@ -95,14 +95,29 @@ impl OutputSink for CodeGuruUploadSink {
             size, profiling_group,
         );
 
-        // Run the async upload on the tokio runtime with a timeout
-        let result = self.rt_handle.block_on(async {
-            tokio::time::timeout(
+        // Spawn the upload as a tokio task and wait for it via a oneshot channel.
+        // We cannot use block_on() here because finish() is called from within
+        // the tokio runtime (inside #[tokio::main]). Using block_on() from
+        // inside a runtime panics with "Cannot start a runtime from within a
+        // runtime". Instead, we spawn the work and use a std channel to bridge
+        // the sync/async boundary.
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        self.rt_handle.spawn(async move {
+            let result = tokio::time::timeout(
                 Duration::from_secs(UPLOAD_TIMEOUT_SECS),
                 do_upload(&profiling_group, json_bytes),
             )
-            .await
+            .await;
+            let _ = tx.send(result);
         });
+
+        // Wait for the spawned task's result (blocking the current thread
+        // is fine here — we're in a sync OutputSink::finish call and the
+        // upload task runs on a different tokio worker thread).
+        let result = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Upload task died before sending result"))?;
 
         match result {
             Ok(Ok(())) => {

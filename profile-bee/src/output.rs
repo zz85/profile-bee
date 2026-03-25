@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use inferno::flamegraph::{self, Options};
 
-use crate::codeguru::{collapse_to_codeguru, CodeGuruOptions};
+use crate::codeguru::{collapse_to_codeguru, CodeGuruOptions, CounterType};
 use crate::html::{collapse_to_json, generate_html_file};
 use crate::pprof::{collapse_to_pprof, PprofOptions};
 
@@ -278,12 +278,17 @@ pub struct CodeGuruSink {
 }
 
 impl CodeGuruSink {
-    pub fn new(path: PathBuf, frequency_hz: u64, duration_ms: u64) -> Self {
+    pub fn new(path: PathBuf, frequency_hz: u64, duration_ms: u64, off_cpu: bool) -> Self {
         Self {
             path,
             options: CodeGuruOptions {
                 frequency_hz,
                 duration_ms,
+                counter_type: if off_cpu {
+                    CounterType::Waiting
+                } else {
+                    CounterType::Runnable
+                },
                 ..Default::default()
             },
         }
@@ -300,8 +305,9 @@ impl CodeGuruSink {
         path: PathBuf,
         frequency_hz: u64,
         duration_ms: u64,
+        off_cpu: bool,
         fleet_id: String,
-        fleet_type: String,
+        host_type: String,
     ) -> Self {
         Self {
             path,
@@ -309,7 +315,12 @@ impl CodeGuruSink {
                 frequency_hz,
                 duration_ms,
                 fleet_id,
-                fleet_type,
+                host_type,
+                counter_type: if off_cpu {
+                    CounterType::Waiting
+                } else {
+                    CounterType::Runnable
+                },
             },
         }
     }

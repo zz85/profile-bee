@@ -564,6 +564,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             codeguru_path.clone(),
             opt.frequency,
             opt.time.unwrap_or(10000) as u64,
+            opt.off_cpu,
         )));
     }
     #[cfg(feature = "aws")]
@@ -575,6 +576,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         let codeguru_opts = profile_bee::codeguru::CodeGuruOptions {
             frequency_hz: opt.frequency,
             duration_ms: opt.time.unwrap_or(10000) as u64,
+            counter_type: if opt.off_cpu {
+                profile_bee::codeguru::CounterType::Waiting
+            } else {
+                profile_bee::codeguru::CounterType::Runnable
+            },
             ..Default::default()
         };
         sinks.push(Box::new(
