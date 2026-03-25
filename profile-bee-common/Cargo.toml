@@ -1,6 +1,6 @@
 [package]
 name = "profile-bee-common"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 license = "MIT"
 description = "Shared types between profile-bee userspace and eBPF programs"
