@@ -56,8 +56,8 @@ impl CodeGuruUploadSink {
             && std::env::var("AWS_PROFILE").is_err()
             && std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").is_err()
         {
-            eprintln!(
-                "Warning: no AWS credentials detected in environment. \
+            tracing::error!(
+                "No AWS credentials detected in environment. \
                  If running with sudo, use `sudo -E` to preserve credentials."
             );
         }

@@ -48,15 +48,17 @@ Google's pprof protobuf format — the standard interchange format for profiling
 
 ### 10b. AWS CodeGuru Profiler JSON Format ✅ Done
 
-CodeGuru's `PostAgentProfile` API accepts `application/json` with a recursive call-tree structure. Schema referenced from the open-source [Python agent](https://github.com/aws/amazon-codeguru-profiler-python-agent). Key design points:
+CodeGuru's `PostAgentProfile` API accepts `application/json` with a recursive call-tree structure. Schema referenced from the open-source [Python agent](https://github.com/aws/amazon-codeguru-profiler-python-agent) and [AWS thread-state docs](https://docs.aws.amazon.com/codeguru/latest/profiler-ug/working-with-visualizations-thread-states.html). Key design points:
 
 - Call tree stored as nested JSON objects (`children` is a map, not array)
-- Only **self-time counts at leaf nodes** (`"WALL_TIME"` counter)
-- Agent metadata: sample weights, duration, fleet info, agent version
+- Only **self-time counts at leaf nodes** with proper thread-state counter types (`RUNNABLE` for on-CPU, `WAITING` for off-CPU)
+- Agent metadata: sample weights, duration, fleet info (`fleetInstanceId`, `hostType`), agent version
 - No Ion dependency needed — plain `serde_json`
-- Conversion reuses the same tree-building pattern as `html.rs::collapse_to_json`
+- See `docs/codeguru_format.md` for full schema reference
 
-Implemented via `--codeguru <path>` flag for local file output. Future: add `--codeguru-upload` with `aws-sdk-codeguruprofiler` behind a feature flag to POST directly to the API.
+Implemented via:
+- `--codeguru <path>` flag for local file output (`src/codeguru.rs`)
+- `--codeguru-upload --profiling-group <name>` for direct upload to CodeGuru via `PostAgentProfile` API (`src/codeguru_upload.rs`). Uses the AWS SDK credential chain; requires `sudo -E` to preserve credentials.
 
 ### 10c. JFR (Java Flight Recorder) Format — Planned
 

@@ -19,6 +19,8 @@ fn main() {
 
     eprintln!("Read {} stack lines from {}", stacks.len(), args[1]);
 
+    // Demo defaults — in production, these should come from the profiler
+    // session that generated the collapse file (frequency, actual duration, etc.)
     let opts = PprofOptions {
         frequency_hz: 99,
         duration_ms: 10000,
