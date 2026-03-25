@@ -179,10 +179,7 @@ impl CallGraphNode {
             return;
         }
 
-        let child = self
-            .children
-            .entry(frames[0].to_owned())
-            .or_insert_with(CallGraphNode::new);
+        let child = self.children.entry(frames[0].to_owned()).or_default();
 
         if frames.len() == 1 {
             // Leaf node — add self-time count
