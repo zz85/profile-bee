@@ -186,15 +186,15 @@ pub async fn setup_ring_buffer_task(
         match guard.try_io(|inner| {
             let ring_buf = inner.get_mut();
             while let Some(item) = ring_buf.next() {
-                if item.len() < std::mem::size_of::<StackInfo>() {
+                if item.len() < StackInfo::STRUCT_SIZE {
                     tracing::warn!(
                         "Ring buffer item too small for StackInfo ({} < {}), skipping",
                         item.len(),
-                        std::mem::size_of::<StackInfo>()
+                        StackInfo::STRUCT_SIZE,
                     );
                     continue;
                 }
-                let stack: StackInfo = unsafe { *item.as_ptr().cast() };
+                let stack: StackInfo = unsafe { std::ptr::read_unaligned(item.as_ptr().cast()) };
                 if perf_tx.send(PerfWork::StackInfo(stack)).is_err() {
                     // Receiver dropped — event loop is done, exit task
                     return Ok(());
@@ -226,15 +226,16 @@ pub async fn setup_process_exit_ring_buffer_task(
         match guard.try_io(|inner| {
             let ring_buf = inner.get_mut();
             while let Some(item) = ring_buf.next() {
-                if item.len() < std::mem::size_of::<ProcessExitEvent>() {
+                if item.len() < ProcessExitEvent::STRUCT_SIZE {
                     tracing::warn!(
                         "Ring buffer item too small for ProcessExitEvent ({} < {}), skipping",
                         item.len(),
-                        std::mem::size_of::<ProcessExitEvent>()
+                        ProcessExitEvent::STRUCT_SIZE,
                     );
                     continue;
                 }
-                let exit_event: ProcessExitEvent = unsafe { *item.as_ptr().cast() };
+                let exit_event: ProcessExitEvent =
+                    unsafe { std::ptr::read_unaligned(item.as_ptr().cast()) };
                 tracing::debug!("eBPF detected: PID {} has exited", exit_event.pid);
                 if perf_tx.send(PerfWork::ProcessExit(exit_event)).is_err() {
                     // Receiver dropped — event loop is done, exit task
