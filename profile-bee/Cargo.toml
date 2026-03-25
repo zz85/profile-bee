@@ -50,7 +50,7 @@ aws-sdk-codeguruprofiler = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 
 [features]
-default = ["tui"]
+default = ["tui", "aws"]
 tui = ["dep:profile-bee-tui"]
 aws = ["dep:aws-sdk-codeguruprofiler", "dep:aws-config"]
 

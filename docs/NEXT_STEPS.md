@@ -81,6 +81,6 @@ Binary format used by JDK Mission Control, IntelliJ, Grafana/Pyroscope, and Data
 
 ## 11. S3 / Remote Upload — Planned
 
-Upload profiling data (pprof, CodeGuru JSON, or JFR) to S3 or HTTP endpoints for continuous profiling pipelines. Behind an `aws` feature flag with `aws-sdk-s3` dependency.
+Upload profiling data (pprof, CodeGuru JSON, or JFR) to S3 or HTTP endpoints for continuous profiling pipelines.
 
-Pattern from [async-profiler/rust-agent](https://github.com/async-profiler/rust-agent): zip file containing profile data + `metadata.json`, uploaded via `PutObject` with path prefix based on EC2/ECS instance metadata.
+Note: Direct CodeGuru upload is already implemented via `--codeguru-upload`. S3 upload would be for custom pipelines or non-CodeGuru consumers (e.g., Pyroscope, Grafana Cloud Profiles).

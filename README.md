@@ -8,7 +8,8 @@ Profile Bee is an eBPF-based CPU profiler that ships as a single binary — no B
 - Walks stacks directly in the kernel via frame pointers (fast, the default) or DWARF unwind tables (for those `-O2` binaries everyone ships without frame pointers)
 - Attaches to perf events, kprobes, uprobes, or tracepoints — auto-discovers uprobe targets with glob and regex matching
 - Demangles Rust and C++ symbols out of the box
-- Outputs to interactive TUI, SVG, HTML, JSON, stackcollapse, or a real-time web server — whatever fits your workflow
+- Outputs to interactive TUI, SVG, HTML, JSON, stackcollapse, pprof, or a real-time web server — whatever fits your workflow
+- Uploads profiles directly to AWS CodeGuru Profiler for continuous profiling in the cloud
 
 ## Screenshots
 
@@ -76,7 +77,8 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 
 - **Interactive TUI** — real-time flamegraph viewer with vim-style navigation, search, zoom, and mouse support (click, scroll, double-click to zoom)
 - **Off-CPU profiling** (`--off-cpu`) — trace context switches via `finish_task_switch` kprobe to find where threads block on I/O, locks, or sleep. Configurable block-time filters.
-- **Multiple output formats** — SVG, HTML, JSON (d3), and [stackcollapse](https://www.speedscope.app/) format
+- **Multiple output formats** — SVG, HTML, JSON (d3), [stackcollapse](https://www.speedscope.app/), and [pprof](https://github.com/google/pprof) protobuf (`.pb.gz`)
+- **AWS CodeGuru integration** (`--codeguru-upload`) — upload profiles directly to AWS CodeGuru Profiler with proper thread-state counter types (RUNNABLE/WAITING)
 - **Frame pointer unwinding** (default) — fast eBPF-based stack walking via `bpf_get_stackid`
 - **DWARF unwinding** (`--dwarf`) — profiles `-O2`/`-O3` binaries without frame pointers using `.eh_frame` tables loaded into eBPF maps
 - **Smart uprobes** — GDB-style symbol resolution with glob, regex, demangled name matching, and multi-attach
@@ -103,8 +105,14 @@ sudo probee --time 5000 --html flamegraphs.html
 # Stackcollapse format (compatible with speedscope, flamegraph.pl)
 sudo probee --collapse profile.txt --frequency 999 --time 10000
 
+# pprof protobuf (compatible with go tool pprof, Grafana/Pyroscope, Speedscope)
+sudo probee --pprof profile.pb.gz --time 5000
+
+# AWS CodeGuru Profiler JSON (uploadable via AWS CLI)
+sudo probee --codeguru profile.json --time 5000
+
 # All output formats at once
-sudo probee --time 5000 --html out.html --json out.json --collapse out.txt --svg out.svg
+sudo probee --time 5000 --html out.html --json out.json --collapse out.txt --svg out.svg --pprof out.pb.gz
 
 # Grouped by CPU
 sudo probee --svg profile.svg --frequency 999 --time 2000 --group-by-cpu
@@ -275,6 +283,63 @@ sudo probee --svg output.svg --time 5000 -- ./my-fp-binary
 **Limitations:** Max 8 executable mappings per process, 131K unwind table entries per binary (up to 64 binaries), up to 165 frame depth (via tail-call chaining; legacy fallback: 21 frames). x86_64 only. Libraries loaded via dlopen are detected within ~1 second.
 
 See [docs/dwarf_unwinding_design.md](docs/dwarf_unwinding_design.md) for architecture details, and [Polar Signals' article on profiling without frame pointers](https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers) for background.
+
+---
+
+## Cloud Integration
+
+### AWS CodeGuru Profiler
+
+Upload profiles directly to [AWS CodeGuru Profiler](https://docs.aws.amazon.com/codeguru/latest/profiler-ug/what-is-codeguru-profiler.html) for continuous profiling with anomaly detection and optimization recommendations.
+
+```bash
+# One-time setup: create a profiling group
+aws codeguruprofiler create-profiling-group \
+  --profiling-group-name my-app \
+  --compute-platform Default
+
+# Profile and upload directly (use sudo -E to preserve AWS credentials)
+sudo -E probee --codeguru-upload --profiling-group my-app --time 10000
+
+# Off-CPU profiling uploads as WAITING counter type (visible in Latency view)
+sudo -E probee --codeguru-upload --profiling-group my-app --off-cpu --time 10000
+
+# Save a local copy while uploading
+sudo -E probee --codeguru-upload --profiling-group my-app --codeguru local.json --time 10000
+
+# Or generate the JSON locally and upload separately via AWS CLI
+sudo probee --codeguru profile.json --time 10000
+aws codeguruprofiler post-agent-profile \
+  --profiling-group-name my-app \
+  --agent-profile fileb://profile.json \
+  --content-type application/json
+```
+
+Uses the standard AWS credential chain (environment variables, `~/.aws/credentials`, IAM role, IMDS). When running with `sudo`, use `sudo -E` to preserve environment variables.
+
+On-CPU samples use `RUNNABLE` counter type (visible in CPU and Latency views). Off-CPU samples use `WAITING` (visible in Latency view only). See [docs/codeguru_format.md](docs/codeguru_format.md) for format details.
+
+### pprof Format
+
+The `--pprof` flag outputs gzip-compressed [pprof](https://github.com/google/pprof) protobuf, the standard interchange format for profiling data:
+
+```bash
+sudo probee --pprof profile.pb.gz --time 5000
+
+# View with go tool pprof
+go tool pprof -http :8080 profile.pb.gz
+
+# Upload to Grafana Cloud Profiles, Pyroscope, Datadog, or Polar Signals
+```
+
+Compatible with: `go tool pprof`, Grafana/Pyroscope, Speedscope, Datadog Continuous Profiler, Polar Signals/Parca.
+
+### Building Without Cloud Features
+
+```bash
+# Build without AWS SDK (smaller binary, fewer dependencies)
+cargo build --release --no-default-features --features tui
+```
 
 ---
 
