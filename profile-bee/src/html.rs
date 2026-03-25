@@ -31,8 +31,13 @@ impl<'a> Stack<'a> {
     }
 }
 
-/// starts a local server that serves ht flmaegraph html file
-pub async fn start_server(mut rx: Receiver<String>) {
+/// starts a local server that serves the flamegraph html file
+pub async fn start_server(rx: Receiver<String>) {
+    start_server_on_port(rx, 8000).await;
+}
+
+/// starts a local server on the specified port that serves the flamegraph html file
+pub async fn start_server_on_port(mut rx: Receiver<String>, port: u16) {
     use warp::Filter;
 
     let latest_data = Arc::new(Mutex::new("{}".to_string()));
@@ -92,10 +97,9 @@ pub async fn start_server(mut rx: Receiver<String>) {
             .body(flamegraph_html_with_mode(&json_copy, true))
     });
 
-    tracing::info!("start_server: listening on http://127.0.0.1:8000/");
-    eprintln!("Listening on port 8000. Goto http://localhost:8000/");
+    tracing::info!("Web server listening on http://127.0.0.1:{}/", port);
     warp::serve(index.or(json).or(stream))
-        .run(([127, 0, 0, 1], 8000))
+        .run(([127, 0, 0, 1], port))
         .await;
     tracing::warn!("start_server: warp server exited");
 }

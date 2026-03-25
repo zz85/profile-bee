@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use inferno::flamegraph::{self, Options};
 
+use crate::codeguru::{collapse_to_codeguru, CodeGuruOptions, CounterType};
 use crate::html::{collapse_to_json, generate_html_file};
+use crate::pprof::{collapse_to_pprof, PprofOptions};
 
 /// Trait for consuming profiling output.
 ///
@@ -28,6 +30,11 @@ pub trait OutputSink: Send {
     fn finish(&mut self, _final_stacks: &[String]) -> Result<()> {
         Ok(())
     }
+
+    /// Called before `finish` to update metadata with the actual profiling
+    /// duration. Sinks that embed duration in their output (pprof, CodeGuru)
+    /// should override this; others can ignore it.
+    fn set_actual_duration_ms(&mut self, _duration_ms: u64) {}
 }
 
 /// Fans out to multiple sinks.
@@ -42,6 +49,12 @@ impl MultiplexSink {
 }
 
 impl OutputSink for MultiplexSink {
+    fn set_actual_duration_ms(&mut self, duration_ms: u64) {
+        for sink in &mut self.sinks {
+            sink.set_actual_duration_ms(duration_ms);
+        }
+    }
+
     fn write_batch(&mut self, stacks: &[String]) -> Result<()> {
         let mut first_err: Option<anyhow::Error> = None;
         for sink in &mut self.sinks {
@@ -204,5 +217,124 @@ impl OutputSink for WebBroadcastSink {
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
         // Forward the final batch so web clients see the last data snapshot.
         self.write_batch(final_stacks)
+    }
+}
+
+/// Writes a gzip-compressed pprof protobuf file on finish.
+///
+/// The output is compatible with `go tool pprof`, Grafana/Pyroscope,
+/// Speedscope, and other pprof-compatible tools.
+pub struct PprofSink {
+    path: PathBuf,
+    options: PprofOptions,
+}
+
+impl PprofSink {
+    pub fn new(path: PathBuf, frequency_hz: u64, duration_ms: u64, off_cpu: bool) -> Self {
+        Self {
+            path,
+            options: PprofOptions {
+                frequency_hz,
+                duration_ms,
+                off_cpu,
+            },
+        }
+    }
+
+    /// Update the duration after profiling completes so the exported
+    /// metadata reflects the actual session length, not the requested timeout.
+    pub fn set_duration_ms(&mut self, duration_ms: u64) {
+        self.options.duration_ms = duration_ms;
+    }
+}
+
+impl OutputSink for PprofSink {
+    fn set_actual_duration_ms(&mut self, duration_ms: u64) {
+        self.options.duration_ms = duration_ms;
+    }
+
+    fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
+        tracing::info!("Writing pprof to: {}", self.path.display());
+        let pprof_bytes = collapse_to_pprof(final_stacks, &self.options)
+            .context("Failed to generate pprof output")?;
+        std::fs::write(&self.path, pprof_bytes).context("Unable to write pprof file")?;
+        Ok(())
+    }
+}
+
+/// Writes an AWS CodeGuru Profiler JSON file on finish.
+///
+/// The output conforms to CodeGuru's `PostAgentProfile` API schema
+/// (`Content-Type: application/json`). Can be uploaded via:
+/// ```bash
+/// aws codeguruprofiler post-agent-profile \
+///   --profiling-group-name my-group \
+///   --agent-profile fileb://profile.codeguru.json \
+///   --content-type application/json
+/// ```
+pub struct CodeGuruSink {
+    path: PathBuf,
+    options: CodeGuruOptions,
+}
+
+impl CodeGuruSink {
+    pub fn new(path: PathBuf, frequency_hz: u64, duration_ms: u64, off_cpu: bool) -> Self {
+        Self {
+            path,
+            options: CodeGuruOptions {
+                frequency_hz,
+                duration_ms,
+                counter_type: if off_cpu {
+                    CounterType::Waiting
+                } else {
+                    CounterType::Runnable
+                },
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Update the duration after profiling completes so the exported
+    /// metadata reflects the actual session length, not the requested timeout.
+    pub fn set_duration_ms(&mut self, duration_ms: u64) {
+        self.options.duration_ms = duration_ms;
+    }
+
+    /// Create with explicit fleet info for AWS environments.
+    pub fn with_fleet_info(
+        path: PathBuf,
+        frequency_hz: u64,
+        duration_ms: u64,
+        off_cpu: bool,
+        fleet_id: String,
+        host_type: String,
+    ) -> Self {
+        Self {
+            path,
+            options: CodeGuruOptions {
+                frequency_hz,
+                duration_ms,
+                fleet_id,
+                host_type,
+                counter_type: if off_cpu {
+                    CounterType::Waiting
+                } else {
+                    CounterType::Runnable
+                },
+            },
+        }
+    }
+}
+
+impl OutputSink for CodeGuruSink {
+    fn set_actual_duration_ms(&mut self, duration_ms: u64) {
+        self.options.duration_ms = duration_ms;
+    }
+
+    fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
+        tracing::info!("Writing CodeGuru JSON to: {}", self.path.display());
+        let json = collapse_to_codeguru(final_stacks, &self.options);
+        std::fs::write(&self.path, &json).context("Unable to write CodeGuru JSON file")?;
+        Ok(())
     }
 }

@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- **Library API** (`ProfilingSession`) — profile-bee can now be used as a Rust library, not just a CLI binary. `ProfilingSession::new(config)` consolidates the entire eBPF + DWARF setup sequence into a single call. Supports batch and streaming modes via `OutputSink` trait. (#48)
+- **pprof output** (`--pprof`) — gzip-compressed protobuf format compatible with `go tool pprof`, Grafana/Pyroscope, Speedscope, Datadog, and Polar Signals/Parca.
+- **AWS CodeGuru Profiler JSON** (`--codeguru`) — recursive call-tree format with proper thread-state counter types (`RUNNABLE` for on-CPU, `WAITING` for off-CPU). Uploadable via AWS CLI.
+- **Direct CodeGuru upload** (`--codeguru-upload`) — uploads profiles directly to CodeGuru's `PostAgentProfile` API using the AWS SDK. Uses the standard credential chain. Included by default (behind `aws` feature flag).
+- **CodeGuru format documentation** — `docs/codeguru_format.md` with full schema reference covering all 7 counter types, metadata fields, and CodeGuru console visualization views.
+
+### Improvements
+
+- **Library refactor** — moved ~660 lines of orchestration from the binary into reusable library modules: `session.rs`, `event_loop.rs`, `pipeline.rs`. Binary reduced from 1753 to ~1100 lines.
+- **println/eprintln replaced with tracing** in all library code (spawn.rs, ebpf.rs, html.rs, trace_handler.rs).
+- **Parameterized web server port** — `html::start_server_on_port(port)` for library consumers.
+- **Process-exit monitoring added to TUI modes** — `--pid` auto-stop and DWARF cleanup now work in `--tui` and `--tui --serve` modes (was missing).
+- **Ring buffer tasks exit on receiver drop** — prevents background tasks from running indefinitely after profiling completes.
+- **Ctrl-C handler logs errors** instead of treating signal setup failure as Ctrl-C received.
+- **Size checks on ring buffer reads** — defensive guard before unsafe pointer casts.
+- **`syscall_name_to_nr` gated to x86_64** — `#[cfg(target_arch = "x86_64")]` with stubs for other architectures.
+- **Sink duration accuracy** — pprof and CodeGuru sinks now receive actual profiling duration via `set_actual_duration_ms` instead of the requested timeout.
+- **TUI warns about ignored output flags** — `--tui --pprof` etc. now prints a warning instead of silently dropping the output.
+
+### Bug Fixes
+
+- Fix misleading "DWARF-unwound stack" log message appearing without `--dwarf` (the stacked_pointers map is shared by FP and DWARF paths).
+- Fix `CodeGuruUploadSink` panic: "Cannot start a runtime from within a runtime" — replaced `block_on()` with `spawn()` + channel bridge.
+- Fix `event_loop.rs` batch-mode channel disconnect not setting `stopped = true`.
+- Fix `session.rs` `group_by_cpu` hardcoded to `false` — now wired through `SessionConfig`.
+
 ## v0.3.5
 
 ### Improvements

@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::ebpf::SmartUProbeConfig;
+use crate::probe_spec::parse_probe_spec;
 use addr2line::demangle;
 use gimli::{self, EndianSlice, NativeEndian};
 use object::{Object, ObjectSymbol};
@@ -635,6 +637,66 @@ pub fn format_resolved_probes(probes: &[ResolvedProbe]) -> String {
     ));
 
     output
+}
+
+// ---------------------------------------------------------------------------
+// Uprobe resolution helpers (moved from binary for library access)
+// ---------------------------------------------------------------------------
+
+/// Convert an optional i32 PID to u32, rejecting negative values.
+pub fn uprobe_pid_as_u32(uprobe_pid: Option<i32>) -> Result<Option<u32>, anyhow::Error> {
+    uprobe_pid
+        .map(|p| {
+            u32::try_from(p)
+                .map_err(|_| anyhow::anyhow!("--uprobe-pid must be non-negative, got {}", p))
+        })
+        .transpose()
+}
+
+/// Resolve uprobe spec strings into a SmartUProbeConfig ready for eBPF attachment.
+pub fn resolve_uprobe_specs(
+    specs: &[String],
+    pid: Option<u32>,
+    uprobe_pid: Option<i32>,
+) -> Result<SmartUProbeConfig, anyhow::Error> {
+    let resolver = ProbeResolver::new();
+    let effective_pid = pid.or(uprobe_pid_as_u32(uprobe_pid)?);
+    let mut all_probes: Vec<ResolvedProbe> = Vec::new();
+
+    for spec_str in specs {
+        let spec = parse_probe_spec(spec_str)
+            .map_err(|e| anyhow::anyhow!("invalid probe spec '{}': {}", spec_str, e))?;
+
+        tracing::info!("Resolving uprobe: {}", spec);
+
+        let probes = if let Some(target_pid) = effective_pid {
+            resolver.resolve_for_pid(&spec, target_pid)
+        } else {
+            resolver.resolve_system_wide(&spec)
+        }
+        .map_err(|e| anyhow::anyhow!("failed to resolve '{}': {}", spec_str, e))?;
+
+        if probes.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no symbols found matching '{}'. Use --list-probes to search.",
+                spec_str,
+            ));
+        }
+
+        tracing::info!(
+            "  resolved {} match{} for '{}'",
+            probes.len(),
+            if probes.len() == 1 { "" } else { "es" },
+            spec_str,
+        );
+
+        all_probes.extend(probes);
+    }
+
+    Ok(SmartUProbeConfig {
+        probes: all_probes,
+        pid: uprobe_pid,
+    })
 }
 
 #[cfg(test)]
