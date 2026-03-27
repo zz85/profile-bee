@@ -272,7 +272,16 @@ pub fn collapse_to_codeguru(stacks: &[String], opts: &CodeGuruOptions) -> String
         };
 
         let frames: Vec<&str> = stack_part.split(';').collect();
-        root.insert(&frames, count, counter_key);
+
+        // Detect idle/swapper stacks (tgid == 0 produces "cpu_NN;idle" frames)
+        // and classify them as IDLE so CodeGuru excludes them from CPU/Latency views.
+        let effective_counter = if frames.last() == Some(&"idle") {
+            CounterType::Idle.as_str()
+        } else {
+            counter_key
+        };
+
+        root.insert(&frames, count, effective_counter);
         total_samples += count;
     }
 
@@ -523,5 +532,37 @@ mod tests {
         assert!(value["end"].is_number());
         assert!(value["agentMetadata"].is_object());
         assert!(value["callgraph"].is_object());
+    }
+
+    #[test]
+    fn test_idle_stacks_use_idle_counter() {
+        let stacks = vec![
+            "main;compute 50".to_string(),
+            "cpu_00;idle 200".to_string(),
+            "cpu_01;idle 150".to_string(),
+        ];
+        let opts = CodeGuruOptions {
+            duration_ms: 10000,
+            counter_type: CounterType::Runnable,
+            ..Default::default()
+        };
+        let json = collapse_to_codeguru(&stacks, &opts);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // Active stack should use RUNNABLE
+        let compute = &parsed["callgraph"]["children"]["main"]["children"]["compute"];
+        assert_eq!(compute["counts"]["RUNNABLE"], 50);
+        assert!(compute["counts"]["IDLE"].is_null());
+
+        // Idle stacks should use IDLE, not RUNNABLE
+        let idle_00 = &parsed["callgraph"]["children"]["cpu_00"]["children"]["idle"];
+        assert_eq!(idle_00["counts"]["IDLE"], 200);
+        assert!(idle_00["counts"]["RUNNABLE"].is_null());
+
+        let idle_01 = &parsed["callgraph"]["children"]["cpu_01"]["children"]["idle"];
+        assert_eq!(idle_01["counts"]["IDLE"], 150);
+
+        // Total samples includes both active and idle
+        assert_eq!(parsed["agentMetadata"]["numTimesSampled"], 400);
     }
 }
