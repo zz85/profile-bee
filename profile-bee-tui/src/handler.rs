@@ -26,10 +26,16 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 pub fn handle_command(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     let mut key_handled = handle_command_generic(key_event, app)?;
     if !key_handled {
-        if app.flamegraph_state().view_kind == ViewKind::FlameGraph {
-            key_handled = handle_command_flamegraph(key_event, app)?;
-        } else {
-            key_handled = handle_command_table(key_event, app)?;
+        match app.flamegraph_state().view_kind {
+            ViewKind::FlameGraph => {
+                key_handled = handle_command_flamegraph(key_event, app)?;
+            }
+            ViewKind::Table => {
+                key_handled = handle_command_table(key_event, app)?;
+            }
+            ViewKind::Output => {
+                key_handled = handle_command_output(key_event, app)?;
+            }
         }
     }
     if key_handled && app.transient_message.is_some() {
@@ -62,7 +68,18 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
             }
         }
         KeyCode::Tab => {
-            app.flamegraph_view.state.toggle_view_kind();
+            if app.has_output() {
+                app.flamegraph_view.state.toggle_view_kind_with_output();
+            } else {
+                app.flamegraph_view.state.toggle_view_kind();
+            }
+        }
+        KeyCode::Char('o') => {
+            if app.has_output() {
+                app.output_state.show_panel = !app.output_state.show_panel;
+            } else {
+                key_handled = false;
+            }
         }
         KeyCode::Char('/') => {
             app.input_buffer = Some(InputBuffer {
@@ -158,6 +175,53 @@ fn handle_command_table(key_event: KeyEvent, app: &mut App) -> AppResult<bool> {
         }
         KeyCode::Enter => {
             app.search_selected_row();
+        }
+        _ => {
+            key_handled = false;
+        }
+    }
+    Ok(key_handled)
+}
+
+fn handle_command_output(key_event: KeyEvent, app: &mut App) -> AppResult<bool> {
+    let mut key_handled = true;
+    // Get total line count and visible height for scroll calculations.
+    let (total_lines, visible_height) = if let Some(ref buf) = app.process_output {
+        let total = buf.lock().map(|b| b.len()).unwrap_or(0);
+        // Use the frame height from the flamegraph state as an approximation
+        // of the visible area.  Subtract a few lines for header/footer chrome.
+        let visible = app
+            .flamegraph_view
+            .state
+            .frame_height
+            .map(|h| h as usize)
+            .unwrap_or(24);
+        (total, visible)
+    } else {
+        (0, 24)
+    };
+
+    match key_event.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.output_state.scroll_down(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.output_state.scroll_up(1, total_lines, visible_height);
+        }
+        KeyCode::Char('f') => {
+            let page = visible_height.saturating_sub(2).max(1);
+            app.output_state.scroll_down(page);
+        }
+        KeyCode::Char('b') => {
+            let page = visible_height.saturating_sub(2).max(1);
+            app.output_state
+                .scroll_up(page, total_lines, visible_height);
+        }
+        KeyCode::Char('G') => {
+            app.output_state.scroll_to_bottom();
+        }
+        KeyCode::Char('g') => {
+            app.output_state.scroll_to_top(total_lines, visible_height);
         }
         _ => {
             key_handled = false;

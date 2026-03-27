@@ -1,4 +1,5 @@
 use crate::flame::{FlameGraph, SearchPattern, StackIdentifier};
+use crate::output::{ProcessOutputState, SharedOutputBuffer};
 use crate::state::{FlameGraphState, UpdateMode};
 use crate::view::FlameGraphView;
 use std::collections::HashMap;
@@ -62,6 +63,10 @@ pub struct App {
     pub stack_positions: Vec<StackPosition>,
     /// Last click for double-click detection
     pub last_click: Option<(std::time::Instant, u16, u16)>,
+    /// Shared process output buffer (None when no child process)
+    pub process_output: Option<SharedOutputBuffer>,
+    /// UI state for the process output view / split panel
+    pub output_state: ProcessOutputState,
 }
 
 impl App {
@@ -80,6 +85,8 @@ impl App {
             update_mode_handle: Arc::new(Mutex::new(UpdateMode::default())),
             stack_positions: Vec::new(),
             last_click: None,
+            process_output: None,
+            output_state: ProcessOutputState::default(),
         }
     }
 
@@ -109,7 +116,24 @@ impl App {
             update_mode_handle,
             stack_positions: Vec::new(),
             last_click: None,
+            process_output: None,
+            output_state: ProcessOutputState::default(),
         }
+    }
+
+    /// Constructs a new instance for live profiling with process output capture.
+    pub fn with_live_and_output(
+        update_mode: UpdateMode,
+        output_buffer: SharedOutputBuffer,
+    ) -> Self {
+        let mut app = Self::with_live_and_mode(update_mode);
+        app.process_output = Some(output_buffer);
+        app
+    }
+
+    /// Whether this app has a process output buffer attached.
+    pub fn has_output(&self) -> bool {
+        self.process_output.is_some()
     }
 
     /// Get a handle to update the flamegraph from another thread
@@ -157,6 +181,17 @@ impl App {
                 self.elapsed
                     .insert("replacement".to_string(), tic.elapsed());
                 self.dirty = true;
+            }
+        }
+
+        // Check for new process output
+        if let Some(ref buf) = self.process_output {
+            if let Ok(buf) = buf.lock() {
+                let version = buf.version();
+                if version != self.output_state.last_seen_version {
+                    self.output_state.last_seen_version = version;
+                    self.dirty = true;
+                }
             }
         }
     }

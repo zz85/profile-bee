@@ -2,7 +2,7 @@ use std::io::Error;
 // use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -59,8 +59,51 @@ impl SpawnProcess {
         ))
     }
 
+    /// Spawn the child with piped stdout and stderr so the parent can
+    /// capture its output (e.g. for displaying in the TUI).
+    pub fn spawn_captured(program: &str, args: &[&str]) -> Result<(Self, StopHandler), Error> {
+        use std::process::Stdio;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel::<Nothing>(1);
+
+        let child = Command::new(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let pid = child.id().expect("pid");
+
+        let stop = StopHandler { tx };
+
+        Ok((
+            Self {
+                pid,
+                child,
+                running,
+                stopper_rx: rx,
+            },
+            stop,
+        ))
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Take the child's piped stdout handle.
+    /// Only available after `spawn_captured()`; returns `None` if stdio was
+    /// inherited or already taken.
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    /// Take the child's piped stderr handle.
+    /// Only available after `spawn_captured()`; returns `None` if stdio was
+    /// inherited or already taken.
+    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
     }
 
     fn running(&self) -> bool {
@@ -102,39 +145,6 @@ impl SpawnProcess {
         }
     }
 
-    // Spawn new thread to monitor output in real-time
-    // pub fn monitor(&mut self) {
-    //     if let Some(stdout) = self.child.stdout.take() {
-    //         std::thread::spawn(move || {
-    //             let mut reader = io::BufReader::new(stdout);
-    //             let mut buffer = String::new();
-    //             while let Ok(n) = reader.read_line(&mut buffer) {
-    //                 if n == 0 {
-    //                     break;
-    //                 }
-    //                 print!("{}", buffer);
-    //                 buffer.clear();
-    //             }
-    //         });
-    //     }
-    // }
-
-    // pub fn monitor_stderr(&mut self) {
-    //     if let Some(stderr) = self.child.stderr.take() {
-    //         std::thread::spawn(move || {
-    //             let mut reader = io::BufReader::new(stderr);
-    //             let mut buffer = String::new();
-    //             while let Ok(n) = reader.read_line(&mut buffer) {
-    //                 if n == 0 {
-    //                     break;
-    //                 }
-    //                 eprint!("{}", buffer);
-    //                 buffer.clear();
-    //             }
-    //         });
-    //     }
-    // }
-
     pub async fn close_signal(&mut self) -> Result<(), Error> {
         match self.stopper_rx.recv().await {
             Some(_) => {
@@ -166,10 +176,21 @@ impl Drop for SpawnProcess {
 ///
 /// Returns `(Option<StopHandler>, Option<SpawnProcess>)`.  When no command
 /// is given, both are `None`.
+///
+/// When `capture_output` is true, the child's stdout/stderr are piped so
+/// the caller can read them (e.g. for TUI display).  Use
+/// [`SpawnProcess::take_stdout`] / [`take_stderr`] to obtain the handles.
 pub fn setup_process_to_profile(
     cmd: &Option<String>,
     command: &[String],
+    capture_output: bool,
 ) -> anyhow::Result<(Option<StopHandler>, Option<SpawnProcess>)> {
+    let spawn_fn = if capture_output {
+        SpawnProcess::spawn_captured
+    } else {
+        SpawnProcess::spawn
+    };
+
     // Prefer the new command format (--) over the old --cmd format
     if !command.is_empty() {
         let program = &command[0];
@@ -177,7 +198,7 @@ pub fn setup_process_to_profile(
 
         tracing::info!("Running command: {} {}", program, args.join(" "));
 
-        let (child, stopper) = SpawnProcess::spawn(program, &args)?;
+        let (child, stopper) = spawn_fn(program, &args)?;
         tracing::info!("Profiling PID {}..", child.pid());
 
         return Ok((Some(stopper), Some(child)));
@@ -193,7 +214,7 @@ pub fn setup_process_to_profile(
 
         // todo: use shelltools
         let args: Vec<_> = cmd.split(' ').collect();
-        let (child, stopper) = SpawnProcess::spawn(args[0], &args[1..])?;
+        let (child, stopper) = spawn_fn(args[0], &args[1..])?;
 
         tracing::info!("Profiling PID {}..", child.pid());
 

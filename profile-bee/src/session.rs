@@ -120,7 +120,7 @@ impl ProfilingSession {
         tracing::info!("eBPF verification completed in {:?}", verification_time);
 
         // 2. Spawn child process (if configured)
-        let (stopper, mut spawn) = setup_process_to_profile(&config.cmd, &config.command)?;
+        let (stopper, mut spawn) = setup_process_to_profile(&config.cmd, &config.command, false)?;
         let pid = if let Some(cmd) = &spawn {
             Some(cmd.pid())
         } else {

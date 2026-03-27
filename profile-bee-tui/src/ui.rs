@@ -1,6 +1,7 @@
 use crate::{
     app::{App, FlameGraphInput},
     flame::{SortColumn, StackIdentifier, StackInfo},
+    output::OutputStream,
     state::ViewKind,
 };
 use ratatui::{
@@ -136,15 +137,37 @@ impl<'a> FlamelensWidget<'a> {
         header.render(header_layout[1].offset(header_offset), buf);
         version_indicator.render(header_layout[2].offset(header_offset), buf);
 
-        // Main area for flamegraph / top view
+        // Main area for flamegraph / top view / output view
         let tic = std::time::Instant::now();
         let main_area = layout[1];
-        if self.is_flamegraph_view() {
-            self.render_flamegraph(main_area, buf, state)
+
+        // Determine if the split output panel should be shown:
+        // only when the panel toggle is on, we have an output buffer,
+        // and the current view is NOT the full output tab.
+        let show_split_panel =
+            self.app.output_state.show_panel && self.app.has_output() && !self.is_output_view();
+
+        if show_split_panel {
+            // Split the main area: 70% top (flamegraph/table), 30% bottom (output panel)
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(vec![Constraint::Percentage(70), Constraint::Percentage(30)])
+                .split(main_area);
+
+            if self.is_flamegraph_view() {
+                self.render_flamegraph(split[0], buf, state);
+            } else if self.is_table_view() {
+                self.render_table(split[0], buf);
+            }
+
+            self.render_output_panel(split[1], buf);
+        } else if self.is_output_view() {
+            self.render_output(main_area, buf);
+        } else if self.is_flamegraph_view() {
+            self.render_flamegraph(main_area, buf, state);
         } else {
             self.render_table(main_area, buf);
-            false
-        };
+        }
         let flamegraph_render_time = tic.elapsed();
 
         // Context bars
@@ -183,12 +206,23 @@ impl<'a> FlamelensWidget<'a> {
                 }
                 help_tags.add("m", "update mode");
             }
+            if self.app.has_output() {
+                help_tags.add("o", "output panel");
+            }
+        } else if self.is_output_view() {
+            help_tags.add("j/k", "scroll");
+            help_tags.add("f/b", "page up/down");
+            help_tags.add("G/g", "bottom/top");
         } else {
+            // Table view
             help_tags.add("j/k", "move cursor");
             help_tags.add("f/b", "scroll");
             help_tags.add("1", "sort by total");
             help_tags.add("2", "sort by own");
             help_tags.add("/", "filter");
+            if self.app.has_output() {
+                help_tags.add("o", "output panel");
+            }
         }
         help_tags
     }
@@ -245,6 +279,109 @@ impl<'a> FlamelensWidget<'a> {
             .with_selected(self.app.flamegraph_state().table_state.selected)
             .with_offset(self.app.flamegraph_state().table_state.offset);
         StatefulWidget::render(ordered_stacks_table, area, buf, &mut table_state);
+    }
+
+    /// Render the full-screen Output tab view.
+    fn render_output(&self, area: Rect, buf: &mut Buffer) {
+        self.render_output_lines(area, buf, true);
+    }
+
+    /// Render the bottom split panel showing process output.
+    fn render_output_panel(&self, area: Rect, buf: &mut Buffer) {
+        self.render_output_lines(area, buf, false);
+    }
+
+    /// Shared implementation for rendering output lines into an area.
+    /// When `full_view` is true, no border is drawn (the tab header
+    /// already identifies the view); when false, a titled border is
+    /// shown for the split panel.
+    fn render_output_lines(&self, area: Rect, buf: &mut Buffer, full_view: bool) {
+        let inner_area = if full_view {
+            area
+        } else {
+            let block = Block::default()
+                .borders(Borders::TOP)
+                .title(" Output ")
+                .title_style(Style::default().bold().yellow());
+            let inner = block.inner(area);
+            block.render(area, buf);
+            inner
+        };
+
+        let height = inner_area.height as usize;
+        if height == 0 {
+            return;
+        }
+
+        let buf_ref = match &self.app.process_output {
+            Some(b) => b,
+            None => {
+                // No output buffer — show placeholder
+                let msg = Line::from("No process output available")
+                    .style(Style::default().fg(Color::DarkGray));
+                let y = inner_area.y + inner_area.height / 2;
+                let x = inner_area
+                    .x
+                    .saturating_add(inner_area.width.saturating_sub(msg.width() as u16) / 2);
+                buf.set_line(x, y, &msg, inner_area.width);
+                return;
+            }
+        };
+
+        let output_buf = buf_ref.lock().unwrap();
+        let total_lines = output_buf.len();
+
+        if total_lines == 0 {
+            let msg =
+                Line::from("Waiting for output...").style(Style::default().fg(Color::DarkGray));
+            let y = inner_area.y + inner_area.height / 2;
+            let x = inner_area
+                .x
+                .saturating_add(inner_area.width.saturating_sub(msg.width() as u16) / 2);
+            buf.set_line(x, y, &msg, inner_area.width);
+            return;
+        }
+
+        // Compute the range of lines to display.
+        // scroll_offset == 0 means "follow the tail" (show the newest lines).
+        let scroll_offset = if full_view {
+            self.app.output_state.scroll_offset
+        } else {
+            // Split panel always follows the tail
+            0
+        };
+
+        let end = total_lines.saturating_sub(scroll_offset);
+        let start = end.saturating_sub(height);
+
+        for (i, line) in output_buf.iter().skip(start).take(end - start).enumerate() {
+            let y = inner_area.y + i as u16;
+            if y >= inner_area.bottom() {
+                break;
+            }
+            let style = match line.stream {
+                OutputStream::Stderr => Style::default().fg(Color::Red),
+                OutputStream::Stdout => Style::default(),
+            };
+            let text = Line::from(Span::styled(&line.text, style));
+            buf.set_line(inner_area.x, y, &text, inner_area.width);
+        }
+
+        // For full view, show a scroll indicator in the bottom-right
+        if full_view && total_lines > height {
+            let indicator = if self.app.output_state.auto_scroll {
+                format!(" {total_lines} lines [following] ")
+            } else {
+                let pos = total_lines.saturating_sub(scroll_offset);
+                format!(" {pos}/{total_lines} ")
+            };
+            let indicator_line = Line::from(indicator).style(Style::default().fg(Color::DarkGray));
+            let x = inner_area
+                .right()
+                .saturating_sub(indicator_line.width() as u16);
+            let y = inner_area.bottom().saturating_sub(1);
+            buf.set_line(x, y, &indicator_line, indicator_line.width() as u16);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -538,6 +675,14 @@ impl<'a> FlamelensWidget<'a> {
             ViewKind::Table,
             self.app.flamegraph_state().view_kind,
         ));
+        if self.app.has_output() {
+            header_bottom_title_spans.push(Span::from(" | "));
+            header_bottom_title_spans.push(_get_view_kind_span(
+                "Output",
+                ViewKind::Output,
+                self.app.flamegraph_state().view_kind,
+            ));
+        }
         header_bottom_title_spans.push(Span::from(" "));
         Line::from(header_bottom_title_spans)
     }
@@ -699,6 +844,10 @@ impl<'a> FlamelensWidget<'a> {
 
     fn is_flamegraph_view(&self) -> bool {
         self.view_kind() == ViewKind::FlameGraph
+    }
+
+    fn is_output_view(&self) -> bool {
+        self.view_kind() == ViewKind::Output
     }
 }
 

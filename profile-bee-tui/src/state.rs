@@ -44,6 +44,7 @@ impl ZoomState {
 pub enum ViewKind {
     FlameGraph,
     Table,
+    Output,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -123,6 +124,17 @@ impl FlameGraphState {
         self.view_kind = match self.view_kind {
             ViewKind::FlameGraph => ViewKind::Table,
             ViewKind::Table => ViewKind::FlameGraph,
+            ViewKind::Output => ViewKind::FlameGraph,
+        };
+    }
+
+    /// Cycle view kind including the Output tab (when a process output
+    /// buffer is available).
+    pub fn toggle_view_kind_with_output(&mut self) {
+        self.view_kind = match self.view_kind {
+            ViewKind::FlameGraph => ViewKind::Table,
+            ViewKind::Table => ViewKind::Output,
+            ViewKind::Output => ViewKind::FlameGraph,
         };
     }
 

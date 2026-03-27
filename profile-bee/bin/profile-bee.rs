@@ -402,7 +402,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     println!("eBPF verification completed in {:?}", verification_time);
 
     // Only spawn process after eBPF verification succeeds
-    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
+    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command, false)?;
 
     let pid = if let Some(cmd) = &spawn {
         Some(cmd.pid())
@@ -1049,6 +1049,59 @@ fn run_tui_event_loop(
 }
 
 // ---------------------------------------------------------------------------
+// Process output monitoring (TUI mode)
+// ---------------------------------------------------------------------------
+
+/// Reads lines from the child process's stdout and stderr and pushes them
+/// into the shared [`ProcessOutputBuffer`] for display in the TUI.
+///
+/// ANSI escape codes are stripped so that ratatui can render cleanly.
+#[cfg(feature = "tui")]
+async fn monitor_child_output(
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    buf: profile_bee_tui::output::SharedOutputBuffer,
+) {
+    use profile_bee_tui::output::OutputStream;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    /// Strip ANSI escape sequences from a string.
+    fn strip_ansi(s: &str) -> String {
+        let stripped = strip_ansi_escapes::strip(s.as_bytes());
+        String::from_utf8_lossy(&stripped).into_owned()
+    }
+
+    let buf_out = buf.clone();
+    let stdout_task = async move {
+        if let Some(stdout) = stdout {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut b = buf_out.lock().unwrap();
+                b.push(strip_ansi(&line), OutputStream::Stdout);
+            }
+        }
+    };
+
+    let buf_err = buf.clone();
+    let stderr_task = async move {
+        if let Some(stderr) = stderr {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let mut b = buf_err.lock().unwrap();
+                b.push(strip_ansi(&line), OutputStream::Stderr);
+            }
+        }
+    };
+
+    tokio::join!(stdout_task, stderr_task);
+
+    // Mark that the process has exited
+    if let Ok(mut b) = buf.lock() {
+        b.push("[process exited]".to_string(), OutputStream::Stderr);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
@@ -1059,6 +1112,7 @@ async fn run_combined_mode(
     web_tx: tokio::sync::broadcast::Sender<String>,
 ) -> std::result::Result<(), anyhow::Error> {
     use profile_bee_tui::app::App;
+    use profile_bee_tui::output::{ProcessOutputBuffer, SharedOutputBuffer};
 
     println!("Starting combined TUI + serve mode...");
 
@@ -1068,13 +1122,29 @@ async fn run_combined_mode(
         profile_bee::html::start_server(web_rx).await;
     });
 
-    // Process / PID setup
-    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
+    // Process / PID setup — capture output when a child is spawned
+    let (stopper, mut spawn) = setup_process_to_profile(&opt.cmd, &opt.command, true)?;
     let pid = if let Some(cmd) = &spawn {
         Some(cmd.pid())
     } else {
         opt.pid
     };
+
+    // Set up process output capture before handing spawn to the child-stop task.
+    let output_buffer: Option<SharedOutputBuffer> = if spawn.is_some() {
+        Some(ProcessOutputBuffer::shared())
+    } else {
+        None
+    };
+
+    if let (Some(ref mut child), Some(ref buf)) = (&mut spawn, &output_buffer) {
+        let stdout = child.take_stdout();
+        let stderr = child.take_stderr();
+        let buf_clone = buf.clone();
+        task::spawn(async move {
+            monitor_child_output(stdout, stderr, buf_clone).await;
+        });
+    }
 
     // Shared infrastructure
     let mut config = build_profiler_config(&opt, pid)?;
@@ -1084,7 +1154,11 @@ async fn run_combined_mode(
 
     // TUI app + update handle
     let update_mode = parse_update_mode(&opt.update_mode);
-    let mut app = App::with_live_and_mode(update_mode);
+    let mut app = if let Some(buf) = output_buffer {
+        App::with_live_and_output(update_mode, buf)
+    } else {
+        App::with_live_and_mode(update_mode)
+    };
     let update_handle = app.get_update_handle();
     let update_mode_handle = app.get_update_mode_handle();
 
@@ -1142,16 +1216,33 @@ async fn run_combined_mode(
 #[cfg(feature = "tui")]
 async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     use profile_bee_tui::app::App;
+    use profile_bee_tui::output::{ProcessOutputBuffer, SharedOutputBuffer};
 
     println!("Starting TUI mode...");
 
-    // Process / PID setup
-    let (stopper, spawn) = setup_process_to_profile(&opt.cmd, &opt.command)?;
+    // Process / PID setup — capture output when a child is spawned
+    let (stopper, mut spawn) = setup_process_to_profile(&opt.cmd, &opt.command, true)?;
     let pid = if let Some(cmd) = &spawn {
         Some(cmd.pid())
     } else {
         opt.pid
     };
+
+    // Set up process output capture before handing spawn to the child-stop task.
+    let output_buffer: Option<SharedOutputBuffer> = if spawn.is_some() {
+        Some(ProcessOutputBuffer::shared())
+    } else {
+        None
+    };
+
+    if let (Some(ref mut child), Some(ref buf)) = (&mut spawn, &output_buffer) {
+        let stdout = child.take_stdout();
+        let stderr = child.take_stderr();
+        let buf_clone = buf.clone();
+        task::spawn(async move {
+            monitor_child_output(stdout, stderr, buf_clone).await;
+        });
+    }
 
     // Shared infrastructure
     let mut config = build_profiler_config(&opt, pid)?;
@@ -1161,7 +1252,11 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
 
     // TUI app + update handle
     let update_mode = parse_update_mode(&opt.update_mode);
-    let mut app = App::with_live_and_mode(update_mode);
+    let mut app = if let Some(buf) = output_buffer {
+        App::with_live_and_output(update_mode, buf)
+    } else {
+        App::with_live_and_mode(update_mode)
+    };
     let update_handle = app.get_update_handle();
     let update_mode_handle = app.get_update_mode_handle();
 
