@@ -99,6 +99,8 @@ pub struct ProcessOutputState {
     pub show_panel: bool,
     /// Last-seen buffer version — used to detect new output and set `dirty`.
     pub last_seen_version: u64,
+    /// Last-seen total line count — used to adjust scroll_offset when paused.
+    pub last_seen_total: usize,
 }
 
 impl Default for ProcessOutputState {
@@ -108,6 +110,7 @@ impl Default for ProcessOutputState {
             auto_scroll: true,
             show_panel: false,
             last_seen_version: 0,
+            last_seen_total: 0,
         }
     }
 }
@@ -140,6 +143,20 @@ impl ProcessOutputState {
     pub fn scroll_to_top(&mut self, total_lines: usize, visible_lines: usize) {
         self.auto_scroll = false;
         self.scroll_offset = total_lines.saturating_sub(visible_lines);
+    }
+
+    /// Adjust scroll_offset when new lines arrive while paused.
+    ///
+    /// When `auto_scroll` is false the viewport should stay on the same
+    /// absolute lines.  Since `scroll_offset` is measured from the bottom,
+    /// new lines appended to the tail would shift the viewport downward
+    /// unless we compensate by bumping `scroll_offset` by the delta.
+    pub fn adjust_for_new_lines(&mut self, new_total: usize) {
+        let old_total = self.last_seen_total;
+        self.last_seen_total = new_total;
+        if !self.auto_scroll && new_total > old_total {
+            self.scroll_offset += new_total - old_total;
+        }
     }
 }
 

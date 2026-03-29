@@ -35,46 +35,33 @@ pub struct SpawnProcess {
 
 impl SpawnProcess {
     pub fn spawn(program: &str, args: &[&str]) -> Result<(Self, StopHandler), Error> {
-        let running = Arc::new(AtomicBool::new(true));
-        let (tx, rx) = mpsc::channel::<Nothing>(1);
-
-        let child = Command::new(program)
-            .args(args)
-            // .stdout(Stdio::piped())
-            // .stderr(Stdio::piped())
-            .spawn()?;
-
-        let pid = child.id().expect("pid");
-
-        let stop = StopHandler { tx };
-
-        Ok((
-            Self {
-                pid,
-                child,
-                running,
-                stopper_rx: rx,
-            },
-            stop,
-        ))
+        Self::spawn_internal(program, args, false)
     }
 
     /// Spawn the child with piped stdout and stderr so the parent can
     /// capture its output (e.g. for displaying in the TUI).
     pub fn spawn_captured(program: &str, args: &[&str]) -> Result<(Self, StopHandler), Error> {
+        Self::spawn_internal(program, args, true)
+    }
+
+    fn spawn_internal(
+        program: &str,
+        args: &[&str],
+        capture: bool,
+    ) -> Result<(Self, StopHandler), Error> {
         use std::process::Stdio;
 
         let running = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel::<Nothing>(1);
 
-        let child = Command::new(program)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        if capture {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+        let child = cmd.spawn()?;
 
         let pid = child.id().expect("pid");
-
         let stop = StopHandler { tx };
 
         Ok((

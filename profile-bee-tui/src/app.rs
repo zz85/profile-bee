@@ -186,11 +186,25 @@ impl App {
 
         // Check for new process output
         if let Some(ref buf) = self.process_output {
-            if let Ok(buf) = buf.lock() {
-                let version = buf.version();
-                if version != self.output_state.last_seen_version {
-                    self.output_state.last_seen_version = version;
-                    self.dirty = true;
+            match buf.lock() {
+                Ok(buf) => {
+                    let version = buf.version();
+                    if version != self.output_state.last_seen_version {
+                        self.output_state.adjust_for_new_lines(buf.len());
+                        self.output_state.last_seen_version = version;
+                        self.dirty = true;
+                    }
+                }
+                Err(poisoned) => {
+                    // Recover from a poisoned mutex — the monitor thread may
+                    // have panicked, but the data is still usable.
+                    let buf = poisoned.into_inner();
+                    let version = buf.version();
+                    if version != self.output_state.last_seen_version {
+                        self.output_state.adjust_for_new_lines(buf.len());
+                        self.output_state.last_seen_version = version;
+                        self.dirty = true;
+                    }
                 }
             }
         }

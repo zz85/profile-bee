@@ -161,6 +161,9 @@ impl<'a> FlamelensWidget<'a> {
             }
 
             self.render_output_panel(split[1], buf);
+
+            // Use the top pane height for paging calculations
+            state.frame_height = split[0].height;
         } else if self.is_output_view() {
             self.render_output(main_area, buf);
         } else if self.is_flamegraph_view() {
@@ -178,8 +181,11 @@ impl<'a> FlamelensWidget<'a> {
         // Help bar
         help_bar.render(layout[help_bar_index], buf);
 
-        // Update widget state
-        state.frame_height = main_area.height;
+        // Update widget state — frame_height was already set in the split
+        // panel branch; only overwrite when not splitting.
+        if !show_split_panel {
+            state.frame_height = main_area.height;
+        }
         state.frame_width = main_area.width;
         state.render_time = flamegraph_render_time;
         state.cursor_position = self.get_cursor_position(layout[help_bar_index - 1]);
@@ -345,7 +351,9 @@ impl<'a> FlamelensWidget<'a> {
         // Compute the range of lines to display.
         // scroll_offset == 0 means "follow the tail" (show the newest lines).
         let scroll_offset = if full_view {
-            self.app.output_state.scroll_offset
+            // Clamp against current buffer/height to handle resizes.
+            let max_offset = total_lines.saturating_sub(height);
+            self.app.output_state.scroll_offset.min(max_offset)
         } else {
             // Split panel always follows the tail
             0

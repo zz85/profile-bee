@@ -7,7 +7,7 @@ enriches the stack data with custom metadata, and uploads results to a backend
 
 ## Architecture
 
-```
+```text
 your-profiling-agent/           (your crate)
 ├── Cargo.toml                  (depends on profile-bee)
 └── src/

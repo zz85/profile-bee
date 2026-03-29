@@ -1113,9 +1113,17 @@ async fn monitor_child_output(
                     }
 
                     // Single lock acquisition for the whole batch.
-                    let mut b = buf.lock().unwrap();
-                    for text in batch {
-                        b.push(text, stream);
+                    match buf.lock() {
+                        Ok(mut b) => {
+                            for text in batch {
+                                b.push(text, stream);
+                            }
+                        }
+                        Err(_) => {
+                            // Mutex poisoned — TUI thread panicked.
+                            // Drop the batch and stop reading.
+                            break;
+                        }
                     }
                 }
                 Err(_) => break,

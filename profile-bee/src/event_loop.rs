@@ -103,113 +103,7 @@ impl ProfilingEventLoop {
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
     ) -> CollectResult {
-        let mut queue_processed = 0u64;
-        let mut stopped = false;
-        let local_counting = self.stream_mode == EVENT_TRACE_ALWAYS;
-
-        // Drain the eBPF counts map. In streaming/serve mode the map is
-        // intentionally emptied each invocation so that samples are transferred
-        // into the caller-owned `trace_count` for accumulation.
-        let keys = self.counts.keys().flatten().collect::<Vec<_>>();
-        for k in keys {
-            let _ = self.counts.remove(&k);
-        }
-
-        // Compute deadline for streaming mode; batch mode uses recv() directly
-        let deadline = timeout.map(|d| Instant::now() + d);
-
-        loop {
-            let work = if let Some(dl) = deadline {
-                let remaining = dl.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                match rx.recv_timeout(remaining) {
-                    Ok(w) => w,
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        tracing::warn!("ProfilingEventLoop::collect: channel disconnected");
-                        stopped = true;
-                        break;
-                    }
-                }
-            } else {
-                // Batch mode: block indefinitely
-                match rx.recv() {
-                    Ok(w) => w,
-                    Err(_) => {
-                        stopped = true;
-                        break;
-                    }
-                }
-            };
-
-            match work {
-                PerfWork::StackInfo(stack) => {
-                    queue_processed += 1;
-                    if queue_processed == 1 {
-                        tracing::debug!(
-                            "ProfilingEventLoop::collect: received first StackInfo event"
-                        );
-                    }
-
-                    // Request DWARF loading for newly seen processes
-                    if let Some(tx) = &self.tgid_request_tx {
-                        if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
-                            let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
-                        }
-                    }
-
-                    if local_counting {
-                        let trace = self.trace_count.entry(stack).or_insert(0);
-                        *trace += 1;
-                        if *trace == 1 {
-                            self.trace_handler.get_exp_stacked_frames(
-                                &stack,
-                                &self.stack_traces,
-                                self.group_by_cpu,
-                                &self.stacked_pointers,
-                            );
-                        }
-                    } else {
-                        self.trace_handler.get_exp_stacked_frames(
-                            &stack,
-                            &self.stack_traces,
-                            self.group_by_cpu,
-                            &self.stacked_pointers,
-                        );
-                    }
-                }
-                PerfWork::DwarfRefresh(update) => {
-                    if let Err(e) = apply_dwarf_refresh(&mut self.bpf, update) {
-                        tracing::warn!("{:#}", e);
-                    }
-                }
-                PerfWork::ProcessExit(exit_event) => {
-                    if let Some(tx) = &self.tgid_request_tx {
-                        let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
-                    }
-                    self.known_tgids.remove(&exit_event.pid);
-                    if Some(exit_event.pid) == self.monitor_exit_pid {
-                        tracing::info!("target process {} exited, stopping", exit_event.pid);
-                        stopped = true;
-                        break;
-                    }
-                    tracing::debug!("DWARF-tracked process {} exited", exit_event.pid);
-                }
-                PerfWork::Stop => {
-                    tracing::info!("ProfilingEventLoop::collect: received Stop");
-                    stopped = true;
-                    break;
-                }
-            }
-        }
-
-        tracing::debug!(
-            "ProfilingEventLoop::collect: processed {} events",
-            queue_processed
-        );
-
+        let (local_counting, stopped) = self.drain_events(rx, timeout);
         let stacks = self.build_collapse_output(local_counting);
         CollectResult { stacks, stopped }
     }
@@ -241,10 +135,26 @@ impl ProfilingEventLoop {
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
     ) -> RawCollectResult {
+        let (local_counting, stopped) = self.drain_events(rx, timeout);
+        let stacks = self.build_raw_stacks(local_counting);
+        RawCollectResult { stacks, stopped }
+    }
+
+    /// Drain events from the PerfWork channel, symbolize stacks on the fly,
+    /// and return `(local_counting, stopped)`.
+    ///
+    /// This is the shared event-draining loop used by both [`collect`] and
+    /// [`collect_raw`].
+    fn drain_events(
+        &mut self,
+        rx: &mpsc::Receiver<PerfWork>,
+        timeout: Option<Duration>,
+    ) -> (bool, bool) {
         let mut queue_processed = 0u64;
         let mut stopped = false;
         let local_counting = self.stream_mode == EVENT_TRACE_ALWAYS;
 
+        // Drain the eBPF counts map so samples transfer into trace_count.
         let keys = self.counts.keys().flatten().collect::<Vec<_>>();
         for k in keys {
             let _ = self.counts.remove(&k);
@@ -262,7 +172,7 @@ impl ProfilingEventLoop {
                     Ok(w) => w,
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        tracing::warn!("ProfilingEventLoop::collect_raw: channel disconnected");
+                        tracing::warn!("drain_events: channel disconnected");
                         stopped = true;
                         break;
                     }
@@ -281,9 +191,7 @@ impl ProfilingEventLoop {
                 PerfWork::StackInfo(stack) => {
                     queue_processed += 1;
                     if queue_processed == 1 {
-                        tracing::debug!(
-                            "ProfilingEventLoop::collect_raw: received first StackInfo event"
-                        );
+                        tracing::debug!("drain_events: received first StackInfo event");
                     }
                     if let Some(tx) = &self.tgid_request_tx {
                         if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
@@ -328,20 +236,15 @@ impl ProfilingEventLoop {
                     tracing::debug!("DWARF-tracked process {} exited", exit_event.pid);
                 }
                 PerfWork::Stop => {
-                    tracing::info!("ProfilingEventLoop::collect_raw: received Stop");
+                    tracing::info!("drain_events: received Stop");
                     stopped = true;
                     break;
                 }
             }
         }
 
-        tracing::debug!(
-            "ProfilingEventLoop::collect_raw: processed {} events",
-            queue_processed
-        );
-
-        let stacks = self.build_raw_stacks(local_counting);
-        RawCollectResult { stacks, stopped }
+        tracing::debug!("drain_events: processed {} events", queue_processed);
+        (local_counting, stopped)
     }
 
     /// Symbolize and return raw [`FrameCount`] data from the current trace counts.

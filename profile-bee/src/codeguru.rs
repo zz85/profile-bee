@@ -249,6 +249,7 @@ fn hostname_or_unknown() -> String {
 pub fn collapse_to_codeguru(stacks: &[String], opts: &CodeGuruOptions) -> String {
     let mut root = CallGraphNode::new();
     let mut total_samples: u64 = 0;
+    let mut counter_samples: BTreeMap<String, u64> = BTreeMap::new();
     let counter_key = opts.counter_type.as_str();
 
     for line in stacks {
@@ -282,6 +283,9 @@ pub fn collapse_to_codeguru(stacks: &[String], opts: &CodeGuruOptions) -> String
         };
 
         root.insert(&frames, count, effective_counter);
+        *counter_samples
+            .entry(effective_counter.to_owned())
+            .or_insert(0u64) += count;
         total_samples += count;
     }
 
@@ -293,16 +297,19 @@ pub fn collapse_to_codeguru(stacks: &[String], opts: &CodeGuruOptions) -> String
     let duration_ms = opts.duration_ms as i64;
     let start_ms = now_ms - duration_ms;
 
-    // sample_weight = total_samples / duration_seconds
+    // sample_weight = samples_for_counter / duration_seconds
     let duration_secs = (duration_ms as f64) / 1000.0;
-    let sample_weight = if duration_secs > 0.0 {
-        total_samples as f64 / duration_secs
-    } else {
-        total_samples as f64
-    };
-
     let mut sample_weights = BTreeMap::new();
-    sample_weights.insert(counter_key.to_owned(), sample_weight);
+    for (counter, count) in &counter_samples {
+        let weight = if duration_secs > 0.0 {
+            *count as f64 / duration_secs
+        } else {
+            *count as f64
+        };
+        sample_weights.insert(counter.clone(), weight);
+    }
+    // Ensure the primary counter always has an entry even if zero
+    sample_weights.entry(counter_key.to_owned()).or_insert(0.0);
 
     let profile = CodeGuruProfile {
         start: start_ms,
@@ -564,5 +571,12 @@ mod tests {
 
         // Total samples includes both active and idle
         assert_eq!(parsed["agentMetadata"]["numTimesSampled"], 400);
+
+        // sampleWeights should have per-counter entries
+        let weights = &parsed["agentMetadata"]["sampleWeights"];
+        // 50 samples / 10s = 5.0
+        assert_eq!(weights["RUNNABLE"], 5.0);
+        // 350 samples / 10s = 35.0
+        assert_eq!(weights["IDLE"], 35.0);
     }
 }
