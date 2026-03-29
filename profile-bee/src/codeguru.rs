@@ -237,6 +237,40 @@ fn hostname_or_unknown() -> String {
 // Conversion: collapse format → CodeGuru JSON
 // ---------------------------------------------------------------------------
 
+/// Known kernel idle function names that appear as the leaf frame
+/// on idle CPU stacks.  A stack is classified as idle when its root
+/// frame matches the `cpu_\d+` pattern AND its leaf is one of these.
+const IDLE_LEAF_NAMES: &[&str] = &[
+    "idle",
+    "swapper",
+    "cpu_idle",
+    "default_idle",
+    "native_safe_halt",
+    "acpi_idle_do_entry",
+    "intel_idle",
+    "mwait_idle",
+];
+
+/// Returns `true` when `frames` looks like a kernel idle stack.
+///
+/// The heuristic requires both:
+/// 1. The root frame starts with `cpu_` (kernel idle threads are named `cpu_<N>`)
+/// 2. The leaf frame is a known idle function name
+///
+/// This prevents false-positives from user-space functions that happen to be
+/// named "idle" (e.g. an event-loop idle callback).
+fn is_idle_stack(frames: &[&str]) -> bool {
+    let root = match frames.first() {
+        Some(r) => r,
+        None => return false,
+    };
+    let leaf = match frames.last() {
+        Some(l) => l,
+        None => return false,
+    };
+    root.starts_with("cpu_") && IDLE_LEAF_NAMES.contains(leaf)
+}
+
 /// Convert collapse-format stack strings to CodeGuru JSON profile string.
 ///
 /// Input format: `"frame1;frame2;frame3 count"` (root to leaf, left to right).
@@ -276,7 +310,8 @@ pub fn collapse_to_codeguru(stacks: &[String], opts: &CodeGuruOptions) -> String
 
         // Detect idle/swapper stacks (tgid == 0 produces "cpu_NN;idle" frames)
         // and classify them as IDLE so CodeGuru excludes them from CPU/Latency views.
-        let effective_counter = if frames.last() == Some(&"idle") {
+        // Also match common kernel idle function names that may appear as the leaf.
+        let effective_counter = if is_idle_stack(&frames) {
             CounterType::Idle.as_str()
         } else {
             counter_key
@@ -578,5 +613,27 @@ mod tests {
         assert_eq!(weights["RUNNABLE"], 5.0);
         // 350 samples / 10s = 35.0
         assert_eq!(weights["IDLE"], 35.0);
+    }
+
+    #[test]
+    fn test_is_idle_stack() {
+        // Positive: root is cpu_NN, leaf is a known idle function
+        assert!(is_idle_stack(&["cpu_00", "idle"]));
+        assert!(is_idle_stack(&["cpu_01", "swapper"]));
+        assert!(is_idle_stack(&["cpu_12", "default_idle"]));
+        assert!(is_idle_stack(&["cpu_00", "native_safe_halt"]));
+        assert!(is_idle_stack(&["cpu_03", "intel_idle"]));
+
+        // Negative: root is not cpu_NN
+        assert!(!is_idle_stack(&["main", "idle"]));
+        assert!(!is_idle_stack(&["myapp", "idle_callback"]));
+
+        // Negative: leaf is not a known idle function
+        assert!(!is_idle_stack(&["cpu_00", "compute"]));
+        assert!(!is_idle_stack(&["cpu_00", "my_idle_handler"]));
+
+        // Edge cases
+        assert!(!is_idle_stack(&[]));
+        assert!(!is_idle_stack(&["cpu_00"])); // single frame: root == leaf, "cpu_00" not in idle list
     }
 }

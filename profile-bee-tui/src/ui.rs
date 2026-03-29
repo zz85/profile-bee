@@ -33,6 +33,9 @@ pub struct FlamelensWidgetState {
     render_time: Duration,
     cursor_position: Option<(u16, u16)>,
     pub stack_positions: Vec<crate::app::StackPosition>,
+    /// Rendered height of the output view (full tab or split panel).
+    /// Used by the key handler for accurate page-up/page-down.
+    pub output_view_height: u16,
 }
 
 pub struct ZoomState {
@@ -164,8 +167,11 @@ impl<'a> FlamelensWidget<'a> {
 
             // Use the top pane height for paging calculations
             state.frame_height = split[0].height;
+            // Record output panel height (minus border) for scroll calculations
+            state.output_view_height = split[1].height.saturating_sub(1);
         } else if self.is_output_view() {
             self.render_output(main_area, buf);
+            state.output_view_height = main_area.height;
         } else if self.is_flamegraph_view() {
             self.render_flamegraph(main_area, buf, state);
         } else {
@@ -904,6 +910,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         .set_frame_height(flamelens_state.frame_height);
     app.flamegraph_view
         .set_frame_width(flamelens_state.frame_width);
+    app.output_state.visible_height = flamelens_state.output_view_height as usize;
     app.add_elapsed("render", flamelens_state.render_time);
     if let Some(input_buffer) = &mut app.input_buffer {
         input_buffer.cursor = flamelens_state.cursor_position;

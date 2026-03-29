@@ -188,14 +188,12 @@ fn handle_command_output(key_event: KeyEvent, app: &mut App) -> AppResult<bool> 
     // Get total line count and visible height for scroll calculations.
     let (total_lines, visible_height) = if let Some(ref buf) = app.process_output {
         let total = buf.lock().map(|b| b.len()).unwrap_or(0);
-        // Use the frame height from the flamegraph state as an approximation
-        // of the visible area.  Subtract a few lines for header/footer chrome.
-        let visible = app
-            .flamegraph_view
-            .state
-            .frame_height
-            .map(|h| h as usize)
-            .unwrap_or(24);
+        // Use the rendered output view height recorded during the last frame.
+        let visible = if app.output_state.visible_height > 0 {
+            app.output_state.visible_height
+        } else {
+            24 // fallback before first render
+        };
         (total, visible)
     } else {
         (0, 24)

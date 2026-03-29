@@ -420,3 +420,74 @@ where
     out.sort();
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::StackFrameInfo;
+
+    fn make_frame(symbol: &str) -> StackFrameInfo {
+        StackFrameInfo {
+            symbol: Some(symbol.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn sample_stacks() -> Vec<FrameCount> {
+        vec![
+            FrameCount {
+                frames: vec![make_frame("main"), make_frame("compute")],
+                count: 10,
+            },
+            FrameCount {
+                frames: vec![make_frame("main"), make_frame("idle_loop")],
+                count: 5,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_collapse_raw_produces_sorted_output() {
+        let stacks = sample_stacks();
+        let out = collapse_raw(&stacks);
+        assert_eq!(out.len(), 2);
+        // Output must be sorted lexicographically
+        assert!(out[0] < out[1]);
+        assert_eq!(out[0], "main;compute 10");
+        assert_eq!(out[1], "main;idle_loop 5");
+    }
+
+    #[test]
+    fn test_collapse_raw_empty() {
+        let out = collapse_raw(&[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_collapse_raw_with_custom_formatter() {
+        let stacks = sample_stacks();
+        // Use a custom formatter that uppercases symbols
+        let out = collapse_raw_with(&stacks, |f| {
+            f.symbol.as_deref().unwrap_or("?").to_uppercase()
+        });
+        assert_eq!(out[0], "MAIN;COMPUTE 10");
+        assert_eq!(out[1], "MAIN;IDLE_LOOP 5");
+    }
+
+    #[test]
+    fn test_collapse_raw_with_object_prefix() {
+        let stacks = vec![FrameCount {
+            frames: vec![StackFrameInfo {
+                symbol: Some("read".to_string()),
+                cmd: "myapp".to_string(),
+                ..Default::default()
+            }],
+            count: 42,
+        }];
+        // Perf-style "object`symbol" format
+        let out = collapse_raw_with(&stacks, |f| {
+            format!("{}`{}", f.fmt_object(), f.symbol.as_deref().unwrap_or("?"))
+        });
+        assert_eq!(out[0], "myapp`read 42");
+    }
+}

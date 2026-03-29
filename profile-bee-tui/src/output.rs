@@ -101,6 +101,9 @@ pub struct ProcessOutputState {
     pub last_seen_version: u64,
     /// Last-seen total line count — used to adjust scroll_offset when paused.
     pub last_seen_total: usize,
+    /// Rendered height of the output view area (set during rendering).
+    /// Used for accurate page-up/page-down calculations.
+    pub visible_height: usize,
 }
 
 impl Default for ProcessOutputState {
@@ -111,6 +114,7 @@ impl Default for ProcessOutputState {
             show_panel: false,
             last_seen_version: 0,
             last_seen_total: 0,
+            visible_height: 0,
         }
     }
 }
@@ -204,5 +208,51 @@ mod tests {
         state.scroll_to_bottom();
         assert!(state.auto_scroll);
         assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn scroll_to_top_sets_max_offset() {
+        let mut state = ProcessOutputState::default();
+        state.scroll_to_top(100, 20);
+        assert!(!state.auto_scroll);
+        assert_eq!(state.scroll_offset, 80); // 100 - 20
+    }
+
+    #[test]
+    fn scroll_down_past_bottom_re_enables_auto_scroll() {
+        let mut state = ProcessOutputState::default();
+        // First scroll up so we have an offset
+        state.scroll_up(10, 100, 20);
+        assert_eq!(state.scroll_offset, 10);
+        assert!(!state.auto_scroll);
+
+        // Scroll down by more than the offset — snaps to bottom
+        state.scroll_down(15);
+        assert_eq!(state.scroll_offset, 0);
+        assert!(state.auto_scroll);
+    }
+
+    #[test]
+    fn adjust_for_new_lines_compensates_when_paused() {
+        let mut state = ProcessOutputState::default();
+        state.last_seen_total = 200;
+        state.scroll_offset = 50;
+        state.auto_scroll = false;
+
+        // 10 new lines arrive
+        state.adjust_for_new_lines(210);
+        assert_eq!(state.scroll_offset, 60); // 50 + 10
+        assert_eq!(state.last_seen_total, 210);
+    }
+
+    #[test]
+    fn adjust_for_new_lines_noop_when_auto_scrolling() {
+        let mut state = ProcessOutputState::default();
+        state.last_seen_total = 200;
+        state.scroll_offset = 0;
+        state.auto_scroll = true;
+
+        state.adjust_for_new_lines(210);
+        assert_eq!(state.scroll_offset, 0); // unchanged
     }
 }
