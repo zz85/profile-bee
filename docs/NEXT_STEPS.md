@@ -86,3 +86,22 @@ Binary format used by JDK Mission Control, IntelliJ, Grafana/Pyroscope, and Data
 Upload profiling data (pprof, CodeGuru JSON, or JFR) to S3 or HTTP endpoints for continuous profiling pipelines.
 
 Note: Direct CodeGuru upload is already implemented via `--codeguru-upload`. S3 upload would be for custom pipelines or non-CodeGuru consumers (e.g., Pyroscope, Grafana Cloud Profiles).
+
+## 12. TUI: PTY/VTE Terminal Emulation for Process Output — Planned
+
+The current TUI process output capture (Issue #57) uses piped stdio, which means the
+child process detects it's not connected to a terminal (`isatty()` returns false). Programs
+may disable colors, switch to full buffering, or hide interactive features.
+
+A future enhancement would embed a terminal emulator inside the TUI output panel:
+
+- Allocate a PTY pair (`openpty`); child gets the slave end and thinks it has a real terminal
+- Parse the master end through a VTE state machine (`vte` crate) into a virtual cell grid
+- Render the virtual screen into the ratatui frame (preserving colors, cursor position, etc.)
+- Forward mouse events from the output area back to the PTY master
+- Forward SIGWINCH so the child knows the "terminal" size
+
+This would enable full-fidelity output rendering (progress bars, colors, interactive prompts)
+similar to what zellij/tmux provide. Dependencies: `vte`, `pty-process` or raw `openpty`/`forkpty`.
+Complexity is significantly higher than the pipe-based approach (terminal lifecycle, signal
+forwarding, input multiplexing, job control edge cases).

@@ -1071,25 +1071,67 @@ async fn monitor_child_output(
         String::from_utf8_lossy(&stripped).into_owned()
     }
 
-    let buf_out = buf.clone();
-    let stdout_task = async move {
-        if let Some(stdout) = stdout {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                let mut b = buf_out.lock().unwrap();
-                b.push(strip_ansi(&line), OutputStream::Stdout);
+    /// Read lines from a stream and push them into the shared buffer.
+    /// After each awaited read, drains any additional complete lines
+    /// already in the BufReader's internal buffer before releasing the
+    /// mutex, reducing lock acquisitions under high output.
+    async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
+        reader: R,
+        stream: OutputStream,
+        buf: profile_bee_tui::output::SharedOutputBuffer,
+    ) {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    // Collect this line plus any others already buffered.
+                    let mut batch = vec![strip_ansi(
+                        line.trim_end_matches('\n').trim_end_matches('\r'),
+                    )];
+
+                    // Drain additional complete lines from the internal buffer
+                    // without awaiting (no yield = stays on this thread).
+                    loop {
+                        let available = reader.buffer();
+                        if available.is_empty() || !available.contains(&b'\n') {
+                            break;
+                        }
+                        line.clear();
+                        // Data is already buffered — read_line resolves instantly.
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                batch.push(strip_ansi(
+                                    line.trim_end_matches('\n').trim_end_matches('\r'),
+                                ));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    // Single lock acquisition for the whole batch.
+                    let mut b = buf.lock().unwrap();
+                    for text in batch {
+                        b.push(text, stream);
+                    }
+                }
+                Err(_) => break,
             }
+        }
+    }
+
+    let stdout_task = async {
+        if let Some(stdout) = stdout {
+            drain_stream(stdout, OutputStream::Stdout, buf.clone()).await;
         }
     };
 
-    let buf_err = buf.clone();
-    let stderr_task = async move {
+    let stderr_task = async {
         if let Some(stderr) = stderr {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                let mut b = buf_err.lock().unwrap();
-                b.push(strip_ansi(&line), OutputStream::Stderr);
-            }
+            drain_stream(stderr, OutputStream::Stderr, buf.clone()).await;
         }
     };
 

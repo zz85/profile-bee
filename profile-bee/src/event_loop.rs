@@ -25,6 +25,21 @@ pub struct CollectResult {
     pub stopped: bool,
 }
 
+/// Result of a single `collect_raw` call, returning structured frames.
+///
+/// Unlike [`CollectResult`] which provides pre-formatted collapse strings,
+/// this gives callers the raw [`FrameCount`] data so they can inspect,
+/// mutate, or re-format stacks before output.  This is the primary
+/// extension point for custom profiling agents that need to enrich
+/// stack data (e.g. annotating frames with deployment environment
+/// information or reformatting process names).
+pub struct RawCollectResult {
+    /// Symbolized stack frames with sample counts.
+    pub stacks: Vec<FrameCount>,
+    /// Whether the profiling loop received a Stop or exit event.
+    pub stopped: bool,
+}
+
 /// Configuration for the event loop.
 pub struct EventLoopConfig {
     pub stream_mode: u8,
@@ -199,8 +214,138 @@ impl ProfilingEventLoop {
         CollectResult { stacks, stopped }
     }
 
-    /// Build collapse-format output from trace counts or kernel counts.
-    fn build_collapse_output(&mut self, local_counting: bool) -> Vec<String> {
+    /// Drain events and return structured [`FrameCount`] data.
+    ///
+    /// Identical to [`collect`](Self::collect) but returns raw symbolized
+    /// frames instead of pre-formatted collapse strings.  This lets callers
+    /// inspect, mutate, or re-format stacks before output — useful for
+    /// custom profiling agents that enrich frames with external metadata.
+    ///
+    /// # Example: continuous profiling agent
+    ///
+    /// ```rust,ignore
+    /// loop {
+    ///     let result = event_loop.collect_raw(&rx, Some(Duration::from_secs(10)));
+    ///
+    ///     // Enrich stacks with deployment metadata, reformat process names, etc.
+    ///     let enriched = post_process(result.stacks);
+    ///
+    ///     // Convert to your upload format and send
+    ///     upload(enriched);
+    ///
+    ///     if result.stopped { break; }
+    /// }
+    /// ```
+    pub fn collect_raw(
+        &mut self,
+        rx: &mpsc::Receiver<PerfWork>,
+        timeout: Option<Duration>,
+    ) -> RawCollectResult {
+        let mut queue_processed = 0u64;
+        let mut stopped = false;
+        let local_counting = self.stream_mode == EVENT_TRACE_ALWAYS;
+
+        let keys = self.counts.keys().flatten().collect::<Vec<_>>();
+        for k in keys {
+            let _ = self.counts.remove(&k);
+        }
+
+        let deadline = timeout.map(|d| Instant::now() + d);
+
+        loop {
+            let work = if let Some(dl) = deadline {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(w) => w,
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::warn!("ProfilingEventLoop::collect_raw: channel disconnected");
+                        stopped = true;
+                        break;
+                    }
+                }
+            } else {
+                match rx.recv() {
+                    Ok(w) => w,
+                    Err(_) => {
+                        stopped = true;
+                        break;
+                    }
+                }
+            };
+
+            match work {
+                PerfWork::StackInfo(stack) => {
+                    queue_processed += 1;
+                    if queue_processed == 1 {
+                        tracing::debug!(
+                            "ProfilingEventLoop::collect_raw: received first StackInfo event"
+                        );
+                    }
+                    if let Some(tx) = &self.tgid_request_tx {
+                        if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
+                            let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
+                        }
+                    }
+                    if local_counting {
+                        let trace = self.trace_count.entry(stack).or_insert(0);
+                        *trace += 1;
+                        if *trace == 1 {
+                            self.trace_handler.get_exp_stacked_frames(
+                                &stack,
+                                &self.stack_traces,
+                                self.group_by_cpu,
+                                &self.stacked_pointers,
+                            );
+                        }
+                    } else {
+                        self.trace_handler.get_exp_stacked_frames(
+                            &stack,
+                            &self.stack_traces,
+                            self.group_by_cpu,
+                            &self.stacked_pointers,
+                        );
+                    }
+                }
+                PerfWork::DwarfRefresh(update) => {
+                    if let Err(e) = apply_dwarf_refresh(&mut self.bpf, update) {
+                        tracing::warn!("{:#}", e);
+                    }
+                }
+                PerfWork::ProcessExit(exit_event) => {
+                    if let Some(tx) = &self.tgid_request_tx {
+                        let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
+                    }
+                    self.known_tgids.remove(&exit_event.pid);
+                    if Some(exit_event.pid) == self.monitor_exit_pid {
+                        tracing::info!("target process {} exited, stopping", exit_event.pid);
+                        stopped = true;
+                        break;
+                    }
+                    tracing::debug!("DWARF-tracked process {} exited", exit_event.pid);
+                }
+                PerfWork::Stop => {
+                    tracing::info!("ProfilingEventLoop::collect_raw: received Stop");
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+
+        tracing::debug!(
+            "ProfilingEventLoop::collect_raw: processed {} events",
+            queue_processed
+        );
+
+        let stacks = self.build_raw_stacks(local_counting);
+        RawCollectResult { stacks, stopped }
+    }
+
+    /// Symbolize and return raw [`FrameCount`] data from the current trace counts.
+    fn build_raw_stacks(&mut self, local_counting: bool) -> Vec<FrameCount> {
         let sources: Vec<(StackInfo, u64)> = if local_counting {
             self.trace_count
                 .iter()
@@ -227,6 +372,13 @@ impl ProfilingEventLoop {
                 count: *count,
             });
         }
+
+        stacks
+    }
+
+    /// Build collapse-format output from trace counts or kernel counts.
+    fn build_collapse_output(&mut self, local_counting: bool) -> Vec<String> {
+        let stacks = self.build_raw_stacks(local_counting);
 
         let mut out: Vec<String> = stacks
             .into_iter()
@@ -319,4 +471,49 @@ impl ProfilingEventLoop {
     pub fn monitor_exit_pid(&self) -> Option<u32> {
         self.monitor_exit_pid
     }
+}
+
+/// Convert structured [`FrameCount`] data into sorted collapse-format strings.
+///
+/// Each entry becomes `"frame1;frame2;...;frameN count\n"`.  This is the same
+/// format produced by [`ProfilingEventLoop::collect`] and consumed by tools
+/// like `inferno`, `flamegraph.pl`, and profile-bee's own SVG/HTML/TUI outputs.
+///
+/// Useful when you call [`ProfilingEventLoop::collect_raw`], enrich the stacks,
+/// and then want collapse-format output.
+pub fn collapse_raw(stacks: &[FrameCount]) -> Vec<String> {
+    collapse_raw_with(stacks, |f| f.fmt_symbol())
+}
+
+/// Convert structured [`FrameCount`] data into sorted collapse-format strings,
+/// using a custom frame formatter.
+///
+/// This is the customizable variant of [`collapse_raw`].  The `fmt` closure
+/// controls how each [`StackFrameInfo`] becomes a string in the output.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use profile_bee::event_loop::collapse_raw_with;
+///
+/// // Include the object (library) name in the output
+/// let stacks = collapse_raw_with(&raw.stacks, |frame| {
+///     let obj = frame.fmt_object();
+///     let sym = frame.symbol.as_deref().unwrap_or("[unknown]");
+///     format!("{}`{}", obj, sym)
+/// });
+/// ```
+pub fn collapse_raw_with<F>(stacks: &[FrameCount], fmt: F) -> Vec<String>
+where
+    F: Fn(&crate::types::StackFrameInfo) -> String,
+{
+    let mut out: Vec<String> = stacks
+        .iter()
+        .map(|fc| {
+            let key = fc.frames.iter().map(&fmt).collect::<Vec<_>>().join(";");
+            format!("{} {}", &key, fc.count)
+        })
+        .collect();
+    out.sort();
+    out
 }
