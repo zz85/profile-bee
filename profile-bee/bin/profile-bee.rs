@@ -187,6 +187,11 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     group_by_cpu: bool,
 
+    /// Group flamegraph by process name and PID. Each process gets its own
+    /// sub-tree rooted at "process_name (pid)". Useful for system-wide profiling.
+    #[arg(long, default_value_t = false)]
+    group_by_process: bool,
+
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     dwarf: Option<bool>,
@@ -498,6 +503,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let event_loop_config = EventLoopConfig {
         stream_mode: opt.stream_mode,
         group_by_cpu: opt.group_by_cpu,
+        group_by_process: opt.group_by_process,
         monitor_exit_pid,
         tgid_request_tx,
     };
@@ -811,6 +817,7 @@ fn spawn_profiling_thread(
     web_tx: Option<tokio::sync::broadcast::Sender<String>>,
     stream_mode: u8,
     group_by_cpu: bool,
+    group_by_process: bool,
     tui_refresh_ms: u64,
     monitor_exit_pid: Option<u32>,
 ) {
@@ -864,6 +871,7 @@ fn spawn_profiling_thread(
                                     &stack,
                                     &stack_traces,
                                     group_by_cpu,
+                                    group_by_process,
                                     &stacked_pointers,
                                 );
                             }
@@ -873,6 +881,7 @@ fn spawn_profiling_thread(
                                 &stack,
                                 &stack_traces,
                                 group_by_cpu,
+                                group_by_process,
                                 &stacked_pointers,
                             );
                         }
@@ -940,6 +949,7 @@ fn spawn_profiling_thread(
                             &stack,
                             &stack_traces,
                             group_by_cpu,
+                            group_by_process,
                             &stacked_pointers,
                         );
                     }
@@ -952,6 +962,7 @@ fn spawn_profiling_thread(
                     stack,
                     &stack_traces,
                     group_by_cpu,
+                    group_by_process,
                     &stacked_pointers,
                 );
                 stacks.push(FrameCount {
@@ -1250,6 +1261,7 @@ async fn run_combined_mode(
         Some(web_tx),
         opt.stream_mode,
         opt.group_by_cpu,
+        opt.group_by_process,
         opt.tui_refresh_ms,
         external_pid,
     );
@@ -1348,6 +1360,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         None,
         opt.stream_mode,
         opt.group_by_cpu,
+        opt.group_by_process,
         opt.tui_refresh_ms,
         external_pid,
     );

@@ -205,6 +205,7 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("enter/esc", "zoom");
             help_tags.add("/", "search");
             help_tags.add("#", "search like cursor");
+            help_tags.add("p", "cycle process");
             if let Some(p) = &self.app.flamegraph_state().search_pattern {
                 if p.is_manual {
                     help_tags.add("n/N", "next/prev search");

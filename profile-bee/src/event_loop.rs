@@ -44,6 +44,7 @@ pub struct RawCollectResult {
 pub struct EventLoopConfig {
     pub stream_mode: u8,
     pub group_by_cpu: bool,
+    pub group_by_process: bool,
     pub monitor_exit_pid: Option<u32>,
     pub tgid_request_tx: Option<mpsc::Sender<DwarfThreadMsg>>,
 }
@@ -61,6 +62,7 @@ pub struct ProfilingEventLoop {
     tgid_request_tx: Option<mpsc::Sender<DwarfThreadMsg>>,
     stream_mode: u8,
     group_by_cpu: bool,
+    group_by_process: bool,
     monitor_exit_pid: Option<u32>,
     // Persistent state across calls
     trace_count: HashMap<StackInfo, usize>,
@@ -88,6 +90,7 @@ impl ProfilingEventLoop {
             tgid_request_tx: config.tgid_request_tx,
             stream_mode: config.stream_mode,
             group_by_cpu: config.group_by_cpu,
+            group_by_process: config.group_by_process,
             monitor_exit_pid: config.monitor_exit_pid,
             trace_count: HashMap::new(),
             known_tgids: HashSet::new(),
@@ -206,6 +209,7 @@ impl ProfilingEventLoop {
                                 &stack,
                                 &self.stack_traces,
                                 self.group_by_cpu,
+                                self.group_by_process,
                                 &self.stacked_pointers,
                             );
                         }
@@ -214,6 +218,7 @@ impl ProfilingEventLoop {
                             &stack,
                             &self.stack_traces,
                             self.group_by_cpu,
+                            self.group_by_process,
                             &self.stacked_pointers,
                         );
                     }
@@ -268,6 +273,7 @@ impl ProfilingEventLoop {
                 stack,
                 &self.stack_traces,
                 self.group_by_cpu,
+                self.group_by_process,
                 &self.stacked_pointers,
             );
             stacks.push(FrameCount {

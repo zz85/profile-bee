@@ -154,6 +154,7 @@ impl TraceHandler {
         stack_info: &StackInfo,
         stack_traces: &StackTraceMap<MapData>,
         group_by_cpu: bool,
+        group_by_process: bool,
         stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
     ) -> Vec<StackFrameInfo> {
         let tgid = stack_info.tgid;
@@ -196,7 +197,13 @@ impl TraceHandler {
             fp_user_stack
         };
 
-        let result = self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu);
+        let result = self.format_stack_trace(
+            stack_info,
+            kernel_stack,
+            user_stack,
+            group_by_cpu,
+            group_by_process,
+        );
 
         if cacheable {
             self.cache
@@ -212,9 +219,16 @@ impl TraceHandler {
         stack_info: &StackInfo,
         stack_traces: &StackTraceMap<MapData>,
         group_by_cpu: bool,
+        group_by_process: bool,
     ) -> Vec<StackFrameInfo> {
         let (kernel_stack, user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
-        self.format_stack_trace(stack_info, kernel_stack, user_stack, group_by_cpu)
+        self.format_stack_trace(
+            stack_info,
+            kernel_stack,
+            user_stack,
+            group_by_cpu,
+            group_by_process,
+        )
     }
 
     /// Extract stacks from StackTraceMaps (kernel's implementation only support FP unwinding)
@@ -258,8 +272,8 @@ impl TraceHandler {
         stack_info: &StackInfo,
         kernel_stack: Option<Vec<u64>>,
         user_stack: Option<Vec<u64>>,
-        // stacked_pointers: &StackFrameInfo
         group_by_cpu: bool,
+        group_by_process: bool,
     ) -> Vec<StackFrameInfo> {
         if stack_info.tgid == 0 {
             let mut idle = StackFrameInfo::prepare(stack_info);
@@ -310,6 +324,15 @@ impl TraceHandler {
 
                 combined.push(frame);
             }
+        }
+
+        if group_by_process {
+            let cmd = stack_info.get_cmd();
+            let frame = StackFrameInfo {
+                symbol: Some(format!("{} ({})", cmd, stack_info.tgid)),
+                ..Default::default()
+            };
+            combined.push(frame);
         }
 
         combined.reverse();

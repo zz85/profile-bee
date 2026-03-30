@@ -142,6 +142,9 @@ fn handle_command_flamegraph(key_event: KeyEvent, app: &mut App) -> AppResult<bo
         KeyCode::Char('#') => {
             app.search_selected();
         }
+        KeyCode::Char('p') => {
+            app.flamegraph_view.zoom_next_process();
+        }
         _ => {
             key_handled = false;
         }

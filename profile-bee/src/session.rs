@@ -38,6 +38,8 @@ pub struct SessionConfig {
     pub duration_ms: usize,
     /// Group samples by CPU core.
     pub group_by_cpu: bool,
+    /// Group samples by process name and PID.
+    pub group_by_process: bool,
     /// Whether to set up process-exit monitoring for external PIDs.
     pub monitor_exit: bool,
 }
@@ -50,6 +52,7 @@ impl Default for SessionConfig {
             command: Vec::new(),
             duration_ms: 0,
             group_by_cpu: false,
+            group_by_process: false,
             monitor_exit: true,
         }
     }
@@ -214,6 +217,7 @@ impl ProfilingSession {
         let event_loop_config = EventLoopConfig {
             stream_mode: config.profiler.stream_mode,
             group_by_cpu: config.group_by_cpu,
+            group_by_process: config.group_by_process,
             monitor_exit_pid,
             tgid_request_tx,
         };

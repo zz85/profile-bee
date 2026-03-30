@@ -404,6 +404,54 @@ impl FlameGraphView {
         self.set_zoom_for_id(self.state.selected);
     }
 
+    /// Cycle zoom through level-1 children of the root (typically process names).
+    /// Press once to zoom into the first process, again for the next, etc.
+    /// After the last process, unzooms back to the full view.
+    pub fn zoom_next_process(&mut self) {
+        let root = match self.flamegraph.get_stack(&ROOT_ID) {
+            Some(r) => r,
+            None => return,
+        };
+        let children = &root.children;
+        if children.is_empty() {
+            return;
+        }
+
+        // Sort children by total_count descending for a natural ordering
+        let mut sorted_children: Vec<StackIdentifier> = children.clone();
+        sorted_children.sort_by(|a, b| {
+            let count_a = self.flamegraph.get_stack(a).map_or(0, |s| s.total_count);
+            let count_b = self.flamegraph.get_stack(b).map_or(0, |s| s.total_count);
+            count_b.cmp(&count_a)
+        });
+
+        // Find current zoomed process in the sorted list
+        let current_idx = self
+            .state
+            .zoom
+            .as_ref()
+            .and_then(|z| sorted_children.iter().position(|c| *c == z.stack_id));
+
+        match current_idx {
+            Some(idx) if idx + 1 < sorted_children.len() => {
+                // Cycle to next process
+                let next = sorted_children[idx + 1];
+                self.state.select_id(&next);
+                self.set_zoom_for_id(next);
+            }
+            Some(_) => {
+                // Was on the last process — unzoom back to full view
+                self.unset_zoom();
+            }
+            None => {
+                // Not zoomed on a process — zoom into the first (largest) one
+                let first = sorted_children[0];
+                self.state.select_id(&first);
+                self.set_zoom_for_id(first);
+            }
+        }
+    }
+
     pub fn unset_zoom(&mut self) {
         if let Some(zoom_stack_id) = self.state.zoom.as_ref().map(|z| z.stack_id) {
             // Restore selected to previous zoom point
