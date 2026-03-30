@@ -46,7 +46,6 @@ pub enum ViewKind {
     Table,
     Output,
     ProcessList,
-    TreeView,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -74,6 +73,9 @@ pub struct FlameGraphState {
     /// When true, stacks are prefixed with "process_name (pid)" root frames
     /// to split the flamegraph by process. Toggled with 'p'.
     pub pid_mode: bool,
+    /// When true, the Top/Processes views show an expandable tree instead
+    /// of a flat list. Toggled with 't'.
+    pub tree_mode: bool,
     pub view_kind: ViewKind,
     pub table_state: TableState,
     pub process_list_state: TableState,
@@ -117,6 +119,7 @@ impl Default for FlameGraphState {
             search_pattern: None,
             freeze: false,
             pid_mode: false,
+            tree_mode: false,
             view_kind: ViewKind::FlameGraph,
             table_state: TableState::default(),
             process_list_state: TableState::default(),
@@ -161,7 +164,6 @@ impl FlameGraphState {
             ViewKind::Table => ViewKind::ProcessList,
             ViewKind::ProcessList => ViewKind::FlameGraph,
             ViewKind::Output => ViewKind::FlameGraph,
-            ViewKind::TreeView => ViewKind::FlameGraph,
         };
     }
 
@@ -173,7 +175,6 @@ impl FlameGraphState {
             ViewKind::Table => ViewKind::ProcessList,
             ViewKind::ProcessList => ViewKind::Output,
             ViewKind::Output => ViewKind::FlameGraph,
-            ViewKind::TreeView => ViewKind::FlameGraph,
         };
     }
 
@@ -201,6 +202,15 @@ impl FlameGraphState {
         // thread and share SearchPattern via Arc but let's keep it simple for now.
         if let Some(p) = &self.search_pattern {
             new.set_hits(p);
+        }
+
+        // Remap expanded tree node IDs from old to new flamegraph.
+        // Nodes are matched by full name so expanded state survives data refreshes.
+        let old_expanded = std::mem::take(&mut self.tree_view_state.expanded);
+        for old_id in old_expanded {
+            if let Some(new_id) = Self::get_new_stack_id(&old_id, old, new) {
+                self.tree_view_state.expanded.insert(new_id);
+            }
         }
     }
 

@@ -159,12 +159,14 @@ impl<'a> FlamelensWidget<'a> {
 
             if self.is_flamegraph_view() {
                 self.render_flamegraph(split[0], buf, state);
-            } else if self.is_table_view() {
-                self.render_table(split[0], buf);
-            } else if self.is_process_list_view() {
-                self.render_process_list(split[0], buf);
-            } else if self.is_tree_view() {
-                self.render_tree_view(split[0], buf);
+            } else if self.is_table_view() || self.is_process_list_view() {
+                if self.app.flamegraph_state().tree_mode {
+                    self.render_tree_view(split[0], buf);
+                } else if self.is_table_view() {
+                    self.render_table(split[0], buf);
+                } else {
+                    self.render_process_list(split[0], buf);
+                }
             }
 
             self.render_output_panel(split[1], buf);
@@ -178,12 +180,14 @@ impl<'a> FlamelensWidget<'a> {
             state.output_view_height = main_area.height;
         } else if self.is_flamegraph_view() {
             self.render_flamegraph(main_area, buf, state);
-        } else if self.is_process_list_view() {
-            self.render_process_list(main_area, buf);
-        } else if self.is_tree_view() {
-            self.render_tree_view(main_area, buf);
-        } else {
-            self.render_table(main_area, buf);
+        } else if self.is_table_view() || self.is_process_list_view() {
+            if self.app.flamegraph_state().tree_mode {
+                self.render_tree_view(main_area, buf);
+            } else if self.is_table_view() {
+                self.render_table(main_area, buf);
+            } else {
+                self.render_process_list(main_area, buf);
+            }
         }
         let flamegraph_render_time = tic.elapsed();
 
@@ -235,16 +239,17 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("j/k", "scroll");
             help_tags.add("f/b", "page up/down");
             help_tags.add("G/g", "bottom/top");
-        } else if self.is_process_list_view() {
-            help_tags.add("j/k", "move cursor");
-            help_tags.add("enter", "zoom into process");
-            help_tags.add("esc/p", "back to flamegraph");
-        } else if self.is_tree_view() {
+        } else if self.app.flamegraph_state().tree_mode {
+            // Tree mode (applies to both Top and Processes views)
             help_tags.add("j/k", "move cursor");
             help_tags.add("enter/l", "expand");
             help_tags.add("h", "collapse/parent");
             help_tags.add("esc", "collapse all");
-            help_tags.add("t", "back to flamegraph");
+            help_tags.add("t", "list mode");
+        } else if self.is_process_list_view() {
+            help_tags.add("j/k", "move cursor");
+            help_tags.add("enter", "zoom into process");
+            help_tags.add("t", "tree mode");
         } else {
             // Table view
             help_tags.add("j/k", "move cursor");
@@ -252,6 +257,7 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("1", "sort by total");
             help_tags.add("2", "sort by own");
             help_tags.add("/", "filter");
+            help_tags.add("t", "tree mode");
             if self.app.has_output() {
                 help_tags.add("o", "output panel");
             }
@@ -846,12 +852,6 @@ impl<'a> FlamelensWidget<'a> {
             ViewKind::ProcessList,
             self.app.flamegraph_state().view_kind,
         ));
-        header_bottom_title_spans.push(Span::from(" | "));
-        header_bottom_title_spans.push(_get_view_kind_span(
-            "Tree",
-            ViewKind::TreeView,
-            self.app.flamegraph_state().view_kind,
-        ));
         if self.app.has_output() {
             header_bottom_title_spans.push(Span::from(" | "));
             header_bottom_title_spans.push(_get_view_kind_span(
@@ -1029,10 +1029,6 @@ impl<'a> FlamelensWidget<'a> {
 
     fn is_process_list_view(&self) -> bool {
         self.view_kind() == ViewKind::ProcessList
-    }
-
-    fn is_tree_view(&self) -> bool {
-        self.view_kind() == ViewKind::TreeView
     }
 }
 

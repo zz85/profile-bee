@@ -26,21 +26,23 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 pub fn handle_command(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
     let mut key_handled = handle_command_generic(key_event, app)?;
     if !key_handled {
-        match app.flamegraph_state().view_kind {
+        let view = app.flamegraph_state().view_kind;
+        let tree_mode = app.flamegraph_view.state.tree_mode;
+        match view {
             ViewKind::FlameGraph => {
                 key_handled = handle_command_flamegraph(key_event, app)?;
+            }
+            ViewKind::Table | ViewKind::ProcessList if tree_mode => {
+                key_handled = handle_command_tree_view(key_event, app)?;
             }
             ViewKind::Table => {
                 key_handled = handle_command_table(key_event, app)?;
             }
-            ViewKind::Output => {
-                key_handled = handle_command_output(key_event, app)?;
-            }
             ViewKind::ProcessList => {
                 key_handled = handle_command_process_list(key_event, app)?;
             }
-            ViewKind::TreeView => {
-                key_handled = handle_command_tree_view(key_event, app)?;
+            ViewKind::Output => {
+                key_handled = handle_command_output(key_event, app)?;
             }
         }
     }
@@ -97,11 +99,13 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
             app.toggle_debug();
         }
         KeyCode::Char('t') => {
-            if app.flamegraph_state().view_kind == ViewKind::TreeView {
-                app.flamegraph_view.state.view_kind = ViewKind::FlameGraph;
+            app.flamegraph_view.state.tree_mode = !app.flamegraph_view.state.tree_mode;
+            let mode_str = if app.flamegraph_view.state.tree_mode {
+                "on"
             } else {
-                app.flamegraph_view.state.view_kind = ViewKind::TreeView;
-            }
+                "off"
+            };
+            app.set_transient_message(&format!("Tree mode: {}", mode_str));
         }
         _ => {
             key_handled = false;
