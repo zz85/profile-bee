@@ -45,6 +45,7 @@ pub enum ViewKind {
     FlameGraph,
     Table,
     Output,
+    ProcessList,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -71,6 +72,7 @@ pub struct FlameGraphState {
     pub freeze: bool,
     pub view_kind: ViewKind,
     pub table_state: TableState,
+    pub process_list_state: TableState,
     pub update_mode: UpdateMode,
 }
 
@@ -86,6 +88,7 @@ impl Default for FlameGraphState {
             freeze: false,
             view_kind: ViewKind::FlameGraph,
             table_state: TableState::default(),
+            process_list_state: TableState::default(),
             update_mode: UpdateMode::default(),
         }
     }
@@ -125,6 +128,7 @@ impl FlameGraphState {
             ViewKind::FlameGraph => ViewKind::Table,
             ViewKind::Table => ViewKind::FlameGraph,
             ViewKind::Output => ViewKind::FlameGraph,
+            ViewKind::ProcessList => ViewKind::FlameGraph,
         };
     }
 
@@ -135,6 +139,7 @@ impl FlameGraphState {
             ViewKind::FlameGraph => ViewKind::Table,
             ViewKind::Table => ViewKind::Output,
             ViewKind::Output => ViewKind::FlameGraph,
+            ViewKind::ProcessList => ViewKind::FlameGraph,
         };
     }
 

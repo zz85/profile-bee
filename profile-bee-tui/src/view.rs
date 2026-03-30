@@ -2,8 +2,17 @@ use std::cmp::min;
 
 use crate::{
     flame::{FlameGraph, SearchPattern, SortColumn, StackIdentifier, StackInfo, ROOT_ID},
-    state::{FlameGraphState, ZoomState},
+    state::{FlameGraphState, ViewKind, ZoomState},
 };
+
+/// An entry in the process list view.
+#[derive(Debug, Clone)]
+pub struct ProcessEntry {
+    pub name: String,
+    pub stack_id: StackIdentifier,
+    pub samples: u64,
+    pub percentage: f64,
+}
 
 #[derive(Debug)]
 pub struct FlameGraphView {
@@ -404,52 +413,39 @@ impl FlameGraphView {
         self.set_zoom_for_id(self.state.selected);
     }
 
-    /// Cycle zoom through level-1 children of the root (typically process names).
-    /// Press once to zoom into the first process, again for the next, etc.
-    /// After the last process, unzooms back to the full view.
-    pub fn zoom_next_process(&mut self) {
+    /// Get a list of top-level processes (root's children) sorted by sample count.
+    /// Returns (name, stack_id, sample_count, percentage) tuples.
+    pub fn get_process_list(&self) -> Vec<ProcessEntry> {
         let root = match self.flamegraph.get_stack(&ROOT_ID) {
             Some(r) => r,
-            None => return,
+            None => return Vec::new(),
         };
-        let children = &root.children;
-        if children.is_empty() {
-            return;
-        }
+        let total = self.flamegraph.total_count().max(1) as f64;
 
-        // Sort children by total_count descending for a natural ordering
-        let mut sorted_children: Vec<StackIdentifier> = children.clone();
-        sorted_children.sort_by(|a, b| {
-            let count_a = self.flamegraph.get_stack(a).map_or(0, |s| s.total_count);
-            let count_b = self.flamegraph.get_stack(b).map_or(0, |s| s.total_count);
-            count_b.cmp(&count_a)
-        });
+        let mut entries: Vec<ProcessEntry> = root
+            .children
+            .iter()
+            .filter_map(|child_id| {
+                let stack = self.flamegraph.get_stack(child_id)?;
+                let name = self.flamegraph.get_stack_short_name(child_id)?;
+                Some(ProcessEntry {
+                    name: name.to_owned(),
+                    stack_id: *child_id,
+                    samples: stack.total_count,
+                    percentage: (stack.total_count as f64 / total) * 100.0,
+                })
+            })
+            .collect();
 
-        // Find current zoomed process in the sorted list
-        let current_idx = self
-            .state
-            .zoom
-            .as_ref()
-            .and_then(|z| sorted_children.iter().position(|c| *c == z.stack_id));
+        entries.sort_by(|a, b| b.samples.cmp(&a.samples));
+        entries
+    }
 
-        match current_idx {
-            Some(idx) if idx + 1 < sorted_children.len() => {
-                // Cycle to next process
-                let next = sorted_children[idx + 1];
-                self.state.select_id(&next);
-                self.set_zoom_for_id(next);
-            }
-            Some(_) => {
-                // Was on the last process — unzoom back to full view
-                self.unset_zoom();
-            }
-            None => {
-                // Not zoomed on a process — zoom into the first (largest) one
-                let first = sorted_children[0];
-                self.state.select_id(&first);
-                self.set_zoom_for_id(first);
-            }
-        }
+    /// Zoom into a specific process by its stack ID and switch back to flamegraph view.
+    pub fn zoom_to_process(&mut self, stack_id: StackIdentifier) {
+        self.state.select_id(&stack_id);
+        self.set_zoom_for_id(stack_id);
+        self.state.view_kind = ViewKind::FlameGraph;
     }
 
     pub fn unset_zoom(&mut self) {

@@ -36,6 +36,9 @@ pub fn handle_command(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
             ViewKind::Output => {
                 key_handled = handle_command_output(key_event, app)?;
             }
+            ViewKind::ProcessList => {
+                key_handled = handle_command_process_list(key_event, app)?;
+            }
         }
     }
     if key_handled && app.transient_message.is_some() {
@@ -143,7 +146,8 @@ fn handle_command_flamegraph(key_event: KeyEvent, app: &mut App) -> AppResult<bo
             app.search_selected();
         }
         KeyCode::Char('p') => {
-            app.flamegraph_view.zoom_next_process();
+            app.flamegraph_view.state.view_kind = ViewKind::ProcessList;
+            app.flamegraph_view.state.process_list_state.reset();
         }
         _ => {
             key_handled = false;
@@ -223,6 +227,46 @@ fn handle_command_output(key_event: KeyEvent, app: &mut App) -> AppResult<bool> 
         }
         KeyCode::Char('g') => {
             app.output_state.scroll_to_top(total_lines, visible_height);
+        }
+        _ => {
+            key_handled = false;
+        }
+    }
+    Ok(key_handled)
+}
+
+fn handle_command_process_list(key_event: KeyEvent, app: &mut App) -> AppResult<bool> {
+    let process_count = app.flamegraph_view.get_process_list().len();
+    let mut key_handled = true;
+    match key_event.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            if process_count > 0 {
+                let state = &mut app.flamegraph_view.state.process_list_state;
+                state.selected = (state.selected + 1).min(process_count.saturating_sub(1));
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            let state = &mut app.flamegraph_view.state.process_list_state;
+            state.selected = state.selected.saturating_sub(1);
+        }
+        KeyCode::Char('G') => {
+            if process_count > 0 {
+                app.flamegraph_view.state.process_list_state.selected =
+                    process_count.saturating_sub(1);
+            }
+        }
+        KeyCode::Char('g') => {
+            app.flamegraph_view.state.process_list_state.selected = 0;
+        }
+        KeyCode::Enter => {
+            let processes = app.flamegraph_view.get_process_list();
+            let selected = app.flamegraph_view.state.process_list_state.selected;
+            if let Some(entry) = processes.get(selected) {
+                app.flamegraph_view.zoom_to_process(entry.stack_id);
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('p') => {
+            app.flamegraph_view.state.view_kind = ViewKind::FlameGraph;
         }
         _ => {
             key_handled = false;

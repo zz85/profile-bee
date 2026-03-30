@@ -10,8 +10,8 @@ use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{
-        block::Position, Block, Borders, Paragraph, Row, StatefulWidget, Table, TableState, Widget,
-        Wrap,
+        block::Position, Block, Borders, Cell, Paragraph, Row, StatefulWidget, Table, TableState,
+        Widget, Wrap,
     },
     Frame,
 };
@@ -161,6 +161,8 @@ impl<'a> FlamelensWidget<'a> {
                 self.render_flamegraph(split[0], buf, state);
             } else if self.is_table_view() {
                 self.render_table(split[0], buf);
+            } else if self.is_process_list_view() {
+                self.render_process_list(split[0], buf);
             }
 
             self.render_output_panel(split[1], buf);
@@ -174,6 +176,8 @@ impl<'a> FlamelensWidget<'a> {
             state.output_view_height = main_area.height;
         } else if self.is_flamegraph_view() {
             self.render_flamegraph(main_area, buf, state);
+        } else if self.is_process_list_view() {
+            self.render_process_list(main_area, buf);
         } else {
             self.render_table(main_area, buf);
         }
@@ -205,7 +209,7 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("enter/esc", "zoom");
             help_tags.add("/", "search");
             help_tags.add("#", "search like cursor");
-            help_tags.add("p", "cycle process");
+            help_tags.add("p", "processes");
             if let Some(p) = &self.app.flamegraph_state().search_pattern {
                 if p.is_manual {
                     help_tags.add("n/N", "next/prev search");
@@ -226,6 +230,10 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("j/k", "scroll");
             help_tags.add("f/b", "page up/down");
             help_tags.add("G/g", "bottom/top");
+        } else if self.is_process_list_view() {
+            help_tags.add("j/k", "move cursor");
+            help_tags.add("enter", "zoom into process");
+            help_tags.add("esc/p", "back to flamegraph");
         } else {
             // Table view
             help_tags.add("j/k", "move cursor");
@@ -292,6 +300,59 @@ impl<'a> FlamelensWidget<'a> {
             .with_selected(self.app.flamegraph_state().table_state.selected)
             .with_offset(self.app.flamegraph_state().table_state.offset);
         StatefulWidget::render(ordered_stacks_table, area, buf, &mut table_state);
+    }
+
+    fn render_process_list(&self, area: Rect, buf: &mut Buffer) {
+        let processes = self.app.flamegraph_view.get_process_list();
+        let selected = self.app.flamegraph_state().process_list_state.selected;
+
+        let header = Row::new(vec![
+            Cell::from(" Process").style(Style::default().bold()),
+            Cell::from("Samples").style(Style::default().bold()),
+            Cell::from("CPU%").style(Style::default().bold()),
+        ])
+        .height(1);
+
+        let rows: Vec<Row> = processes
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let style = if i == selected {
+                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                } else {
+                    Style::default()
+                };
+
+                // Simple bar visualization proportional to percentage
+                let bar_width = (entry.percentage * 0.3) as usize;
+                let bar = "\u{2588}".repeat(bar_width.min(20));
+
+                Row::new(vec![
+                    Cell::from(format!(" {}", entry.name)),
+                    Cell::from(format!("{}", entry.samples)),
+                    Cell::from(format!("{:5.1}% {}", entry.percentage, bar)),
+                ])
+                .style(style)
+            })
+            .collect();
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Percentage(50),
+                Constraint::Percentage(15),
+                Constraint::Percentage(35),
+            ],
+        )
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Processes (Enter=zoom, Esc=back) ")
+                .title_style(Style::default().bold().yellow()),
+        );
+
+        Widget::render(table, area, buf);
     }
 
     /// Render the full-screen Output tab view.
@@ -690,6 +751,12 @@ impl<'a> FlamelensWidget<'a> {
             ViewKind::Table,
             self.app.flamegraph_state().view_kind,
         ));
+        header_bottom_title_spans.push(Span::from(" | "));
+        header_bottom_title_spans.push(_get_view_kind_span(
+            "Processes",
+            ViewKind::ProcessList,
+            self.app.flamegraph_state().view_kind,
+        ));
         if self.app.has_output() {
             header_bottom_title_spans.push(Span::from(" | "));
             header_bottom_title_spans.push(_get_view_kind_span(
@@ -863,6 +930,10 @@ impl<'a> FlamelensWidget<'a> {
 
     fn is_output_view(&self) -> bool {
         self.view_kind() == ViewKind::Output
+    }
+
+    fn is_process_list_view(&self) -> bool {
+        self.view_kind() == ViewKind::ProcessList
     }
 }
 
