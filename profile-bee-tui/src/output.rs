@@ -234,10 +234,12 @@ mod tests {
 
     #[test]
     fn adjust_for_new_lines_compensates_when_paused() {
-        let mut state = ProcessOutputState::default();
-        state.last_seen_total = 200;
-        state.scroll_offset = 50;
-        state.auto_scroll = false;
+        let mut state = ProcessOutputState {
+            last_seen_total: 200,
+            scroll_offset: 50,
+            auto_scroll: false,
+            ..Default::default()
+        };
 
         // 10 new lines arrive
         state.adjust_for_new_lines(210);
@@ -247,10 +249,10 @@ mod tests {
 
     #[test]
     fn adjust_for_new_lines_noop_when_auto_scrolling() {
-        let mut state = ProcessOutputState::default();
-        state.last_seen_total = 200;
-        state.scroll_offset = 0;
-        state.auto_scroll = true;
+        let mut state = ProcessOutputState {
+            last_seen_total: 200,
+            ..Default::default()
+        };
 
         state.adjust_for_new_lines(210);
         assert_eq!(state.scroll_offset, 0); // unchanged
