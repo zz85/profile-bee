@@ -146,8 +146,13 @@ fn handle_command_flamegraph(key_event: KeyEvent, app: &mut App) -> AppResult<bo
             app.search_selected();
         }
         KeyCode::Char('p') => {
-            app.flamegraph_view.state.view_kind = ViewKind::ProcessList;
-            app.flamegraph_view.state.process_list_state.reset();
+            let new_val = !app.flamegraph_view.state.pid_mode;
+            app.flamegraph_view.state.pid_mode = new_val;
+            // Sync to shared handle so profiling thread picks it up
+            app.get_pid_mode_handle()
+                .store(new_val, std::sync::atomic::Ordering::Relaxed);
+            let mode_str = if new_val { "on" } else { "off" };
+            app.set_transient_message(&format!("PID mode: {}", mode_str));
         }
         _ => {
             key_handled = false;

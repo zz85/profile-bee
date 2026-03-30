@@ -70,6 +70,9 @@ pub struct FlameGraphState {
     pub zoom: Option<ZoomState>,
     pub search_pattern: Option<SearchPattern>,
     pub freeze: bool,
+    /// When true, stacks are prefixed with "process_name (pid)" root frames
+    /// to split the flamegraph by process. Toggled with 'p'.
+    pub pid_mode: bool,
     pub view_kind: ViewKind,
     pub table_state: TableState,
     pub process_list_state: TableState,
@@ -86,6 +89,7 @@ impl Default for FlameGraphState {
             zoom: None,
             search_pattern: None,
             freeze: false,
+            pid_mode: false,
             view_kind: ViewKind::FlameGraph,
             table_state: TableState::default(),
             process_list_state: TableState::default(),
@@ -126,9 +130,9 @@ impl FlameGraphState {
     pub fn toggle_view_kind(&mut self) {
         self.view_kind = match self.view_kind {
             ViewKind::FlameGraph => ViewKind::Table,
-            ViewKind::Table => ViewKind::FlameGraph,
-            ViewKind::Output => ViewKind::FlameGraph,
+            ViewKind::Table => ViewKind::ProcessList,
             ViewKind::ProcessList => ViewKind::FlameGraph,
+            ViewKind::Output => ViewKind::FlameGraph,
         };
     }
 
@@ -137,9 +141,9 @@ impl FlameGraphState {
     pub fn toggle_view_kind_with_output(&mut self) {
         self.view_kind = match self.view_kind {
             ViewKind::FlameGraph => ViewKind::Table,
-            ViewKind::Table => ViewKind::Output,
+            ViewKind::Table => ViewKind::ProcessList,
+            ViewKind::ProcessList => ViewKind::Output,
             ViewKind::Output => ViewKind::FlameGraph,
-            ViewKind::ProcessList => ViewKind::FlameGraph,
         };
     }
 
