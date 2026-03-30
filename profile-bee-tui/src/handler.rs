@@ -39,6 +39,9 @@ pub fn handle_command(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
             ViewKind::ProcessList => {
                 key_handled = handle_command_process_list(key_event, app)?;
             }
+            ViewKind::TreeView => {
+                key_handled = handle_command_tree_view(key_event, app)?;
+            }
         }
     }
     if key_handled && app.transient_message.is_some() {
@@ -92,6 +95,13 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
         }
         KeyCode::Char('?') => {
             app.toggle_debug();
+        }
+        KeyCode::Char('t') => {
+            if app.flamegraph_state().view_kind == ViewKind::TreeView {
+                app.flamegraph_view.state.view_kind = ViewKind::FlameGraph;
+            } else {
+                app.flamegraph_view.state.view_kind = ViewKind::TreeView;
+            }
         }
         _ => {
             key_handled = false;
@@ -272,6 +282,74 @@ fn handle_command_process_list(key_event: KeyEvent, app: &mut App) -> AppResult<
         }
         KeyCode::Esc | KeyCode::Char('p') => {
             app.flamegraph_view.state.view_kind = ViewKind::FlameGraph;
+        }
+        _ => {
+            key_handled = false;
+        }
+    }
+    Ok(key_handled)
+}
+
+fn handle_command_tree_view(key_event: KeyEvent, app: &mut App) -> AppResult<bool> {
+    let rows = app.flamegraph_view.get_tree_rows();
+    let row_count = rows.len();
+    let mut key_handled = true;
+    match key_event.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            if row_count > 0 {
+                let state = &mut app.flamegraph_view.state.tree_view_state;
+                state.selected = (state.selected + 1).min(row_count.saturating_sub(1));
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            let state = &mut app.flamegraph_view.state.tree_view_state;
+            state.selected = state.selected.saturating_sub(1);
+        }
+        KeyCode::Char('G') => {
+            if row_count > 0 {
+                app.flamegraph_view.state.tree_view_state.selected = row_count.saturating_sub(1);
+            }
+        }
+        KeyCode::Char('g') => {
+            app.flamegraph_view.state.tree_view_state.selected = 0;
+        }
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            // Expand the selected node (or collapse if already expanded)
+            let selected = app.flamegraph_view.state.tree_view_state.selected;
+            if let Some(row) = rows.get(selected) {
+                if row.has_children {
+                    app.flamegraph_view
+                        .state
+                        .tree_view_state
+                        .toggle_expanded(row.stack_id);
+                }
+            }
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            // Collapse the selected node, or move to parent
+            let selected = app.flamegraph_view.state.tree_view_state.selected;
+            if let Some(row) = rows.get(selected) {
+                if row.is_expanded {
+                    // Collapse it
+                    app.flamegraph_view
+                        .state
+                        .tree_view_state
+                        .expanded
+                        .remove(&row.stack_id);
+                } else if row.depth > 0 {
+                    // Move cursor to parent (find the row with depth-1 above us)
+                    for i in (0..selected).rev() {
+                        if rows[i].depth < row.depth {
+                            app.flamegraph_view.state.tree_view_state.selected = i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Esc => {
+            // Collapse all and reset
+            app.flamegraph_view.state.tree_view_state.expanded.clear();
         }
         _ => {
             key_handled = false;

@@ -46,6 +46,7 @@ pub enum ViewKind {
     Table,
     Output,
     ProcessList,
+    TreeView,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -76,7 +77,33 @@ pub struct FlameGraphState {
     pub view_kind: ViewKind,
     pub table_state: TableState,
     pub process_list_state: TableState,
+    pub tree_view_state: TreeViewState,
     pub update_mode: UpdateMode,
+}
+
+/// State for the expandable call-tree view (like `perf report`).
+#[derive(Debug, Clone, Default)]
+pub struct TreeViewState {
+    /// Currently selected row in the flattened tree.
+    pub selected: usize,
+    /// Scroll offset for rendering.
+    pub offset: usize,
+    /// Set of expanded node IDs.
+    pub expanded: std::collections::HashSet<StackIdentifier>,
+}
+
+impl TreeViewState {
+    pub fn reset(&mut self) {
+        self.selected = 0;
+        self.offset = 0;
+        self.expanded.clear();
+    }
+
+    pub fn toggle_expanded(&mut self, id: StackIdentifier) {
+        if !self.expanded.remove(&id) {
+            self.expanded.insert(id);
+        }
+    }
 }
 
 impl Default for FlameGraphState {
@@ -93,6 +120,7 @@ impl Default for FlameGraphState {
             view_kind: ViewKind::FlameGraph,
             table_state: TableState::default(),
             process_list_state: TableState::default(),
+            tree_view_state: TreeViewState::default(),
             update_mode: UpdateMode::default(),
         }
     }
@@ -133,6 +161,7 @@ impl FlameGraphState {
             ViewKind::Table => ViewKind::ProcessList,
             ViewKind::ProcessList => ViewKind::FlameGraph,
             ViewKind::Output => ViewKind::FlameGraph,
+            ViewKind::TreeView => ViewKind::FlameGraph,
         };
     }
 
@@ -144,6 +173,7 @@ impl FlameGraphState {
             ViewKind::Table => ViewKind::ProcessList,
             ViewKind::ProcessList => ViewKind::Output,
             ViewKind::Output => ViewKind::FlameGraph,
+            ViewKind::TreeView => ViewKind::FlameGraph,
         };
     }
 

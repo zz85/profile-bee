@@ -163,6 +163,8 @@ impl<'a> FlamelensWidget<'a> {
                 self.render_table(split[0], buf);
             } else if self.is_process_list_view() {
                 self.render_process_list(split[0], buf);
+            } else if self.is_tree_view() {
+                self.render_tree_view(split[0], buf);
             }
 
             self.render_output_panel(split[1], buf);
@@ -178,6 +180,8 @@ impl<'a> FlamelensWidget<'a> {
             self.render_flamegraph(main_area, buf, state);
         } else if self.is_process_list_view() {
             self.render_process_list(main_area, buf);
+        } else if self.is_tree_view() {
+            self.render_tree_view(main_area, buf);
         } else {
             self.render_table(main_area, buf);
         }
@@ -210,6 +214,7 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("/", "search");
             help_tags.add("#", "search like cursor");
             help_tags.add("p", "pid mode");
+            help_tags.add("t", "tree view");
             if let Some(p) = &self.app.flamegraph_state().search_pattern {
                 if p.is_manual {
                     help_tags.add("n/N", "next/prev search");
@@ -234,6 +239,12 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("j/k", "move cursor");
             help_tags.add("enter", "zoom into process");
             help_tags.add("esc/p", "back to flamegraph");
+        } else if self.is_tree_view() {
+            help_tags.add("j/k", "move cursor");
+            help_tags.add("enter/l", "expand");
+            help_tags.add("h", "collapse/parent");
+            help_tags.add("esc", "collapse all");
+            help_tags.add("t", "back to flamegraph");
         } else {
             // Table view
             help_tags.add("j/k", "move cursor");
@@ -349,6 +360,84 @@ impl<'a> FlamelensWidget<'a> {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Processes (Enter=zoom, Esc=back) ")
+                .title_style(Style::default().bold().yellow()),
+        );
+
+        Widget::render(table, area, buf);
+    }
+
+    fn render_tree_view(&self, area: Rect, buf: &mut Buffer) {
+        let rows = self.app.flamegraph_view.get_tree_rows();
+        let selected = self.app.flamegraph_state().tree_view_state.selected;
+        let view_height = area.height.saturating_sub(3) as usize; // borders + header
+
+        // Compute scroll offset to keep selected row visible
+        let offset = {
+            let state = &self.app.flamegraph_state().tree_view_state;
+            if selected < state.offset {
+                selected
+            } else if selected >= state.offset + view_height {
+                selected.saturating_sub(view_height) + 1
+            } else {
+                state.offset
+            }
+        };
+
+        let header = Row::new(vec![
+            Cell::from("  Overhead").style(Style::default().bold()),
+            Cell::from("Self").style(Style::default().bold()),
+            Cell::from("Symbol").style(Style::default().bold()),
+        ])
+        .height(1);
+
+        let visible_rows: Vec<Row> = rows
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(view_height)
+            .map(|(i, row)| {
+                let style = if i == selected {
+                    Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+                } else {
+                    Style::default()
+                };
+
+                // Build indentation + expand/collapse marker
+                let indent = "  ".repeat(row.depth);
+                let marker = if !row.has_children {
+                    " "
+                } else if row.is_expanded {
+                    "-"
+                } else {
+                    "+"
+                };
+
+                Row::new(vec![
+                    Cell::from(format!("{:6.2}%", row.overhead_pct)),
+                    Cell::from(if row.self_pct > 0.01 {
+                        format!("{:5.2}%", row.self_pct)
+                    } else {
+                        "     ".to_string()
+                    }),
+                    Cell::from(format!("{}{} {}", indent, marker, row.name)),
+                ])
+                .style(style)
+            })
+            .collect();
+
+        let table = Table::new(
+            visible_rows,
+            [
+                Constraint::Length(10),
+                Constraint::Length(8),
+                Constraint::Percentage(80),
+            ],
+        )
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Call Tree (Enter=expand, h=collapse, t=back) ")
                 .title_style(Style::default().bold().yellow()),
         );
 
@@ -757,6 +846,12 @@ impl<'a> FlamelensWidget<'a> {
             ViewKind::ProcessList,
             self.app.flamegraph_state().view_kind,
         ));
+        header_bottom_title_spans.push(Span::from(" | "));
+        header_bottom_title_spans.push(_get_view_kind_span(
+            "Tree",
+            ViewKind::TreeView,
+            self.app.flamegraph_state().view_kind,
+        ));
         if self.app.has_output() {
             header_bottom_title_spans.push(Span::from(" | "));
             header_bottom_title_spans.push(_get_view_kind_span(
@@ -934,6 +1029,10 @@ impl<'a> FlamelensWidget<'a> {
 
     fn is_process_list_view(&self) -> bool {
         self.view_kind() == ViewKind::ProcessList
+    }
+
+    fn is_tree_view(&self) -> bool {
+        self.view_kind() == ViewKind::TreeView
     }
 }
 
