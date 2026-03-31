@@ -472,6 +472,39 @@ pub fn attach_process_exit_tracepoint(bpf: &mut Ebpf) -> Result<(), anyhow::Erro
     Ok(())
 }
 
+/// Set up the ring buffer for process exec events.
+/// Returns `Ok(None)` if the eBPF binary doesn't include the exec map
+/// (backward compat with older eBPF builds).
+pub fn setup_process_exec_ring_buffer(
+    bpf: &mut Ebpf,
+) -> Result<Option<RingBuf<MapData>>, anyhow::Error> {
+    match bpf.take_map("process_exec_events") {
+        Some(map) => Ok(Some(RingBuf::try_from(map)?)),
+        None => {
+            tracing::debug!("process_exec_events map not found (older eBPF binary)");
+            Ok(None)
+        }
+    }
+}
+
+/// Attach the sched_process_exec tracepoint for monitoring process exec events.
+/// Returns `Ok(false)` if the eBPF binary doesn't include the exec program
+/// (backward compat with older eBPF builds).
+pub fn attach_process_exec_tracepoint(bpf: &mut Ebpf) -> Result<bool, anyhow::Error> {
+    let program = match bpf.program_mut("tracepoint_process_exec") {
+        Some(p) => p,
+        None => {
+            tracing::debug!("tracepoint_process_exec not found (older eBPF binary)");
+            return Ok(false);
+        }
+    };
+    let tp: &mut TracePoint = program.try_into()?;
+    tp.load()?;
+    tp.attach("sched", "sched_process_exec")?;
+    tracing::info!("attached sched_process_exec tracepoint");
+    Ok(true)
+}
+
 impl EbpfProfiler {
     /// Set the target PID for eBPF filtering (0 = profile all processes)
     pub fn set_target_pid(&mut self, pid: u32) -> Result<(), anyhow::Error> {
@@ -493,6 +526,23 @@ impl EbpfProfiler {
         )?;
         monitor_exit_pid_map.set(0, pid, 0)?;
         Ok(())
+    }
+
+    /// Enable or disable process lifecycle tracking in eBPF.
+    /// When enabled, exit events fire for all processes (not just DWARF-tracked
+    /// or monitored PIDs).
+    pub fn set_lifecycle_tracking(&mut self, enabled: bool) -> Result<(), anyhow::Error> {
+        match self.bpf.map_mut("lifecycle_tracking_map") {
+            Some(map) => {
+                let mut arr: Array<&mut MapData, u32> = Array::try_from(map)?;
+                arr.set(0, if enabled { 1 } else { 0 }, 0)?;
+                Ok(())
+            }
+            None => {
+                tracing::debug!("lifecycle_tracking_map not found (older eBPF binary)");
+                Ok(())
+            }
+        }
     }
 
     /// Load DWARF unwind tables into eBPF maps for a process

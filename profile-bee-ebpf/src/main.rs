@@ -10,7 +10,7 @@ use aya_ebpf::{
 use profile_bee_ebpf::{
     collect_off_cpu_trace, collect_trace, collect_trace_raw_syscall,
     collect_trace_raw_syscall_exit, collect_trace_raw_tp_with_task_regs,
-    collect_trace_stackid_only, dwarf_unwind_step_impl, handle_process_exit,
+    collect_trace_stackid_only, dwarf_unwind_step_impl, handle_process_exec, handle_process_exit,
 };
 
 #[perf_event]
@@ -93,6 +93,14 @@ pub fn raw_tp_with_regs(ctx: RawTracePointContext) -> u32 {
 #[tracepoint(category = "sched", name = "sched_process_exit")]
 pub fn tracepoint_process_exit(ctx: TracePointContext) -> u32 {
     unsafe { handle_process_exit(ctx) }
+    0
+}
+
+/// Tracepoint for monitoring process exec events.
+/// Detects execve() calls for proactive DWARF loading and cache invalidation.
+#[tracepoint(category = "sched", name = "sched_process_exec")]
+pub fn tracepoint_process_exec(ctx: TracePointContext) -> u32 {
+    unsafe { handle_process_exec(ctx) }
     0
 }
 
