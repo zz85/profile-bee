@@ -87,7 +87,7 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 - **Automatic termination** — stops when `--pid` target or `--cmd` process exits
 - **Rust & C++ demangling** — via gimli/blazesym
 - **BPF-based aggregation** — stack counting in kernel to reduce userspace data transfer
-- **Group by CPU** — per-core flamegraph breakdown
+- **Group by CPU / process** — per-core or per-PID flamegraph breakdown (`--group-by-cpu`, `--group-by-process`)
 
 ---
 
@@ -116,6 +116,9 @@ sudo probee --time 5000 --html out.html --json out.json --collapse out.txt --svg
 
 # Grouped by CPU
 sudo probee --svg profile.svg --frequency 999 --time 2000 --group-by-cpu
+
+# Grouped by process (each PID gets its own flamegraph sub-tree)
+sudo probee --svg profile.svg --time 5000 --group-by-process
 ```
 
 ### Targeting
@@ -237,11 +240,24 @@ cargo build --release --no-default-features
 | `hjkl` / arrows | Navigate cursor |
 | `Enter` | Zoom into selected frame |
 | `Esc` | Reset zoom |
+| `Tab` | Cycle views: Flamegraph → Top → Processes (→ Output) |
+| `t` | Toggle tree mode (expandable call tree in Top/Processes) |
+| `p` | Toggle PID mode (split flamegraph by process) |
 | `/` | Search frames with regex |
 | `#` | Highlight selected frame |
 | `n` / `N` | Next / previous match |
+| `m` | Cycle update mode: Accumulate / Reset / Decay |
 | `z` | Freeze / unfreeze live updates |
 | `q` or `Ctrl+C` | Quit |
+
+**Views:**
+
+| View | Description |
+|------|-------------|
+| **Flamegraph** | Interactive flame chart (default) |
+| **Top** | Flat function list sorted by overhead. Press `t` for expandable call tree. |
+| **Processes** | Process list with CPU% breakdown. `Enter` to zoom into a process. Press `t` for tree. |
+| **Output** | Child process stdout/stderr (when using `--cmd` or `--`) |
 
 ---
 

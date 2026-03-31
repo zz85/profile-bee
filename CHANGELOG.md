@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.9
+
+### New Features
+
+- **Group by process** (`--group-by-process`) — prefix each stack with `process_name (pid)` to split flamegraphs into per-process sub-trees. Works with all output formats. (#86)
+- **TUI process list view** — new Processes tab (via Tab key) showing all processes sorted by sample count with CPU% bar visualization. Enter to zoom into a process.
+- **TUI expandable call tree** — press `t` to toggle tree mode in Top or Processes views. Shows a perf report-style expandable call tree with overhead% and self%, expand/collapse with Enter/h. Expanded state persists across live data refreshes.
+- **TUI PID mode toggle** — press `p` to toggle PID mode on the fly, splitting the flamegraph by process without restarting.
+- **CodeGuru idle stack classification** — idle/swapper stacks (pid == 0) now use the `IDLE` counter type, which CodeGuru excludes from CPU and Latency views.
+
 ## v0.3.8
 
 ### New Features
