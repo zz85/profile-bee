@@ -45,6 +45,10 @@ pub struct ProcessMetadata {
     pub exe: Option<PathBuf>,
     /// Mount namespace inode (`/proc/[pid]/ns/mnt`).
     pub ns_mnt: Option<u64>,
+    /// Process start time in clock ticks since boot (`/proc/[pid]/stat` field 22).
+    /// Used to detect PID reuse — if a cached entry's start_time differs from
+    /// the current `/proc/[pid]/stat` starttime, the PID was recycled.
+    pub start_time: u64,
     /// When this entry was loaded.
     pub loaded_at: Instant,
 }
@@ -54,6 +58,9 @@ impl ProcessMetadata {
     /// Returns `None` if the process doesn't exist (e.g., already exited).
     fn load(pid: u32) -> Option<Self> {
         let process = procfs::process::Process::new(pid as i32).ok()?;
+
+        let stat = process.stat().ok();
+        let start_time = stat.as_ref().map_or(0, |s| s.starttime);
 
         let cmdline = process.cmdline().ok();
         let cwd = process.cwd().ok();
@@ -74,8 +81,18 @@ impl ProcessMetadata {
             environ,
             exe,
             ns_mnt,
+            start_time,
             loaded_at: Instant::now(),
         })
+    }
+
+    /// Read the current start time for a PID from `/proc/[pid]/stat`.
+    /// Returns 0 if the process doesn't exist or stat can't be read.
+    fn current_start_time(pid: u32) -> u64 {
+        procfs::process::Process::new(pid as i32)
+            .ok()
+            .and_then(|p| p.stat().ok())
+            .map_or(0, |s| s.starttime)
     }
 
     /// Look up a specific environment variable by name.
@@ -113,11 +130,31 @@ impl ProcessMetadataCache {
     /// Get or lazily load metadata for a PID.
     ///
     /// On first access for a given PID, reads from `/proc/[pid]/`. Subsequent
-    /// calls return the cached entry. Returns `None` if the process doesn't
-    /// exist (already exited) or the cache is at capacity.
+    /// calls return the cached entry unless the PID has been recycled (detected
+    /// via `/proc/[pid]/stat` starttime mismatch). Returns `None` if the process
+    /// doesn't exist (already exited) or the cache is at capacity.
     pub fn get_or_load(&mut self, pid: u32) -> Option<&ProcessMetadata> {
         if self.cache.contains_key(&pid) {
-            return self.cache.get(&pid);
+            // Validate against PID reuse: if the start_time changed, the
+            // cached entry belongs to a different process incarnation.
+            let cached_start = self.cache[&pid].start_time;
+            if cached_start != 0 {
+                let current_start = ProcessMetadata::current_start_time(pid);
+                if current_start != 0 && current_start != cached_start {
+                    tracing::debug!(
+                        "PID {} recycled (starttime {} -> {}), reloading metadata",
+                        pid,
+                        cached_start,
+                        current_start,
+                    );
+                    self.cache.remove(&pid);
+                    // Fall through to reload below
+                } else {
+                    return self.cache.get(&pid);
+                }
+            } else {
+                return self.cache.get(&pid);
+            }
         }
         if self.cache.len() >= self.max_entries {
             tracing::warn!(

@@ -75,6 +75,11 @@ pub struct ProfilingEventLoop {
     known_tgids: HashSet<u32>,
     /// Optional process metadata cache, maintained via eBPF lifecycle events.
     process_metadata: Option<ProcessMetadataCache>,
+    /// PIDs that exited during the current drain_events() call.
+    /// Eviction from `process_metadata` is deferred until after
+    /// `build_raw_stacks()` completes, so agents can still look up
+    /// metadata for processes that exited within the collection window.
+    pending_exit_pids: Vec<u32>,
 }
 
 impl ProfilingEventLoop {
@@ -107,6 +112,7 @@ impl ProfilingEventLoop {
             } else {
                 None
             },
+            pending_exit_pids: Vec::new(),
         }
     }
 
@@ -156,6 +162,24 @@ impl ProfilingEventLoop {
         RawCollectResult { stacks, stopped }
     }
 
+    /// Immediately evict process metadata for PIDs that exited during
+    /// previous `drain_events()` calls.
+    ///
+    /// Normally eviction is deferred automatically: exit PIDs from cycle N
+    /// are evicted at the start of cycle N+1's `drain_events()` call,
+    /// giving agents one full collection cycle to read metadata for
+    /// processes that exited. Call this method only if you need to free
+    /// cache entries sooner (e.g., memory pressure).
+    pub fn evict_pending_exits(&mut self) {
+        if let Some(ref mut cache) = self.process_metadata {
+            for pid in self.pending_exit_pids.drain(..) {
+                cache.remove(pid);
+            }
+        } else {
+            self.pending_exit_pids.clear();
+        }
+    }
+
     /// Drain events from the PerfWork channel, symbolize stacks on the fly,
     /// and return `(local_counting, stopped)`.
     ///
@@ -166,6 +190,12 @@ impl ProfilingEventLoop {
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
     ) -> (bool, bool) {
+        // Evict metadata for PIDs that exited in the PREVIOUS cycle.
+        // This gives agents one full collection cycle to read metadata
+        // for processes that exited, covering async ring buffer delivery
+        // where a sample may arrive after its process's exit event.
+        self.evict_pending_exits();
+
         let mut queue_processed = 0u64;
         let mut stopped = false;
         let local_counting = self.stream_mode == EVENT_TRACE_ALWAYS;
@@ -248,8 +278,11 @@ impl ProfilingEventLoop {
                                 let _ = tx.send(DwarfThreadMsg::ProcessExited(event.pid));
                             }
                             self.known_tgids.remove(&event.pid);
-                            if let Some(ref mut cache) = self.process_metadata {
-                                cache.remove(event.pid);
+                            // Defer metadata cache eviction until after build_raw_stacks()
+                            // so agents can still look up metadata for processes that
+                            // exited within the collection window.
+                            if self.process_metadata.is_some() {
+                                self.pending_exit_pids.push(event.pid);
                             }
                             if Some(event.pid) == self.monitor_exit_pid {
                                 tracing::info!("target process {} exited, stopping", event.pid);
@@ -263,6 +296,10 @@ impl ProfilingEventLoop {
                             if let Some(tx) = &self.tgid_request_tx {
                                 let _ = tx.send(DwarfThreadMsg::ProcessExeced(event.pid));
                             }
+                            // Flush pre-exec samples from trace_count before invalidating
+                            // caches — otherwise build_raw_stacks() would try to symbolize
+                            // old addresses against the new binary image.
+                            self.trace_count.retain(|k, _| k.tgid != event.pid);
                             // The PID is still alive but with a new binary image.
                             // Re-add to known_tgids so DWARF tables are reloaded.
                             self.known_tgids.remove(&event.pid);
