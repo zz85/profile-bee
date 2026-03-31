@@ -187,6 +187,11 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     group_by_cpu: bool,
 
+    /// Group flamegraph by process name and PID. Each process gets its own
+    /// sub-tree rooted at "process_name (pid)". Useful for system-wide profiling.
+    #[arg(long, default_value_t = false)]
+    group_by_process: bool,
+
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     dwarf: Option<bool>,
@@ -498,6 +503,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let event_loop_config = EventLoopConfig {
         stream_mode: opt.stream_mode,
         group_by_cpu: opt.group_by_cpu,
+        group_by_process: opt.group_by_process,
         monitor_exit_pid,
         tgid_request_tx,
     };
@@ -811,6 +817,7 @@ fn spawn_profiling_thread(
     web_tx: Option<tokio::sync::broadcast::Sender<String>>,
     stream_mode: u8,
     group_by_cpu: bool,
+    group_by_process: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tui_refresh_ms: u64,
     monitor_exit_pid: Option<u32>,
 ) {
@@ -835,6 +842,7 @@ fn spawn_profiling_thread(
 
             // Compute local_counting before the loop to avoid double-counting
             let local_counting = stream_mode == EVENT_TRACE_ALWAYS;
+            let gbp = group_by_process.load(std::sync::atomic::Ordering::Relaxed);
 
             // Process incoming events until the refresh deadline, so we
             // batch samples over the full tui_refresh_ms window instead of
@@ -864,6 +872,7 @@ fn spawn_profiling_thread(
                                     &stack,
                                     &stack_traces,
                                     group_by_cpu,
+                                    gbp,
                                     &stacked_pointers,
                                 );
                             }
@@ -873,6 +882,7 @@ fn spawn_profiling_thread(
                                 &stack,
                                 &stack_traces,
                                 group_by_cpu,
+                                gbp,
                                 &stacked_pointers,
                             );
                         }
@@ -940,6 +950,7 @@ fn spawn_profiling_thread(
                             &stack,
                             &stack_traces,
                             group_by_cpu,
+                            gbp,
                             &stacked_pointers,
                         );
                     }
@@ -952,6 +963,7 @@ fn spawn_profiling_thread(
                     stack,
                     &stack_traces,
                     group_by_cpu,
+                    gbp,
                     &stacked_pointers,
                 );
                 stacks.push(FrameCount {
@@ -1211,6 +1223,8 @@ async fn run_combined_mode(
     };
     let update_handle = app.get_update_handle();
     let update_mode_handle = app.get_update_mode_handle();
+    let pid_mode_handle = app.get_pid_mode_handle();
+    pid_mode_handle.store(opt.group_by_process, std::sync::atomic::Ordering::Relaxed);
 
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
@@ -1250,6 +1264,7 @@ async fn run_combined_mode(
         Some(web_tx),
         opt.stream_mode,
         opt.group_by_cpu,
+        pid_mode_handle.clone(),
         opt.tui_refresh_ms,
         external_pid,
     );
@@ -1309,6 +1324,8 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     };
     let update_handle = app.get_update_handle();
     let update_mode_handle = app.get_update_mode_handle();
+    let pid_mode_handle = app.get_pid_mode_handle();
+    pid_mode_handle.store(opt.group_by_process, std::sync::atomic::Ordering::Relaxed);
 
     // Stopping mechanisms (timer, Ctrl-C, child exit, PID exit)
     let external_pid = if spawn.is_none() { opt.pid } else { None };
@@ -1348,6 +1365,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         None,
         opt.stream_mode,
         opt.group_by_cpu,
+        pid_mode_handle.clone(),
         opt.tui_refresh_ms,
         external_pid,
     );

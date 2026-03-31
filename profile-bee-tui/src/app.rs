@@ -4,6 +4,7 @@ use crate::state::{FlameGraphState, UpdateMode};
 use crate::view::FlameGraphView;
 use std::collections::HashMap;
 use std::error;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -59,6 +60,8 @@ pub struct App {
     next_flamegraph: Arc<Mutex<Option<ParsedFlameGraph>>>,
     /// Shared update mode for the profiling thread
     update_mode_handle: Arc<Mutex<UpdateMode>>,
+    /// Shared pid-mode flag for the profiling thread (toggled with 'p')
+    pid_mode_handle: Arc<AtomicBool>,
     /// Stack positions from last render (for mouse click handling)
     pub stack_positions: Vec<StackPosition>,
     /// Last click for double-click detection
@@ -83,6 +86,7 @@ impl App {
             dirty: true,
             next_flamegraph: Arc::new(Mutex::new(None)),
             update_mode_handle: Arc::new(Mutex::new(UpdateMode::default())),
+            pid_mode_handle: Arc::new(AtomicBool::new(false)),
             stack_positions: Vec::new(),
             last_click: None,
             process_output: None,
@@ -114,6 +118,7 @@ impl App {
             debug: false,
             dirty: true,
             update_mode_handle,
+            pid_mode_handle: Arc::new(AtomicBool::new(false)),
             stack_positions: Vec::new(),
             last_click: None,
             process_output: None,
@@ -149,6 +154,10 @@ impl App {
     /// Get a handle to the update mode for sharing with the profiling thread
     pub fn get_update_mode_handle(&self) -> Arc<Mutex<UpdateMode>> {
         self.update_mode_handle.clone()
+    }
+
+    pub fn get_pid_mode_handle(&self) -> Arc<AtomicBool> {
+        self.pid_mode_handle.clone()
     }
 
     /// Update flamegraph with new data

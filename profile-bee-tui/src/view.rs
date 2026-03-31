@@ -2,8 +2,29 @@ use std::cmp::min;
 
 use crate::{
     flame::{FlameGraph, SearchPattern, SortColumn, StackIdentifier, StackInfo, ROOT_ID},
-    state::{FlameGraphState, ZoomState},
+    state::{FlameGraphState, TreeViewState, ViewKind, ZoomState},
 };
+
+/// An entry in the process list view.
+#[derive(Debug, Clone)]
+pub struct ProcessEntry {
+    pub name: String,
+    pub stack_id: StackIdentifier,
+    pub samples: u64,
+    pub percentage: f64,
+}
+
+/// A single row in the flattened tree view.
+#[derive(Debug, Clone)]
+pub struct TreeRow {
+    pub stack_id: StackIdentifier,
+    pub name: String,
+    pub depth: usize,
+    pub overhead_pct: f64,
+    pub self_pct: f64,
+    pub has_children: bool,
+    pub is_expanded: bool,
+}
 
 #[derive(Debug)]
 pub struct FlameGraphView {
@@ -402,6 +423,114 @@ impl FlameGraphView {
 
     pub fn set_zoom(&mut self) {
         self.set_zoom_for_id(self.state.selected);
+    }
+
+    /// Get a list of top-level processes (root's children) sorted by sample count.
+    /// Returns (name, stack_id, sample_count, percentage) tuples.
+    pub fn get_process_list(&self) -> Vec<ProcessEntry> {
+        let root = match self.flamegraph.get_stack(&ROOT_ID) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let total = self.flamegraph.total_count().max(1) as f64;
+
+        let mut entries: Vec<ProcessEntry> = root
+            .children
+            .iter()
+            .filter_map(|child_id| {
+                let stack = self.flamegraph.get_stack(child_id)?;
+                let name = self.flamegraph.get_stack_short_name(child_id)?;
+                Some(ProcessEntry {
+                    name: name.to_owned(),
+                    stack_id: *child_id,
+                    samples: stack.total_count,
+                    percentage: (stack.total_count as f64 / total) * 100.0,
+                })
+            })
+            .collect();
+
+        entries.sort_by(|a, b| b.samples.cmp(&a.samples));
+        entries
+    }
+
+    /// Zoom into a specific process by its stack ID and switch back to flamegraph view.
+    pub fn zoom_to_process(&mut self, stack_id: StackIdentifier) {
+        self.state.select_id(&stack_id);
+        self.set_zoom_for_id(stack_id);
+        self.state.view_kind = ViewKind::FlameGraph;
+    }
+
+    /// Flatten the flamegraph tree into visible rows for the tree view.
+    /// Only children of expanded nodes are included.
+    pub fn get_tree_rows(&self) -> Vec<TreeRow> {
+        let total = self.flamegraph.total_count().max(1) as f64;
+        let tree_state = &self.state.tree_view_state;
+        let mut rows = Vec::new();
+
+        let root = match self.flamegraph.get_stack(&ROOT_ID) {
+            Some(r) => r,
+            None => return rows,
+        };
+
+        // Sort root children by total_count descending
+        let mut children = root.children.clone();
+        self.sort_children_by_count(&mut children);
+
+        for child_id in &children {
+            self.flatten_tree_node(*child_id, 0, total, tree_state, &mut rows);
+        }
+        rows
+    }
+
+    /// Recursively flatten a tree node and its expanded children.
+    fn flatten_tree_node(
+        &self,
+        stack_id: StackIdentifier,
+        depth: usize,
+        total: f64,
+        tree_state: &TreeViewState,
+        rows: &mut Vec<TreeRow>,
+    ) {
+        let stack = match self.flamegraph.get_stack(&stack_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let name = self
+            .flamegraph
+            .get_stack_short_name(&stack_id)
+            .unwrap_or("???")
+            .to_owned();
+
+        let has_children = !stack.children.is_empty();
+        let is_expanded = tree_state.expanded.contains(&stack_id);
+
+        rows.push(TreeRow {
+            stack_id,
+            name,
+            depth,
+            overhead_pct: (stack.total_count as f64 / total) * 100.0,
+            self_pct: (stack.self_count as f64 / total) * 100.0,
+            has_children,
+            is_expanded,
+        });
+
+        if is_expanded && has_children {
+            let mut children = stack.children.clone();
+            self.sort_children_by_count(&mut children);
+            for child_id in &children {
+                self.flatten_tree_node(*child_id, depth + 1, total, tree_state, rows);
+            }
+        }
+    }
+
+    /// Sort children by total_count descending.
+    fn sort_children_by_count(&self, children: &mut [StackIdentifier]) {
+        children.sort_by(|a, b| {
+            let count_a = self.flamegraph.get_stack(a).map_or(0, |s| s.total_count);
+            let count_b = self.flamegraph.get_stack(b).map_or(0, |s| s.total_count);
+            count_b.cmp(&count_a)
+        });
     }
 
     pub fn unset_zoom(&mut self) {

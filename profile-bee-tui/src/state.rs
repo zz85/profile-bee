@@ -45,6 +45,7 @@ pub enum ViewKind {
     FlameGraph,
     Table,
     Output,
+    ProcessList,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -69,9 +70,42 @@ pub struct FlameGraphState {
     pub zoom: Option<ZoomState>,
     pub search_pattern: Option<SearchPattern>,
     pub freeze: bool,
+    /// When true, stacks are prefixed with "process_name (pid)" root frames
+    /// to split the flamegraph by process. Toggled with 'p'.
+    pub pid_mode: bool,
+    /// When true, the Top/Processes views show an expandable tree instead
+    /// of a flat list. Toggled with 't'.
+    pub tree_mode: bool,
     pub view_kind: ViewKind,
     pub table_state: TableState,
+    pub process_list_state: TableState,
+    pub tree_view_state: TreeViewState,
     pub update_mode: UpdateMode,
+}
+
+/// State for the expandable call-tree view (like `perf report`).
+#[derive(Debug, Clone, Default)]
+pub struct TreeViewState {
+    /// Currently selected row in the flattened tree.
+    pub selected: usize,
+    /// Scroll offset for rendering.
+    pub offset: usize,
+    /// Set of expanded node IDs.
+    pub expanded: std::collections::HashSet<StackIdentifier>,
+}
+
+impl TreeViewState {
+    pub fn reset(&mut self) {
+        self.selected = 0;
+        self.offset = 0;
+        self.expanded.clear();
+    }
+
+    pub fn toggle_expanded(&mut self, id: StackIdentifier) {
+        if !self.expanded.remove(&id) {
+            self.expanded.insert(id);
+        }
+    }
 }
 
 impl Default for FlameGraphState {
@@ -84,8 +118,12 @@ impl Default for FlameGraphState {
             zoom: None,
             search_pattern: None,
             freeze: false,
+            pid_mode: false,
+            tree_mode: false,
             view_kind: ViewKind::FlameGraph,
             table_state: TableState::default(),
+            process_list_state: TableState::default(),
+            tree_view_state: TreeViewState::default(),
             update_mode: UpdateMode::default(),
         }
     }
@@ -123,7 +161,8 @@ impl FlameGraphState {
     pub fn toggle_view_kind(&mut self) {
         self.view_kind = match self.view_kind {
             ViewKind::FlameGraph => ViewKind::Table,
-            ViewKind::Table => ViewKind::FlameGraph,
+            ViewKind::Table => ViewKind::ProcessList,
+            ViewKind::ProcessList => ViewKind::FlameGraph,
             ViewKind::Output => ViewKind::FlameGraph,
         };
     }
@@ -133,7 +172,8 @@ impl FlameGraphState {
     pub fn toggle_view_kind_with_output(&mut self) {
         self.view_kind = match self.view_kind {
             ViewKind::FlameGraph => ViewKind::Table,
-            ViewKind::Table => ViewKind::Output,
+            ViewKind::Table => ViewKind::ProcessList,
+            ViewKind::ProcessList => ViewKind::Output,
             ViewKind::Output => ViewKind::FlameGraph,
         };
     }
@@ -162,6 +202,15 @@ impl FlameGraphState {
         // thread and share SearchPattern via Arc but let's keep it simple for now.
         if let Some(p) = &self.search_pattern {
             new.set_hits(p);
+        }
+
+        // Remap expanded tree node IDs from old to new flamegraph.
+        // Nodes are matched by full name so expanded state survives data refreshes.
+        let old_expanded = std::mem::take(&mut self.tree_view_state.expanded);
+        for old_id in old_expanded {
+            if let Some(new_id) = Self::get_new_stack_id(&old_id, old, new) {
+                self.tree_view_state.expanded.insert(new_id);
+            }
         }
     }
 
