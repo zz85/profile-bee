@@ -2276,7 +2276,7 @@ dependencies = [
 
 [[package]]
 name = "profile-bee"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -2313,14 +2313,14 @@ dependencies = [
 
 [[package]]
 name = "profile-bee-common"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "aya 0.13.1",
 ]
 
 [[package]]
 name = "profile-bee-tui"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "crossterm",
