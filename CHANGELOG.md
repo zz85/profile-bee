@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.10
+
+### New Features
+
+- **eBPF process lifecycle tracking** — new `sched_process_exec` and broadened `sched_process_exit` tracepoints detect process exec and exit events in the kernel. Events are delivered to userspace via a dedicated ring buffer. Enabled automatically when DWARF unwinding is active; agents can enable it explicitly via `SessionConfig::track_process_lifecycle`. (#89)
+- **`ProcessMetadataCache`** (`process_metadata` module) — lazy, capacity-bounded cache of per-process metadata read from `/proc/[pid]/`. Provides `cmdline`, `cwd`, `environ`, `exe`, and mount namespace inode for any PID seen during profiling. Integrates with lifecycle events for automatic cache invalidation (exec) and eviction (exit). Agents can enrich stack traces with `cache.get_or_load(pid)` and `cache.environ_var(pid, "MY_VAR")`.
+- **`ProcessEvent` shared type** — unified 16-byte `#[repr(C)]` struct in `profile-bee-common` carrying event type, PID, and timestamp for both exec and exit events.
+
+### Improvements
+
+- **Thread exit filtering in eBPF** — `handle_process_exit()` and `handle_process_exec()` return early when `tid != tgid`, avoiding thousands of spurious ring buffer events on thread-heavy workloads (Java, Go runtime threads).
+- **Deferred metadata eviction** — exit events are queued in `pending_exit_pids` and evicted at the start of the next `drain_events()` cycle, covering the async delivery race where StackInfo and exit event for the same PID arrive in different drain windows.
+- **Trace count flushed on exec** — when a PID execs, its accumulated `trace_count` entries are flushed before cache invalidation, so the old binary's samples are not lost.
+- **PID reuse detection** — `ProcessMetadataCache::get_or_load()` validates cached entries against `/proc/[pid]/stat` starttime; mismatches trigger automatic reload.
+- **DWARF table reload on exec** — exec events are forwarded to the DWARF thread, which reloads unwind tables for the new binary.
+- **Debug impl redacts secrets** — `ProcessMetadata`'s `Debug` output shows entry counts instead of raw `environ`/`cmdline` values, preventing accidental secret leakage in logs.
+- **Robust `/proc` stat handling** — `ProcessMetadata::load()` returns `None` when `/proc/[pid]/stat` is unreadable (process already exited), preventing `start_time = 0` entries from bypassing PID-reuse detection. `get_or_load()` removes stale entries when the process disappears between cache hit and validation.
+
 ## v0.3.9
 
 ### New Features

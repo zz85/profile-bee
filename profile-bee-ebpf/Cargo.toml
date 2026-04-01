@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya-ebpf = { git = "https://github.com/Brskt/aya", rev = "9e8f2dc" }
-aya-log-ebpf = { git = "https://github.com/Brskt/aya", rev = "9e8f2dc" }
+aya-ebpf = { git = "https://github.com/Brskt/aya", branch = "hashmapofmaps-new" }
+aya-log-ebpf = { git = "https://github.com/Brskt/aya", branch = "hashmapofmaps-new" }
 profile-bee-common = { path = "../profile-bee-common" }
 
 [[bin]]
@@ -27,6 +27,7 @@ rpath = false
 lto = true
 panic = "abort"
 codegen-units = 1
+strip = "none"
 
 [workspace]
 members = []

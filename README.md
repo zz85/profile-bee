@@ -88,6 +88,8 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 - **Rust & C++ demangling** — via gimli/blazesym
 - **BPF-based aggregation** — stack counting in kernel to reduce userspace data transfer
 - **Group by CPU / process** — per-core or per-PID flamegraph breakdown (`--group-by-cpu`, `--group-by-process`)
+- **Process lifecycle tracking** — eBPF-driven exec and exit detection via `sched_process_exec` / `sched_process_exit` tracepoints. Auto-enabled with DWARF unwinding; available to library consumers via `SessionConfig::track_process_lifecycle`
+- **Process metadata cache** — lazy per-PID cache of `cmdline`, `cwd`, `environ`, `exe`, and mount namespace. Library API for agents that need to enrich profiling data with process context
 
 ---
 
@@ -355,6 +357,59 @@ Compatible with: `go tool pprof`, Grafana/Pyroscope, Speedscope, Datadog Continu
 ```bash
 # Build without AWS SDK (smaller binary, fewer dependencies)
 cargo build --release --no-default-features --features tui
+```
+
+---
+
+## Library API
+
+Profile Bee can be used as a Rust library (not just a CLI). The `ProfilingSession` API consolidates eBPF loading, DWARF setup, and the event loop into a single entry point.
+
+### Process Metadata Cache
+
+When building a custom profiling agent, you often need per-process context (command line, environment variables, working directory) to enrich stack traces. The `ProcessMetadataCache` provides a lazy, capacity-bounded cache backed by `/proc/[pid]/`:
+
+```rust
+use profile_bee::process_metadata::ProcessMetadataCache;
+
+let mut cache = ProcessMetadataCache::new(1024);
+
+// Lazily loads from /proc on first access
+if let Some(meta) = cache.get_or_load(pid) {
+    println!("exe: {:?}", meta.exe);
+    println!("cwd: {:?}", meta.cwd);
+
+    // Read a specific environment variable
+    if let Some(val) = meta.environ_var("APOLLO_GRAPH_REF") {
+        println!("graph ref: {}", val);
+    }
+}
+
+// Shorthand for get_or_load + environ_var
+let db_url = cache.environ_var(pid, "DATABASE_URL");
+```
+
+The cache integrates with eBPF lifecycle events: exec events invalidate entries (same PID, new binary), exit events remove them. PID reuse is detected via `/proc/[pid]/stat` starttime comparison.
+
+### Process Lifecycle Tracking
+
+Enable `SessionConfig::track_process_lifecycle` to receive eBPF-driven exec and exit events. This is auto-enabled when DWARF unwinding is active (unwind tables need to be reloaded on exec). Custom agents should enable it for metadata cache management:
+
+```rust
+use profile_bee::session::{SessionConfig, ProfilingSession};
+use profile_bee::ebpf::ProfilerConfig;
+
+let config = SessionConfig {
+    track_process_lifecycle: true,
+    profiler: ProfilerConfig::default(),
+    ..Default::default()
+};
+
+let session = ProfilingSession::new(config).await?;
+// The event loop automatically handles exec (cache invalidation, DWARF reload)
+// and exit (deferred eviction) events.
+// Access the metadata cache via session's event loop:
+// event_loop.process_metadata().get_or_load(pid)
 ```
 
 ---

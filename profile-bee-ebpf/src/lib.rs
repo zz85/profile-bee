@@ -10,9 +10,9 @@ use aya_ebpf::{
         bpf_ktime_get_ns, bpf_probe_read, bpf_probe_read_kernel, bpf_probe_read_user,
         bpf_task_pt_regs,
     },
-    macros::map,
+    macros::{btf_map, map},
     maps::lpm_trie::{Key as LpmKey, LpmTrie},
-    maps::{Array, ArrayOfMaps, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
+    maps::{Array, HashMap, PerCpuArray, ProgramArray, RingBuf, StackTrace},
     programs::RawTracePointContext,
     EbpfContext,
 };
@@ -24,6 +24,20 @@ use profile_bee_common::{
     EXEC_MAPPING_KEY_BITS, FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH,
     MAX_BIN_SEARCH_DEPTH, MAX_DWARF_STACK_DEPTH, MAX_EXEC_MAPPING_ENTRIES, MAX_SHARD_ENTRIES,
     MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
+};
+
+// Force LLVM to retain the full type definition of UnwindEntry during LTO.
+// Without this, bpf-linker emits only a BTF FWD (forward declaration) for
+// cross-crate types used solely as pointer targets in btf_map structs,
+// causing aya's BTF parser to fail with UnexpectedBtfType.
+#[used]
+static _UNWIND_ENTRY_BTF_ANCHOR: UnwindEntry = UnwindEntry {
+    pc: 0,
+    cfa_offset: 0,
+    rbp_offset: 0,
+    cfa_type: 0,
+    rbp_type: 0,
+    _pad: [0; 2],
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -160,17 +174,16 @@ pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0
 // The outer map is indexed by shard_id (0..MAX_UNWIND_SHARDS-1).
 // Userspace creates inner maps of the exact size needed per binary, then inserts
 // their FDs into this outer map. This eliminates the old 8-shard / 65K-entry caps.
+//
+// Uses BTF map definition so the inner map shape is encoded in BTF metadata.
+// The aya loader resolves the inner map template from BTF at load time — no
+// separate UNWIND_SHARD_TEMPLATE map needed.
 
-#[map(name = "unwind_shards", inner = "UNWIND_SHARD_TEMPLATE")]
-pub static UNWIND_SHARDS: ArrayOfMaps<Array<UnwindEntry>> =
-    ArrayOfMaps::with_max_entries(MAX_UNWIND_SHARDS as u32, 0);
-
-/// Inner map template for the UNWIND_SHARDS ArrayOfMaps.
-/// This template defines the shape (key/value sizes, max_entries) that all inner
-/// maps must match (required on kernel <5.14). Userspace creates inner Array maps
-/// matching this template and inserts their FDs into UNWIND_SHARDS.
-#[map]
-static UNWIND_SHARD_TEMPLATE: Array<UnwindEntry> = Array::with_max_entries(MAX_SHARD_ENTRIES, 0);
+#[btf_map(name = "unwind_shards")]
+pub static UNWIND_SHARDS: aya_ebpf::btf_maps::ArrayOfMaps<
+    aya_ebpf::btf_maps::Array<UnwindEntry, { MAX_SHARD_ENTRIES as usize }>,
+    { MAX_UNWIND_SHARDS },
+> = aya_ebpf::btf_maps::ArrayOfMaps::new();
 
 /// LPM trie for exec mapping lookups: maps (tgid, virtual_address) → ExecMapping.
 /// Replaces the old proc_info HashMap + linear scan with O(log n) longest prefix match.

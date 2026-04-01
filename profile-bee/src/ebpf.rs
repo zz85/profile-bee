@@ -3,8 +3,8 @@ use std::os::fd::{AsFd, AsRawFd};
 use anyhow::{anyhow, Result};
 use aya::maps::lpm_trie::{Key as LpmKey, LpmTrie};
 use aya::maps::{
-    Array, HashMap, InnerMap, MapData, PerCpuArray, PerCpuValues, ProgramArray, RingBuf,
-    StackTraceMap,
+    Array, CreatableMap, HashMap, IterableMap, MapData, PerCpuArray, PerCpuValues, ProgramArray,
+    RingBuf, StackTraceMap,
 };
 use aya::programs::{
     perf_event::{PerfEventConfig, PerfEventScope, SamplePolicy, SoftwareEvent},
@@ -714,7 +714,7 @@ fn batch_populate_inner_map(
         return Ok(());
     }
 
-    let fd = inner.fd().as_fd().as_raw_fd();
+    let fd = inner.map().fd().as_fd().as_raw_fd();
 
     // Build contiguous key array [0, 1, 2, ..., n-1]
     let keys: Vec<u32> = (0..entries.len() as u32).collect();
