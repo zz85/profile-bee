@@ -12,14 +12,15 @@ use tokio::task;
 
 use crate::dwarf_unwind::DwarfUnwindManager;
 use crate::ebpf::{
-    attach_process_exit_tracepoint, setup_ebpf_with_tp_fallback, setup_process_exit_ring_buffer,
-    setup_ring_buffer, ProfilerConfig,
+    attach_process_exec_tracepoint, attach_process_exit_tracepoint, setup_ebpf_with_tp_fallback,
+    setup_process_exec_ring_buffer, setup_process_exit_ring_buffer, setup_ring_buffer,
+    ProfilerConfig,
 };
 use crate::event_loop::{EventLoopConfig, ProfilingEventLoop};
 use crate::output::OutputSink;
 use crate::pipeline::{
-    dwarf_refresh_loop, setup_process_exit_ring_buffer_task, setup_ring_buffer_task,
-    setup_timer_and_child_stop, DwarfThreadMsg, PerfWork,
+    dwarf_refresh_loop, setup_process_exec_ring_buffer_task, setup_process_exit_ring_buffer_task,
+    setup_ring_buffer_task, setup_timer_and_child_stop, DwarfThreadMsg, PerfWork,
 };
 use crate::spawn::{setup_process_to_profile, SpawnProcess, StopHandler};
 
@@ -42,6 +43,15 @@ pub struct SessionConfig {
     pub group_by_process: bool,
     /// Whether to set up process-exit monitoring for external PIDs.
     pub monitor_exit: bool,
+    /// Track process lifecycle events (exec + broadened exit) via eBPF tracepoints.
+    ///
+    /// When `true`, attaches `sched_process_exec` and broadens `sched_process_exit`
+    /// to fire for all processes (not just DWARF-tracked or monitored PIDs).
+    ///
+    /// Automatically enabled when `profiler.dwarf` is `true` (DWARF tables benefit
+    /// from proactive exec/exit detection). Agents should enable this for
+    /// `ProcessMetadataCache` eviction and process-aware profiling.
+    pub track_process_lifecycle: bool,
 }
 
 impl Default for SessionConfig {
@@ -54,6 +64,7 @@ impl Default for SessionConfig {
             group_by_cpu: false,
             group_by_process: false,
             monitor_exit: true,
+            track_process_lifecycle: false,
         }
     }
 }
@@ -178,7 +189,7 @@ impl ProfilingSession {
         // 6. Ring buffer setup
         let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
 
-        // 7. Process exit monitoring
+        // 7. Process exit monitoring + lifecycle tracking
         let external_pid = if spawn.is_none() {
             config.profiler.pid
         } else {
@@ -186,11 +197,22 @@ impl ProfilingSession {
         };
         let monitor_exit_pid = external_pid;
 
-        if (external_pid.is_some() || config.profiler.dwarf) && config.monitor_exit {
+        // Lifecycle tracking: auto-enable when DWARF is on, or when explicitly requested
+        let lifecycle_tracking = config.track_process_lifecycle || config.profiler.dwarf;
+
+        if (external_pid.is_some() || config.profiler.dwarf || lifecycle_tracking)
+            && config.monitor_exit
+        {
             attach_process_exit_tracepoint(&mut ebpf_profiler.bpf)?;
             if let Some(pid_to_monitor) = external_pid {
                 ebpf_profiler.set_monitor_exit_pid(pid_to_monitor)?;
             }
+
+            // Enable broadened exit events when lifecycle tracking is on
+            if lifecycle_tracking {
+                ebpf_profiler.set_lifecycle_tracking(true)?;
+            }
+
             let exit_ring_buf = setup_process_exit_ring_buffer(&mut ebpf_profiler.bpf)?;
             let exit_perf_tx = perf_tx.clone();
             task::spawn(async move {
@@ -200,6 +222,24 @@ impl ProfilingSession {
                     tracing::error!("Failed to set up process exit ring buffer: {:?}", e);
                 }
             });
+        }
+
+        // 7b. Process exec monitoring (lifecycle tracking only)
+        if lifecycle_tracking
+            && config.monitor_exit
+            && attach_process_exec_tracepoint(&mut ebpf_profiler.bpf)?
+        {
+            if let Ok(Some(exec_ring_buf)) = setup_process_exec_ring_buffer(&mut ebpf_profiler.bpf)
+            {
+                let exec_perf_tx = perf_tx.clone();
+                task::spawn(async move {
+                    if let Err(e) =
+                        setup_process_exec_ring_buffer_task(exec_ring_buf, exec_perf_tx).await
+                    {
+                        tracing::error!("Failed to set up process exec ring buffer: {:?}", e);
+                    }
+                });
+            }
         }
 
         // 8. Start ring buffer polling task
@@ -220,6 +260,7 @@ impl ProfilingSession {
             group_by_process: config.group_by_process,
             monitor_exit_pid,
             tgid_request_tx,
+            enable_process_metadata: lifecycle_tracking,
         };
         let event_loop = ProfilingEventLoop::new(
             ebpf_profiler.counts,

@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 
 use aya::maps::{MapData, StackTraceMap};
 use aya::Ebpf;
-use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
+use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS, PROCESS_EVENT_EXEC, PROCESS_EVENT_EXIT};
 
 use crate::ebpf::{apply_dwarf_refresh, FramePointersPod, StackInfoPod};
 use crate::pipeline::{DwarfThreadMsg, PerfWork};
+use crate::process_metadata::ProcessMetadataCache;
 use crate::trace_handler::TraceHandler;
 use crate::types::FrameCount;
 
@@ -47,6 +48,11 @@ pub struct EventLoopConfig {
     pub group_by_process: bool,
     pub monitor_exit_pid: Option<u32>,
     pub tgid_request_tx: Option<mpsc::Sender<DwarfThreadMsg>>,
+    /// Whether to maintain a process metadata cache.
+    /// When `true`, a `ProcessMetadataCache` is created and updated
+    /// on exec/exit events. Library consumers can access it via
+    /// `process_metadata()`.
+    pub enable_process_metadata: bool,
 }
 
 /// Owns the state needed to drain eBPF events and produce collapsed stacks.
@@ -67,6 +73,13 @@ pub struct ProfilingEventLoop {
     // Persistent state across calls
     trace_count: HashMap<StackInfo, usize>,
     known_tgids: HashSet<u32>,
+    /// Optional process metadata cache, maintained via eBPF lifecycle events.
+    process_metadata: Option<ProcessMetadataCache>,
+    /// PIDs that exited during the current drain_events() call.
+    /// Eviction from `process_metadata` is deferred until after
+    /// `build_raw_stacks()` completes, so agents can still look up
+    /// metadata for processes that exited within the collection window.
+    pending_exit_pids: Vec<u32>,
 }
 
 impl ProfilingEventLoop {
@@ -94,6 +107,12 @@ impl ProfilingEventLoop {
             monitor_exit_pid: config.monitor_exit_pid,
             trace_count: HashMap::new(),
             known_tgids: HashSet::new(),
+            process_metadata: if config.enable_process_metadata {
+                Some(ProcessMetadataCache::new(4096))
+            } else {
+                None
+            },
+            pending_exit_pids: Vec::new(),
         }
     }
 
@@ -143,6 +162,24 @@ impl ProfilingEventLoop {
         RawCollectResult { stacks, stopped }
     }
 
+    /// Immediately evict process metadata for PIDs that exited during
+    /// previous `drain_events()` calls.
+    ///
+    /// Normally eviction is deferred automatically: exit PIDs from cycle N
+    /// are evicted at the start of cycle N+1's `drain_events()` call,
+    /// giving agents one full collection cycle to read metadata for
+    /// processes that exited. Call this method only if you need to free
+    /// cache entries sooner (e.g., memory pressure).
+    pub fn evict_pending_exits(&mut self) {
+        if let Some(ref mut cache) = self.process_metadata {
+            for pid in self.pending_exit_pids.drain(..) {
+                cache.remove(pid);
+            }
+        } else {
+            self.pending_exit_pids.clear();
+        }
+    }
+
     /// Drain events from the PerfWork channel, symbolize stacks on the fly,
     /// and return `(local_counting, stopped)`.
     ///
@@ -153,6 +190,12 @@ impl ProfilingEventLoop {
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
     ) -> (bool, bool) {
+        // Evict metadata for PIDs that exited in the PREVIOUS cycle.
+        // This gives agents one full collection cycle to read metadata
+        // for processes that exited, covering async ring buffer delivery
+        // where a sample may arrive after its process's exit event.
+        self.evict_pending_exits();
+
         let mut queue_processed = 0u64;
         let mut stopped = false;
         let local_counting = self.stream_mode == EVENT_TRACE_ALWAYS;
@@ -228,17 +271,53 @@ impl ProfilingEventLoop {
                         tracing::warn!("{:#}", e);
                     }
                 }
-                PerfWork::ProcessExit(exit_event) => {
-                    if let Some(tx) = &self.tgid_request_tx {
-                        let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
+                PerfWork::ProcessEvent(event) => {
+                    match event.event_type {
+                        PROCESS_EVENT_EXIT => {
+                            if let Some(tx) = &self.tgid_request_tx {
+                                let _ = tx.send(DwarfThreadMsg::ProcessExited(event.pid));
+                            }
+                            self.known_tgids.remove(&event.pid);
+                            // Defer metadata cache eviction until after build_raw_stacks()
+                            // so agents can still look up metadata for processes that
+                            // exited within the collection window.
+                            if self.process_metadata.is_some() {
+                                self.pending_exit_pids.push(event.pid);
+                            }
+                            if Some(event.pid) == self.monitor_exit_pid {
+                                tracing::info!("target process {} exited, stopping", event.pid);
+                                stopped = true;
+                                break;
+                            }
+                            tracing::debug!("process {} exited", event.pid);
+                        }
+                        PROCESS_EVENT_EXEC => {
+                            tracing::debug!("process {} called exec", event.pid);
+                            if let Some(tx) = &self.tgid_request_tx {
+                                let _ = tx.send(DwarfThreadMsg::ProcessExeced(event.pid));
+                            }
+                            // Flush pre-exec samples from trace_count before invalidating
+                            // caches — otherwise build_raw_stacks() would try to symbolize
+                            // old addresses against the new binary image.
+                            self.trace_count.retain(|k, _| k.tgid != event.pid);
+                            // The PID is still alive but with a new binary image.
+                            // Re-add to known_tgids so DWARF tables are reloaded.
+                            self.known_tgids.remove(&event.pid);
+                            self.known_tgids.insert(event.pid);
+                            // Invalidate symbol caches for this PID
+                            self.trace_handler.invalidate_caches_for_pid(event.pid);
+                            if let Some(ref mut cache) = self.process_metadata {
+                                cache.invalidate(event.pid);
+                            }
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "unknown process event type {} for pid {}",
+                                event.event_type,
+                                event.pid
+                            );
+                        }
                     }
-                    self.known_tgids.remove(&exit_event.pid);
-                    if Some(exit_event.pid) == self.monitor_exit_pid {
-                        tracing::info!("target process {} exited, stopping", exit_event.pid);
-                        stopped = true;
-                        break;
-                    }
-                    tracing::debug!("DWARF-tracked process {} exited", exit_event.pid);
                 }
                 PerfWork::Stop => {
                     tracing::info!("drain_events: received Stop");
@@ -379,6 +458,15 @@ impl ProfilingEventLoop {
     /// Access monitor_exit_pid.
     pub fn monitor_exit_pid(&self) -> Option<u32> {
         self.monitor_exit_pid
+    }
+
+    /// Access the process metadata cache (if enabled).
+    ///
+    /// Returns `None` if lifecycle tracking was not enabled. Library consumers
+    /// can use this to look up process metadata (cmdline, cwd, environ, etc.)
+    /// between `collect_raw()` calls for stack enrichment.
+    pub fn process_metadata(&mut self) -> Option<&mut ProcessMetadataCache> {
+        self.process_metadata.as_mut()
     }
 }
 

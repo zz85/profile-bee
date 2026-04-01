@@ -55,7 +55,8 @@ impl ProbeEvent {
     pub const STRUCT_SIZE: usize = size_of::<ProbeEvent>();
 }
 
-/// Process exit notification sent from eBPF to userspace
+/// Process exit notification sent from eBPF to userspace.
+/// Deprecated: prefer `ProcessEvent` which carries both exec and exit events.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 #[repr(C)]
 pub struct ProcessExitEvent {
@@ -65,6 +66,45 @@ pub struct ProcessExitEvent {
 
 impl ProcessExitEvent {
     pub const STRUCT_SIZE: usize = size_of::<ProcessExitEvent>();
+}
+
+/// Process exec notification sent from eBPF to userspace when a process
+/// calls execve(). Used for proactive DWARF table loading and cache invalidation.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(C)]
+pub struct ProcessExecEvent {
+    pub pid: u32,
+    pub _pad: u32,
+}
+
+impl ProcessExecEvent {
+    pub const STRUCT_SIZE: usize = size_of::<ProcessExecEvent>();
+}
+
+// --- Process Lifecycle Event Types ---
+
+/// Process lifecycle event type: process exited.
+pub const PROCESS_EVENT_EXIT: u32 = 0;
+/// Process lifecycle event type: process called execve().
+pub const PROCESS_EVENT_EXEC: u32 = 1;
+
+/// Unified process lifecycle event sent from eBPF to userspace.
+/// Carries both exec and exit notifications through a single ring buffer,
+/// replacing the narrower `ProcessExitEvent`.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(C)]
+pub struct ProcessEvent {
+    /// Event type: `PROCESS_EVENT_EXIT` or `PROCESS_EVENT_EXEC`.
+    pub event_type: u32,
+    /// The PID (tgid) of the process.
+    pub pid: u32,
+    /// For EXIT events: the exit code. For EXEC events: 0.
+    pub exit_code: i32,
+    pub _pad: u32,
+}
+
+impl ProcessEvent {
+    pub const STRUCT_SIZE: usize = size_of::<ProcessEvent>();
 }
 
 // --- DWARF Unwind Table Types (used by eBPF-side unwinding) ---

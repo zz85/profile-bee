@@ -77,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
             ..ProfilerConfig::default()
         },
         duration_ms: 0,             // Run indefinitely (we control the loop)
+        // Enable process lifecycle tracking for metadata cache + DWARF improvements.
+        // Note: automatically enabled when dwarf: true, shown here for clarity.
+        track_process_lifecycle: true,
         ..SessionConfig::default()
     };
 
@@ -113,7 +116,45 @@ async fn main() -> anyhow::Result<()> {
 
 ## Stack Enrichment Pattern
 
-A common pattern is to look up per-process metadata and annotate stacks.
+### Using the Built-in ProcessMetadataCache
+
+When `track_process_lifecycle` is enabled (or DWARF is on), the event loop
+maintains a `ProcessMetadataCache` that automatically reads `/proc/[pid]/*`
+on first access and evicts entries when eBPF detects process exec/exit events.
+
+```rust
+use profile_bee::types::{FrameCount, StackFrameInfo};
+
+fn enrich_with_builtin_cache(
+    session: &mut ProfilingSession,
+    stacks: &[FrameCount],
+) {
+    // Access the built-in metadata cache (requires track_process_lifecycle)
+    if let Some(cache) = session.event_loop.process_metadata() {
+        for fc in stacks {
+            if let Some(first_frame) = fc.frames.first() {
+                let pid = first_frame.pid as u32;
+                if let Some(meta) = cache.get_or_load(pid) {
+                    // meta.cmdline, meta.cwd, meta.environ, meta.exe, meta.ns_mnt
+                    // are all available for enrichment
+                    if let Some(env_val) = meta.environ_var("MY_SERVICE_NAME") {
+                        // Use the environment variable for grouping
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+The cache is automatically maintained by the event loop:
+- On `sched_process_exec`: invalidates the entry (same PID, new binary)
+- On `sched_process_exit`: removes the entry entirely
+- No manual eviction needed — eBPF events handle it
+
+### Custom Enrichment (without built-in cache)
+
+For more control, you can build your own metadata cache.
 Since `StackFrameInfo` contains the `pid`, you can read `/proc/[pid]/*`
 to get process context:
 
@@ -331,3 +372,47 @@ pub struct StackFrameInfo {
     pub ns: Option<u64>,                // mount namespace inode
 }
 ```
+
+### `ProcessMetadataCache`
+
+```rust
+use profile_bee::process_metadata::ProcessMetadataCache;
+
+// Access via the event loop (when track_process_lifecycle is enabled):
+if let Some(cache) = session.event_loop.process_metadata() {
+    // Lazily loads from /proc on first access
+    if let Some(meta) = cache.get_or_load(pid) {
+        meta.cmdline;     // Option<Vec<String>>
+        meta.cwd;         // Option<PathBuf>
+        meta.environ;     // Option<HashMap<OsString, OsString>>
+        meta.exe;         // Option<PathBuf>
+        meta.ns_mnt;      // Option<u64> — mount namespace inode
+    }
+
+    // Convenience: look up a specific environment variable
+    let val = cache.environ_var(pid, "MY_ENV_VAR");
+}
+```
+
+Entries are automatically:
+- **Invalidated** on `sched_process_exec` (same PID, new binary image)
+- **Removed** on `sched_process_exit` (process gone)
+
+### `SessionConfig` — Lifecycle Tracking
+
+```rust
+pub struct SessionConfig {
+    // ... other fields ...
+
+    /// Track process lifecycle events (exec + broadened exit) via eBPF tracepoints.
+    /// Automatically enabled when profiler.dwarf is true.
+    pub track_process_lifecycle: bool,
+}
+```
+
+When enabled:
+- Attaches `sched:sched_process_exec` tracepoint (detects `execve()` calls)
+- Broadens `sched:sched_process_exit` to fire for all processes (not just DWARF-tracked)
+- Creates a `ProcessMetadataCache` in the event loop
+- DWARF tables are proactively reloaded on exec (no 1-second poll delay)
+- Symbol caches are invalidated on exec (no stale resolutions)

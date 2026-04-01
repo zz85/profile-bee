@@ -506,6 +506,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         group_by_process: opt.group_by_process,
         monitor_exit_pid,
         tgid_request_tx,
+        enable_process_metadata: false,
     };
     let mut event_loop = ProfilingEventLoop::new(
         ebpf_profiler.counts,
@@ -892,20 +893,34 @@ fn spawn_profiling_thread(
                             tracing::warn!("{:#}", e);
                         }
                     }
-                    Ok(PerfWork::ProcessExit(exit_event)) => {
-                        // Forward to DWARF thread for LPM trie cleanup
-                        if let Some(tx) = &tgid_request_tx {
-                            let _ = tx.send(DwarfThreadMsg::ProcessExited(exit_event.pid));
-                        }
-                        // Allow PID reuse to trigger a fresh LoadProcess
-                        known_tgids.remove(&exit_event.pid);
-                        // Only stop profiling if this is the monitored target process
-                        if Some(exit_event.pid) == monitor_exit_pid {
-                            tracing::info!(
-                                "target process {} exited, stopping TUI",
-                                exit_event.pid
-                            );
-                            return;
+                    Ok(PerfWork::ProcessEvent(event)) => {
+                        use profile_bee_common::{PROCESS_EVENT_EXEC, PROCESS_EVENT_EXIT};
+                        match event.event_type {
+                            PROCESS_EVENT_EXIT => {
+                                // Forward to DWARF thread for LPM trie cleanup
+                                if let Some(tx) = &tgid_request_tx {
+                                    let _ = tx.send(DwarfThreadMsg::ProcessExited(event.pid));
+                                }
+                                // Allow PID reuse to trigger a fresh LoadProcess
+                                known_tgids.remove(&event.pid);
+                                // Only stop profiling if this is the monitored target process
+                                if Some(event.pid) == monitor_exit_pid {
+                                    tracing::info!(
+                                        "target process {} exited, stopping TUI",
+                                        event.pid
+                                    );
+                                    return;
+                                }
+                            }
+                            PROCESS_EVENT_EXEC => {
+                                tracing::debug!("process {} called exec", event.pid);
+                                if let Some(tx) = &tgid_request_tx {
+                                    let _ = tx.send(DwarfThreadMsg::ProcessExeced(event.pid));
+                                }
+                                known_tgids.remove(&event.pid);
+                                known_tgids.insert(event.pid);
+                            }
+                            _ => {}
                         }
                     }
                     Ok(PerfWork::Stop) => return,

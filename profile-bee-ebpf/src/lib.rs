@@ -72,6 +72,12 @@ static TARGET_PID_MAP: Array<u32> = Array::with_max_entries(1, 0);
 #[map(name = "monitor_exit_pid_map")]
 static MONITOR_EXIT_PID_MAP: Array<u32> = Array::with_max_entries(1, 0);
 
+/// Whether process lifecycle tracking is enabled (0 = disabled, 1 = enabled).
+/// When enabled, exit events fire for ALL process exits (not just DWARF-tracked
+/// or monitored PIDs), and the exec tracepoint sends exec events.
+#[map(name = "lifecycle_tracking_map")]
+static LIFECYCLE_TRACKING_MAP: Array<u32> = Array::with_max_entries(1, 0);
+
 #[inline]
 unsafe fn skip_idle() -> bool {
     let skip = core::ptr::read_volatile(&SKIP_IDLE);
@@ -119,6 +125,14 @@ unsafe fn monitor_exit_pid() -> u32 {
     }
 }
 
+#[inline]
+unsafe fn lifecycle_tracking_enabled() -> bool {
+    match LIFECYCLE_TRACKING_MAP.get(0) {
+        Some(&v) => v != 0,
+        None => false,
+    }
+}
+
 /* Setup maps */
 #[map]
 static mut STORAGE: PerCpuArray<FramePointers> = PerCpuArray::with_max_entries(1, 0);
@@ -135,6 +149,9 @@ static RING_BUF_STACKS: RingBuf = RingBuf::with_byte_size(STACK_SIZE, 0);
 
 #[map(name = "process_exit_events")]
 static RING_BUF_PROCESS_EXIT: RingBuf = RingBuf::with_byte_size(4096, 0);
+
+#[map(name = "process_exec_events")]
+static RING_BUF_PROCESS_EXEC: RingBuf = RingBuf::with_byte_size(4096, 0);
 
 #[map(name = "stack_traces")]
 pub static STACK_TRACES: StackTrace = StackTrace::with_max_entries(STACK_SIZE, 0);
@@ -1382,19 +1399,34 @@ unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
 /// Handle sched_process_exit tracepoint for process exit monitoring.
 /// Sends a ProcessExitEvent when:
 /// - The monitored PID exits (--pid mode: stops profiling), OR
-/// - A DWARF-tracked process exits (cleanup LPM trie entries).
+/// - A DWARF-tracked process exits (cleanup LPM trie entries), OR
+/// - Lifecycle tracking is enabled (system-wide process awareness).
+///
+/// Only fires for process exits (tid == tgid), not individual thread exits.
+/// sched_process_exit fires for every thread exit; without this filter,
+/// thread-heavy workloads (Java, Go) would generate thousands of
+/// duplicate events per second for the same tgid.
 #[inline(always)]
 pub unsafe fn handle_process_exit<C: EbpfContext>(ctx: C) {
     use profile_bee_common::ProcessExitEvent;
 
+    let tid = ctx.pid();
     let tgid = ctx.tgid();
+
+    // Skip thread exits — only fire for the main thread (process exit).
+    if tid != tgid {
+        return;
+    }
+
     let monitor_pid = monitor_exit_pid();
 
-    // Send notification if this is either the monitored PID or a DWARF-tracked process
+    // Send notification if this is a monitored PID, DWARF-tracked process,
+    // or lifecycle tracking is enabled (for system-wide process awareness).
     let is_monitored = monitor_pid != 0 && tgid == monitor_pid;
     let is_dwarf_tracked = unsafe { DWARF_TGIDS.get(&tgid).is_some() };
+    let lifecycle = unsafe { lifecycle_tracking_enabled() };
 
-    if is_monitored || is_dwarf_tracked {
+    if is_monitored || is_dwarf_tracked || lifecycle {
         if let Some(mut entry) = RING_BUF_PROCESS_EXIT.reserve::<ProcessExitEvent>(0) {
             let exit_event = ProcessExitEvent {
                 pid: tgid,
@@ -1403,6 +1435,25 @@ pub unsafe fn handle_process_exit<C: EbpfContext>(ctx: C) {
             let _writable = entry.write(exit_event);
             entry.submit(0);
         }
+    }
+}
+
+/// Handle sched_process_exec tracepoint for process exec monitoring.
+/// Sends a ProcessExecEvent when a process calls execve(), enabling
+/// proactive DWARF table loading and metadata cache invalidation.
+///
+/// Note: sched_process_exec only fires once per execve() (not per-thread),
+/// so no tid == tgid filter is needed here.
+#[inline(always)]
+pub unsafe fn handle_process_exec<C: EbpfContext>(ctx: C) {
+    use profile_bee_common::ProcessExecEvent;
+
+    let tgid = ctx.tgid();
+
+    if let Some(mut entry) = RING_BUF_PROCESS_EXEC.reserve::<ProcessExecEvent>(0) {
+        let exec_event = ProcessExecEvent { pid: tgid, _pad: 0 };
+        let _writable = entry.write(exec_event);
+        entry.submit(0);
     }
 }
 

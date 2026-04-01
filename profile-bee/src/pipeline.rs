@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 
 use aya::maps::{MapData, RingBuf};
-use profile_bee_common::{ProcessExitEvent, StackInfo};
+use profile_bee_common::{
+    ProcessEvent, ProcessExecEvent, ProcessExitEvent, StackInfo, PROCESS_EVENT_EXEC,
+    PROCESS_EVENT_EXIT,
+};
 
 use crate::dwarf_unwind::{DwarfUnwindManager, MappingsDiff};
 use crate::ebpf::{build_dwarf_refresh, DwarfRefreshUpdate};
@@ -23,8 +26,8 @@ pub enum PerfWork {
     StackInfo(StackInfo),
     /// Incremental DWARF table update from background thread.
     DwarfRefresh(DwarfRefreshUpdate),
-    /// Process exit detected by eBPF tracepoint.
-    ProcessExit(ProcessExitEvent),
+    /// Process lifecycle event (exec or exit) detected by eBPF tracepoint.
+    ProcessEvent(ProcessEvent),
     /// Signal to stop profiling.
     Stop,
 }
@@ -35,6 +38,8 @@ pub enum DwarfThreadMsg {
     LoadProcess(u32),
     /// Process exited — clean up mappings and LPM trie entries.
     ProcessExited(u32),
+    /// Process called execve() — invalidate and reload DWARF tables.
+    ProcessExeced(u32),
 }
 
 /// Build a `DwarfRefreshUpdate` and send it on the `PerfWork` channel.
@@ -109,6 +114,33 @@ pub fn dwarf_refresh_loop(
                     }
                     tracked_pids.retain(|&p| p != tgid);
                     last_maps_mtime.remove(&tgid);
+                }
+                DwarfThreadMsg::ProcessExeced(tgid) => {
+                    tracing::debug!(
+                        "DWARF thread: process {} exec'd, invalidating and reloading",
+                        tgid
+                    );
+                    // Remove old DWARF data (binary image has changed)
+                    if let Some(removal_diff) = manager.remove_process(tgid) {
+                        if !send_refresh(&manager, &tx, vec![], removal_diff) {
+                            return;
+                        }
+                    }
+                    tracked_pids.retain(|&p| p != tgid);
+                    last_maps_mtime.remove(&tgid);
+
+                    // Reload with the new binary
+                    tracked_pids.push(tgid);
+                    let maps_path = format!("/proc/{}/maps", tgid);
+                    let pre_refresh_mtime = std::fs::metadata(&maps_path)
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    if let Ok((new_shard_ids, diff)) = manager.refresh_process(tgid) {
+                        if !send_refresh(&manager, &tx, new_shard_ids, diff) {
+                            return;
+                        }
+                        last_maps_mtime.insert(tgid, pre_refresh_mtime);
+                    }
                 }
             }
         }
@@ -236,9 +268,62 @@ pub async fn setup_process_exit_ring_buffer_task(
                 }
                 let exit_event: ProcessExitEvent =
                     unsafe { std::ptr::read_unaligned(item.as_ptr().cast()) };
-                tracing::debug!("eBPF detected: PID {} has exited", exit_event.pid);
-                if perf_tx.send(PerfWork::ProcessExit(exit_event)).is_err() {
+                let event = ProcessEvent {
+                    event_type: PROCESS_EVENT_EXIT,
+                    pid: exit_event.pid,
+                    exit_code: exit_event.exit_code,
+                    _pad: 0,
+                };
+                tracing::debug!("eBPF detected: PID {} has exited", event.pid);
+                if perf_tx.send(PerfWork::ProcessEvent(event)).is_err() {
                     // Receiver dropped — event loop is done, exit task
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }) {
+            Ok(_) => {
+                guard.clear_ready();
+                continue;
+            }
+            Err(_would_block) => continue,
+        }
+    }
+
+    Ok(())
+}
+
+/// Async task that polls the eBPF ring buffer for process exec events and
+/// forwards them to the profiling event loop via the `PerfWork` channel.
+pub async fn setup_process_exec_ring_buffer_task(
+    ring_buf: RingBuf<MapData>,
+    perf_tx: mpsc::Sender<PerfWork>,
+) -> anyhow::Result<()> {
+    use tokio::io::unix::AsyncFd;
+    let mut fd = AsyncFd::new(ring_buf)?;
+
+    while let Ok(mut guard) = fd.readable_mut().await {
+        match guard.try_io(|inner| {
+            let ring_buf = inner.get_mut();
+            while let Some(item) = ring_buf.next() {
+                if item.len() < ProcessExecEvent::STRUCT_SIZE {
+                    tracing::warn!(
+                        "Ring buffer item too small for ProcessExecEvent ({} < {}), skipping",
+                        item.len(),
+                        ProcessExecEvent::STRUCT_SIZE,
+                    );
+                    continue;
+                }
+                let exec_event: ProcessExecEvent =
+                    unsafe { std::ptr::read_unaligned(item.as_ptr().cast()) };
+                let event = ProcessEvent {
+                    event_type: PROCESS_EVENT_EXEC,
+                    pid: exec_event.pid,
+                    exit_code: 0,
+                    _pad: 0,
+                };
+                tracing::debug!("eBPF detected: PID {} called exec", event.pid);
+                if perf_tx.send(PerfWork::ProcessEvent(event)).is_err() {
                     return Ok(());
                 }
             }

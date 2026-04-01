@@ -168,4 +168,21 @@ impl PointerStackFramesCache {
             hits as f64 / self.total as f64 * 100.0
         )
     }
+
+    /// Remove all cached entries for a specific process (tgid).
+    ///
+    /// Called when a process calls execve() — the binary image changed so
+    /// all cached symbol resolutions for that PID are stale.
+    pub fn invalidate_pid(&mut self, tgid: u32) {
+        // Collect keys to remove (can't mutate while iterating)
+        let keys_to_remove: Vec<(u32, i32, i32)> = self
+            .map
+            .iter()
+            .filter(|(&(t, _, _), _)| t == tgid)
+            .map(|(&k, _)| k)
+            .collect();
+        for key in keys_to_remove {
+            self.map.pop(&key);
+        }
+    }
 }

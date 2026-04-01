@@ -94,6 +94,15 @@ impl TraceHandler {
         }
     }
 
+    /// Invalidate all cached symbol resolutions for a specific process.
+    ///
+    /// Called when a process calls execve() — the binary image changed so
+    /// all cached address-to-symbol mappings for that PID are stale.
+    pub fn invalidate_caches_for_pid(&mut self, tgid: u32) {
+        self.cache.invalidate_pid(tgid);
+        tracing::debug!("invalidated symbol caches for pid {}", tgid);
+    }
+
     pub fn print_stats(&self) {
         tracing::info!("{}", self.cache.stats());
     }
