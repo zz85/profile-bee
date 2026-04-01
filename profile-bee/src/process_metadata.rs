@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 /// Cached metadata for a single process, read from `/proc/[pid]/`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProcessMetadata {
     /// The process ID.
     pub pid: u32,
@@ -51,6 +51,28 @@ pub struct ProcessMetadata {
     pub start_time: u64,
     /// When this entry was loaded.
     pub loaded_at: Instant,
+}
+
+// Manual Debug impl to avoid leaking secrets from environ/cmdline into logs.
+impl std::fmt::Debug for ProcessMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessMetadata")
+            .field("pid", &self.pid)
+            .field("exe", &self.exe)
+            .field("cwd", &self.cwd)
+            .field(
+                "cmdline",
+                &self.cmdline.as_ref().map(|c| format!("<{} args>", c.len())),
+            )
+            .field(
+                "environ",
+                &self.environ.as_ref().map(|e| format!("<{} vars>", e.len())),
+            )
+            .field("ns_mnt", &self.ns_mnt)
+            .field("start_time", &self.start_time)
+            .field("loaded_at", &self.loaded_at)
+            .finish()
+    }
 }
 
 impl ProcessMetadata {
