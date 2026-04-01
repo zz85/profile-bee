@@ -55,12 +55,13 @@ pub struct ProcessMetadata {
 
 impl ProcessMetadata {
     /// Load metadata for a PID from `/proc`.
-    /// Returns `None` if the process doesn't exist (e.g., already exited).
+    /// Returns `None` if the process doesn't exist or `/proc/[pid]/stat`
+    /// can't be read (start_time is required for PID reuse detection).
     fn load(pid: u32) -> Option<Self> {
         let process = procfs::process::Process::new(pid as i32).ok()?;
 
-        let stat = process.stat().ok();
-        let start_time = stat.as_ref().map_or(0, |s| s.starttime);
+        let stat = process.stat().ok()?;
+        let start_time = stat.starttime;
 
         let cmdline = process.cmdline().ok();
         let cwd = process.cwd().ok();
@@ -138,20 +139,16 @@ impl ProcessMetadataCache {
             // Validate against PID reuse: if the start_time changed, the
             // cached entry belongs to a different process incarnation.
             let cached_start = self.cache[&pid].start_time;
-            if cached_start != 0 {
-                let current_start = ProcessMetadata::current_start_time(pid);
-                if current_start != 0 && current_start != cached_start {
-                    tracing::debug!(
-                        "PID {} recycled (starttime {} -> {}), reloading metadata",
-                        pid,
-                        cached_start,
-                        current_start,
-                    );
-                    self.cache.remove(&pid);
-                    // Fall through to reload below
-                } else {
-                    return self.cache.get(&pid);
-                }
+            let current_start = ProcessMetadata::current_start_time(pid);
+            if current_start != 0 && current_start != cached_start {
+                tracing::debug!(
+                    "PID {} recycled (starttime {} -> {}), reloading metadata",
+                    pid,
+                    cached_start,
+                    current_start,
+                );
+                self.cache.remove(&pid);
+                // Fall through to reload below
             } else {
                 return self.cache.get(&pid);
             }
