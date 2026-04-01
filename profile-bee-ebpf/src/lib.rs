@@ -1401,11 +1401,23 @@ unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
 /// - The monitored PID exits (--pid mode: stops profiling), OR
 /// - A DWARF-tracked process exits (cleanup LPM trie entries), OR
 /// - Lifecycle tracking is enabled (system-wide process awareness).
+///
+/// Only fires for process exits (tid == tgid), not individual thread exits.
+/// sched_process_exit fires for every thread exit; without this filter,
+/// thread-heavy workloads (Java, Go) would generate thousands of
+/// duplicate events per second for the same tgid.
 #[inline(always)]
 pub unsafe fn handle_process_exit<C: EbpfContext>(ctx: C) {
     use profile_bee_common::ProcessExitEvent;
 
+    let tid = ctx.pid();
     let tgid = ctx.tgid();
+
+    // Skip thread exits — only fire for the main thread (process exit).
+    if tid != tgid {
+        return;
+    }
+
     let monitor_pid = monitor_exit_pid();
 
     // Send notification if this is a monitored PID, DWARF-tracked process,
@@ -1429,6 +1441,9 @@ pub unsafe fn handle_process_exit<C: EbpfContext>(ctx: C) {
 /// Handle sched_process_exec tracepoint for process exec monitoring.
 /// Sends a ProcessExecEvent when a process calls execve(), enabling
 /// proactive DWARF table loading and metadata cache invalidation.
+///
+/// Note: sched_process_exec only fires once per execve() (not per-thread),
+/// so no tid == tgid filter is needed here.
 #[inline(always)]
 pub unsafe fn handle_process_exec<C: EbpfContext>(ctx: C) {
     use profile_bee_common::ProcessExecEvent;
