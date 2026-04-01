@@ -136,11 +136,16 @@ impl ProcessMetadataCache {
     /// doesn't exist (already exited) or the cache is at capacity.
     pub fn get_or_load(&mut self, pid: u32) -> Option<&ProcessMetadata> {
         if self.cache.contains_key(&pid) {
-            // Validate against PID reuse: if the start_time changed, the
-            // cached entry belongs to a different process incarnation.
+            // Validate against PID reuse and process exit: compare the cached
+            // start_time against the current /proc/[pid]/stat starttime.
             let cached_start = self.cache[&pid].start_time;
             let current_start = ProcessMetadata::current_start_time(pid);
-            if current_start != 0 && current_start != cached_start {
+            if current_start == 0 {
+                // Process is gone (/proc/[pid]/stat unreadable) — remove stale entry.
+                self.cache.remove(&pid);
+                return None;
+            }
+            if current_start != cached_start {
                 tracing::debug!(
                     "PID {} recycled (starttime {} -> {}), reloading metadata",
                     pid,
