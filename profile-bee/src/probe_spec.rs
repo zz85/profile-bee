@@ -10,10 +10,78 @@
 //!   MyClass::method               - C++ mangled name matching
 //!   pthread_*                     - glob pattern matching
 //!   /regex_pattern/               - regex matching
+//!
+//! Event prefix syntax (for `-e` / `--event`):
+//!   kprobe:<fn>           - kernel function probe (also k:)
+//!   uprobe:<spec>         - userspace probe (also u:) — default if no prefix
+//!   uretprobe:<spec>      - userspace return probe (also ur:)
+//!   tracepoint:<cat:name> - tracepoint (also t:, tp:)
 
 use std::fmt;
 
 use regex::Regex;
+
+// ---------------------------------------------------------------------------
+// Event kind prefix parsing (for unified -e / --event syntax)
+// ---------------------------------------------------------------------------
+
+/// The kind of probe/event, determined by the prefix of an `-e` spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// Kernel function probe (`kprobe:` or `k:`)
+    Kprobe,
+    /// Userspace function probe (`uprobe:` or `u:`, also the default)
+    Uprobe,
+    /// Userspace return probe (`uretprobe:` or `ur:`)
+    Uretprobe,
+    /// Tracepoint (`tracepoint:` or `tp:` or `t:`)
+    Tracepoint,
+}
+
+/// Parse the event-kind prefix from a unified `-e` spec string.
+///
+/// Returns the detected `EventKind` and the remaining spec after stripping the prefix.
+/// If no recognized prefix is found, defaults to `Uprobe` (backward compatible).
+///
+/// # Examples
+/// ```
+/// use profile_bee::probe_spec::{parse_event_prefix, EventKind};
+/// assert_eq!(parse_event_prefix("kprobe:vfs_write"), (EventKind::Kprobe, "vfs_write"));
+/// assert_eq!(parse_event_prefix("k:vfs_write"), (EventKind::Kprobe, "vfs_write"));
+/// assert_eq!(parse_event_prefix("uprobe:malloc"), (EventKind::Uprobe, "malloc"));
+/// assert_eq!(parse_event_prefix("u:malloc"), (EventKind::Uprobe, "malloc"));
+/// assert_eq!(parse_event_prefix("uretprobe:malloc"), (EventKind::Uretprobe, "malloc"));
+/// assert_eq!(parse_event_prefix("ur:malloc"), (EventKind::Uretprobe, "malloc"));
+/// assert_eq!(parse_event_prefix("tracepoint:sched:sched_switch"), (EventKind::Tracepoint, "sched:sched_switch"));
+/// assert_eq!(parse_event_prefix("tp:sched:sched_switch"), (EventKind::Tracepoint, "sched:sched_switch"));
+/// assert_eq!(parse_event_prefix("t:sched:sched_switch"), (EventKind::Tracepoint, "sched:sched_switch"));
+/// assert_eq!(parse_event_prefix("malloc"), (EventKind::Uprobe, "malloc"));
+/// assert_eq!(parse_event_prefix("pthread_*"), (EventKind::Uprobe, "pthread_*"));
+/// ```
+pub fn parse_event_prefix(input: &str) -> (EventKind, &str) {
+    // Check prefixes in order — longest first to avoid ambiguous matches
+    // (e.g. "uretprobe:" before "uprobe:", "tracepoint:" before "tp:" before "t:")
+    const PREFIXES: &[(&str, EventKind)] = &[
+        ("kprobe:", EventKind::Kprobe),
+        ("k:", EventKind::Kprobe),
+        ("uretprobe:", EventKind::Uretprobe),
+        ("ur:", EventKind::Uretprobe),
+        ("uprobe:", EventKind::Uprobe),
+        ("u:", EventKind::Uprobe),
+        ("tracepoint:", EventKind::Tracepoint),
+        ("tp:", EventKind::Tracepoint),
+        ("t:", EventKind::Tracepoint),
+    ];
+
+    for &(prefix, kind) in PREFIXES {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            return (kind, rest);
+        }
+    }
+
+    // Default: uprobe (backward compatible with old --uprobe behavior)
+    (EventKind::Uprobe, input)
+}
 
 /// A parsed probe specification.
 #[derive(Debug, Clone)]

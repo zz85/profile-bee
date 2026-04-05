@@ -53,19 +53,19 @@ Installs `probee` and `pbee` (short alias). No nightly Rust required — a prebu
 sudo probee --tui
 
 # Profile a specific command
-sudo probee --tui --cmd "my-application"
+sudo probee --tui -- my-application
 
 # Generate an SVG flamegraph
-sudo probee --svg flamegraph.svg --time 5000
+sudo probee -o flamegraph.svg -t 5000
 
 # Profile a command with args
-sudo probee --svg output.svg -- ./my-binary arg1 arg2
+sudo probee -o output.svg -- ./my-binary arg1 arg2
 
 # Real-time flamegraphs via web server
 sudo probee --serve --skip-idle
 
 # Trace function calls with uprobe
-sudo probee --uprobe malloc --time 1000 --svg malloc.svg
+sudo probee -e uprobe:malloc -t 1000 -o malloc.svg
 
 # Off-CPU profiling — find where threads block
 sudo probee --off-cpu --tui -- ./my-server
@@ -84,7 +84,7 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 - **Smart uprobes** — GDB-style symbol resolution with glob, regex, demangled name matching, and multi-attach
 - **kprobe & tracepoint** support — profile kernel functions and tracepoint events
 - **Real-time web server** (`--serve`) — live flamegraph updates over HTTP with interactive controls
-- **Automatic termination** — stops when `--pid` target or `--cmd` process exits
+- **Automatic termination** — stops when `-p` target or child process exits
 - **Rust & C++ demangling** — via gimli/blazesym
 - **BPF-based aggregation** — stack counting in kernel to reduce userspace data transfer
 - **Group by CPU / process** — per-core or per-PID flamegraph breakdown (`--group-by-cpu`, `--group-by-process`)
@@ -97,57 +97,61 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 
 ### Output Formats
 
+Use `-o <file>` to specify output — the format is inferred from the file extension:
+
 ```bash
 # SVG flamegraph
-sudo probee --svg profile.svg --frequency 999 --time 5000
+sudo probee -o profile.svg -f 999 -t 5000
 
 # HTML flamegraph
-sudo probee --time 5000 --html flamegraphs.html
+sudo probee -o flamegraphs.html -t 5000
 
 # Stackcollapse format (compatible with speedscope, flamegraph.pl)
-sudo probee --collapse profile.txt --frequency 999 --time 10000
+sudo probee -o profile.folded -f 999 -t 10000
 
 # pprof protobuf (compatible with go tool pprof, Grafana/Pyroscope, Speedscope)
-sudo probee --pprof profile.pb.gz --time 5000
+sudo probee -o profile.pb.gz -t 5000
 
 # AWS CodeGuru Profiler JSON (uploadable via AWS CLI)
-sudo probee --codeguru profile.json --time 5000
+sudo probee -o profile.codeguru.json -t 5000
 
 # All output formats at once
-sudo probee --time 5000 --html out.html --json out.json --collapse out.txt --svg out.svg --pprof out.pb.gz
+sudo probee -t 5000 -o out.html -o out.json -o out.folded -o out.svg -o out.pb.gz
 
 # Grouped by CPU
-sudo probee --svg profile.svg --frequency 999 --time 2000 --group-by-cpu
+sudo probee -o profile.svg -f 999 -t 2000 --group-by-cpu
 
 # Grouped by process (each PID gets its own flamegraph sub-tree)
-sudo probee --svg profile.svg --time 5000 --group-by-process
+sudo probee -o profile.svg -t 5000 --group-by-process
 ```
 
 ### Targeting
 
 ```bash
 # Profile specific PID (auto-stops when process exits)
-sudo probee --pid <pid> --svg output.svg --time 10000
+sudo probee -p <pid> -o output.svg -t 10000
 
 # Profile specific CPU core
-sudo probee --cpu 0 --svg output.svg --time 5000
+sudo probee --cpu 0 -o output.svg -t 5000
 
 # Profile a command
-sudo probee --svg output.svg -- ./my-binary arg1 arg2
+sudo probee -o output.svg -- ./my-binary arg1 arg2
 
 # Real-time flamegraphs via web server
-sudo probee --time 5000 --serve --skip-idle --stream-mode 1
+sudo probee -t 5000 --serve --skip-idle --stream-mode 1
 # Then open http://localhost:8000/ and click "realtime-updates"
 ```
 
 ### Kprobe & Tracepoint
 
+Use `-e` with a probe type prefix:
+
 ```bash
 # Profile kernel function calls
-sudo probee --kprobe vfs_write --time 200 --svg kprobe.svg
+sudo probee -e kprobe:vfs_write -t 200 -o kprobe.svg
 
 # Profile tracepoint events
-sudo probee --tracepoint tcp:tcp_probe --time 200 --svg tracepoint.svg
+sudo probee -e tracepoint:tcp:tcp_probe -t 200 -o tracepoint.svg
 ```
 
 ### Smart Uprobe Targeting
@@ -156,40 +160,40 @@ Profile-bee supports GDB-style symbol resolution for uprobes. Instead of manuall
 
 ```bash
 # Auto-discover library
-sudo probee --uprobe malloc --time 1000 --svg malloc.svg
+sudo probee -e uprobe:malloc -t 1000 -o malloc.svg
 
 # Multiple probes at once
-sudo probee --uprobe malloc --uprobe 'ret:free' --time 1000 --svg alloc.svg
+sudo probee -e uprobe:malloc -e uretprobe:free -t 1000 -o alloc.svg
 
 # Glob matching — trace all pthread functions
-sudo probee --uprobe 'pthread_*' --time 1000 --svg pthread.svg
+sudo probee -e 'uprobe:pthread_*' -t 1000 -o pthread.svg
 
 # Regex matching
-sudo probee --uprobe '/^sql_.*query/' --pid 1234 --time 2000 --svg sql.svg
+sudo probee -e 'uprobe:/^sql_.*query/' -p 1234 -t 2000 -o sql.svg
 
 # Demangled C++/Rust name matching
-sudo probee --uprobe 'std::vector::push_back' --pid 1234 --time 1000 --svg vec.svg
+sudo probee -e 'uprobe:std::vector::push_back' -p 1234 -t 1000 -o vec.svg
 
 # Source file and line number (requires DWARF debug info)
-sudo probee --uprobe 'main.c:42' --pid 1234 --time 1000 --svg source.svg
+sudo probee -e 'uprobe:main.c:42' -p 1234 -t 1000 -o source.svg
 
 # Explicit library prefix
-sudo probee --uprobe libc:malloc --time 1000 --svg malloc.svg
+sudo probee -e uprobe:libc:malloc -t 1000 -o malloc.svg
 
 # Absolute path to binary
-sudo probee --uprobe '/usr/lib/libc.so.6:malloc' --time 1000 --svg malloc.svg
+sudo probee -e 'uprobe:/usr/lib/libc.so.6:malloc' -t 1000 -o malloc.svg
 
 # Return probe (uretprobe)
-sudo probee --uprobe ret:malloc --time 1000 --svg malloc_ret.svg
+sudo probee -e uretprobe:malloc -t 1000 -o malloc_ret.svg
 
 # Function with offset
-sudo probee --uprobe malloc+0x10 --time 1000 --svg malloc_offset.svg
+sudo probee -e uprobe:malloc+0x10 -t 1000 -o malloc_offset.svg
 
 # Scope to a specific PID
-sudo probee --uprobe malloc --uprobe-pid 12345 --time 1000 --svg malloc_pid.svg
+sudo probee -e uprobe:malloc --uprobe-pid 12345 -t 1000 -o malloc_pid.svg
 
 # Discovery mode — list matching symbols without attaching
-sudo probee --list-probes 'pthread_*' --pid 1234
+sudo probee --list-probes 'uprobe:pthread_*' -p 1234
 ```
 
 **Probe spec syntax:**
@@ -223,13 +227,13 @@ The interactive terminal flamegraph viewer is included by default (forked and ad
 
 ```bash
 # Interactive TUI with a command
-sudo probee --tui --cmd "your-command"
+sudo probee --tui -- your-command
 
 # Live profiling of a running process
-sudo probee --tui --pid <pid> --time 30000
+sudo probee --tui -p <pid> -t 30000
 
 # With DWARF unwinding for optimized binaries
-sudo probee --tui --dwarf --cmd "./optimized-binary"
+sudo probee --tui --dwarf -- ./optimized-binary
 
 # Build without TUI support
 cargo build --release --no-default-features
@@ -259,7 +263,7 @@ cargo build --release --no-default-features
 | **Flamegraph** | Interactive flame chart (default) |
 | **Top** | Flat function list sorted by overhead. Press `t` for expandable call tree. |
 | **Processes** | Process list with CPU% breakdown. `Enter` to zoom into a process. Press `t` for tree. |
-| **Output** | Child process stdout/stderr (when using `--cmd` or `--`) |
+| **Output** | Child process stdout/stderr (when using `-- <command>`) |
 
 ---
 
@@ -288,10 +292,10 @@ This is the same approach used by [parca-agent](https://github.com/parca-dev/par
 
 ```bash
 # Enable DWARF unwinding for a no-frame-pointer binary
-sudo probee --dwarf --svg output.svg --time 5000 -- ./my-optimized-binary
+sudo probee --dwarf -o output.svg -t 5000 -- ./my-optimized-binary
 
 # Frame pointer unwinding (the default)
-sudo probee --svg output.svg --time 5000 -- ./my-fp-binary
+sudo probee -o output.svg -t 5000 -- ./my-fp-binary
 ```
 
 **Note**: For symbol resolution, you still need debug information:
@@ -317,19 +321,19 @@ aws codeguruprofiler create-profiling-group \
   --compute-platform Default
 
 # Profile and upload directly (use sudo -E to preserve AWS credentials)
-sudo -E probee --codeguru-upload --profiling-group my-app --time 10000
+sudo -E probee --codeguru-upload --profiling-group my-app -t 10000
 
 # Off-CPU profiling uploads as WAITING counter type (visible in Latency view)
-sudo -E probee --codeguru-upload --profiling-group my-app --off-cpu --time 10000
+sudo -E probee --codeguru-upload --profiling-group my-app --off-cpu -t 10000
 
 # Save a local copy while uploading
-sudo -E probee --codeguru-upload --profiling-group my-app --codeguru local.json --time 10000
+sudo -E probee --codeguru-upload --profiling-group my-app -o local.codeguru.json -t 10000
 
 # Or generate the JSON locally and upload separately via AWS CLI
-sudo probee --codeguru profile.json --time 10000
+sudo probee -o profile.codeguru.json -t 10000
 aws codeguruprofiler post-agent-profile \
   --profiling-group-name my-app \
-  --agent-profile fileb://profile.json \
+  --agent-profile fileb://profile.codeguru.json \
   --content-type application/json
 ```
 
@@ -339,10 +343,10 @@ On-CPU samples use `RUNNABLE` counter type (visible in CPU and Latency views). O
 
 ### pprof Format
 
-The `--pprof` flag outputs gzip-compressed [pprof](https://github.com/google/pprof) protobuf, the standard interchange format for profiling data:
+The `-o profile.pb.gz` output produces gzip-compressed [pprof](https://github.com/google/pprof) protobuf, the standard interchange format for profiling data:
 
 ```bash
-sudo probee --pprof profile.pb.gz --time 5000
+sudo probee -o profile.pb.gz -t 5000
 
 # View with go tool pprof
 go tool pprof -http :8080 profile.pb.gz
