@@ -548,7 +548,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d18bc4e506fbb85ab7392ed993a7db4d1a452c71b75a246af4a80ab8c9d2dd50"
 dependencies = [
  "assert_matches",
- "aya-obj 0.2.1",
+ "aya-obj",
  "bitflags 2.11.0",
  "bytes",
  "libc",
@@ -556,42 +556,6 @@ dependencies = [
  "object 0.36.7",
  "once_cell",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "aya"
-version = "0.13.2"
-source = "git+https://github.com/Brskt/aya?branch=hashmapofmaps-new#85183c632cf087d0f9474c0c31143a75ac86bcf7"
-dependencies = [
- "assert_matches",
- "aya-obj 0.2.2",
- "bitflags 2.11.0",
- "bytes",
- "hashbrown 0.16.1",
- "libc",
- "log",
- "object 0.39.0",
- "once_cell",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "aya-log"
-version = "0.2.2"
-source = "git+https://github.com/Brskt/aya?branch=hashmapofmaps-new#85183c632cf087d0f9474c0c31143a75ac86bcf7"
-dependencies = [
- "aya 0.13.2",
- "aya-log-common",
- "log",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "aya-log-common"
-version = "0.1.16"
-source = "git+https://github.com/Brskt/aya?branch=hashmapofmaps-new#85183c632cf087d0f9474c0c31143a75ac86bcf7"
-dependencies = [
- "num_enum",
 ]
 
 [[package]]
@@ -606,18 +570,6 @@ dependencies = [
  "log",
  "object 0.36.7",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "aya-obj"
-version = "0.2.2"
-source = "git+https://github.com/Brskt/aya?branch=hashmapofmaps-new#85183c632cf087d0f9474c0c31143a75ac86bcf7"
-dependencies = [
- "bytes",
- "hashbrown 0.16.1",
- "log",
- "object 0.39.0",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2284,14 +2236,12 @@ dependencies = [
 
 [[package]]
 name = "profile-bee"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "addr2line",
  "anyhow",
  "aws-config",
  "aws-sdk-codeguruprofiler",
- "aya 0.13.2",
- "aya-log",
  "blazesym",
  "bytes",
  "clap 4.6.0",
@@ -2304,6 +2254,8 @@ dependencies = [
  "memmap2",
  "object 0.37.3",
  "procfs",
+ "profile-bee-aya",
+ "profile-bee-aya-log",
  "profile-bee-common",
  "profile-bee-tui",
  "prost",
@@ -2320,15 +2272,67 @@ dependencies = [
 ]
 
 [[package]]
-name = "profile-bee-common"
-version = "0.3.10"
+name = "profile-bee-aya"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419d1e4771d00494e3e956748930f233691bbfb20235d9987d0989557e7ccaf2"
 dependencies = [
- "aya 0.13.1",
+ "assert_matches",
+ "bitflags 2.11.0",
+ "bytes",
+ "hashbrown 0.16.1",
+ "libc",
+ "log",
+ "object 0.39.0",
+ "once_cell",
+ "profile-bee-aya-obj",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "profile-bee-aya-log"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2502870c13656946d657ea29a4922b538caee658d3d7e19087d2ffe4890749a"
+dependencies = [
+ "log",
+ "profile-bee-aya",
+ "profile-bee-aya-log-common",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "profile-bee-aya-log-common"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "132c59d28d318f0638886adc86170169851bc0ccd5825d45a0d96297ab9f1b9c"
+dependencies = [
+ "num_enum",
+]
+
+[[package]]
+name = "profile-bee-aya-obj"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c4030c9bb7f583fd511d9bf8f2e5f9ab364badc6f975aba74bc5e924471fcc0"
+dependencies = [
+ "bytes",
+ "hashbrown 0.16.1",
+ "log",
+ "object 0.39.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "profile-bee-common"
+version = "0.3.11"
+dependencies = [
+ "aya",
 ]
 
 [[package]]
 name = "profile-bee-tui"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "anyhow",
  "crossterm",

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.11
+
+### New Features
+
+- **Unified output flag** (`-o` / `--output`) — replace per-format flags (`--svg`, `--html`, `--json`, `--collapse`, `--pprof`, `--codeguru`) with a single repeatable `-o <file>` flag. Format is inferred from file extension: `.svg`, `.html`, `.json`, `.folded`, `.pb.gz`, `.pprof`, `.codeguru.json`. Multiple outputs at once: `-o flame.svg -o profile.pb.gz`. (#88)
+- **Unified event/probe flag** (`-e` / `--event`) — replace `--kprobe`, `--uprobe`, `--tracepoint` with a single `-e <spec>` flag using prefix syntax: `kprobe:fn`, `uprobe:spec`, `uretprobe:spec`, `tracepoint:cat:name` (short forms: `k:`, `u:`, `ur:`, `t:`, `tp:`). Bare names default to uprobe. (#25)
+- **Output format inference** — `infer_output_format()` maps file extensions to output sinks. Compound extensions like `.codeguru.json` and `.cg.json` are supported. Unknown extensions produce a clear error message listing valid options.
+- **Event prefix parsing** — `parse_event_prefix()` in `probe_spec.rs` with doc-tests covering all 9 prefix variants. `EventKind` enum exported from the library for programmatic use.
+
+### Improvements
+
+- **Legacy flags preserved** — `--svg`, `--html`, `--json`, `--collapse`, `--pprof`, `--codeguru`, `--kprobe`, `--uprobe`, `--tracepoint` continue to work (hidden from `--help` but documented in the examples section). 100% backward compatible.
+- **Simplified help output** — `--help` now shows `-o` and `-e` as the primary interface, with legacy flags mentioned in the examples footer. Usage line updated to `(sudo) probee [OPTIONS] [-o <FILE>...] [-e <EVENT>...] [-- <COMMAND>...]`.
+- **`--list-probes` accepts unified prefix** — `--list-probes 'uprobe:pthread_*'` works alongside bare specs.
+- **TUI `build_profiler_config` uses event parsing** — both batch and TUI paths share the same `parse_event_specs()` code path.
+- **README and docs updated** — all ~37 example commands converted to new syntax.
+
 ## v0.3.10
 
 ### New Features

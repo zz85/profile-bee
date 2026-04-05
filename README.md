@@ -6,9 +6,9 @@ Profile Bee is an eBPF-based CPU profiler that ships as a single binary — no B
 
 - Just `cargo install`, `sudo probee --tui`, and you're looking at a live flamegraph — no package manager dance, no Python dependencies, no separate visualization step
 - Walks stacks directly in the kernel via frame pointers (fast, the default) or DWARF unwind tables (for those `-O2` binaries everyone ships without frame pointers)
-- Attaches to perf events, kprobes, uprobes, or tracepoints — auto-discovers uprobe targets with glob and regex matching
+- Attaches to perf events, kprobes, uprobes, or tracepoints — auto-discovers uprobe targets with glob and regex matching (`-e kprobe:fn`, `-e 'uprobe:pthread_*'`)
 - Demangles Rust and C++ symbols out of the box
-- Outputs to interactive TUI, SVG, HTML, JSON, stackcollapse, pprof, or a real-time web server — whatever fits your workflow
+- Outputs to interactive TUI, SVG, HTML, JSON, stackcollapse, pprof, or a real-time web server — just use `-o file.svg` and the format is inferred from the extension
 - Uploads profiles directly to AWS CodeGuru Profiler for continuous profiling in the cloud
 
 ## Screenshots
