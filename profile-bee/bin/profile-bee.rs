@@ -17,7 +17,7 @@ use profile_bee::pipeline::{
 use profile_bee::probe_resolver::{
     format_resolved_probes, resolve_uprobe_specs, uprobe_pid_as_u32, ProbeResolver,
 };
-use profile_bee::probe_spec::parse_probe_spec;
+use profile_bee::probe_spec::{parse_event_prefix, parse_probe_spec, EventKind};
 use profile_bee::spawn::setup_process_to_profile;
 use profile_bee::TraceHandler;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS};
@@ -25,83 +25,145 @@ use tokio::task;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
 use profile_bee::types::FrameCount;
+
+// ---------------------------------------------------------------------------
+// Output format inference from file extension
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Svg,
+    Html,
+    Json,
+    Collapse,
+    Pprof,
+    CodeGuru,
+}
+
+fn infer_output_format(path: &Path) -> Result<OutputFormat, anyhow::Error> {
+    let name = path.to_string_lossy();
+    // Check compound extensions first
+    if name.ends_with(".codeguru.json") || name.ends_with(".cg.json") {
+        return Ok(OutputFormat::CodeGuru);
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("svg") => Ok(OutputFormat::Svg),
+        Some("html") | Some("htm") => Ok(OutputFormat::Html),
+        Some("json") => Ok(OutputFormat::Json),
+        Some("folded") | Some("collapsed") | Some("collapse") => Ok(OutputFormat::Collapse),
+        Some("pprof") => Ok(OutputFormat::Pprof),
+        Some("gz") if name.ends_with(".pb.gz") => Ok(OutputFormat::Pprof),
+        _ => Err(anyhow::anyhow!(
+            "cannot infer output format from '{}' — use a known extension \
+             (.svg, .html, .json, .folded, .pb.gz, .pprof, .codeguru.json)",
+            path.display()
+        )),
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
     author,
     version,
     about = "eBPF-based CPU profiler with flamegraph generation and interactive TUI.\n\
-             Supports kprobe, uprobe (with glob/regex matching), and tracepoint probes.\n\
-             Renders TUI, SVG, JSON, stackcollapse, HTML. Run --help for examples.",
+             Use -o <file> for output (format from extension) and -e <spec> for probes.\n\
+             Supports SVG, HTML, JSON, pprof, stackcollapse, CodeGuru output formats.\n\
+             Run --help for examples.",
     long_about = None,
-    override_usage = "(sudo) probee [OPTIONS] [-- <COMMAND>...]",
+    override_usage = "(sudo) probee [OPTIONS] [-o <FILE>...] [-e <EVENT>...] [-- <COMMAND>...]",
     after_long_help = "\x1b[1mExamples:\x1b[0m
   # Interactive TUI flamegraph (live profiling)
   sudo probee --tui
 
   # TUI with a specific command
-  sudo probee --tui --cmd \"my-application\"
+  sudo probee --tui -- my-application
 
   # Profile system-wide for 5s, generate SVG flamegraph
-  sudo probee --svg flamegraph.svg --time 5000
+  sudo probee -o flamegraph.svg -t 5000
 
   # Profile a command, writing output to SVG
-  sudo probee --svg output.svg -- ./my-binary arg1 arg2
+  sudo probee -o output.svg -- ./my-binary arg1 arg2
 
   # DWARF unwinding for binaries without frame pointers
-  sudo probee --tui --dwarf --cmd \"./optimized-binary\"
+  sudo probee --tui --dwarf -- ./optimized-binary
 
-  # Profile at high frequency, multiple output formats
-  sudo probee --frequency 999 --time 5000 --svg out.svg --html out.html
+  # Multiple output formats at once
+  sudo probee -f 999 -t 5000 -o out.svg -o out.html -o profile.pb.gz
 
   # Real-time flamegraphs via web server
   sudo probee --serve --skip-idle
 
-  # Trace specific syscalls via kprobe/tracepoint/uprobe
-  sudo probee --kprobe vfs_write --time 200 --svg kprobe.svg
-  sudo probee --uprobe malloc --time 1000 --svg malloc.svg
-  sudo probee --uprobe 'pthread_*' --time 1000 --svg pthread.svg
+  # Trace via kprobe / uprobe / tracepoint
+  sudo probee -e kprobe:vfs_write -t 200 -o kprobe.svg
+  sudo probee -e uprobe:malloc -t 1000 -o malloc.svg
+  sudo probee -e 'uprobe:pthread_*' -t 1000 -o pthread.svg
+  sudo probee -e tracepoint:sched:sched_switch -o tp.svg
 
   # Discovery mode — list matching probe targets
-  sudo probee --list-probes 'pthread_*'
+  sudo probee --list-probes 'uprobe:pthread_*'
 
   # Off-CPU profiling — measure blocked/waiting time
-  sudo probee --off-cpu --svg offcpu.svg --time 5000
-  sudo probee --off-cpu --tui --pid 1234
-  sudo probee --off-cpu --min-block-time 100 --svg offcpu.svg -- ./my-app
+  sudo probee --off-cpu -o offcpu.svg -t 5000
+  sudo probee --off-cpu --tui -p 1234
+  sudo probee --off-cpu --min-block-time 100 -o offcpu.svg -- ./my-app
+
+\x1b[1mLegacy flags (still work, hidden from options list):\x1b[0m
+  --svg, --html, --json, --collapse, --pprof, --codeguru
+    Equivalent to -o <file> with the corresponding extension.
+  --kprobe, --uprobe, --tracepoint
+    Equivalent to -e kprobe:<fn>, -e <spec>, -e tracepoint:<spec>.
 
 \x1b[1mShort alias:\x1b[0m pbee (e.g., sudo pbee --tui)"
 )]
 struct Opt {
-    /// Filename to write in stackcollapse format
-    #[arg(short, long)]
+    /// Output file(s) — format inferred from extension:
+    ///   .svg              SVG flamegraph
+    ///   .html             HTML flamegraph
+    ///   .json             d3-flamegraph JSON
+    ///   .folded/.collapse stackcollapse format
+    ///   .pb.gz/.pprof     pprof protobuf (gzip)
+    ///   .codeguru.json    AWS CodeGuru JSON
+    /// Can be repeated: -o flame.svg -o profile.pb.gz
+    #[arg(short = 'o', long = "output")]
+    output: Vec<PathBuf>,
+
+    /// Event/probe specification — prefix selects probe type:
+    ///   kprobe:<fn>           kernel function probe (also k:)
+    ///   uprobe:<spec>         userspace probe (also u:) — default if no prefix
+    ///   uretprobe:<spec>      userspace return probe (also ur:)
+    ///   tracepoint:<cat:name> tracepoint (also t:, tp:)
+    /// Uprobe specs support glob, regex, demangled names, offsets.
+    /// Can be repeated: -e kprobe:vfs_write -e 'uprobe:malloc'
+    #[arg(short = 'e', long = "event")]
+    event: Vec<String>,
+
+    /// [hidden] Filename to write in stackcollapse format (use -o file.folded instead)
+    #[arg(short = 'c', long, hide = true)]
     collapse: Option<PathBuf>,
 
-    /// Filename to generate flamegraph svg
-    #[arg(short, long)]
+    /// [hidden] Filename to generate flamegraph svg (use -o file.svg instead)
+    #[arg(short = 's', long, hide = true)]
     svg: Option<PathBuf>,
 
-    /// Filename for generate html version of flamegraph
-    #[arg(long)]
+    /// [hidden] Filename for HTML flamegraph (use -o file.html instead)
+    #[arg(long, hide = true)]
     html: Option<PathBuf>,
 
-    /// Generate json data format in d3 flamegraph format
-    #[arg(long)]
+    /// [hidden] d3-flamegraph JSON (use -o file.json instead)
+    #[arg(long, hide = true)]
     json: Option<PathBuf>,
 
-    /// Filename for pprof protobuf output (gzip-compressed, .pb.gz).
-    /// Compatible with `go tool pprof`, Grafana/Pyroscope, Speedscope, etc.
-    #[arg(long)]
+    /// [hidden] pprof protobuf output (use -o file.pb.gz instead)
+    #[arg(long, hide = true)]
     pprof: Option<PathBuf>,
 
-    /// Filename for AWS CodeGuru Profiler JSON output.
-    /// Output can be uploaded via `aws codeguruprofiler post-agent-profile`.
-    #[arg(long)]
+    /// [hidden] CodeGuru JSON output (use -o file.codeguru.json instead)
+    #[arg(long, hide = true)]
     codeguru: Option<PathBuf>,
 
     /// Upload profile directly to AWS CodeGuru Profiler.
@@ -153,22 +215,12 @@ struct Opt {
     #[arg(short, long, default_value_t = 99)]
     frequency: u64,
 
-    /// function name to attached kprobe
-    #[arg(long)]
+    /// [hidden] kprobe function name (use -e kprobe:<fn> instead)
+    #[arg(long, hide = true)]
     kprobe: Option<String>,
 
-    /// Uprobe specification. GDB-style smart matching:
-    ///   malloc                        - auto-discover library
-    ///   libc:malloc                   - explicit library
-    ///   /usr/lib/libc.so.6:malloc     - absolute path
-    ///   ret:malloc                    - return probe
-    ///   malloc+0x10                   - function + offset
-    ///   pthread_*                     - glob pattern
-    ///   /regex_pattern/               - regex matching
-    ///   std::vector::push_back        - demangled name match
-    ///   main.c:42                     - source file:line (DWARF)
-    /// Can be specified multiple times to attach multiple probes.
-    #[arg(long)]
+    /// [hidden] Uprobe specification (use -e uprobe:<spec> or -e <spec> instead)
+    #[arg(long, hide = true)]
     uprobe: Vec<String>,
 
     /// PID to attach uprobe to (if not specified, attaches to all processes)
@@ -176,12 +228,13 @@ struct Opt {
     uprobe_pid: Option<i32>,
 
     /// List matching probe targets without attaching (discovery mode).
-    /// Pass a probe spec like --list-probes 'pthread_*'
+    /// Accepts unified prefix syntax: --list-probes 'uprobe:pthread_*'
+    /// or bare spec: --list-probes 'pthread_*'
     #[arg(long)]
     list_probes: Option<String>,
 
-    /// function name to attached tracepoint eg.
-    #[arg(long)]
+    /// [hidden] tracepoint (use -e tracepoint:<cat:name> instead)
+    #[arg(long, hide = true)]
     tracepoint: Option<String>,
 
     #[arg(long, default_value_t = false)]
@@ -248,8 +301,11 @@ impl Opt {
     /// Returns true if the user expressed any profiling intent via flags.
     /// When false, we show help instead of silently starting a system-wide profile.
     fn has_user_intent(&self) -> bool {
-        // Any output format requested
-        self.collapse.is_some()
+        // New unified flags
+        !self.output.is_empty()
+            || !self.event.is_empty()
+            // Legacy output format flags
+            || self.collapse.is_some()
             || self.svg.is_some()
             || self.html.is_some()
             || self.json.is_some()
@@ -264,7 +320,7 @@ impl Opt {
             || self.cmd.is_some()
             || !self.command.is_empty()
             || self.self_profile
-            // Probe types
+            // Legacy probe type flags
             || self.kprobe.is_some()
             || !self.uprobe.is_empty()
             || self.tracepoint.is_some()
@@ -278,7 +334,7 @@ impl Opt {
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
-    let opt = Opt::parse();
+    let mut opt = Opt::parse();
 
     // If no meaningful flags were provided, show help with examples and exit.
     if !opt.has_user_intent() {
@@ -288,6 +344,52 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             .unwrap_or_else(|| "probee".to_string());
         Opt::command().bin_name(bin_name).print_long_help()?;
         std::process::exit(0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Normalize legacy flags into the unified -o / -e vectors.
+    // After this block, only `resolved_outputs`, `opt.event` are used for
+    // output formats and probe types respectively.
+    // -----------------------------------------------------------------------
+
+    // Resolve output formats: -o paths use extension inference, legacy flags use known format
+    let mut resolved_outputs: Vec<(OutputFormat, PathBuf)> = Vec::new();
+
+    // -o / --output paths: infer format from extension
+    for p in &opt.output {
+        let fmt = infer_output_format(p)?;
+        resolved_outputs.push((fmt, p.clone()));
+    }
+
+    // Legacy output flags: format is known from the flag itself
+    if let Some(p) = opt.svg.take() {
+        resolved_outputs.push((OutputFormat::Svg, p));
+    }
+    if let Some(p) = opt.html.take() {
+        resolved_outputs.push((OutputFormat::Html, p));
+    }
+    if let Some(p) = opt.json.take() {
+        resolved_outputs.push((OutputFormat::Json, p));
+    }
+    if let Some(p) = opt.collapse.take() {
+        resolved_outputs.push((OutputFormat::Collapse, p));
+    }
+    if let Some(p) = opt.pprof.take() {
+        resolved_outputs.push((OutputFormat::Pprof, p));
+    }
+    if let Some(p) = opt.codeguru.take() {
+        resolved_outputs.push((OutputFormat::CodeGuru, p));
+    }
+
+    // Legacy probe flags → -e vec
+    if let Some(k) = opt.kprobe.take() {
+        opt.event.push(format!("kprobe:{}", k));
+    }
+    for u in std::mem::take(&mut opt.uprobe) {
+        opt.event.push(format!("uprobe:{}", u));
+    }
+    if let Some(t) = opt.tracepoint.take() {
+        opt.event.push(format!("tracepoint:{}", t));
     }
 
     // TUI and serve modes can now run together
@@ -307,21 +409,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     #[cfg(feature = "tui")]
     if opt.tui {
         // Warn about output flags that TUI mode doesn't support
-        let unsupported: Vec<&str> = [
-            opt.pprof.as_ref().map(|_| "--pprof"),
-            opt.codeguru.as_ref().map(|_| "--codeguru"),
-            opt.svg.as_ref().map(|_| "--svg"),
-            opt.html.as_ref().map(|_| "--html"),
-            opt.json.as_ref().map(|_| "--json"),
-            opt.collapse.as_ref().map(|_| "--collapse"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if !unsupported.is_empty() {
+        if !resolved_outputs.is_empty() {
+            let names: Vec<String> = resolved_outputs
+                .iter()
+                .map(|(_, p)| format!("-o {}", p.display()))
+                .collect();
             eprintln!(
                 "Warning: {} ignored in TUI mode (TUI has its own output pipeline)",
-                unsupported.join(", ")
+                names.join(", ")
             );
         }
 
@@ -364,16 +459,27 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // profile_bee::load(&opt.cmd.unwrap()).unwrap();
     // return Ok(());
 
+    // Parse -e / --event specs into categorized probe config
+    let (parsed_kprobe, parsed_uprobe_specs, parsed_tracepoint) = parse_event_specs(&opt.event)?;
+
     // Validate mutually exclusive options
-    if opt.off_cpu && (opt.kprobe.is_some() || !opt.uprobe.is_empty() || opt.tracepoint.is_some()) {
+    if opt.off_cpu
+        && (parsed_kprobe.is_some()
+            || !parsed_uprobe_specs.is_empty()
+            || parsed_tracepoint.is_some())
+    {
         return Err(anyhow::anyhow!(
-            "--off-cpu is mutually exclusive with --kprobe, --uprobe, and --tracepoint"
+            "--off-cpu is mutually exclusive with kprobe, uprobe, and tracepoint events"
         ));
     }
 
     // Resolve smart uprobe specs (if any)
-    let smart_uprobe = if !opt.uprobe.is_empty() {
-        Some(resolve_uprobe_specs(&opt.uprobe, opt.pid, opt.uprobe_pid)?)
+    let smart_uprobe = if !parsed_uprobe_specs.is_empty() {
+        Some(resolve_uprobe_specs(
+            &parsed_uprobe_specs,
+            opt.pid,
+            opt.uprobe_pid,
+        )?)
     } else {
         None
     };
@@ -383,10 +489,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         skip_idle: opt.skip_idle,
         stream_mode: opt.stream_mode,
         frequency: opt.frequency,
-        kprobe: opt.kprobe.clone(),
+        kprobe: parsed_kprobe,
         uprobe: None,
         smart_uprobe,
-        tracepoint: opt.tracepoint.clone(),
+        tracepoint: parsed_tracepoint,
         raw_tracepoint: None,
         raw_tracepoint_task_regs: None,
         raw_tracepoint_generic: None,
@@ -532,48 +638,53 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     let started = Instant::now();
 
-    // Build output sink from CLI options
+    // Build output sinks from resolved outputs (format + path pairs)
     let mut sinks: Vec<Box<dyn OutputSink>> = Vec::new();
-    if let Some(svg_path) = &opt.svg {
-        let title = if opt.off_cpu {
-            format!(
-                "Off-CPU Time Flame Graph ({}ms, finish_task_switch)",
-                opt.time.unwrap_or(10000)
-            )
-        } else {
-            format!(
-                "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
-                opt.time.unwrap_or(10000),
-                opt.frequency
-            )
-        };
-        sinks.push(Box::new(SvgSink::new(svg_path.clone(), title, opt.off_cpu)));
+    for (fmt, path) in &resolved_outputs {
+        match fmt {
+            OutputFormat::Svg => {
+                let title = if opt.off_cpu {
+                    format!(
+                        "Off-CPU Time Flame Graph ({}ms, finish_task_switch)",
+                        opt.time.unwrap_or(10000)
+                    )
+                } else {
+                    format!(
+                        "Flamegraph profile generated from profile-bee ({}ms @ {}hz)",
+                        opt.time.unwrap_or(10000),
+                        opt.frequency
+                    )
+                };
+                sinks.push(Box::new(SvgSink::new(path.clone(), title, opt.off_cpu)));
+            }
+            OutputFormat::Html => {
+                sinks.push(Box::new(HtmlSink::new(path.clone())));
+            }
+            OutputFormat::Json => {
+                sinks.push(Box::new(JsonFileSink::new(path.clone())));
+            }
+            OutputFormat::Collapse => {
+                sinks.push(Box::new(CollapseSink::new(path.clone())));
+            }
+            OutputFormat::Pprof => {
+                sinks.push(Box::new(PprofSink::new(
+                    path.clone(),
+                    opt.frequency,
+                    opt.time.unwrap_or(10000) as u64,
+                    opt.off_cpu,
+                )));
+            }
+            OutputFormat::CodeGuru => {
+                sinks.push(Box::new(CodeGuruSink::new(
+                    path.clone(),
+                    opt.frequency,
+                    opt.time.unwrap_or(10000) as u64,
+                    opt.off_cpu,
+                )));
+            }
+        }
     }
-    if let Some(html_path) = &opt.html {
-        sinks.push(Box::new(HtmlSink::new(html_path.clone())));
-    }
-    if let Some(json_path) = &opt.json {
-        sinks.push(Box::new(JsonFileSink::new(json_path.clone())));
-    }
-    if let Some(collapse_path) = &opt.collapse {
-        sinks.push(Box::new(CollapseSink::new(collapse_path.clone())));
-    }
-    if let Some(pprof_path) = &opt.pprof {
-        sinks.push(Box::new(PprofSink::new(
-            pprof_path.clone(),
-            opt.frequency,
-            opt.time.unwrap_or(10000) as u64,
-            opt.off_cpu,
-        )));
-    }
-    if let Some(codeguru_path) = &opt.codeguru {
-        sinks.push(Box::new(CodeGuruSink::new(
-            codeguru_path.clone(),
-            opt.frequency,
-            opt.time.unwrap_or(10000) as u64,
-            opt.off_cpu,
-        )));
-    }
+    // CodeGuru upload is a cloud action, not a file output — stays as its own flag
     #[cfg(feature = "aws")]
     if opt.codeguru_upload {
         let group = opt
@@ -590,11 +701,16 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             },
             ..Default::default()
         };
+        // Check if any resolved output is CodeGuru format (to also save locally)
+        let local_codeguru_path = resolved_outputs
+            .iter()
+            .find(|(fmt, _)| *fmt == OutputFormat::CodeGuru)
+            .map(|(_, p)| p.clone());
         sinks.push(Box::new(
             profile_bee::codeguru_upload::CodeGuruUploadSink::new(
                 group.clone(),
                 codeguru_opts,
-                opt.codeguru.clone(), // also save locally if --codeguru was specified
+                local_codeguru_path,
                 tokio::runtime::Handle::current(),
             ),
         ));
@@ -666,13 +782,28 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 }
 
 /// Handle --list-probes: resolve and display matching symbols, then exit.
+/// Accepts unified prefix syntax: 'uprobe:pthread_*', 'kprobe:vfs_*', or bare spec: 'pthread_*'
 fn handle_list_probes(
     probe_str: &str,
     pid: Option<u32>,
     uprobe_pid: Option<i32>,
 ) -> Result<(), anyhow::Error> {
-    let spec = parse_probe_spec(probe_str)
-        .map_err(|e| anyhow::anyhow!("invalid probe spec '{}': {}", probe_str, e))?;
+    // Strip event-kind prefix if present (for unified syntax support)
+    let (kind, rest) = parse_event_prefix(probe_str);
+    let spec_str = match kind {
+        EventKind::Kprobe => {
+            eprintln!("Note: --list-probes currently only supports uprobe targets; kprobe: prefix ignored");
+            rest
+        }
+        EventKind::Tracepoint => {
+            eprintln!("Note: --list-probes currently only supports uprobe targets; tracepoint: prefix ignored");
+            rest
+        }
+        _ => rest,
+    };
+
+    let spec = parse_probe_spec(spec_str)
+        .map_err(|e| anyhow::anyhow!("invalid probe spec '{}': {}", spec_str, e))?;
 
     eprintln!("Searching for: {}", spec);
 
@@ -693,6 +824,51 @@ fn handle_list_probes(
     Ok(())
 }
 
+/// Parse `-e` / `--event` specs into categorized probe configuration.
+///
+/// Returns (kprobe, uprobe_specs, tracepoint) — each is None/empty if not specified.
+#[allow(clippy::type_complexity)]
+fn parse_event_specs(
+    events: &[String],
+) -> Result<(Option<String>, Vec<String>, Option<String>), anyhow::Error> {
+    let mut kprobe: Option<String> = None;
+    let mut uprobe_specs: Vec<String> = Vec::new();
+    let mut tracepoint: Option<String> = None;
+
+    for spec in events {
+        let (kind, rest) = parse_event_prefix(spec);
+        match kind {
+            EventKind::Kprobe => {
+                if kprobe.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "multiple kprobe events not supported — got duplicate: {}",
+                        spec
+                    ));
+                }
+                kprobe = Some(rest.to_string());
+            }
+            EventKind::Uprobe => {
+                uprobe_specs.push(rest.to_string());
+            }
+            EventKind::Uretprobe => {
+                // Prepend "ret:" so the existing ProbeSpec parser handles it
+                uprobe_specs.push(format!("ret:{}", rest));
+            }
+            EventKind::Tracepoint => {
+                if tracepoint.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "multiple tracepoint events not supported — got duplicate: {}",
+                        spec
+                    ));
+                }
+                tracepoint = Some(rest.to_string());
+            }
+        }
+    }
+
+    Ok((kprobe, uprobe_specs, tracepoint))
+}
+
 /// Parse update mode from string
 #[cfg(feature = "tui")]
 fn parse_update_mode(mode: &str) -> profile_bee_tui::state::UpdateMode {
@@ -710,10 +886,17 @@ fn parse_update_mode(mode: &str) -> profile_bee_tui::state::UpdateMode {
 // ---------------------------------------------------------------------------
 
 /// Builds a `ProfilerConfig` from CLI options, resolving smart uprobe specs.
+/// Uses the unified `-e` / `--event` vec (after normalization from legacy flags).
 #[cfg(feature = "tui")]
 fn build_profiler_config(opt: &Opt, pid: Option<u32>) -> Result<ProfilerConfig, anyhow::Error> {
-    let smart_uprobe = if !opt.uprobe.is_empty() {
-        Some(resolve_uprobe_specs(&opt.uprobe, pid, opt.uprobe_pid)?)
+    let (parsed_kprobe, parsed_uprobe_specs, parsed_tracepoint) = parse_event_specs(&opt.event)?;
+
+    let smart_uprobe = if !parsed_uprobe_specs.is_empty() {
+        Some(resolve_uprobe_specs(
+            &parsed_uprobe_specs,
+            pid,
+            opt.uprobe_pid,
+        )?)
     } else {
         None
     };
@@ -722,10 +905,10 @@ fn build_profiler_config(opt: &Opt, pid: Option<u32>) -> Result<ProfilerConfig, 
         skip_idle: opt.skip_idle,
         stream_mode: opt.stream_mode,
         frequency: opt.frequency,
-        kprobe: opt.kprobe.clone(),
+        kprobe: parsed_kprobe,
         uprobe: None,
         smart_uprobe,
-        tracepoint: opt.tracepoint.clone(),
+        tracepoint: parsed_tracepoint,
         raw_tracepoint: None,
         raw_tracepoint_task_regs: None,
         raw_tracepoint_generic: None,
