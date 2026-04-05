@@ -131,7 +131,7 @@ these to populate different visualization views:
 ## Example: On-CPU Profile
 
 ```bash
-sudo probee --codeguru profile.json --time 10000
+sudo probee -o profile.codeguru.json -t 10000
 ```
 
 ```json
@@ -165,7 +165,7 @@ sudo probee --codeguru profile.json --time 10000
 ## Example: Off-CPU Profile
 
 ```bash
-sudo probee --codeguru offcpu.json --off-cpu --time 10000
+sudo probee -o offcpu.codeguru.json --off-cpu -t 10000
 ```
 
 ```json

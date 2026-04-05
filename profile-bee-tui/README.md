@@ -39,7 +39,7 @@ This crate is not meant to be used directly. Instead, use it through profile-bee
 cargo build --release --features tui
 
 # Use the TUI viewer
-sudo ./target/release/profile-bee --tui --cmd "your-command"
+sudo ./target/release/profile-bee --tui -- your-command
 ```
 
 ## Architecture
