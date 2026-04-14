@@ -802,10 +802,7 @@ fn warn_nodejs_without_perf_map(pid: u32) {
         Ok(p) => p,
         Err(_) => return,
     };
-    let basename = exe_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let basename = exe_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if !matches!(basename, "node" | "nodejs" | "nsolid") {
         return;
     }
@@ -822,12 +819,8 @@ fn warn_nodejs_without_perf_map(pid: u32) {
     );
     eprintln!("JavaScript function names will appear as [unknown] in the flamegraph.");
     eprintln!("To enable JIT symbol resolution, restart Node.js with:");
-    eprintln!(
-        "  node --perf-prof --interpreted-frames-native-stack <script>"
-    );
-    eprintln!(
-        "Or use profile-bee's auto-injection: probee -- node <script>\n"
-    );
+    eprintln!("  node --perf-prof --interpreted-frames-native-stack <script>");
+    eprintln!("Or use profile-bee's auto-injection: probee -- node <script>\n");
 }
 
 /// Handle --list-probes: resolve and display matching symbols, then exit.
