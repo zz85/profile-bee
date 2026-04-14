@@ -610,14 +610,34 @@ impl DwarfUnwindManager {
                 continue;
             }
 
+            let start_addr = map.address.0;
+            let end_addr = map.address.1;
+
+            // Anonymous executable mappings (JIT code from V8, JVM, etc.) have no
+            // backing ELF file and thus no DWARF unwind info. Register them as
+            // FP-only zones (shard_id = SHARD_NONE, table_count = 0) so the eBPF
+            // unwinder uses frame-pointer walking through these regions instead of
+            // failing the LPM lookup entirely. This is critical for mixed stacks
+            // (native → JIT → native) where the JIT frames need FP unwinding but
+            // surrounding native frames should still use DWARF.
+            if matches!(&map.pathname, MMapPath::Anonymous | MMapPath::Other(_)) {
+                mappings.push(ExecMapping {
+                    begin: start_addr,
+                    end: end_addr,
+                    load_bias: 0,
+                    shard_id: profile_bee_common::SHARD_NONE,
+                    _pad1: [0; 2],
+                    table_count: 0,
+                });
+                continue;
+            }
+
             let file_path = match &map.pathname {
                 MMapPath::Path(p) => p.to_path_buf(),
                 MMapPath::Vdso => std::path::PathBuf::from("[vdso]"),
                 _ => continue,
             };
 
-            let start_addr = map.address.0;
-            let end_addr = map.address.1;
             let file_offset = map.offset;
             let is_vdso = matches!(&map.pathname, MMapPath::Vdso);
 

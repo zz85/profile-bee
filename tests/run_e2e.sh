@@ -445,6 +445,96 @@ test_offcpu_min_block_filter() {
     fi
 }
 
+# ---------- Node.js / JIT Runtime tests -------------------------------------
+
+# Run the profiler against a Node.js script with perf-map support.
+# Uses -- <command> syntax so setup_process_to_profile auto-injects NODE_OPTIONS.
+run_node_profiler() {
+    local script="$1"
+    local name="$2"
+    shift 2
+    local extra_args=("$@")
+    local collapse_file="$OUTPUT_DIR/${name}.collapse"
+
+    local profiler_output
+    profiler_output=$(DURATION_MS=$((PROFILE_TIME_MS + 500)) timeout "$TEST_TIMEOUT" "$PROFILER" \
+        --time "$PROFILE_TIME_MS" \
+        --frequency "$FREQUENCY" \
+        --collapse "$collapse_file" \
+        --skip-idle \
+        "${extra_args[@]+"${extra_args[@]}"}" \
+        -- node "$script" 2>&1) || true
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "--- profiler output ---" >&2
+        echo "$profiler_output" >&2
+        echo "--- end ---" >&2
+    fi
+
+    if [[ ! -f "$collapse_file" ]]; then
+        echo "Collapse file not created: $collapse_file" >&2
+        return 1
+    fi
+
+    echo "$collapse_file"
+}
+
+test_nodejs_callstack() {
+    if ! command -v node &>/dev/null; then
+        echo "  SKIP: node not found in PATH" >&2
+        return 0
+    fi
+
+    local script="$SCRIPT_DIR/fixtures/src/node_callstack.js"
+    if [[ ! -f "$script" ]]; then
+        echo "  SKIP: fixture $script not found" >&2
+        return 0
+    fi
+
+    local file
+    file=$(run_node_profiler "$script" "nodejs-callstack")
+
+    local total
+    total=$(count_samples "$file")
+    if [[ "$total" -le 0 ]]; then
+        echo "  No samples collected for Node.js" >&2
+        return 1
+    fi
+
+    # V8 perf-map symbols should be formatted by our V8 symbol formatter.
+    # Look for our JS function names. After formatting, they appear as:
+    #   hot (node_callstack.js:8)  or  ~hot (node_callstack.js:8)
+    # But they might also appear raw if perf-map wasn't ready: LazyCompile:*hot
+    # Accept any form — the key test is that JS function names appear at all.
+    assert_stack_contains "$file" "hot\|processData\|handleRequest\|serverLoop" \
+        "At least one JavaScript function should appear in the stack"
+}
+
+test_nodejs_samples_collected() {
+    if ! command -v node &>/dev/null; then
+        echo "  SKIP: node not found in PATH" >&2
+        return 0
+    fi
+
+    local script="$SCRIPT_DIR/fixtures/src/node_callstack.js"
+    if [[ ! -f "$script" ]]; then
+        echo "  SKIP: fixture $script not found" >&2
+        return 0
+    fi
+
+    local file
+    file=$(run_node_profiler "$script" "nodejs-samples")
+
+    local total
+    total=$(count_samples "$file")
+    if [[ "$total" -gt 0 ]]; then
+        return 0
+    else
+        echo "  No samples collected for Node.js (total=$total)" >&2
+        return 1
+    fi
+}
+
 # ── Run all tests ────────────────────────────────────────────────────────────
 
 echo ""
@@ -490,6 +580,11 @@ echo ""
 echo "── Off-CPU Profiling ──"
 run_test "Off-CPU captures sleep stacks"             test_offcpu_sleep
 run_test "Off-CPU min-block-time filter"             test_offcpu_min_block_filter
+echo ""
+
+echo "── Node.js / JIT Runtime ──"
+run_test "Node.js samples collected"                 test_nodejs_samples_collected
+run_test "Node.js JS function names in stacks"       test_nodejs_callstack
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────────

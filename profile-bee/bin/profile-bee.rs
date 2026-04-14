@@ -569,6 +569,16 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         println!("Profiling PID {}..", target_pid);
     }
 
+    // Warn if profiling an existing Node.js process without perf-map file.
+    // When we spawn the process ourselves (--cmd / -- <command>), NODE_OPTIONS
+    // is injected automatically by setup_process_to_profile(). This warning
+    // only applies to --pid targeting an already-running process.
+    if spawn.is_none() {
+        if let Some(target_pid) = pid {
+            warn_nodejs_without_perf_map(target_pid);
+        }
+    }
+
     // Take ownership of ring buffer map after DWARF loading
     let ring_buf = setup_ring_buffer(&mut ebpf_profiler.bpf)?;
 
@@ -779,6 +789,45 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     Ok(())
+}
+
+/// Warn if profiling an already-running Node.js process that lacks a perf-map
+/// file. Without `--perf-prof`, V8 JIT-compiled JavaScript functions show as
+/// `[unknown]` in flamegraphs because there is no symbol information for
+/// dynamically generated machine code in anonymous memory mappings.
+fn warn_nodejs_without_perf_map(pid: u32) {
+    // Check if the target is a Node.js process by reading /proc/<pid>/exe
+    let exe_link = format!("/proc/{}/exe", pid);
+    let exe_path = match std::fs::read_link(&exe_link) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let basename = exe_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if !matches!(basename, "node" | "nodejs" | "nsolid") {
+        return;
+    }
+
+    // Check for perf-map file
+    let perf_map = format!("/tmp/perf-{}.map", pid);
+    if std::path::Path::new(&perf_map).exists() {
+        return; // perf-map file present, JIT symbols will be resolved
+    }
+
+    eprintln!(
+        "\n\x1b[33mWarning: Profiling Node.js process (PID {}) without JIT symbol support.\x1b[0m",
+        pid
+    );
+    eprintln!("JavaScript function names will appear as [unknown] in the flamegraph.");
+    eprintln!("To enable JIT symbol resolution, restart Node.js with:");
+    eprintln!(
+        "  node --perf-prof --interpreted-frames-native-stack <script>"
+    );
+    eprintln!(
+        "Or use profile-bee's auto-injection: probee -- node <script>\n"
+    );
 }
 
 /// Handle --list-probes: resolve and display matching symbols, then exit.
@@ -1412,6 +1461,13 @@ async fn run_combined_mode(
     let (mut ebpf_profiler, ring_buf, tgid_request_tx) =
         setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf.unwrap_or(false))?;
 
+    // Warn if targeting an existing Node.js process without perf-map
+    if spawn.is_none() {
+        if let Some(target_pid) = pid {
+            warn_nodejs_without_perf_map(target_pid);
+        }
+    }
+
     // TUI app + update handle
     let update_mode = parse_update_mode(&opt.update_mode);
     let mut app = if let Some(buf) = output_buffer {
@@ -1512,6 +1568,13 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     let (perf_tx, perf_rx) = mpsc::channel();
     let (mut ebpf_profiler, ring_buf, tgid_request_tx) =
         setup_ebpf_and_dwarf(&mut config, &perf_tx, pid, opt.dwarf.unwrap_or(false))?;
+
+    // Warn if targeting an existing Node.js process without perf-map
+    if spawn.is_none() {
+        if let Some(target_pid) = pid {
+            warn_nodejs_without_perf_map(target_pid);
+        }
+    }
 
     // TUI app + update handle
     let update_mode = parse_update_mode(&opt.update_mode);
