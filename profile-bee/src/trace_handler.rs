@@ -101,12 +101,29 @@ fn format_v8_symbol(raw: &str) -> Option<String> {
 /// Shorten a V8 source location for display.
 /// Input:  `/home/user/app/server.js:42:5`
 /// Output: `server.js:42`
+///
+/// Splits from the right so that paths containing colons are handled
+/// correctly (e.g. `node:internal/modules/cjs/loader.js:42:5`).
 fn format_short_source(source: &str) -> String {
-    // Split off the path from the line:column suffix
-    // Find the file basename and first line number
-    let parts: Vec<&str> = source.splitn(3, ':').collect();
-    let file_path = parts[0];
-    let line = parts.get(1);
+    // Split from the right: at most 3 parts → [path, line, column]
+    // e.g. "node:internal/modules/cjs/loader.js:42:5"
+    //    → ["node:internal/modules/cjs/loader.js", "42", "5"]
+    let parts: Vec<&str> = source.rsplitn(3, ':').collect();
+    // rsplitn yields parts in reverse order: [column, line, path]
+    let (file_path, line) = match parts.len() {
+        3 => (parts[2], Some(parts[1])),
+        2 => {
+            // Could be "path:line" or "path:something" — check if the
+            // last segment looks like a line number
+            if parts[0].bytes().all(|b| b.is_ascii_digit()) {
+                (parts[1], Some(parts[0]))
+            } else {
+                // Not a line number, treat entire string as path
+                (source, None)
+            }
+        }
+        _ => (source, None),
+    };
 
     let basename = Path::new(file_path)
         .file_name()
@@ -545,5 +562,35 @@ mod tests {
         );
         assert_eq!(format_short_source("/app/index.js"), "index.js");
         assert_eq!(format_short_source("server.js:10:1"), "server.js:10");
+    }
+
+    #[test]
+    fn test_format_short_source_node_internal() {
+        // V8 emits paths like "node:internal/modules/cjs/loader.js:42:5"
+        // for built-in modules — the colon in "node:" must not be treated
+        // as a line-number separator.
+        assert_eq!(
+            format_short_source("node:internal/modules/cjs/loader.js:42:5"),
+            "loader.js:42"
+        );
+        assert_eq!(
+            format_short_source("node:internal/main/run_main_module.js:1:1"),
+            "run_main_module.js:1"
+        );
+    }
+
+    #[test]
+    fn test_format_short_source_no_line() {
+        // Path with no line/column at all
+        assert_eq!(format_short_source("/app/index.js"), "index.js");
+    }
+
+    #[test]
+    fn test_format_short_source_path_only_with_colon() {
+        // A path with colon but no numeric suffix — should not split
+        assert_eq!(
+            format_short_source("node:internal/modules/cjs/loader.js"),
+            "loader.js"
+        );
     }
 }

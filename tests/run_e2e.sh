@@ -456,6 +456,10 @@ run_node_profiler() {
     local extra_args=("$@")
     local collapse_file="$OUTPUT_DIR/${name}.collapse"
 
+    # Remove any stale collapse file so the existence check below
+    # verifies that the profiler actually produced fresh output.
+    rm -f "$collapse_file"
+
     local profiler_output
     profiler_output=$(DURATION_MS=$((PROFILE_TIME_MS + 500)) timeout "$TEST_TIMEOUT" "$PROFILER" \
         --time "$PROFILE_TIME_MS" \
@@ -535,6 +539,33 @@ test_nodejs_samples_collected() {
     fi
 }
 
+test_nodejs_dwarf_callstack() {
+    if ! command -v node &>/dev/null; then
+        echo "  SKIP: node not found in PATH" >&2
+        return 0
+    fi
+
+    local script="$SCRIPT_DIR/fixtures/src/node_callstack.js"
+    if [[ ! -f "$script" ]]; then
+        echo "  SKIP: fixture $script not found" >&2
+        return 0
+    fi
+
+    local file
+    file=$(run_node_profiler "$script" "nodejs-dwarf-callstack" --dwarf true)
+
+    local total
+    total=$(count_samples "$file")
+    if [[ "$total" -le 0 ]]; then
+        echo "  No samples collected for Node.js with DWARF" >&2
+        return 1
+    fi
+
+    # Same assertion as the FP-only test — at least one JS function name visible
+    assert_stack_contains "$file" "hot\|processData\|handleRequest\|serverLoop" \
+        "At least one JavaScript function should appear with DWARF enabled"
+}
+
 # ── Run all tests ────────────────────────────────────────────────────────────
 
 echo ""
@@ -585,6 +616,7 @@ echo ""
 echo "── Node.js / JIT Runtime ──"
 run_test "Node.js samples collected"                 test_nodejs_samples_collected
 run_test "Node.js JS function names in stacks"       test_nodejs_callstack
+run_test "Node.js DWARF + FP-only JIT zones"         test_nodejs_dwarf_callstack
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────────
