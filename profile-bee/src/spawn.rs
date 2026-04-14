@@ -192,15 +192,19 @@ fn build_runtime_env(program: &str) -> Vec<(&'static str, String)> {
     let mut env = Vec::new();
 
     if is_nodejs_program(program) {
-        let node_flags = "--perf-prof --interpreted-frames-native-stack";
+        // --perf-basic-prof: writes /tmp/perf-<pid>.map with JIT symbol addresses
+        //   (NOT --perf-prof which writes a binary jitdump for `perf inject`)
+        // --interpreted-frames-native-stack: use native frames for interpreted JS
+        //   so the frame-pointer unwinder can walk through them
+        let node_flags = "--perf-basic-prof --interpreted-frames-native-stack";
 
         // Merge with existing NODE_OPTIONS if set
         let value = match std::env::var("NODE_OPTIONS") {
             Ok(existing) if !existing.is_empty() => {
                 // Don't duplicate flags if they're already present
                 let mut combined = existing.clone();
-                if !existing.contains("--perf-prof") {
-                    combined.push_str(" --perf-prof");
+                if !existing.contains("--perf-basic-prof") {
+                    combined.push_str(" --perf-basic-prof");
                 }
                 if !existing.contains("--interpreted-frames-native-stack") {
                     combined.push_str(" --interpreted-frames-native-stack");

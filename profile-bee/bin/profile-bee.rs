@@ -819,7 +819,7 @@ fn warn_nodejs_without_perf_map(pid: u32) {
     );
     eprintln!("JavaScript function names will appear as [unknown] in the flamegraph.");
     eprintln!("To enable JIT symbol resolution, restart Node.js with:");
-    eprintln!("  node --perf-prof --interpreted-frames-native-stack <script>");
+    eprintln!("  node --perf-basic-prof --interpreted-frames-native-stack <script>");
     eprintln!("Or use profile-bee's auto-injection: probee -- node <script>\n");
 }
 
