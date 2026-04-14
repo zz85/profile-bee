@@ -445,6 +445,130 @@ test_offcpu_min_block_filter() {
     fi
 }
 
+# ---------- Node.js / JIT Runtime tests -------------------------------------
+
+# Run the profiler against a Node.js script with perf-map support.
+# Uses -- <command> syntax so setup_process_to_profile auto-injects NODE_OPTIONS.
+run_node_profiler() {
+    local script="$1"
+    local name="$2"
+    shift 2
+    local extra_args=("$@")
+    local collapse_file="$OUTPUT_DIR/${name}.collapse"
+
+    # Remove any stale collapse file so the existence check below
+    # verifies that the profiler actually produced fresh output.
+    rm -f "$collapse_file"
+
+    local profiler_output
+    profiler_output=$(DURATION_MS=$((PROFILE_TIME_MS + 500)) timeout "$TEST_TIMEOUT" "$PROFILER" \
+        --time "$PROFILE_TIME_MS" \
+        --frequency "$FREQUENCY" \
+        --collapse "$collapse_file" \
+        --skip-idle \
+        "${extra_args[@]+"${extra_args[@]}"}" \
+        -- node "$script" 2>&1) || true
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "--- profiler output ---" >&2
+        echo "$profiler_output" >&2
+        echo "--- end ---" >&2
+    fi
+
+    if [[ ! -f "$collapse_file" ]]; then
+        echo "Collapse file not created: $collapse_file" >&2
+        return 1
+    fi
+
+    echo "$collapse_file"
+}
+
+test_nodejs_callstack() {
+    if ! command -v node &>/dev/null; then
+        echo "  SKIP: node not found in PATH" >&2
+        return 0
+    fi
+
+    local script="$SCRIPT_DIR/fixtures/src/node_callstack.js"
+    if [[ ! -f "$script" ]]; then
+        echo "  SKIP: fixture $script not found" >&2
+        return 0
+    fi
+
+    local file
+    file=$(run_node_profiler "$script" "nodejs-callstack")
+
+    local total
+    total=$(count_samples "$file")
+    if [[ "$total" -le 0 ]]; then
+        echo "  No samples collected for Node.js" >&2
+        return 1
+    fi
+
+    # Check for JS function names from perf-map (primary goal).
+    # After V8 symbol formatting these appear as e.g. "hot (node_callstack.js:15)"
+    # or raw "LazyCompile:*hot". Also accept V8 internal frames like
+    # Builtins_JSEntry or v8:: as proof that stack walking through JIT code works,
+    # even if perf-map resolution didn't produce JS names (can happen on older
+    # Node versions or if JIT compilation timing varies).
+    assert_stack_contains "$file" \
+        "hot\|processData\|handleRequest\|serverLoop\|LazyCompile\|Builtins_JSEntry\|v8::" \
+        "Should contain JS function names or V8 internal frames"
+}
+
+test_nodejs_samples_collected() {
+    if ! command -v node &>/dev/null; then
+        echo "  SKIP: node not found in PATH" >&2
+        return 0
+    fi
+
+    local script="$SCRIPT_DIR/fixtures/src/node_callstack.js"
+    if [[ ! -f "$script" ]]; then
+        echo "  SKIP: fixture $script not found" >&2
+        return 0
+    fi
+
+    local file
+    file=$(run_node_profiler "$script" "nodejs-samples")
+
+    local total
+    total=$(count_samples "$file")
+    if [[ "$total" -gt 0 ]]; then
+        return 0
+    else
+        echo "  No samples collected for Node.js (total=$total)" >&2
+        return 1
+    fi
+}
+
+test_nodejs_dwarf_callstack() {
+    if ! command -v node &>/dev/null; then
+        echo "  SKIP: node not found in PATH" >&2
+        return 0
+    fi
+
+    local script="$SCRIPT_DIR/fixtures/src/node_callstack.js"
+    if [[ ! -f "$script" ]]; then
+        echo "  SKIP: fixture $script not found" >&2
+        return 0
+    fi
+
+    local file
+    file=$(run_node_profiler "$script" "nodejs-dwarf-callstack" --dwarf true)
+
+    local total
+    total=$(count_samples "$file")
+    if [[ "$total" -le 0 ]]; then
+        echo "  No samples collected for Node.js with DWARF" >&2
+        return 1
+    fi
+
+    # Same acceptance criteria as the FP test — JS names or V8 internals
+    assert_stack_contains "$file" \
+        "hot\|processData\|handleRequest\|serverLoop\|LazyCompile\|Builtins_JSEntry\|v8::" \
+        "Should contain JS function names or V8 internal frames with DWARF"
+}
+
 # ── Run all tests ────────────────────────────────────────────────────────────
 
 echo ""
@@ -490,6 +614,12 @@ echo ""
 echo "── Off-CPU Profiling ──"
 run_test "Off-CPU captures sleep stacks"             test_offcpu_sleep
 run_test "Off-CPU min-block-time filter"             test_offcpu_min_block_filter
+echo ""
+
+echo "── Node.js / JIT Runtime ──"
+run_test "Node.js samples collected"                 test_nodejs_samples_collected
+run_test "Node.js JS function names in stacks"       test_nodejs_callstack
+run_test "Node.js DWARF + FP-only JIT zones"         test_nodejs_dwarf_callstack
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────────

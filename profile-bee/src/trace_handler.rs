@@ -11,6 +11,136 @@ use blazesym::symbolize::Symbolizer;
 use blazesym::Addr;
 use blazesym::Pid;
 use profile_bee_common::StackInfo;
+use std::path::Path;
+
+/// V8 perf-map symbol prefixes and their meanings.
+/// V8 emits symbols like `LazyCompile:*functionName /path/file.js:10:5`
+/// where the prefix indicates the compilation tier and `*` means optimized,
+/// `~` means interpreted (unoptimized).
+const V8_PREFIXES: &[&str] = &[
+    "LazyCompile:",
+    "Script:",
+    "Eval:",
+    "Function:",
+    "Builtin:",
+    "Stub:",
+    "BytecodeHandler:",
+    "Handler:",
+    "RegExp:",
+];
+
+/// Format a V8 perf-map symbol into a clean display name.
+///
+/// Input:  `LazyCompile:*processData /home/user/app/server.js:42:5`
+/// Output: `processData (server.js:42)` for optimized or
+///         `~processData (server.js:42)` for interpreted
+///
+/// For builtins/stubs without source: `Builtin:ArgumentsAdaptorTrampoline`
+/// Output: `[v8] ArgumentsAdaptorTrampoline`
+fn format_v8_symbol(raw: &str) -> Option<String> {
+    // Find which prefix matches
+    let (prefix, rest) = V8_PREFIXES
+        .iter()
+        .find_map(|p| raw.strip_prefix(p).map(|rest| (*p, rest)))?;
+
+    let is_builtin = matches!(
+        prefix,
+        "Builtin:" | "Stub:" | "BytecodeHandler:" | "Handler:"
+    );
+
+    // Parse optimization marker: * = optimized, ~ = interpreted
+    let (opt_marker, name_and_source) = if rest.starts_with('*') || rest.starts_with('~') {
+        (&rest[..1], &rest[1..])
+    } else {
+        ("", rest)
+    };
+
+    // Split name from source location (separated by space, source starts with /)
+    // e.g. "processData /home/user/app/server.js:42:5"
+    let (func_name, source_loc) = if let Some(space_idx) = name_and_source.rfind(" /") {
+        (
+            &name_and_source[..space_idx],
+            Some(&name_and_source[space_idx + 1..]),
+        )
+    } else if let Some(space_idx) = name_and_source.find(' ') {
+        // Source might not start with / (e.g. relative paths or URLs)
+        (
+            &name_and_source[..space_idx],
+            Some(&name_and_source[space_idx + 1..]),
+        )
+    } else {
+        (name_and_source, None)
+    };
+
+    if func_name.is_empty() && source_loc.is_none() {
+        return None;
+    }
+
+    // For builtins/stubs, use a simpler format
+    if is_builtin {
+        return Some(format!("[v8] {}", func_name));
+    }
+
+    // Build clean display name
+    let display_name = if opt_marker == "~" {
+        format!("~{}", func_name)
+    } else {
+        func_name.to_string()
+    };
+
+    // Format source location: extract basename and line number
+    // "/home/user/app/server.js:42:5" -> "server.js:42"
+    if let Some(src) = source_loc {
+        let short_source = format_short_source(src);
+        Some(format!("{} ({})", display_name, short_source))
+    } else {
+        Some(display_name)
+    }
+}
+
+/// Shorten a V8 source location for display.
+/// Input:  `/home/user/app/server.js:42:5`
+/// Output: `server.js:42`
+///
+/// Splits from the right so that paths containing colons are handled
+/// correctly (e.g. `node:internal/modules/cjs/loader.js:42:5`).
+fn format_short_source(source: &str) -> String {
+    // Split from the right: at most 3 parts → [path, line, column]
+    // e.g. "node:internal/modules/cjs/loader.js:42:5"
+    //    → ["node:internal/modules/cjs/loader.js", "42", "5"]
+    let parts: Vec<&str> = source.rsplitn(3, ':').collect();
+    // rsplitn yields parts in reverse order: [column, line, path]
+    let (file_path, line) = match parts.len() {
+        3 => (parts[2], Some(parts[1])),
+        2 => {
+            // Could be "path:line" or "path:something" — check if the
+            // last segment looks like a line number
+            if parts[0].bytes().all(|b| b.is_ascii_digit()) {
+                (parts[1], Some(parts[0]))
+            } else {
+                // Not a line number, treat entire string as path
+                (source, None)
+            }
+        }
+        _ => (source, None),
+    };
+
+    let basename = Path::new(file_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(file_path);
+
+    if let Some(line) = line {
+        format!("{}:{}", basename, line)
+    } else {
+        basename.to_string()
+    }
+}
+
+/// Check if a symbol name looks like a V8 perf-map entry.
+fn is_v8_symbol(name: &str) -> bool {
+    V8_PREFIXES.iter().any(|p| name.starts_with(p))
+}
 
 pub struct SymbolFormatter;
 
@@ -33,7 +163,7 @@ impl SymbolFormatter {
         }
     }
 
-    /// Simple symbol name only
+    /// Symbol name with V8 perf-map formatting applied when detected.
     fn map_user_sym_to_stack(sym: Symbolized) -> StackFrameInfo {
         let sym = match sym {
             Symbolized::Sym(sym) => sym,
@@ -45,8 +175,15 @@ impl SymbolFormatter {
             }
         };
 
+        let name = sym.name.to_string();
+        let display_name = if is_v8_symbol(&name) {
+            format_v8_symbol(&name).unwrap_or(name)
+        } else {
+            name
+        };
+
         StackFrameInfo {
-            symbol: Some(format!("{}", sym.name)),
+            symbol: Some(display_name),
             ..Default::default()
         }
     }
@@ -347,5 +484,113 @@ impl TraceHandler {
         combined.reverse();
 
         combined
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_v8_optimized_with_source() {
+        let result = format_v8_symbol("LazyCompile:*processData /home/user/app/server.js:42:5");
+        assert_eq!(result, Some("processData (server.js:42)".to_string()));
+    }
+
+    #[test]
+    fn test_v8_interpreted_with_source() {
+        let result = format_v8_symbol("LazyCompile:~handleRequest /home/user/app/handler.js:10:3");
+        assert_eq!(result, Some("~handleRequest (handler.js:10)".to_string()));
+    }
+
+    #[test]
+    fn test_v8_script() {
+        let result = format_v8_symbol("Script: /home/user/app/main.js:1:1");
+        assert_eq!(result, Some(" (main.js:1)".to_string()));
+    }
+
+    #[test]
+    fn test_v8_builtin() {
+        let result = format_v8_symbol("Builtin:ArgumentsAdaptorTrampoline");
+        assert_eq!(result, Some("[v8] ArgumentsAdaptorTrampoline".to_string()));
+    }
+
+    #[test]
+    fn test_v8_stub() {
+        let result = format_v8_symbol("Stub:CEntry");
+        assert_eq!(result, Some("[v8] CEntry".to_string()));
+    }
+
+    #[test]
+    fn test_v8_regex() {
+        let result = format_v8_symbol("RegExp:foo[a-z]+bar");
+        assert_eq!(result, Some("foo[a-z]+bar".to_string()));
+    }
+
+    #[test]
+    fn test_v8_no_source() {
+        let result = format_v8_symbol("LazyCompile:*someFunction");
+        assert_eq!(result, Some("someFunction".to_string()));
+    }
+
+    #[test]
+    fn test_not_v8() {
+        assert!(!is_v8_symbol("std::io::Read::read"));
+        assert!(!is_v8_symbol("[unknown]"));
+        assert!(!is_v8_symbol("main"));
+    }
+
+    #[test]
+    fn test_is_v8_symbol() {
+        assert!(is_v8_symbol("LazyCompile:*foo"));
+        assert!(is_v8_symbol("Builtin:bar"));
+        assert!(is_v8_symbol("Stub:CEntry"));
+        assert!(is_v8_symbol("Script:baz"));
+    }
+
+    #[test]
+    fn test_v8_eval() {
+        let result = format_v8_symbol("Eval:*evalFunc eval:1:10");
+        assert_eq!(result, Some("evalFunc (eval:1)".to_string()));
+    }
+
+    #[test]
+    fn test_format_short_source() {
+        assert_eq!(
+            format_short_source("/home/user/app/server.js:42:5"),
+            "server.js:42"
+        );
+        assert_eq!(format_short_source("/app/index.js"), "index.js");
+        assert_eq!(format_short_source("server.js:10:1"), "server.js:10");
+    }
+
+    #[test]
+    fn test_format_short_source_node_internal() {
+        // V8 emits paths like "node:internal/modules/cjs/loader.js:42:5"
+        // for built-in modules — the colon in "node:" must not be treated
+        // as a line-number separator.
+        assert_eq!(
+            format_short_source("node:internal/modules/cjs/loader.js:42:5"),
+            "loader.js:42"
+        );
+        assert_eq!(
+            format_short_source("node:internal/main/run_main_module.js:1:1"),
+            "run_main_module.js:1"
+        );
+    }
+
+    #[test]
+    fn test_format_short_source_no_line() {
+        // Path with no line/column at all
+        assert_eq!(format_short_source("/app/index.js"), "index.js");
+    }
+
+    #[test]
+    fn test_format_short_source_path_only_with_colon() {
+        // A path with colon but no numeric suffix — should not split
+        assert_eq!(
+            format_short_source("node:internal/modules/cjs/loader.js"),
+            "loader.js"
+        );
     }
 }

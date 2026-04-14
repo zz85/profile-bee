@@ -1,5 +1,5 @@
 use std::io::Error;
-// use std::process::{Child, Command, Stdio};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
@@ -34,20 +34,29 @@ pub struct SpawnProcess {
 }
 
 impl SpawnProcess {
-    pub fn spawn(program: &str, args: &[&str]) -> Result<(Self, StopHandler), Error> {
-        Self::spawn_internal(program, args, false)
+    pub fn spawn(
+        program: &str,
+        args: &[&str],
+        extra_env: &[(&str, String)],
+    ) -> Result<(Self, StopHandler), Error> {
+        Self::spawn_internal(program, args, false, extra_env)
     }
 
     /// Spawn the child with piped stdout and stderr so the parent can
     /// capture its output (e.g. for displaying in the TUI).
-    pub fn spawn_captured(program: &str, args: &[&str]) -> Result<(Self, StopHandler), Error> {
-        Self::spawn_internal(program, args, true)
+    pub fn spawn_captured(
+        program: &str,
+        args: &[&str],
+        extra_env: &[(&str, String)],
+    ) -> Result<(Self, StopHandler), Error> {
+        Self::spawn_internal(program, args, true, extra_env)
     }
 
     fn spawn_internal(
         program: &str,
         args: &[&str],
         capture: bool,
+        extra_env: &[(&str, String)],
     ) -> Result<(Self, StopHandler), Error> {
         use std::process::Stdio;
 
@@ -56,6 +65,9 @@ impl SpawnProcess {
 
         let mut cmd = Command::new(program);
         cmd.args(args);
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
         if capture {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
@@ -159,6 +171,59 @@ impl Drop for SpawnProcess {
     }
 }
 
+/// Check if a program name looks like Node.js.
+fn is_nodejs_program(program: &str) -> bool {
+    let basename = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    matches!(basename, "node" | "nodejs" | "nsolid")
+}
+
+/// Build extra environment variables for runtime-specific profiling support.
+///
+/// For Node.js processes, injects `NODE_OPTIONS` with `--perf-prof` (writes
+/// `/tmp/perf-<pid>.map` for JIT symbol resolution) and
+/// `--interpreted-frames-native-stack` (enables frame pointers in interpreted
+/// frames for reliable stack unwinding).
+///
+/// Merges with any existing `NODE_OPTIONS` from the parent environment.
+fn build_runtime_env(program: &str) -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+
+    if is_nodejs_program(program) {
+        // --perf-basic-prof: writes /tmp/perf-<pid>.map with JIT symbol addresses
+        //   (NOT --perf-prof which writes a binary jitdump for `perf inject`)
+        // --interpreted-frames-native-stack: use native frames for interpreted JS
+        //   so the frame-pointer unwinder can walk through them
+        let node_flags = "--perf-basic-prof --interpreted-frames-native-stack";
+
+        // Merge with existing NODE_OPTIONS if set
+        let value = match std::env::var("NODE_OPTIONS") {
+            Ok(existing) if !existing.is_empty() => {
+                // Don't duplicate flags if they're already present
+                let mut combined = existing.clone();
+                if !existing.contains("--perf-basic-prof") {
+                    combined.push_str(" --perf-basic-prof");
+                }
+                if !existing.contains("--interpreted-frames-native-stack") {
+                    combined.push_str(" --interpreted-frames-native-stack");
+                }
+                combined
+            }
+            _ => node_flags.to_string(),
+        };
+
+        tracing::info!(
+            "Node.js detected: injecting NODE_OPTIONS=\"{}\" for JIT symbol resolution",
+            value
+        );
+        env.push(("NODE_OPTIONS", value));
+    }
+
+    env
+}
+
 /// Sets up the process to profile if a command is provided.
 ///
 /// Returns `(Option<StopHandler>, Option<SpawnProcess>)`.  When no command
@@ -167,17 +232,14 @@ impl Drop for SpawnProcess {
 /// When `capture_output` is true, the child's stdout/stderr are piped so
 /// the caller can read them (e.g. for TUI display).  Use
 /// [`SpawnProcess::take_stdout`] / [`take_stderr`] to obtain the handles.
+///
+/// For Node.js commands, automatically injects `NODE_OPTIONS` environment
+/// variables to enable JIT symbol resolution via perf-map files.
 pub fn setup_process_to_profile(
     cmd: &Option<String>,
     command: &[String],
     capture_output: bool,
 ) -> anyhow::Result<(Option<StopHandler>, Option<SpawnProcess>)> {
-    let spawn_fn = if capture_output {
-        SpawnProcess::spawn_captured
-    } else {
-        SpawnProcess::spawn
-    };
-
     // Prefer the new command format (--) over the old --cmd format
     if !command.is_empty() {
         let program = &command[0];
@@ -185,7 +247,13 @@ pub fn setup_process_to_profile(
 
         tracing::info!("Running command: {} {}", program, args.join(" "));
 
-        let (child, stopper) = spawn_fn(program, &args)?;
+        let extra_env = build_runtime_env(program);
+        let spawn_fn = if capture_output {
+            SpawnProcess::spawn_captured
+        } else {
+            SpawnProcess::spawn
+        };
+        let (child, stopper) = spawn_fn(program, &args, &extra_env)?;
         tracing::info!("Profiling PID {}..", child.pid());
 
         return Ok((Some(stopper), Some(child)));
@@ -201,7 +269,13 @@ pub fn setup_process_to_profile(
 
         // todo: use shelltools
         let args: Vec<_> = cmd.split(' ').collect();
-        let (child, stopper) = spawn_fn(args[0], &args[1..])?;
+        let extra_env = build_runtime_env(args[0]);
+        let spawn_fn = if capture_output {
+            SpawnProcess::spawn_captured
+        } else {
+            SpawnProcess::spawn
+        };
+        let (child, stopper) = spawn_fn(args[0], &args[1..], &extra_env)?;
 
         tracing::info!("Profiling PID {}..", child.pid());
 
