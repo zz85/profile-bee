@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.12
+
+### New Features
+
+- **Node.js profiling support** — profile Node.js applications with JavaScript function names resolved via V8's perf-map files. When spawning via `probee -- node app.js`, automatically injects `NODE_OPTIONS` with `--perf-basic-prof` (writes `/tmp/perf-<pid>.map`) and `--interpreted-frames-native-stack` (enables frame pointers in interpreter frames). blazesym's built-in perf-map support reads these files during symbolization.
+- **V8 symbol formatting** — V8 perf-map symbols like `LazyCompile:*processData /app/server.js:42:5` are formatted into clean display names (`processData (server.js:42)`) for readable flamegraphs. Handles all V8 symbol types: optimized (`*`), interpreted (`~`), builtins, stubs, regex, and eval.
+- **FP-only zones for JIT code** — anonymous executable memory mappings (V8 JIT, JVM HotSpot, etc.) are registered in the eBPF LPM trie with `shard_id=SHARD_NONE` so the unwinder uses frame-pointer walking through JIT regions while preserving DWARF unwinding for surrounding native frames. Enables correct mixed native/JIT stack traces with `--dwarf`.
+- **Node.js missing perf-map warning** — when profiling an existing Node.js process via `--pid` without a perf-map file, prints a warning with instructions to restart with `--perf-basic-prof` or use `probee -- node <script>` for automatic injection.
+
+### Improvements
+
+- **E2E test infrastructure** — `run_test` now recognizes exit code 77 as SKIP (autotools convention) with distinct yellow status output, so missing optional dependencies (e.g. `node`) are reported accurately instead of silently passing.
+- **Node.js E2E tests** — three new test cases: sample collection, JS function name resolution, and DWARF mode with FP-only JIT zones. Tests skip gracefully when `node` is not installed.
+
 ## v0.3.11
 
 ### New Features
