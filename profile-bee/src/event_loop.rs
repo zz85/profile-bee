@@ -16,7 +16,7 @@ use crate::ebpf::{apply_dwarf_refresh, FramePointersPod, StackInfoPod};
 use crate::pipeline::{DwarfThreadMsg, PerfWork};
 use crate::process_metadata::ProcessMetadataCache;
 use crate::trace_handler::TraceHandler;
-use crate::types::FrameCount;
+use crate::types::{FrameCount, StackInfoExt};
 
 /// Result of a single `collect` call.
 pub struct CollectResult {
@@ -37,6 +37,28 @@ pub struct CollectResult {
 pub struct RawCollectResult {
     /// Symbolized stack frames with sample counts.
     pub stacks: Vec<FrameCount>,
+    /// Whether the profiling loop received a Stop or exit event.
+    pub stopped: bool,
+}
+
+/// A single unsymbolized stack sample with raw instruction pointer addresses.
+///
+/// Used by the raw/offline output mode to capture addresses for post-hoc
+/// symbolization. Contains everything needed to re-symbolize the stack later:
+/// PID (for `/proc/<pid>/maps`), process name, and raw kernel + user addresses.
+pub struct RawAddressSample {
+    pub tgid: u32,
+    pub cmd: String,
+    pub cpu: u32,
+    pub kernel_addrs: Vec<u64>,
+    pub user_addrs: Vec<u64>,
+    pub count: u64,
+}
+
+/// Result of a single `collect_unsymbolized` call.
+pub struct UnsymbolizedCollectResult {
+    /// Raw address samples (not symbolized).
+    pub samples: Vec<RawAddressSample>,
     /// Whether the profiling loop received a Stop or exit event.
     pub stopped: bool,
 }
@@ -160,6 +182,26 @@ impl ProfilingEventLoop {
         let (local_counting, stopped) = self.drain_events(rx, timeout);
         let stacks = self.build_raw_stacks(local_counting);
         RawCollectResult { stacks, stopped }
+    }
+
+    /// Drain events and return unsymbolized raw address samples.
+    ///
+    /// Like [`collect`](Self::collect) but skips symbolization entirely,
+    /// returning raw instruction pointer addresses for each stack sample.
+    /// Use this for offline/post-hoc symbolization workflows where captures
+    /// need to be fast and symbolization happens later.
+    ///
+    /// The returned [`UnsymbolizedCollectResult`] contains [`RawAddressSample`]
+    /// values with kernel and user address vectors that can be serialized
+    /// for later re-symbolization (e.g. with `probee symbolize`).
+    pub fn collect_unsymbolized(
+        &mut self,
+        rx: &mpsc::Receiver<PerfWork>,
+        timeout: Option<Duration>,
+    ) -> UnsymbolizedCollectResult {
+        let (local_counting, stopped) = self.drain_events(rx, timeout);
+        let samples = self.build_raw_address_samples(local_counting);
+        UnsymbolizedCollectResult { samples, stopped }
     }
 
     /// Immediately evict process metadata for PIDs that exited during
@@ -362,6 +404,45 @@ impl ProfilingEventLoop {
         }
 
         stacks
+    }
+
+    /// Extract raw address samples without symbolization.
+    ///
+    /// Same source iteration as [`build_raw_stacks`] but calls
+    /// [`TraceHandler::get_raw_addresses`] instead of symbolization,
+    /// producing [`RawAddressSample`] values with raw instruction pointers.
+    fn build_raw_address_samples(&mut self, local_counting: bool) -> Vec<RawAddressSample> {
+        let sources: Vec<(StackInfo, u64)> = if local_counting {
+            self.trace_count
+                .iter()
+                .map(|(&s, &v)| (s, v as u64))
+                .collect()
+        } else {
+            self.counts
+                .iter()
+                .flatten()
+                .map(|(k, v)| (k.0, v))
+                .collect()
+        };
+
+        let mut samples = Vec::new();
+        for (stack, count) in &sources {
+            let (kernel_addrs, user_addrs) = self.trace_handler.get_raw_addresses(
+                stack,
+                &self.stack_traces,
+                &self.stacked_pointers,
+            );
+            samples.push(RawAddressSample {
+                tgid: stack.tgid,
+                cmd: stack.get_cmd(),
+                cpu: stack.cpu,
+                kernel_addrs,
+                user_addrs,
+                count: *count,
+            });
+        }
+
+        samples
     }
 
     /// Build collapse-format output from trace counts or kernel counts.

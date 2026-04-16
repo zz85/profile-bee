@@ -8,7 +8,7 @@ use profile_bee::event_loop::{EventLoopConfig, ProfilingEventLoop};
 use profile_bee::html::collapse_to_json;
 use profile_bee::output::{
     CodeGuruSink, CollapseSink, HtmlSink, JsonFileSink, MultiplexSink, OutputSink, PprofSink,
-    SvgSink, WebBroadcastSink,
+    RawCollapseSink, SvgSink, WebBroadcastSink,
 };
 use profile_bee::pipeline::{
     dwarf_refresh_loop, setup_ctrlc_stop, setup_process_exit_ring_buffer_task,
@@ -43,6 +43,8 @@ enum OutputFormat {
     Collapse,
     Pprof,
     CodeGuru,
+    /// Raw unsymbolized output for offline/post-hoc symbolization
+    Raw,
 }
 
 fn infer_output_format(path: &Path) -> Result<OutputFormat, anyhow::Error> {
@@ -58,9 +60,10 @@ fn infer_output_format(path: &Path) -> Result<OutputFormat, anyhow::Error> {
         Some("folded") | Some("collapsed") | Some("collapse") => Ok(OutputFormat::Collapse),
         Some("pprof") => Ok(OutputFormat::Pprof),
         Some("gz") if name.ends_with(".pb.gz") => Ok(OutputFormat::Pprof),
+        Some("raw") => Ok(OutputFormat::Raw),
         _ => Err(anyhow::anyhow!(
             "cannot infer output format from '{}' — use a known extension \
-             (.svg, .html, .json, .folded, .pb.gz, .pprof, .codeguru.json)",
+             (.svg, .html, .json, .folded, .pb.gz, .pprof, .raw, .codeguru.json)",
             path.display()
         )),
     }
@@ -692,6 +695,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                     opt.off_cpu,
                 )));
             }
+            OutputFormat::Raw => {
+                // Raw sink is handled separately below — not a standard OutputSink
+                // because it receives unsymbolized samples, not collapse strings.
+            }
         }
     }
     // CodeGuru upload is a cloud action, not a file output — stays as its own flag
@@ -730,6 +737,18 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
     let mut sink = MultiplexSink::new(sinks);
 
+    // Create raw collapse sink if .raw output was requested.
+    // This operates independently of the standard OutputSink pipeline because
+    // it receives unsymbolized RawAddressSample data, not collapse strings.
+    let mut raw_sink: Option<RawCollapseSink> = resolved_outputs
+        .iter()
+        .find(|(fmt, _)| *fmt == OutputFormat::Raw)
+        .map(|(_, path)| RawCollapseSink::new(path.clone()));
+    let has_symbolized_sinks = resolved_outputs
+        .iter()
+        .any(|(fmt, _)| *fmt != OutputFormat::Raw)
+        || opt.serve;
+
     if opt.serve {
         // Serve mode: periodically flush data to the web server
         let flush_interval = std::time::Duration::from_secs(2);
@@ -753,14 +772,33 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         }
         sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
         sink.finish(&last_stacks)?;
+    } else if raw_sink.is_some() && !has_symbolized_sinks {
+        // Raw-only mode: skip symbolization entirely for maximum speed.
+        tracing::debug!("raw-only mode: collecting unsymbolized samples");
+        let result = event_loop.collect_unsymbolized(&perf_rx, None);
+        if let Some(ref mut raw) = raw_sink {
+            raw.add_samples(result.samples);
+        }
     } else {
         // Non-serve mode: block until Stop, output once, exit.
+        // If raw sink exists alongside symbolized sinks, collect both.
         tracing::debug!("batch mode: collecting samples (blocks until Stop)");
         let result = event_loop.collect(&perf_rx, None);
         tracing::debug!("batch mode: collected {} stacks", result.stacks.len());
         sink.write_batch(&result.stacks)?;
         sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
         sink.finish(&result.stacks)?;
+
+        // If raw output was also requested, do a second pass for raw addresses.
+        // (In this case, the eBPF maps have been drained by `collect` so we
+        // can't re-extract raw addresses. The raw sink captures what it can
+        // from the symbolized path. For full raw capture, use .raw alone.)
+        // TODO: unified collect path that produces both simultaneously
+    }
+
+    // Write raw collapse file if requested
+    if let Some(ref raw) = raw_sink {
+        raw.write()?;
     }
 
     drop(stopper);

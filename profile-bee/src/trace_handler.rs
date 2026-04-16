@@ -359,6 +359,42 @@ impl TraceHandler {
         result
     }
 
+    /// Extract raw instruction pointer addresses without symbolization.
+    ///
+    /// Returns `(kernel_addrs, user_addrs)` — the same raw `u64` addresses that
+    /// [`get_exp_stacked_frames`] would pass to blazesym, but without the
+    /// symbolization step. Used by the raw/offline output mode to capture
+    /// addresses for post-hoc symbolization.
+    ///
+    /// Follows the same logic as `get_exp_stacked_frames` for selecting the
+    /// best user stack (stacked_pointers vs bpf_get_stackid).
+    pub fn get_raw_addresses(
+        &mut self,
+        stack_info: &StackInfo,
+        stack_traces: &StackTraceMap<MapData>,
+        stacked_pointers: &aya::maps::HashMap<MapData, StackInfoPod, FramePointersPod>,
+    ) -> (Vec<u64>, Vec<u64>) {
+        let (kernel_stack, fp_user_stack) = self.get_instruction_pointers(stack_info, stack_traces);
+
+        let key = StackInfoPod(*stack_info);
+
+        // Same stacked_pointers preference logic as get_exp_stacked_frames
+        let user_stack = if let Ok(pointers) = stacked_pointers.get(&key, 0) {
+            let pointers = pointers.0;
+            let len = pointers.len.min(pointers.pointers.len());
+            let fp_len = fp_user_stack.as_ref().map_or(0, |v| v.len());
+            if len > fp_len {
+                pointers.pointers[..len].to_vec()
+            } else {
+                fp_user_stack.unwrap_or_default()
+            }
+        } else {
+            fp_user_stack.unwrap_or_default()
+        };
+
+        (kernel_stack.unwrap_or_default(), user_stack)
+    }
+
     /// Converts stacks traces into StackFrameInfo structs
     pub fn get_stacked_frames(
         &mut self,
