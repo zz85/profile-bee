@@ -11,6 +11,7 @@ pub mod html;
 pub mod process_metadata;
 pub mod session;
 pub mod spawn;
+pub mod symbolize;
 
 mod legacy;
 pub mod types;

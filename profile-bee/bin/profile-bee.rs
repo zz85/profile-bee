@@ -337,6 +337,14 @@ impl Opt {
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
+    // Intercept `probee symbolize <file.raw> [-o output]` before clap parses
+    // the main Opt struct, since `symbolize` is a subcommand that doesn't
+    // share the profiling flags.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("symbolize") {
+        return run_symbolize_subcommand(&args[2..]);
+    }
+
     let mut opt = Opt::parse();
 
     // If no meaningful flags were provided, show help with examples and exit.
@@ -859,6 +867,98 @@ fn warn_nodejs_without_perf_map(pid: u32) {
     eprintln!("To enable JIT symbol resolution, restart Node.js with:");
     eprintln!("  node --perf-basic-prof --interpreted-frames-native-stack <script>");
     eprintln!("Or use profile-bee's auto-injection: probee -- node <script>\n");
+}
+
+/// Handle `probee symbolize <file.raw> [-o output.svg] [-o output.folded]`.
+///
+/// Re-symbolizes a raw capture file produced by `-o profile.raw`, resolving
+/// addresses via blazesym and writing the result to one or more output formats.
+/// If no `-o` flags are given, writes symbolized collapse to stdout.
+fn run_symbolize_subcommand(args: &[String]) -> anyhow::Result<()> {
+    use profile_bee::symbolize::symbolize_raw_file;
+
+    let mut input_path: Option<PathBuf> = None;
+    let mut output_paths: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() {
+                    anyhow::bail!("-o requires an output path");
+                }
+                output_paths.push(PathBuf::from(&args[i]));
+            }
+            arg if arg.starts_with('-') => {
+                anyhow::bail!("unknown flag for symbolize: {}", arg);
+            }
+            _ => {
+                if input_path.is_some() {
+                    anyhow::bail!("only one input file expected, got extra: {}", args[i]);
+                }
+                input_path = Some(PathBuf::from(&args[i]));
+            }
+        }
+        i += 1;
+    }
+
+    let input_path = input_path.ok_or_else(|| {
+        anyhow::anyhow!("usage: probee symbolize <file.raw> [-o output.svg] [-o output.folded]")
+    })?;
+
+    eprintln!("Symbolizing {}...", input_path.display());
+    let collapse_lines = symbolize_raw_file(&input_path)?;
+    eprintln!("Resolved {} collapse lines", collapse_lines.len());
+
+    if output_paths.is_empty() {
+        // Write to stdout
+        for line in &collapse_lines {
+            println!("{}", line);
+        }
+    } else {
+        // Build output sinks and write
+        let mut sinks: Vec<Box<dyn OutputSink>> = Vec::new();
+        for path in &output_paths {
+            let fmt = infer_output_format(path)?;
+            match fmt {
+                OutputFormat::Svg => {
+                    sinks.push(Box::new(SvgSink::new(
+                        path.clone(),
+                        "Re-symbolized profile".to_string(),
+                        false,
+                    )));
+                }
+                OutputFormat::Html => {
+                    sinks.push(Box::new(HtmlSink::new(path.clone())));
+                }
+                OutputFormat::Json => {
+                    sinks.push(Box::new(JsonFileSink::new(path.clone())));
+                }
+                OutputFormat::Collapse => {
+                    sinks.push(Box::new(CollapseSink::new(path.clone())));
+                }
+                OutputFormat::Pprof => {
+                    sinks.push(Box::new(PprofSink::new(path.clone(), 99, 10000, false)));
+                }
+                OutputFormat::Raw => {
+                    anyhow::bail!("cannot output .raw from symbolize (already symbolized)");
+                }
+                OutputFormat::CodeGuru => {
+                    sinks.push(Box::new(CodeGuruSink::new(path.clone(), 99, 10000, false)));
+                }
+            }
+        }
+
+        let mut sink = MultiplexSink::new(sinks);
+        sink.finish(&collapse_lines)?;
+
+        for path in &output_paths {
+            eprintln!("Wrote {}", path.display());
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle --list-probes: resolve and display matching symbols, then exit.
