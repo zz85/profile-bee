@@ -12,7 +12,7 @@ use aya::maps::{MapData, StackTraceMap};
 use aya::Ebpf;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS, PROCESS_EVENT_EXEC, PROCESS_EVENT_EXIT};
 
-use crate::ebpf::{apply_dwarf_refresh, FramePointersPod, StackInfoPod};
+use crate::ebpf::{apply_dwarf_refresh, FramePointersPod, StackInfoPod, V8ProcInfoPod};
 use crate::pipeline::{DwarfThreadMsg, PerfWork};
 use crate::process_metadata::ProcessMetadataCache;
 use crate::trace_handler::TraceHandler;
@@ -222,6 +222,76 @@ impl ProfilingEventLoop {
         }
     }
 
+    /// Detect if a new PID is a Node.js/V8 process and set up V8 introspection.
+    ///
+    /// Reads `/proc/<pid>/exe` to find the binary, then reads `v8dbg_*` ELF
+    /// symbols to discover V8's internal layout. If successful, loads
+    /// `V8ProcInfo` into the eBPF `v8_proc_info` map (so the FP walker
+    /// extracts JSFunction pointers) and registers a `V8HeapReader` in the
+    /// trace handler (so userspace can resolve SFI → function name).
+    fn try_setup_v8_for_pid(&mut self, tgid: u32) {
+        // Read /proc/<pid>/exe to get the binary path
+        let exe_link = format!("/proc/{}/exe", tgid);
+        let exe_path = match std::fs::read_link(&exe_link) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        if !crate::v8::is_nodejs_binary(&exe_path) {
+            return;
+        }
+
+        tracing::info!(
+            "detected Node.js process (pid {}): {}",
+            tgid,
+            exe_path.display()
+        );
+
+        // Read the ELF binary to extract v8dbg_* introspection symbols
+        let elf_data = match std::fs::read(&exe_path) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("cannot read {}: {}", exe_path.display(), e);
+                return;
+            }
+        };
+
+        let Some(data) = crate::v8::read_introspection_data(&elf_data) else {
+            tracing::warn!(
+                "failed to read V8 introspection data from {}",
+                exe_path.display()
+            );
+            return;
+        };
+
+        // Build compact V8ProcInfo and load into eBPF map
+        let proc_info = data.to_proc_info();
+        match self.bpf.map_mut("v8_proc_info") {
+            Some(map) => {
+                match aya::maps::HashMap::<&mut MapData, u32, V8ProcInfoPod>::try_from(map) {
+                    Ok(mut v8_map) => {
+                        if let Err(e) = v8_map.insert(tgid, V8ProcInfoPod(proc_info), 0) {
+                            tracing::warn!("failed to insert V8ProcInfo for pid {}: {}", tgid, e);
+                        } else {
+                            tracing::info!(
+                                "loaded V8ProcInfo for pid {} (V8 {}.{}.{})",
+                                tgid,
+                                data.version.0,
+                                data.version.1,
+                                data.version.2,
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("v8_proc_info map error: {}", e),
+                }
+            }
+            None => tracing::debug!("v8_proc_info map not found (older eBPF binary)"),
+        }
+
+        // Register V8HeapReader for userspace symbolization
+        self.trace_handler.register_v8_reader(tgid, data);
+    }
+
     /// Drain events from the PerfWork channel, symbolize stacks on the fly,
     /// and return `(local_counting, stopped)`.
     ///
@@ -284,7 +354,14 @@ impl ProfilingEventLoop {
                     if let Some(tx) = &self.tgid_request_tx {
                         if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
                             let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
+                            // Check if this is a Node.js/V8 process and set up
+                            // V8 introspection (eBPF FP context extraction +
+                            // userspace heap reader for JS symbol resolution).
+                            self.try_setup_v8_for_pid(stack.tgid);
                         }
+                    } else if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
+                        // Even without DWARF thread, detect V8 processes
+                        self.try_setup_v8_for_pid(stack.tgid);
                     }
                     if local_counting {
                         let trace = self.trace_count.entry(stack).or_insert(0);

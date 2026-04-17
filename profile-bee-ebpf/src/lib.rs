@@ -20,10 +20,11 @@ use aya_ebpf::{
 // use aya_log_ebpf::info;
 use profile_bee_common::{
     DwarfUnwindState, ExecMapping, ExecMappingKey, FramePointers, StackInfo, UnwindEntry,
-    CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
+    V8ProcInfo, CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
     EXEC_MAPPING_KEY_BITS, FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH,
     MAX_BIN_SEARCH_DEPTH, MAX_DWARF_STACK_DEPTH, MAX_EXEC_MAPPING_ENTRIES, MAX_SHARD_ENTRIES,
-    MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
+    MAX_UNWIND_SHARDS, MAX_V8_FRAMES, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
+    V8_FP_CONTEXT_SIZE,
 };
 
 // Force LLVM to retain the full type definition of UnwindEntry during LTO.
@@ -214,6 +215,16 @@ pub static PROG_ARRAY: ProgramArray = ProgramArray::with_max_entries(4, 0);
 #[map(name = "dwarf_stats")]
 pub static DWARF_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(4, 0);
 
+// --- V8 / Node.js introspection ---
+
+/// Per-process V8 introspection data, keyed by tgid.
+/// Userspace populates this when a Node.js process is detected, with offsets
+/// parsed from v8dbg_* ELF symbols. The FP walker reads this to extract
+/// JSFunction pointers from V8's frame pointer context slots.
+#[map(name = "v8_proc_info")]
+pub static V8_PROC_INFO: HashMap<u32, profile_bee_common::V8ProcInfo> =
+    HashMap::with_max_entries(256, 0);
+
 // --- Off-CPU profiling maps ---
 
 /// Tracks when each thread (by kernel PID = thread ID) went off-CPU.
@@ -288,7 +299,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         let (ip, bp, len) = dwarf_copy_stack_regs(&*regs, &mut pointer.pointers, tgid);
         (ip, bp, len, (*regs).rsp)
     } else {
-        copy_stack_regs(&*regs, &mut pointer.pointers)
+        copy_stack_regs(&*regs, pointer)
     };
     pointer.len = len;
 
@@ -419,7 +430,7 @@ unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &pt_r
         let (ip, bp, len) = dwarf_copy_stack_regs(regs, &mut pointer.pointers, tgid);
         (ip, bp, len, regs.rsp)
     } else {
-        copy_stack_regs(regs, &mut pointer.pointers)
+        copy_stack_regs(regs, pointer)
     };
     pointer.len = len;
 
@@ -605,7 +616,7 @@ pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
         let (ip, bp, len) = dwarf_copy_stack_regs(&regs, &mut pointer.pointers, tgid);
         (ip, bp, len, regs.rsp)
     } else {
-        copy_stack_regs(&regs, &mut pointer.pointers)
+        copy_stack_regs(&regs, pointer)
     };
     pointer.len = len;
 
@@ -815,7 +826,7 @@ unsafe fn dwarf_copy_stack_regs(
         },
     );
     if EXEC_MAPPINGS.get(&first_key).is_none() {
-        let (ip, bp, len, _sp) = copy_stack_regs(regs, pointers);
+        let (ip, bp, len, _sp) = copy_stack_regs_fp_only(regs, pointers);
         return (ip, bp, len);
     }
 
@@ -1185,7 +1196,37 @@ unsafe fn binary_search_unwind_entry(
 
 /// puts the userspace stack in the target pointer slice (from pt_regs directly)
 #[inline(always)]
-unsafe fn copy_stack_regs(regs: &pt_regs, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
+unsafe fn copy_stack_regs(regs: &pt_regs, pointer: &mut FramePointers) -> (u64, u64, usize, u64) {
+    let (ip, bp, len, sp) = copy_stack_regs_fp_only(regs, &mut pointer.pointers);
+    pointer.len = len;
+
+    // Check if this is a V8 process — look up V8ProcInfo by tgid.
+    // If present, extract JSFunction → SFI pointers from the FP context
+    // for each frame so userspace can resolve JavaScript function names.
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if let Some(vi) = V8_PROC_INFO.get(&tgid) {
+        // Re-walk the frame chain to read V8 FP context for each frame.
+        // We re-read bp from regs since copy_stack_regs_fp_only consumed it.
+        let mut frame_bp = regs.rbp;
+        for i in 1..len {
+            if i >= MAX_V8_FRAMES || frame_bp == 0 {
+                break;
+            }
+            // Read V8 SFI from this frame's FP context
+            if let Some(sfi) = try_read_v8_sfi(vi, frame_bp) {
+                pointer.v8_sfi[i] = sfi;
+            }
+            // Advance to next frame (just read the saved bp, don't need the IP)
+            frame_bp = bpf_probe_read(frame_bp as *const u8 as _).unwrap_or(0);
+        }
+    }
+
+    (ip, bp, len, sp)
+}
+
+/// Pure FP-based stack walking without V8 extraction.
+/// Used internally by `copy_stack_regs` and as a fallback from `dwarf_copy_stack_regs`.
+unsafe fn copy_stack_regs_fp_only(regs: &pt_regs, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
     // instruction pointer
     let ip = regs.rip;
     let sp = regs.rsp;
@@ -1206,6 +1247,61 @@ unsafe fn copy_stack_regs(regs: &pt_regs, pointers: &mut [u64]) -> (u64, u64, us
     }
 
     (ip, bp, len, sp)
+}
+
+/// Try to extract the V8 SharedFunctionInfo tagged pointer from a frame's
+/// FP context. Returns the tagged SFI pointer if the frame looks like a V8
+/// JavaScript frame (JSFunction type check passes).
+///
+/// Reads: [fp - V8_FP_CONTEXT_SIZE + fp_function] → JSFunction tagged ptr
+///        JSFunction.map → Map.instance_type (verify it's a JSFunction)
+///        JSFunction.shared → SharedFunctionInfo tagged ptr
+#[inline(always)]
+unsafe fn try_read_v8_sfi(vi: &V8ProcInfo, bp: u64) -> Option<u64> {
+    // The fp_function offset is a byte offset within the 64-byte FP context
+    // buffer (already mapped from the signed FP-relative offset by userspace).
+    let fp_func_offset = vi.fp_function as u64;
+    if fp_func_offset >= V8_FP_CONTEXT_SIZE as u64 {
+        return None; // invalid/sentinel offset
+    }
+
+    // Read the JSFunction tagged pointer from the FP context
+    let fp_ctx_addr = bp.wrapping_sub(V8_FP_CONTEXT_SIZE as u64);
+    let jsfunc_tagged: u64 =
+        bpf_probe_read_user((fp_ctx_addr + fp_func_offset) as *const u64).ok()?;
+
+    // Check heap object tag (low 2 bits == 01)
+    if jsfunc_tagged & 0x3 != 0x1 {
+        return None;
+    }
+    let jsfunc_addr = jsfunc_tagged & !0x3u64;
+
+    // Verify it's a JSFunction by reading HeapObject.map → Map.instance_type
+    let map_tagged: u64 =
+        bpf_probe_read_user((jsfunc_addr + vi.off_heap_object_map as u64) as *const u64).ok()?;
+    if map_tagged & 0x3 != 0x1 {
+        return None;
+    }
+    let map_addr = map_tagged & !0x3u64;
+
+    let instance_type: u16 =
+        bpf_probe_read_user((map_addr + vi.off_map_instance_type as u64) as *const u16).ok()?;
+
+    // Check if instance_type falls in the JSFunction range
+    if instance_type < vi.type_jsfunction_first || instance_type > vi.type_jsfunction_last {
+        return None;
+    }
+
+    // Read JSFunction.shared → SharedFunctionInfo tagged pointer
+    let sfi_tagged: u64 =
+        bpf_probe_read_user((jsfunc_addr + vi.off_jsfunction_shared as u64) as *const u64).ok()?;
+
+    // Verify it's a heap object
+    if sfi_tagged & 0x3 != 0x1 {
+        return None;
+    }
+
+    Some(sfi_tagged)
 }
 
 /// unwind frame pointer
@@ -1370,7 +1466,7 @@ unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
         let (ip, bp, len) = dwarf_copy_stack_regs(&*regs, &mut pointer.pointers, current_tgid);
         (ip, bp, len, (*regs).rsp)
     } else {
-        copy_stack_regs(&*regs, &mut pointer.pointers)
+        copy_stack_regs(&*regs, pointer)
     };
     pointer.len = len;
 

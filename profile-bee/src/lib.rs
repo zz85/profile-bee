@@ -25,5 +25,7 @@ pub mod pprof;
 pub mod probe_resolver;
 pub mod probe_spec;
 
+pub mod v8;
+
 mod trace_handler;
 pub use trace_handler::*;

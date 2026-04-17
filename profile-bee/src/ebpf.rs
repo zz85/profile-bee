@@ -15,7 +15,7 @@ use aya::{include_bytes_aligned, util::online_cpus};
 use aya::{Btf, Ebpf, EbpfLoader};
 
 use aya::Pod;
-use profile_bee_common::{ExecMapping, ExecMappingKey, ProcessExitEvent, UnwindEntry};
+use profile_bee_common::{ExecMapping, ExecMappingKey, ProcessExitEvent, UnwindEntry, V8ProcInfo};
 
 use crate::dwarf_unwind::{summarize_address_range, DwarfUnwindManager, MappingsDiff};
 
@@ -49,6 +49,11 @@ unsafe impl Pod for ExecMappingPod {}
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessExitEventPod(pub ProcessExitEvent);
 unsafe impl Pod for ProcessExitEventPod {}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct V8ProcInfoPod(pub V8ProcInfo);
+unsafe impl Pod for V8ProcInfoPod {}
 
 /// Wrapper for eBPF stuff
 #[derive(Debug)]
@@ -542,6 +547,44 @@ impl EbpfProfiler {
                 tracing::debug!("lifecycle_tracking_map not found (older eBPF binary)");
                 Ok(())
             }
+        }
+    }
+
+    /// Load V8 introspection data for a Node.js process into the eBPF map.
+    ///
+    /// When the eBPF FP walker encounters this PID, it will read the V8 FP
+    /// context using the offsets in `V8ProcInfo` to extract the JSFunction →
+    /// SharedFunctionInfo pointer for each frame.
+    pub fn load_v8_proc_info(&mut self, tgid: u32, info: &V8ProcInfo) -> Result<(), anyhow::Error> {
+        match self.bpf.map_mut("v8_proc_info") {
+            Some(map) => {
+                let mut v8_map: HashMap<&mut MapData, u32, V8ProcInfoPod> = HashMap::try_from(map)?;
+                v8_map.insert(tgid, V8ProcInfoPod(*info), 0)?;
+                tracing::info!(
+                    "loaded V8ProcInfo for pid {} (version={:#x}, JSFunction types [{}, {}])",
+                    tgid,
+                    info.version,
+                    info.type_jsfunction_first,
+                    info.type_jsfunction_last,
+                );
+                Ok(())
+            }
+            None => {
+                tracing::debug!("v8_proc_info map not found (older eBPF binary)");
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove V8 introspection data for a process that exited.
+    pub fn remove_v8_proc_info(&mut self, tgid: u32) -> Result<(), anyhow::Error> {
+        match self.bpf.map_mut("v8_proc_info") {
+            Some(map) => {
+                let mut v8_map: HashMap<&mut MapData, u32, V8ProcInfoPod> = HashMap::try_from(map)?;
+                let _ = v8_map.remove(&tgid); // ignore error if not present
+                Ok(())
+            }
+            None => Ok(()),
         }
     }
 

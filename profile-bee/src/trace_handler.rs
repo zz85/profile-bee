@@ -1,4 +1,5 @@
 use crate::ebpf::{FramePointersPod, StackInfoPod};
+use crate::v8::{V8HeapReader, V8IntrospectionData};
 use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
 use aya::maps::MapData;
 use aya::maps::StackTraceMap;
@@ -10,7 +11,8 @@ use blazesym::symbolize::Symbolized;
 use blazesym::symbolize::Symbolizer;
 use blazesym::Addr;
 use blazesym::Pid;
-use profile_bee_common::StackInfo;
+use profile_bee_common::{StackInfo, MAX_V8_FRAMES};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// V8 perf-map symbol prefixes and their meanings.
@@ -198,6 +200,9 @@ pub struct TraceHandler {
     symbolizer: Symbolizer,
     /// Simple Cache
     cache: PointerStackFramesCache,
+    /// V8 heap readers per PID, for resolving JavaScript function names
+    /// from SFI pointers extracted by the eBPF V8 frame extractor.
+    v8_readers: HashMap<u32, V8HeapReader>,
 }
 
 impl Default for TraceHandler {
@@ -211,6 +216,7 @@ impl TraceHandler {
         TraceHandler {
             symbolizer: Symbolizer::new(),
             cache: Default::default(),
+            v8_readers: HashMap::new(),
         }
     }
 
@@ -237,7 +243,22 @@ impl TraceHandler {
     /// all cached address-to-symbol mappings for that PID are stale.
     pub fn invalidate_caches_for_pid(&mut self, tgid: u32) {
         self.cache.invalidate_pid(tgid);
+        self.v8_readers.remove(&tgid);
         tracing::debug!("invalidated symbol caches for pid {}", tgid);
+    }
+
+    /// Register a V8 heap reader for a Node.js process.
+    /// The reader uses the V8 introspection data to resolve SFI pointers
+    /// from the eBPF V8 frame extractor to JavaScript function names.
+    pub fn register_v8_reader(&mut self, tgid: u32, data: V8IntrospectionData) {
+        tracing::info!(
+            "registered V8 heap reader for pid {} (V8 {}.{}.{})",
+            tgid,
+            data.version.0,
+            data.version.1,
+            data.version.2,
+        );
+        self.v8_readers.insert(tgid, V8HeapReader::new(tgid, data));
     }
 
     pub fn print_stats(&self) {
@@ -323,30 +344,34 @@ impl TraceHandler {
         let key = StackInfoPod(*stack_info);
 
         // Try to use custom-unwound frame pointers from eBPF (FP or DWARF path)
-        let user_stack = if let Ok(pointers) = stacked_pointers.get(&key, 0) {
+        let (user_stack, v8_sfi) = if let Ok(pointers) = stacked_pointers.get(&key, 0) {
             let pointers = pointers.0;
             let len = pointers.len.min(pointers.pointers.len());
             let fp_len = fp_user_stack.as_ref().map_or(0, |v| v.len());
             if len > fp_len {
                 let addrs: Vec<u64> = pointers.pointers[..len].to_vec();
+                // Extract V8 SFI pointers (parallel to user addresses)
+                let sfi_len = len.min(MAX_V8_FRAMES);
+                let v8_sfi: Vec<u64> = pointers.v8_sfi[..sfi_len].to_vec();
                 tracing::debug!(
                     "Using custom-unwound stack ({} frames, vs {} from stackid) for pid {}",
                     addrs.len(),
                     fp_len,
                     stack_info.tgid,
                 );
-                Some(addrs)
+                (Some(addrs), v8_sfi)
             } else {
-                fp_user_stack
+                (fp_user_stack, Vec::new())
             }
         } else {
-            fp_user_stack
+            (fp_user_stack, Vec::new())
         };
 
         let result = self.format_stack_trace(
             stack_info,
             kernel_stack,
             user_stack,
+            &v8_sfi,
             group_by_cpu,
             group_by_process,
         );
@@ -408,6 +433,7 @@ impl TraceHandler {
             stack_info,
             kernel_stack,
             user_stack,
+            &[], // no V8 metadata in this path
             group_by_cpu,
             group_by_process,
         )
@@ -450,10 +476,11 @@ impl TraceHandler {
     /// Return is an array sorted from the bottom (root) to the top (inner most function)
     /// Looks up symbolization
     fn format_stack_trace(
-        &self,
+        &mut self,
         stack_info: &StackInfo,
         kernel_stack: Option<Vec<u64>>,
         user_stack: Option<Vec<u64>>,
+        v8_sfi: &[u64],
         group_by_cpu: bool,
         group_by_process: bool,
     ) -> Vec<StackFrameInfo> {
@@ -481,10 +508,38 @@ impl TraceHandler {
         let pid = stack_info.tgid;
 
         let addrs = user_stack.unwrap_or_default();
-        let user_syms = self
+        let mut user_syms = self
             .symbolize_user_stack(pid, &addrs)
             .ok()
             .unwrap_or_default();
+
+        // Override symbols for V8 frames using the heap reader.
+        // The v8_sfi array is parallel to the user addresses — if v8_sfi[i] != 0,
+        // frame i is a V8 JavaScript frame and we can resolve the SFI pointer
+        // to a function name + source file via process_vm_readv.
+        if let Some(reader) = self.v8_readers.get_mut(&pid) {
+            for (i, sfi) in v8_sfi.iter().enumerate() {
+                if *sfi == 0 {
+                    continue;
+                }
+                // The v8_sfi array is indexed by frame position in the stacked_pointers.
+                // user_syms is in the same order as addrs (which matches pointers[]).
+                if i < user_syms.len() {
+                    if let Some(v8sym) = reader.resolve_sfi(*sfi) {
+                        let display = if let Some(ref src) = v8sym.source_file {
+                            let basename = Path::new(src)
+                                .file_name()
+                                .and_then(|f| f.to_str())
+                                .unwrap_or(src);
+                            format!("{} ({})", v8sym.function_name, basename)
+                        } else {
+                            v8sym.function_name.clone()
+                        };
+                        user_syms[i].symbol = Some(display);
+                    }
+                }
+            }
+        }
 
         let kernel_addrs = kernel_stack.unwrap_or_default();
         let kernel_syms = self
