@@ -714,11 +714,16 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 
     // Set up stopping mechanisms
     // CLI defaults to 10s profiling windows;
-    // serve mode defaults to unlimited (like TUI modes).
-    let duration = opt.time.unwrap_or(if opt.serve { 0 } else { 10000 });
+    // serve/flush-interval modes default to unlimited (like TUI modes).
+    let is_continuous = opt.serve || opt.flush_interval.is_some();
+    let duration = opt.time.unwrap_or(if is_continuous { 0 } else { 10000 });
     setup_timer_and_child_stop(duration, perf_tx.clone(), spawn);
     setup_ctrlc_stop(perf_tx.clone(), stopper.clone());
-    println!("Waiting for Ctrl-C...");
+    if is_continuous && opt.time.is_none() {
+        println!("Profiling continuously (Ctrl-C to stop)...");
+    } else {
+        println!("Waiting for Ctrl-C...");
+    }
 
     // Start symbol uploader if --symbol-server is configured.
     // Uploads ELF binaries from /proc/<pid>/maps to the symbol server
@@ -728,13 +733,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             url.clone(),
             tokio::runtime::Handle::current(),
         );
-        // Upload binaries for the target PID (or all running processes if system-wide)
+        // Upload binaries for the target PID or scan common system binaries
         if let Some(target_pid) = pid {
             uploader.upload_for_pid(target_pid);
         } else {
-            // System-wide profiling: upload common binaries that are likely to appear.
-            // Individual PIDs will be uploaded as they're discovered during profiling.
-            tracing::info!("symbol uploader: system-wide mode, will upload on discovery");
+            // System-wide profiling: upload binaries for PID 1 (init) and self
+            // to cover common system libraries (libc, ld-linux, libpthread, etc.)
+            uploader.upload_for_pid(1);
+            uploader.upload_for_pid(std::process::id());
         }
         uploader
     });
@@ -846,15 +852,28 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             }
         });
         if opt.serve || opt.flush_interval.is_some() {
-            // Serve/continuous mode: use collapse-string-based OtlpSink via MultiplexSink
-            // (collect_raw isn't available in streaming mode)
-            sinks.push(Box::new(profile_bee::output::OtlpSink::new(
-                endpoint.clone(),
-                service_name,
-                opt.frequency,
-                opt.off_cpu,
-                tokio::runtime::Handle::current(),
-            )));
+            // Serve/continuous mode without OTLP: use collapse-string OtlpSink
+            // Only used when there's no native sink (i.e., no --otlp-endpoint
+            // OR the OtlpNativeSink handles it directly in the flush loop)
+            if !opt.flush_interval.is_some() {
+                sinks.push(Box::new(profile_bee::output::OtlpSink::new(
+                    endpoint.clone(),
+                    service_name.clone(),
+                    opt.frequency,
+                    opt.off_cpu,
+                    tokio::runtime::Handle::current(),
+                )));
+            }
+            // For flush-interval mode, use OtlpNativeSink with collect_raw()
+            if opt.flush_interval.is_some() {
+                otlp_native_sink = Some(profile_bee::output::OtlpNativeSink::new(
+                    endpoint.clone(),
+                    service_name,
+                    opt.frequency,
+                    opt.off_cpu,
+                    tokio::runtime::Handle::current(),
+                ));
+            }
         } else {
             // Batch mode: use OtlpNativeSink with real addresses via collect_raw()
             otlp_native_sink = Some(profile_bee::output::OtlpNativeSink::new(
@@ -914,35 +933,52 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         let mut last_stacks = Vec::new();
         let mut cycle_count: u64 = 0;
 
-        tracing::info!(
-            "continuous mode: flushing every {}ms (Ctrl-C or --time to stop)",
+        eprintln!(
+            "continuous mode: flushing every {}ms (Ctrl-C to stop)",
             interval_ms
         );
 
         loop {
-            let result = event_loop.collect(&perf_rx, Some(flush_interval));
+            let result = event_loop.collect_raw(&perf_rx, Some(flush_interval));
             cycle_count += 1;
 
             if !result.stacks.is_empty() {
-                tracing::info!(
-                    "flush #{}: {} stacks (elapsed {:?})",
+                eprintln!(
+                    "flush #{}: {} stacks (elapsed {:.1}s)",
                     cycle_count,
                     result.stacks.len(),
-                    started.elapsed()
+                    started.elapsed().as_secs_f64()
                 );
-                sink.write_batch(&result.stacks)?;
-                last_stacks = result.stacks;
-            } else {
-                tracing::debug!("flush #{}: no new stacks", cycle_count);
-            }
 
-            // Also send to OTLP native sink if configured
-            #[cfg(feature = "otlp")]
-            if let Some(ref mut otlp) = otlp_native_sink {
-                // In continuous mode, collect_raw isn't available (maps drained by collect).
-                // The collapse-string path via write_batch above handles OTLP if OtlpSink
-                // is in the MultiplexSink. For OtlpNativeSink, we skip it here.
-                let _ = otlp;
+                // Send structured data to OTLP native sink (real addresses)
+                #[cfg(feature = "otlp")]
+                {
+                    if let Some(ref mut otlp) = otlp_native_sink {
+                        eprintln!("sending {} framecounts to OTLP native sink", result.stacks.len());
+                        otlp.set_actual_duration_ms(interval_ms);
+                        if let Err(e) = otlp.send_framecounts(&result.stacks) {
+                            eprintln!("OTLP export error: {}", e);
+                        }
+                    } else {
+                        eprintln!("WARNING: otlp_native_sink is None!");
+                    }
+                }
+
+                // Derive collapse strings for any file-based sinks
+                let collapse_stacks: Vec<String> = result
+                    .stacks
+                    .iter()
+                    .map(|fc| {
+                        let frames: Vec<String> = fc
+                            .frames
+                            .iter()
+                            .map(|f| f.fmt_symbol())
+                            .collect();
+                        format!("{} {}", frames.join(";"), fc.count)
+                    })
+                    .collect();
+                sink.write_batch(&collapse_stacks)?;
+                last_stacks = collapse_stacks;
             }
 
             if result.stopped {

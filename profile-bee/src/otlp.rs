@@ -638,6 +638,7 @@ fn compute_htlhash(path: &str) -> Option<String> {
     // Truncate SHA-256 to 128 bits, format as hex
     let digest = hasher.finalize();
     let hex: String = digest[..16].iter().map(|b| format!("{:02x}", b)).collect();
+    eprintln!("htlhash: {} -> {}", path, hex);
     Some(hex)
 }
 
@@ -810,15 +811,33 @@ pub fn framecounts_to_otlp_request(
 
     let mut samples: Vec<Sample> = Vec::new();
 
+    // Debug: check if frames have real addresses
+    let total_frames: usize = frame_counts.iter().map(|fc| fc.frames.len()).sum();
+    let nonzero_addrs: usize = frame_counts
+        .iter()
+        .flat_map(|fc| &fc.frames)
+        .filter(|f| f.address != 0)
+        .count();
+    eprintln!(
+        "OTLP native: {} total frames, {} with non-zero address ({:.1}%)",
+        total_frames,
+        nonzero_addrs,
+        if total_frames > 0 { nonzero_addrs as f64 / total_frames as f64 * 100.0 } else { 0.0 }
+    );
+
     for fc in frame_counts {
         let mut location_indices: Vec<i32> = Vec::with_capacity(fc.frames.len());
+
+        // Extract pid from the first frame that has one (the process-name root frame).
+        // Symbolized frames have pid=0 because map_user_sym_to_stack uses Default.
+        let fc_pid = fc.frames.iter().find(|f| f.pid != 0).map(|f| f.pid as u32).unwrap_or(0);
 
         // frames are root-to-leaf after collect_raw(). OTLP wants leaf-first.
         for frame in fc.frames.iter().rev() {
             let symbol_name = frame.symbol.as_deref().unwrap_or("[unknown]");
             let is_kernel = symbol_name.ends_with("_k");
             let addr = frame.address;
-            let pid = frame.pid as u32;
+            let pid = if frame.pid != 0 { frame.pid as u32 } else { fc_pid };
 
             // Find or create the mapping for this address
             let mapping_idx = if is_kernel || addr == 0 {

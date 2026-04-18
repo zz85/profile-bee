@@ -68,7 +68,7 @@ async fn upload_loop(server_url: String, mut rx: mpsc::UnboundedReceiver<PathBuf
     let uploaded: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
     let client = reqwest::Client::new();
 
-    tracing::info!("symbol uploader: started, server={}", server_url);
+    eprintln!("symbol uploader: started, server={}", server_url);
 
     while let Some(path) = rx.recv().await {
         // Deduplicate
@@ -106,7 +106,7 @@ async fn upload_loop(server_url: String, mut rx: mpsc::UnboundedReceiver<PathBuf
 
         let url = format!("{}/upload?filename={}", server_url, urlencoding(filename));
 
-        tracing::debug!(
+        eprintln!(
             "symbol uploader: uploading {} ({} bytes)",
             path.display(),
             data.len()
@@ -121,11 +121,12 @@ async fn upload_loop(server_url: String, mut rx: mpsc::UnboundedReceiver<PathBuf
         {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    tracing::info!("symbol uploader: uploaded {}", path.display());
+                    let body = resp.text().await.unwrap_or_default();
+                    eprintln!("symbol uploader: uploaded {} -> {}", path.display(), body);
                 } else {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
-                    tracing::debug!(
+                    eprintln!(
                         "symbol uploader: server returned {} for {}: {}",
                         status,
                         path.display(),
@@ -134,7 +135,7 @@ async fn upload_loop(server_url: String, mut rx: mpsc::UnboundedReceiver<PathBuf
                 }
             }
             Err(e) => {
-                tracing::warn!(
+                eprintln!(
                     "symbol uploader: failed to upload {}: {}",
                     path.display(),
                     e

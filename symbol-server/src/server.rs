@@ -28,8 +28,8 @@ pub async fn run(store: SymbolStore, bind: &str, port: u16) -> anyhow::Result<()
         .route("/upload", post(handle_upload))
         .route("/status", get(handle_status))
         // Devfiler-compatible endpoints: /{prefix1}/{prefix2}/{id}/metadata.json
-        .route("/{a}/{b}/{id}/metadata.json", get(handle_metadata))
-        .route("/{a}/{b}/{id}/ranges", get(handle_ranges))
+        .route("/:a/:b/:id/metadata.json", get(handle_metadata))
+        .route("/:a/:b/:id/ranges", get(handle_ranges))
         .with_state(state);
 
     let addr = format!("{}:{}", bind, port);
@@ -153,10 +153,15 @@ async fn handle_metadata(
     State(store): State<AppState>,
     Path((_a, _b, id_str)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
+    tracing::info!("GET metadata: id_str={}", id_str);
     let file_id = match FileId::parse_es(&id_str) {
         Ok(id) => id,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(e) => {
+            tracing::warn!("bad FileId parse: {} -> {}", id_str, e);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
     };
+    tracing::info!("  resolved to FileId hex={}, has_symbols={}", file_id.format_hex(), store.has_symbols(&file_id));
 
     match store.get_metadata(&file_id) {
         Some(metadata) => (
@@ -174,9 +179,13 @@ async fn handle_ranges(
     State(store): State<AppState>,
     Path((_a, _b, id_str)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
+    tracing::info!("GET ranges: id_str={}", id_str);
     let file_id = match FileId::parse_es(&id_str) {
         Ok(id) => id,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(e) => {
+            tracing::warn!("bad FileId parse for ranges: {} -> {}", id_str, e);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
     };
 
     match store.get_ranges(&file_id) {
