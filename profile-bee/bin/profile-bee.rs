@@ -119,6 +119,9 @@ fn infer_output_format(path: &Path) -> Result<OutputFormat, anyhow::Error> {
   sudo probee --otlp-endpoint 127.0.0.1:11000 -t 5000
   sudo probee --otlp-endpoint 127.0.0.1:11000 -o flame.svg -- ./my-app
 
+  # Continuous profiling: upload every 10s, run indefinitely
+  sudo probee --otlp-endpoint 127.0.0.1:11000 --flush-interval 10000 --skip-idle
+
 \x1b[1mLegacy flags (still work, hidden from options list):\x1b[0m
   --svg, --html, --json, --collapse, --pprof, --codeguru
     Equivalent to -o <file> with the corresponding extension.
@@ -319,6 +322,14 @@ struct Opt {
     #[cfg(feature = "otlp")]
     #[arg(long)]
     otlp_service_name: Option<String>,
+
+    /// Flush interval in milliseconds for continuous profiling mode.
+    /// When set, profile-bee runs indefinitely (or until --time expires),
+    /// uploading a batch of samples every N ms to the configured sinks.
+    /// Useful for headless continuous profiling with --otlp-endpoint.
+    /// Example: --flush-interval 10000 uploads every 10 seconds.
+    #[arg(long)]
+    flush_interval: Option<u64>,
 }
 
 impl Opt {
@@ -355,6 +366,8 @@ impl Opt {
             || self.off_cpu
             // OTLP export
             || { #[cfg(feature = "otlp")] { self.otlp_endpoint.is_some() } #[cfg(not(feature = "otlp"))] { false } }
+            // Continuous profiling mode
+            || self.flush_interval.is_some()
     }
 }
 
@@ -806,8 +819,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 "profile-bee".to_string()
             }
         });
-        if opt.serve {
-            // Serve mode: use collapse-string-based OtlpSink via MultiplexSink
+        if opt.serve || opt.flush_interval.is_some() {
+            // Serve/continuous mode: use collapse-string-based OtlpSink via MultiplexSink
             // (collect_raw isn't available in streaming mode)
             sinks.push(Box::new(profile_bee::output::OtlpSink::new(
                 endpoint.clone(),
@@ -862,6 +875,50 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             if !result.stacks.is_empty() {
                 last_stacks = result.stacks;
             }
+            if result.stopped {
+                break;
+            }
+        }
+        sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
+        sink.finish(&last_stacks)?;
+    } else if let Some(interval_ms) = opt.flush_interval {
+        // Continuous profiling mode: run indefinitely (or until --time expires),
+        // flushing a batch of samples every flush_interval ms.
+        let flush_interval = std::time::Duration::from_millis(interval_ms);
+        let mut last_stacks = Vec::new();
+        let mut cycle_count: u64 = 0;
+
+        tracing::info!(
+            "continuous mode: flushing every {}ms (Ctrl-C or --time to stop)",
+            interval_ms
+        );
+
+        loop {
+            let result = event_loop.collect(&perf_rx, Some(flush_interval));
+            cycle_count += 1;
+
+            if !result.stacks.is_empty() {
+                tracing::info!(
+                    "flush #{}: {} stacks (elapsed {:?})",
+                    cycle_count,
+                    result.stacks.len(),
+                    started.elapsed()
+                );
+                sink.write_batch(&result.stacks)?;
+                last_stacks = result.stacks;
+            } else {
+                tracing::debug!("flush #{}: no new stacks", cycle_count);
+            }
+
+            // Also send to OTLP native sink if configured
+            #[cfg(feature = "otlp")]
+            if let Some(ref mut otlp) = otlp_native_sink {
+                // In continuous mode, collect_raw isn't available (maps drained by collect).
+                // The collapse-string path via write_batch above handles OTLP if OtlpSink
+                // is in the MultiplexSink. For OtlpNativeSink, we skip it here.
+                let _ = otlp;
+            }
+
             if result.stopped {
                 break;
             }
