@@ -10,7 +10,8 @@ use aya_ebpf::{
 use profile_bee_ebpf::{
     collect_off_cpu_trace, collect_trace, collect_trace_raw_syscall,
     collect_trace_raw_syscall_exit, collect_trace_raw_tp_with_task_regs,
-    collect_trace_stackid_only, dwarf_unwind_step_impl, handle_process_exec, handle_process_exit,
+    collect_trace_stackid_only, dwarf_unwind_step_impl, fp_v8_unwind_step_impl,
+    handle_process_exec, handle_process_exit,
 };
 
 #[perf_event]
@@ -112,6 +113,19 @@ pub fn tracepoint_process_exec(ctx: TracePointContext) -> u32 {
 pub fn dwarf_unwind_step(ctx: PerfEventContext) -> u32 {
     unsafe {
         dwarf_unwind_step_impl(ctx);
+    }
+    0
+}
+
+/// FP+V8 unwind step program — tail-call target for frame-pointer walking with
+/// V8 SFI extraction. Not attached to any perf event directly; only called via
+/// PROG_ARRAY tail call (index 1) from collect_trace's non-DWARF path.
+/// Walks FRAMES_PER_TAIL_CALL frames per invocation, extracts V8 SFI for each,
+/// and tail-calls itself for more.
+#[perf_event]
+pub fn fp_v8_unwind_step(ctx: PerfEventContext) -> u32 {
+    unsafe {
+        fp_v8_unwind_step_impl(ctx);
     }
     0
 }

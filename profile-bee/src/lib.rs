@@ -11,6 +11,7 @@ pub mod html;
 pub mod process_metadata;
 pub mod session;
 pub mod spawn;
+pub mod symbolize;
 
 mod legacy;
 pub mod types;
@@ -23,6 +24,8 @@ pub mod pprof;
 
 pub mod probe_resolver;
 pub mod probe_spec;
+
+pub mod v8;
 
 mod trace_handler;
 pub use trace_handler::*;

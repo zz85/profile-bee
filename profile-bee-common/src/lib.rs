@@ -36,7 +36,24 @@ pub struct FramePointers {
     /// Describes depth of stack trace (number of frames)
     /// This could be optional because the array is 0 terminated
     pub len: usize,
+    /// V8 SharedFunctionInfo tagged pointers, parallel to `pointers`.
+    /// For frame i: if `v8_sfi[i] != 0`, the frame is V8 JIT/interpreter
+    /// code and `v8_sfi[i]` is the tagged SharedFunctionInfo pointer
+    /// extracted from the V8 FP context. Userspace uses this to resolve
+    /// JavaScript function names via `process_vm_readv`.
+    ///
+    /// **Only the first `MAX_V8_FRAMES` (64) entries are populated.**
+    /// The eBPF FP walker in `copy_stack_regs` (profile-bee-ebpf `lib.rs`)
+    /// stops extracting V8 SFI data at `i >= MAX_V8_FRAMES`, so deep V8
+    /// stacks (>64 JS frames) will have their tail frames degrade to
+    /// `[unknown]` in the flamegraph.  V8 stacks rarely exceed 64 JS
+    /// frames in practice.
+    pub v8_sfi: [u64; MAX_V8_FRAMES],
 }
+
+/// Maximum V8 frames with metadata per stack sample.
+/// V8 stacks rarely exceed 64 JS frames.
+pub const MAX_V8_FRAMES: usize = 64;
 
 impl FramePointers {
     pub const STRUCT_SIZE: usize = size_of::<FramePointers>();
@@ -206,6 +223,44 @@ pub const MAX_BIN_SEARCH_DEPTH: u32 = 17;
 /// Sentinel value: no shard assigned to this mapping
 pub const SHARD_NONE: u16 = 0xFFFF;
 
+// --- V8 / Node.js Introspection ---
+
+/// V8 FP context size: the eBPF V8 frame extractor reads this many bytes
+/// below the frame pointer to find the JSFunction and bytecode offset.
+pub const V8_FP_CONTEXT_SIZE: usize = 64;
+
+/// Compact V8 introspection data shared between userspace and eBPF.
+///
+/// Userspace populates this from `v8dbg_*` ELF symbols in the Node.js binary
+/// and loads it into the `v8_proc_info` eBPF map. The eBPF code uses these
+/// offsets to read the JSFunction pointer from V8's FP context slots during
+/// stack unwinding, without any V8-version-specific logic in eBPF.
+///
+/// Layout matches the OTel eBPF profiler's V8ProcInfo for compatibility.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct V8ProcInfo {
+    /// V8 version: (major << 24) | (minor << 16) | patch
+    pub version: u32,
+    // Instance type ranges for type-checking heap objects
+    pub type_jsfunction_first: u16,
+    pub type_jsfunction_last: u16,
+    pub type_code: u16,
+    pub type_shared_function_info: u16,
+    // Heap object field offsets
+    pub off_heap_object_map: u8,
+    pub off_map_instance_type: u8,
+    pub off_jsfunction_shared: u8,
+    /// Byte offset within the 64-byte FP context buffer for the JSFunction slot.
+    /// The eBPF code reads [fp - V8_FP_CONTEXT_SIZE] and indexes at this offset.
+    pub fp_function: u8,
+    pub _pad: [u8; 4],
+}
+
+impl V8ProcInfo {
+    pub const STRUCT_SIZE: usize = size_of::<V8ProcInfo>();
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(C)]
 pub struct ProcInfoKey {
@@ -236,6 +291,11 @@ pub struct ProcInfo {
 /// This structure is stored in a PerCpuArray and persists across tail calls.
 /// It contains both unwinding state and finalization context so the tail-call
 /// step program can complete the work started by collect_trace.
+///
+/// Also reused by the FP+V8 tail-call walker (PROG_ARRAY index 1) which
+/// stores FP walk progress and V8 SFI extraction results in the same struct.
+/// The two paths are mutually exclusive per-sample (DWARF vs FP), so sharing
+/// the per-CPU state is safe.
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct DwarfUnwindState {
@@ -268,4 +328,10 @@ pub struct DwarfUnwindState {
     /// Saved CPU ID (for finalization)
     pub cpu: u32,
     pub _pad2: u32,
+    /// V8 SharedFunctionInfo tagged pointers extracted during FP+V8 tail-call
+    /// walking. Parallel to `pointers[0..MAX_V8_FRAMES]`. Zero means "not a
+    /// V8 frame" or "beyond V8 extraction limit".
+    /// Only used by the FP+V8 step program (PROG_ARRAY index 1); the DWARF
+    /// step program (index 0) ignores this field.
+    pub v8_sfi: [u64; MAX_V8_FRAMES],
 }

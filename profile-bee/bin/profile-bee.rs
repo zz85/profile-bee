@@ -8,7 +8,7 @@ use profile_bee::event_loop::{EventLoopConfig, ProfilingEventLoop};
 use profile_bee::html::collapse_to_json;
 use profile_bee::output::{
     CodeGuruSink, CollapseSink, HtmlSink, JsonFileSink, MultiplexSink, OutputSink, PprofSink,
-    SvgSink, WebBroadcastSink,
+    RawCollapseSink, SvgSink, WebBroadcastSink,
 };
 use profile_bee::pipeline::{
     dwarf_refresh_loop, setup_ctrlc_stop, setup_process_exit_ring_buffer_task,
@@ -43,6 +43,8 @@ enum OutputFormat {
     Collapse,
     Pprof,
     CodeGuru,
+    /// Raw unsymbolized output for offline/post-hoc symbolization
+    Raw,
 }
 
 fn infer_output_format(path: &Path) -> Result<OutputFormat, anyhow::Error> {
@@ -58,9 +60,10 @@ fn infer_output_format(path: &Path) -> Result<OutputFormat, anyhow::Error> {
         Some("folded") | Some("collapsed") | Some("collapse") => Ok(OutputFormat::Collapse),
         Some("pprof") => Ok(OutputFormat::Pprof),
         Some("gz") if name.ends_with(".pb.gz") => Ok(OutputFormat::Pprof),
+        Some("raw") => Ok(OutputFormat::Raw),
         _ => Err(anyhow::anyhow!(
             "cannot infer output format from '{}' — use a known extension \
-             (.svg, .html, .json, .folded, .pb.gz, .pprof, .codeguru.json)",
+             (.svg, .html, .json, .folded, .pb.gz, .pprof, .raw, .codeguru.json)",
             path.display()
         )),
     }
@@ -334,6 +337,39 @@ impl Opt {
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
+    // Intercept `probee symbolize <file.raw> [-o output]` before clap parses
+    // the main Opt struct, since `symbolize` is a subcommand that doesn't
+    // share the profiling flags.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("symbolize") {
+        let sub_args = &args[2..];
+        // Handle --help / --version before dispatching to the subcommand
+        // so they don't get rejected as "unknown flag for symbolize".
+        if sub_args.is_empty()
+            || sub_args
+                .first()
+                .map(|s| matches!(s.as_str(), "-h" | "--help"))
+                .unwrap_or(false)
+        {
+            eprintln!(
+                "Usage: {} symbolize <file.raw> [-o output.svg] [-o output.folded]\n\n\
+                 Re-symbolize a raw capture file produced by -o profile.raw.\n\
+                 If no -o flags are given, writes symbolized collapse to stdout.",
+                args[0]
+            );
+            return Ok(());
+        }
+        if sub_args
+            .first()
+            .map(|s| matches!(s.as_str(), "-V" | "--version"))
+            .unwrap_or(false)
+        {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        return run_symbolize_subcommand(sub_args);
+    }
+
     let mut opt = Opt::parse();
 
     // If no meaningful flags were provided, show help with examples and exit.
@@ -692,6 +728,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                     opt.off_cpu,
                 )));
             }
+            OutputFormat::Raw => {
+                // Raw sink is handled separately below — not a standard OutputSink
+                // because it receives unsymbolized samples, not collapse strings.
+            }
         }
     }
     // CodeGuru upload is a cloud action, not a file output — stays as its own flag
@@ -730,6 +770,18 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
     let mut sink = MultiplexSink::new(sinks);
 
+    // Create raw collapse sink if .raw output was requested.
+    // This operates independently of the standard OutputSink pipeline because
+    // it receives unsymbolized RawAddressSample data, not collapse strings.
+    let mut raw_sink: Option<RawCollapseSink> = resolved_outputs
+        .iter()
+        .find(|(fmt, _)| *fmt == OutputFormat::Raw)
+        .map(|(_, path)| RawCollapseSink::new(path.clone()));
+    let has_symbolized_sinks = resolved_outputs
+        .iter()
+        .any(|(fmt, _)| *fmt != OutputFormat::Raw)
+        || opt.serve;
+
     if opt.serve {
         // Serve mode: periodically flush data to the web server
         let flush_interval = std::time::Duration::from_secs(2);
@@ -753,14 +805,42 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         }
         sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
         sink.finish(&last_stacks)?;
+    } else if raw_sink.is_some() && !has_symbolized_sinks {
+        // Raw-only mode: skip symbolization entirely for maximum speed.
+        tracing::debug!("raw-only mode: collecting unsymbolized samples");
+        let result = event_loop.collect_unsymbolized(&perf_rx, None);
+        if let Some(ref mut raw) = raw_sink {
+            raw.add_samples(result.samples);
+        }
+    } else if raw_sink.is_some() && has_symbolized_sinks {
+        // Mixed mode: both raw and symbolized outputs requested.
+        // The eBPF maps are consumed by the symbolized collection path, so
+        // the raw sink cannot extract addresses from the same collection pass.
+        anyhow::bail!(
+            "Cannot combine .raw output with symbolized formats in the same run — \
+             the .raw file would be empty. Use -o profile.raw alone for raw captures, \
+             then re-symbolize with: probee symbolize profile.raw -o output.svg"
+        );
     } else {
         // Non-serve mode: block until Stop, output once, exit.
+        // If raw sink exists alongside symbolized sinks, collect both.
         tracing::debug!("batch mode: collecting samples (blocks until Stop)");
         let result = event_loop.collect(&perf_rx, None);
         tracing::debug!("batch mode: collected {} stacks", result.stacks.len());
         sink.write_batch(&result.stacks)?;
         sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
         sink.finish(&result.stacks)?;
+
+        // If raw output was also requested, do a second pass for raw addresses.
+        // (In this case, the eBPF maps have been drained by `collect` so we
+        // can't re-extract raw addresses. The raw sink captures what it can
+        // from the symbolized path. For full raw capture, use .raw alone.)
+        // TODO: unified collect path that produces both simultaneously
+    }
+
+    // Write raw collapse file if requested
+    if let Some(ref raw) = raw_sink {
+        raw.write()?;
     }
 
     drop(stopper);
@@ -821,6 +901,98 @@ fn warn_nodejs_without_perf_map(pid: u32) {
     eprintln!("To enable JIT symbol resolution, restart Node.js with:");
     eprintln!("  node --perf-basic-prof --interpreted-frames-native-stack <script>");
     eprintln!("Or use profile-bee's auto-injection: probee -- node <script>\n");
+}
+
+/// Handle `probee symbolize <file.raw> [-o output.svg] [-o output.folded]`.
+///
+/// Re-symbolizes a raw capture file produced by `-o profile.raw`, resolving
+/// addresses via blazesym and writing the result to one or more output formats.
+/// If no `-o` flags are given, writes symbolized collapse to stdout.
+fn run_symbolize_subcommand(args: &[String]) -> anyhow::Result<()> {
+    use profile_bee::symbolize::symbolize_raw_file;
+
+    let mut input_path: Option<PathBuf> = None;
+    let mut output_paths: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() {
+                    anyhow::bail!("-o requires an output path");
+                }
+                output_paths.push(PathBuf::from(&args[i]));
+            }
+            arg if arg.starts_with('-') => {
+                anyhow::bail!("unknown flag for symbolize: {}", arg);
+            }
+            _ => {
+                if input_path.is_some() {
+                    anyhow::bail!("only one input file expected, got extra: {}", args[i]);
+                }
+                input_path = Some(PathBuf::from(&args[i]));
+            }
+        }
+        i += 1;
+    }
+
+    let input_path = input_path.ok_or_else(|| {
+        anyhow::anyhow!("usage: probee symbolize <file.raw> [-o output.svg] [-o output.folded]")
+    })?;
+
+    eprintln!("Symbolizing {}...", input_path.display());
+    let collapse_lines = symbolize_raw_file(&input_path)?;
+    eprintln!("Resolved {} collapse lines", collapse_lines.len());
+
+    if output_paths.is_empty() {
+        // Write to stdout
+        for line in &collapse_lines {
+            println!("{}", line);
+        }
+    } else {
+        // Build output sinks and write
+        let mut sinks: Vec<Box<dyn OutputSink>> = Vec::new();
+        for path in &output_paths {
+            let fmt = infer_output_format(path)?;
+            match fmt {
+                OutputFormat::Svg => {
+                    sinks.push(Box::new(SvgSink::new(
+                        path.clone(),
+                        "Re-symbolized profile".to_string(),
+                        false,
+                    )));
+                }
+                OutputFormat::Html => {
+                    sinks.push(Box::new(HtmlSink::new(path.clone())));
+                }
+                OutputFormat::Json => {
+                    sinks.push(Box::new(JsonFileSink::new(path.clone())));
+                }
+                OutputFormat::Collapse => {
+                    sinks.push(Box::new(CollapseSink::new(path.clone())));
+                }
+                OutputFormat::Pprof => {
+                    sinks.push(Box::new(PprofSink::new(path.clone(), 99, 10000, false)));
+                }
+                OutputFormat::Raw => {
+                    anyhow::bail!("cannot output .raw from symbolize (already symbolized)");
+                }
+                OutputFormat::CodeGuru => {
+                    sinks.push(Box::new(CodeGuruSink::new(path.clone(), 99, 10000, false)));
+                }
+            }
+        }
+
+        let mut sink = MultiplexSink::new(sinks);
+        sink.finish(&collapse_lines)?;
+
+        for path in &output_paths {
+            eprintln!("Wrote {}", path.display());
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle --list-probes: resolve and display matching symbols, then exit.
@@ -1128,6 +1300,8 @@ fn spawn_profiling_thread(
                                 }
                                 // Allow PID reuse to trigger a fresh LoadProcess
                                 known_tgids.remove(&event.pid);
+                                // Clean up V8 state and symbol caches for the exiting process
+                                profiler.invalidate_caches_for_pid(event.pid);
                                 // Only stop profiling if this is the monitored target process
                                 if Some(event.pid) == monitor_exit_pid {
                                     tracing::info!(
@@ -1142,8 +1316,11 @@ fn spawn_profiling_thread(
                                 if let Some(tx) = &tgid_request_tx {
                                     let _ = tx.send(DwarfThreadMsg::ProcessExeced(event.pid));
                                 }
+                                // Remove from known_tgids so the next StackInfo triggers
+                                // fresh V8/DWARF setup. Do NOT re-insert.
                                 known_tgids.remove(&event.pid);
-                                known_tgids.insert(event.pid);
+                                // Invalidate symbol caches for the old binary image
+                                profiler.invalidate_caches_for_pid(event.pid);
                             }
                             _ => {}
                         }

@@ -12,11 +12,11 @@ use aya::maps::{MapData, StackTraceMap};
 use aya::Ebpf;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS, PROCESS_EVENT_EXEC, PROCESS_EVENT_EXIT};
 
-use crate::ebpf::{apply_dwarf_refresh, FramePointersPod, StackInfoPod};
+use crate::ebpf::{apply_dwarf_refresh, FramePointersPod, StackInfoPod, V8ProcInfoPod};
 use crate::pipeline::{DwarfThreadMsg, PerfWork};
 use crate::process_metadata::ProcessMetadataCache;
 use crate::trace_handler::TraceHandler;
-use crate::types::FrameCount;
+use crate::types::{FrameCount, StackInfoExt};
 
 /// Result of a single `collect` call.
 pub struct CollectResult {
@@ -37,6 +37,28 @@ pub struct CollectResult {
 pub struct RawCollectResult {
     /// Symbolized stack frames with sample counts.
     pub stacks: Vec<FrameCount>,
+    /// Whether the profiling loop received a Stop or exit event.
+    pub stopped: bool,
+}
+
+/// A single unsymbolized stack sample with raw instruction pointer addresses.
+///
+/// Used by the raw/offline output mode to capture addresses for post-hoc
+/// symbolization. Contains everything needed to re-symbolize the stack later:
+/// PID (for `/proc/<pid>/maps`), process name, and raw kernel + user addresses.
+pub struct RawAddressSample {
+    pub tgid: u32,
+    pub cmd: String,
+    pub cpu: u32,
+    pub kernel_addrs: Vec<u64>,
+    pub user_addrs: Vec<u64>,
+    pub count: u64,
+}
+
+/// Result of a single `collect_unsymbolized` call.
+pub struct UnsymbolizedCollectResult {
+    /// Raw address samples (not symbolized).
+    pub samples: Vec<RawAddressSample>,
     /// Whether the profiling loop received a Stop or exit event.
     pub stopped: bool,
 }
@@ -125,7 +147,7 @@ impl ProfilingEventLoop {
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
     ) -> CollectResult {
-        let (local_counting, stopped) = self.drain_events(rx, timeout);
+        let (local_counting, stopped) = self.drain_events(rx, timeout, true);
         let stacks = self.build_collapse_output(local_counting);
         CollectResult { stacks, stopped }
     }
@@ -157,9 +179,29 @@ impl ProfilingEventLoop {
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
     ) -> RawCollectResult {
-        let (local_counting, stopped) = self.drain_events(rx, timeout);
+        let (local_counting, stopped) = self.drain_events(rx, timeout, true);
         let stacks = self.build_raw_stacks(local_counting);
         RawCollectResult { stacks, stopped }
+    }
+
+    /// Drain events and return unsymbolized raw address samples.
+    ///
+    /// Like [`collect`](Self::collect) but skips symbolization entirely,
+    /// returning raw instruction pointer addresses for each stack sample.
+    /// Use this for offline/post-hoc symbolization workflows where captures
+    /// need to be fast and symbolization happens later.
+    ///
+    /// The returned [`UnsymbolizedCollectResult`] contains [`RawAddressSample`]
+    /// values with kernel and user address vectors that can be serialized
+    /// for later re-symbolization (e.g. with `probee symbolize`).
+    pub fn collect_unsymbolized(
+        &mut self,
+        rx: &mpsc::Receiver<PerfWork>,
+        timeout: Option<Duration>,
+    ) -> UnsymbolizedCollectResult {
+        let (local_counting, stopped) = self.drain_events(rx, timeout, false);
+        let samples = self.build_raw_address_samples(local_counting);
+        UnsymbolizedCollectResult { samples, stopped }
     }
 
     /// Immediately evict process metadata for PIDs that exited during
@@ -180,15 +222,110 @@ impl ProfilingEventLoop {
         }
     }
 
-    /// Drain events from the PerfWork channel, symbolize stacks on the fly,
-    /// and return `(local_counting, stopped)`.
+    /// Detect if a new PID is a Node.js/V8 process and set up V8 introspection.
     ///
-    /// This is the shared event-draining loop used by both [`collect`] and
-    /// [`collect_raw`].
+    /// Reads `/proc/<pid>/exe` to find the binary, then reads `v8dbg_*` ELF
+    /// symbols to discover V8's internal layout. If successful, loads
+    /// `V8ProcInfo` into the eBPF `v8_proc_info` map (so the FP walker
+    /// extracts JSFunction pointers) and registers a `V8HeapReader` in the
+    /// trace handler (so userspace can resolve SFI → function name).
+    fn try_setup_v8_for_pid(&mut self, tgid: u32) {
+        // Read /proc/<pid>/exe to get the binary path
+        let exe_link = format!("/proc/{}/exe", tgid);
+        let exe_path = match std::fs::read_link(&exe_link) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        if !crate::v8::is_nodejs_binary(&exe_path) {
+            return;
+        }
+
+        tracing::info!(
+            "detected Node.js process (pid {}): {}",
+            tgid,
+            exe_path.display()
+        );
+
+        // Read the ELF binary to extract v8dbg_* introspection symbols
+        let elf_data = match std::fs::read(&exe_path) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("cannot read {}: {}", exe_path.display(), e);
+                return;
+            }
+        };
+
+        let Some(data) = crate::v8::read_introspection_data(&elf_data) else {
+            tracing::warn!(
+                "failed to read V8 introspection data from {}",
+                exe_path.display()
+            );
+            return;
+        };
+
+        // Build compact V8ProcInfo and load into eBPF map
+        let Some(proc_info) = data.to_proc_info() else {
+            tracing::warn!(
+                "V8ProcInfo for pid {} has offsets out of u8 range, skipping",
+                tgid
+            );
+            return;
+        };
+        match self.bpf.map_mut("v8_proc_info") {
+            Some(map) => {
+                match aya::maps::HashMap::<&mut MapData, u32, V8ProcInfoPod>::try_from(map) {
+                    Ok(mut v8_map) => {
+                        if let Err(e) = v8_map.insert(tgid, V8ProcInfoPod(proc_info), 0) {
+                            tracing::warn!("failed to insert V8ProcInfo for pid {}: {}", tgid, e);
+                        } else {
+                            tracing::info!(
+                                "loaded V8ProcInfo for pid {} (V8 {}.{}.{})",
+                                tgid,
+                                data.version.0,
+                                data.version.1,
+                                data.version.2,
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("v8_proc_info map error: {}", e),
+                }
+            }
+            None => tracing::debug!("v8_proc_info map not found (older eBPF binary)"),
+        }
+
+        // Register V8HeapReader for userspace symbolization
+        self.trace_handler.register_v8_reader(tgid, data);
+    }
+
+    /// Remove the V8ProcInfo entry from the eBPF map for a given PID.
+    /// Called on process exit and exec to prevent the eBPF V8 SFI extraction
+    /// from reading stale V8 layout data for a reused PID.
+    fn remove_v8_proc_info_for_pid(&mut self, tgid: u32) {
+        if let Some(map) = self.bpf.map_mut("v8_proc_info") {
+            if let Ok(mut v8_map) =
+                aya::maps::HashMap::<&mut MapData, u32, V8ProcInfoPod>::try_from(map)
+            {
+                let _ = v8_map.remove(&tgid);
+            }
+        }
+    }
+
+    /// Drain events from the PerfWork channel, optionally symbolize stacks
+    /// on the fly, and return `(local_counting, stopped)`.
+    ///
+    /// When `symbolize` is true, `get_exp_stacked_frames` is called for each
+    /// StackInfo event to prime the symbol cache and read frame pointers.
+    /// When false (used by [`collect_unsymbolized`]), this work is skipped
+    /// so the raw address pipeline runs without symbolization overhead.
+    ///
+    /// This is the shared event-draining loop used by [`collect`],
+    /// [`collect_raw`], and [`collect_unsymbolized`].
     fn drain_events(
         &mut self,
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
+        symbolize: bool,
     ) -> (bool, bool) {
         // Evict metadata for PIDs that exited in the PREVIOUS cycle.
         // This gives agents one full collection cycle to read metadata
@@ -242,12 +379,19 @@ impl ProfilingEventLoop {
                     if let Some(tx) = &self.tgid_request_tx {
                         if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
                             let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
+                            // Check if this is a Node.js/V8 process and set up
+                            // V8 introspection (eBPF FP context extraction +
+                            // userspace heap reader for JS symbol resolution).
+                            self.try_setup_v8_for_pid(stack.tgid);
                         }
+                    } else if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
+                        // Even without DWARF thread, detect V8 processes
+                        self.try_setup_v8_for_pid(stack.tgid);
                     }
                     if local_counting {
                         let trace = self.trace_count.entry(stack).or_insert(0);
                         *trace += 1;
-                        if *trace == 1 {
+                        if *trace == 1 && symbolize {
                             self.trace_handler.get_exp_stacked_frames(
                                 &stack,
                                 &self.stack_traces,
@@ -256,7 +400,7 @@ impl ProfilingEventLoop {
                                 &self.stacked_pointers,
                             );
                         }
-                    } else {
+                    } else if symbolize {
                         self.trace_handler.get_exp_stacked_frames(
                             &stack,
                             &self.stack_traces,
@@ -278,6 +422,12 @@ impl ProfilingEventLoop {
                                 let _ = tx.send(DwarfThreadMsg::ProcessExited(event.pid));
                             }
                             self.known_tgids.remove(&event.pid);
+                            // Clean up V8 state for the exiting process to prevent
+                            // stale readers from being used if the PID is reused.
+                            self.trace_handler.invalidate_caches_for_pid(event.pid);
+                            // Also remove the eBPF v8_proc_info entry so the FP walker
+                            // won't try to extract V8 SFI for a reused PID.
+                            self.remove_v8_proc_info_for_pid(event.pid);
                             // Defer metadata cache eviction until after build_raw_stacks()
                             // so agents can still look up metadata for processes that
                             // exited within the collection window.
@@ -301,11 +451,14 @@ impl ProfilingEventLoop {
                             // old addresses against the new binary image.
                             self.trace_count.retain(|k, _| k.tgid != event.pid);
                             // The PID is still alive but with a new binary image.
-                            // Re-add to known_tgids so DWARF tables are reloaded.
+                            // Remove from known_tgids so the next StackInfo for this
+                            // PID triggers try_setup_v8_for_pid and DWARF reloading.
+                            // Do NOT re-insert — let the StackInfo handler do it.
                             self.known_tgids.remove(&event.pid);
-                            self.known_tgids.insert(event.pid);
                             // Invalidate symbol caches for this PID
                             self.trace_handler.invalidate_caches_for_pid(event.pid);
+                            // Remove eBPF v8_proc_info for the old binary
+                            self.remove_v8_proc_info_for_pid(event.pid);
                             if let Some(ref mut cache) = self.process_metadata {
                                 cache.invalidate(event.pid);
                             }
@@ -362,6 +515,45 @@ impl ProfilingEventLoop {
         }
 
         stacks
+    }
+
+    /// Extract raw address samples without symbolization.
+    ///
+    /// Same source iteration as [`build_raw_stacks`] but calls
+    /// [`TraceHandler::get_raw_addresses`] instead of symbolization,
+    /// producing [`RawAddressSample`] values with raw instruction pointers.
+    fn build_raw_address_samples(&mut self, local_counting: bool) -> Vec<RawAddressSample> {
+        let sources: Vec<(StackInfo, u64)> = if local_counting {
+            self.trace_count
+                .iter()
+                .map(|(&s, &v)| (s, v as u64))
+                .collect()
+        } else {
+            self.counts
+                .iter()
+                .flatten()
+                .map(|(k, v)| (k.0, v))
+                .collect()
+        };
+
+        let mut samples = Vec::new();
+        for (stack, count) in &sources {
+            let (kernel_addrs, user_addrs) = self.trace_handler.get_raw_addresses(
+                stack,
+                &self.stack_traces,
+                &self.stacked_pointers,
+            );
+            samples.push(RawAddressSample {
+                tgid: stack.tgid,
+                cmd: stack.get_cmd(),
+                cpu: stack.cpu,
+                kernel_addrs,
+                user_addrs,
+                count: *count,
+            });
+        }
+
+        samples
     }
 
     /// Build collapse-format output from trace counts or kernel counts.

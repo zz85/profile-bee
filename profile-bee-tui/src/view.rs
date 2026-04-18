@@ -449,7 +449,7 @@ impl FlameGraphView {
             })
             .collect();
 
-        entries.sort_by(|a, b| b.samples.cmp(&a.samples));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.samples));
         entries
     }
 

@@ -4,12 +4,14 @@
 //! concerns. Adding a new output format (pprof, OpenTelemetry, remote HTTP)
 //! requires only implementing this trait — no changes to the profiling loop.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use inferno::flamegraph::{self, Options};
 
 use crate::codeguru::{collapse_to_codeguru, CodeGuruOptions, CounterType};
+use crate::event_loop::RawAddressSample;
 use crate::html::{collapse_to_json, generate_html_file};
 use crate::pprof::{collapse_to_pprof, PprofOptions};
 
@@ -336,5 +338,149 @@ impl OutputSink for CodeGuruSink {
         let json = collapse_to_codeguru(final_stacks, &self.options);
         std::fs::write(&self.path, &json).context("Unable to write CodeGuru JSON file")?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw address collapse output — for offline/post-hoc symbolization
+// ---------------------------------------------------------------------------
+
+/// Writes an unsymbolized "raw collapse" file containing hex instruction
+/// pointer addresses and process memory mapping metadata.
+///
+/// The output format is a self-contained text file that can be re-symbolized
+/// offline:
+///
+/// ```text
+/// # profile-bee raw v1
+/// # mappings:1234
+/// #   7f000000-7f100000 0 /usr/bin/node
+/// #   7f200000-7f300000 1000 /lib/x86_64-linux-gnu/libc.so.6
+/// # end_mappings:1234
+/// node;0xffffffff81234567_k;0xffffffff81234568_k;0x7f000042;0x7f000084 42
+/// ```
+///
+/// - Kernel addresses are suffixed with `_k`
+/// - User addresses are bare hex
+/// - The `# mappings` header captures `/proc/<pid>/maps` for each unique PID
+/// - Multiple PIDs can appear in one file (system-wide profiling)
+pub struct RawCollapseSink {
+    path: PathBuf,
+    samples: Vec<RawAddressSample>,
+    /// Cached /proc/<pid>/maps snapshots, keyed by tgid
+    mappings_cache: HashMap<u32, Vec<String>>,
+}
+
+impl RawCollapseSink {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            samples: Vec::new(),
+            mappings_cache: HashMap::new(),
+        }
+    }
+
+    /// Append raw address samples. Called by the event loop each collection cycle.
+    pub fn add_samples(&mut self, samples: Vec<RawAddressSample>) {
+        for sample in &samples {
+            // Snapshot /proc/<pid>/maps on first encounter of each PID
+            self.mappings_cache
+                .entry(sample.tgid)
+                .or_insert_with(|| Self::read_proc_maps(sample.tgid));
+        }
+        self.samples.extend(samples);
+    }
+
+    /// Write the complete raw collapse file.
+    pub fn write(&self) -> Result<()> {
+        use std::io::Write;
+        tracing::info!("Writing raw collapse to: {}", self.path.display());
+
+        let file = std::fs::File::create(&self.path)
+            .with_context(|| format!("unable to create {}", self.path.display()))?;
+        let mut w = std::io::BufWriter::new(file);
+
+        // Header
+        writeln!(w, "# profile-bee raw v1")?;
+
+        // Write mappings for each unique PID in sorted order for deterministic output
+        let mut sorted_tgids: Vec<u32> = self.mappings_cache.keys().copied().collect();
+        sorted_tgids.sort();
+        for tgid in sorted_tgids {
+            if let Some(maps) = self.mappings_cache.get(&tgid) {
+                writeln!(w, "# mappings:{}", tgid)?;
+                for line in maps {
+                    writeln!(w, "#   {}", line)?;
+                }
+                writeln!(w, "# end_mappings:{}", tgid)?;
+            }
+        }
+        writeln!(w, "#")?;
+
+        // Aggregate samples by (tgid, kernel_addrs, user_addrs)
+        let mut aggregated: HashMap<String, u64> = HashMap::new();
+        for sample in &self.samples {
+            let key = Self::format_sample_key(sample);
+            *aggregated.entry(key).or_insert(0) += sample.count;
+        }
+
+        // Write sorted collapse lines
+        let mut lines: Vec<_> = aggregated.into_iter().collect();
+        lines.sort_by(|a, b| a.0.cmp(&b.0));
+        for (key, count) in lines {
+            writeln!(w, "{} {}", key, count)?;
+        }
+
+        w.flush()?;
+        Ok(())
+    }
+
+    /// Format a single sample as a collapse-style key string.
+    /// Kernel frames get `_k` suffix, user frames are bare hex.
+    /// The tgid is included as a `[pid:N]` prefix after the command name
+    /// so samples from different PIDs with the same command don't collide
+    /// during aggregation. The symbolizer uses this to select the correct
+    /// Process(Pid) source for each sample.
+    fn format_sample_key(sample: &RawAddressSample) -> String {
+        let mut frames = Vec::new();
+
+        // Process name + PID as root frame (prevents cross-PID aggregation collision)
+        frames.push(format!("{}[pid:{}]", sample.cmd, sample.tgid));
+
+        // Kernel frames (bottom of stack, reversed for collapse format)
+        for addr in sample.kernel_addrs.iter().rev() {
+            if *addr != 0 {
+                frames.push(format!("{:#x}_k", addr));
+            }
+        }
+
+        // User frames (bottom of stack, reversed for collapse format)
+        for addr in sample.user_addrs.iter().rev() {
+            if *addr != 0 {
+                frames.push(format!("{:#x}", addr));
+            }
+        }
+
+        frames.join(";")
+    }
+
+    /// Read /proc/<pid>/maps and return executable mapping lines.
+    fn read_proc_maps(tgid: u32) -> Vec<String> {
+        let path = format!("/proc/{}/maps", tgid);
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            tracing::debug!("cannot read {}: process may have exited", path);
+            return Vec::new();
+        };
+
+        contents
+            .lines()
+            .filter(|line| {
+                // Only include executable mappings (r-xp or r--xp)
+                line.split_whitespace()
+                    .nth(1)
+                    .is_some_and(|perms| perms.contains('x'))
+            })
+            .map(|s| s.to_string())
+            .collect()
     }
 }
