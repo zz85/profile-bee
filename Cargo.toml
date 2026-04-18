@@ -1,5 +1,5 @@
 [workspace]
-members = ["profile-bee", "profile-bee-common", "profile-bee-tui", "xtask",]
+members = ["profile-bee", "profile-bee-common", "profile-bee-tui", "symbol-server", "xtask",]
 resolver = "2"
 
 [profile.release]

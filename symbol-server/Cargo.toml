@@ -1,0 +1,48 @@
+[package]
+name = "symbol-server"
+version = "0.1.0"
+edition = "2021"
+description = "Devfiler-compatible symbol server for profile-bee"
+
+[[bin]]
+name = "symbol-server"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# ELF parsing and symbol extraction
+object = { version = "0.37", features = ["read"] }
+gimli = "0.31"
+
+# Hashing (htlhash = SHA-256 of head+tail+length)
+sha2 = "0.10"
+
+# Protobuf encoding for symbfile format
+prost = "0.13"
+
+# Compression
+zstd = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Base64 for FileId encoding
+base64 = "0.22"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Misc
+anyhow = "1"
+parking_lot = "0.12"
+rustc-demangle = "0.1"
+cpp_demangle = "0.4"
