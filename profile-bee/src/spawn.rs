@@ -180,6 +180,15 @@ fn is_nodejs_program(program: &str) -> bool {
     matches!(basename, "node" | "nodejs" | "nsolid")
 }
 
+/// Check if a program name looks like Bun.
+pub fn is_bun_program(program: &str) -> bool {
+    let basename = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    matches!(basename, "bun" | "bunx")
+}
+
 /// Build extra environment variables for runtime-specific profiling support.
 ///
 /// For Node.js processes, injects `NODE_OPTIONS` with `--perf-prof` (writes
@@ -219,6 +228,14 @@ fn build_runtime_env(program: &str) -> Vec<(&'static str, String)> {
             value
         );
         env.push(("NODE_OPTIONS", value));
+    }
+
+    if is_bun_program(program) {
+        // BUN_JSC_useJITDump=1: writes /tmp/jit-<pid>.dump with JIT symbol
+        // addresses for JavaScriptCore. This lets us resolve JIT-compiled
+        // JavaScript function names that would otherwise appear as [unknown].
+        tracing::info!("Bun detected: injecting BUN_JSC_useJITDump=1 for JIT symbol resolution");
+        env.push(("BUN_JSC_useJITDump", "1".to_string()));
     }
 
     env
