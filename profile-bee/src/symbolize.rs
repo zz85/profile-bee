@@ -22,6 +22,8 @@ use blazesym::symbolize::source::{Kernel, Process, Source};
 use blazesym::symbolize::{Input, Symbolized, Symbolizer};
 use blazesym::Pid;
 
+use crate::jitdump::{self, JitSymbolTable};
+
 /// A parsed raw stack sample (one line of the raw collapse file).
 #[derive(Debug)]
 struct RawLine {
@@ -60,6 +62,21 @@ pub fn symbolize_raw_file(path: &Path) -> anyhow::Result<Vec<String>> {
 
     // Determine PIDs from mappings header
     let pids: Vec<u32> = mappings.keys().copied().collect();
+
+    // Load JITDump symbol tables for any PIDs that have them
+    let mut jit_tables: HashMap<u32, JitSymbolTable> = HashMap::new();
+    for &pid in &pids {
+        if let Some(path) = jitdump::find_jitdump_for_pid(pid) {
+            match JitSymbolTable::load_from_file(&path) {
+                Ok(table) if !table.is_empty() => {
+                    tracing::info!("loaded JITDump for pid {} ({} symbols)", pid, table.len());
+                    jit_tables.insert(pid, table);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("JITDump read failed for pid {}: {}", pid, e),
+            }
+        }
+    }
 
     let symbolizer = Symbolizer::new();
     let mut output = Vec::new();
@@ -104,10 +121,23 @@ pub fn symbolize_raw_file(path: &Path) -> anyhow::Result<Vec<String>> {
         if !sample.user_addrs.is_empty() {
             if let Some(pid) = target_pid {
                 let src = Source::Process(Process::new(Pid::from(pid)));
+                let jit_table = jit_tables.get(&pid);
                 match symbolizer.symbolize(&src, Input::AbsAddr(&sample.user_addrs)) {
                     Ok(syms) => {
-                        for sym in syms {
-                            frames.push(format_symbolized(sym, false));
+                        for (i, sym) in syms.into_iter().enumerate() {
+                            let formatted = format_symbolized(sym, false);
+                            // Override [unknown] with JITDump symbol if available
+                            if formatted == "[unknown]" {
+                                if let Some(table) = jit_table {
+                                    if let Some(addr) = sample.user_addrs.get(i) {
+                                        if let Some(jit_sym) = table.resolve(*addr) {
+                                            frames.push(jitdump::format_jit_symbol(jit_sym));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            frames.push(formatted);
                         }
                     }
                     Err(e) => {

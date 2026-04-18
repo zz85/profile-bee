@@ -569,6 +569,100 @@ test_nodejs_dwarf_callstack() {
         "Should contain JS function names or V8 internal frames with DWARF"
 }
 
+# ---------- Bun / JITDump tests ---------------------------------------------
+
+# Run the profiler against a Bun script with JITDump support.
+# Uses -- <command> syntax so setup_process_to_profile auto-injects
+# BUN_JSC_useJITDump=1.
+run_bun_profiler() {
+    local script="$1"
+    local name="$2"
+    shift 2
+    local extra_args=("$@")
+    local collapse_file="$OUTPUT_DIR/${name}.collapse"
+
+    # Remove any stale collapse file so the existence check below
+    # verifies that the profiler actually produced fresh output.
+    rm -f "$collapse_file"
+
+    local profiler_output
+    profiler_output=$(DURATION_MS=$((PROFILE_TIME_MS + 500)) timeout "$TEST_TIMEOUT" "$PROFILER" \
+        --time "$PROFILE_TIME_MS" \
+        --frequency "$FREQUENCY" \
+        --collapse "$collapse_file" \
+        --skip-idle \
+        "${extra_args[@]+"${extra_args[@]}"}" \
+        -- bun "$script" 2>&1) || true
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "--- profiler output ---" >&2
+        echo "$profiler_output" >&2
+        echo "--- end ---" >&2
+    fi
+
+    if [[ ! -f "$collapse_file" ]]; then
+        echo "Collapse file not created: $collapse_file" >&2
+        return 1
+    fi
+
+    echo "$collapse_file"
+}
+
+test_bun_samples_collected() {
+    if ! command -v bun &>/dev/null; then
+        echo "  SKIP: bun not found in PATH" >&2
+        return 0
+    fi
+
+    local script="$SCRIPT_DIR/fixtures/src/bun_callstack.js"
+    if [[ ! -f "$script" ]]; then
+        echo "  SKIP: fixture $script not found" >&2
+        return 0
+    fi
+
+    local file
+    file=$(run_bun_profiler "$script" "bun-samples")
+
+    local total
+    total=$(count_samples "$file")
+    if [[ "$total" -gt 0 ]]; then
+        return 0
+    else
+        echo "  No samples collected for Bun (total=$total)" >&2
+        return 1
+    fi
+}
+
+test_bun_jitdump_callstack() {
+    if ! command -v bun &>/dev/null; then
+        echo "  SKIP: bun not found in PATH" >&2
+        return 0
+    fi
+
+    local script="$SCRIPT_DIR/fixtures/src/bun_callstack.js"
+    if [[ ! -f "$script" ]]; then
+        echo "  SKIP: fixture $script not found" >&2
+        return 0
+    fi
+
+    local file
+    file=$(run_bun_profiler "$script" "bun-jitdump-callstack")
+
+    local total
+    total=$(count_samples "$file")
+    if [[ "$total" -le 0 ]]; then
+        echo "  No samples collected for Bun" >&2
+        return 1
+    fi
+
+    # Check for JS function names from JITDump (primary goal).
+    # JIT-compiled functions should appear with their JS names.
+    # Also accept Bun/JSC internal frames as proof that stack walking works.
+    assert_stack_contains "$file" \
+        "hot\|processData\|handleRequest\|serverLoop" \
+        "Should contain JS function names from JITDump"
+}
+
 # ── Run all tests ────────────────────────────────────────────────────────────
 
 echo ""
@@ -620,6 +714,11 @@ echo "── Node.js / JIT Runtime ──"
 run_test "Node.js samples collected"                 test_nodejs_samples_collected
 run_test "Node.js JS function names in stacks"       test_nodejs_callstack
 run_test "Node.js DWARF + FP-only JIT zones"         test_nodejs_dwarf_callstack
+echo ""
+
+echo "── Bun / JITDump ──"
+run_test "Bun samples collected"                     test_bun_samples_collected
+run_test "Bun JS function names via JITDump"         test_bun_jitdump_callstack
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────────
