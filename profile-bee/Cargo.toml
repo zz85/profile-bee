@@ -49,6 +49,7 @@ flate2 = "1"
 strip-ansi-escapes = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 parking_lot = "0.12"
+sha2 = "0.10"
 aws-sdk-codeguruprofiler = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 tonic = { version = "0.12", features = ["gzip", "transport"], optional = true }

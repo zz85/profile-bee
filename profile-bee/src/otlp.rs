@@ -602,13 +602,43 @@ fn read_proc_maps(pid: u32) -> Vec<ProcMapEntry> {
         .collect()
 }
 
-/// Try to read the ELF build ID from a binary file, returning it as a hex string.
-fn read_build_id(path: &str) -> Option<String> {
-    let data = std::fs::read(path).ok()?;
-    let file = object::File::parse(&*data).ok()?;
-    use object::Object;
-    let build_id = file.build_id().ok()??;
-    Some(build_id.iter().map(|b| format!("{:02x}", b)).collect())
+/// Compute the htlhash FileId for an ELF binary — compatible with devfiler.
+///
+/// Algorithm: SHA-256(first_4096_bytes || last_4096_bytes || big_endian_u64_length)[0:16]
+/// Serialized as lowercase hex for the `process.executable.build_id.htlhash` attribute.
+fn compute_htlhash(path: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+
+    const PARTIAL_HASH_SIZE: u64 = 4096;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.seek(SeekFrom::End(0)).ok()?;
+    file.seek(SeekFrom::Start(0)).ok()?;
+
+    let mut hasher = Sha256::new();
+
+    // Hash head (first 4096 bytes or less)
+    let head_size = file_len.min(PARTIAL_HASH_SIZE) as usize;
+    let mut head_buf = vec![0u8; head_size];
+    file.read_exact(&mut head_buf).ok()?;
+    hasher.update(&head_buf);
+
+    // Hash tail (last 4096 bytes or less)
+    let tail_start = file_len.saturating_sub(PARTIAL_HASH_SIZE);
+    file.seek(SeekFrom::Start(tail_start)).ok()?;
+    let tail_size = (file_len - tail_start) as usize;
+    let mut tail_buf = vec![0u8; tail_size];
+    file.read_exact(&mut tail_buf).ok()?;
+    hasher.update(&tail_buf);
+
+    // Hash file length as big-endian u64
+    hasher.update(file_len.to_be_bytes());
+
+    // Truncate SHA-256 to 128 bits, format as hex
+    let digest = hasher.finalize();
+    let hex: String = digest[..16].iter().map(|b| format!("{:02x}", b)).collect();
+    Some(hex)
 }
 
 /// Convert structured `FrameCount` data (with real addresses) into an OTLP
@@ -695,14 +725,13 @@ pub fn framecounts_to_otlp_request(
                 })
         };
 
-    // Use "go" for user-space frames. devfiler skips loc.lines entirely for
-    // "native" frames (unconditional `continue` in ingest_locations) and only
-    // does address-based symbolization from the binary. Since we want devfiler
-    // to read our pre-symbolized function names, we must use a non-native type.
-    // "go" is the closest compiled-language type. Real addresses and mappings
-    // are still sent for proper frame identity and future binary symbolization.
+    // Use "native" for user-space frames. With the symbol-server providing
+    // symbols to devfiler via --symb-endpoint, devfiler can resolve native
+    // frames by address using the htlhash build ID to look up symbols.
+    // Function names are still included in loc.lines as fallback for receivers
+    // that don't do server-side symbolization (e.g., Pyroscope, OTel Collector).
     let native_attr_idx =
-        get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "go");
+        get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "native");
     let kernel_attr_idx =
         get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "kernel");
 
@@ -750,7 +779,7 @@ pub fn framecounts_to_otlp_request(
         // Try to read build ID
         let build_id = build_id_cache
             .entry(entry.pathname.clone())
-            .or_insert_with(|| read_build_id(&entry.pathname))
+            .or_insert_with(|| compute_htlhash(&entry.pathname))
             .clone();
 
         let mut mapping_attr_indices = vec![];

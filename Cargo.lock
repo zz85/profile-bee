@@ -2552,6 +2552,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "strip-ansi-escapes",
  "thiserror 1.0.69",
  "tokio",
