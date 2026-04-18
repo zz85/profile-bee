@@ -22,6 +22,9 @@ pub mod output;
 pub mod pipeline;
 pub mod pprof;
 
+#[cfg(feature = "otlp")]
+pub mod otlp;
+
 pub mod probe_resolver;
 pub mod probe_spec;
 

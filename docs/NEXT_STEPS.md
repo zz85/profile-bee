@@ -60,7 +60,13 @@ Implemented via:
 - `--codeguru <path>` flag for local file output (`src/codeguru.rs`)
 - `--codeguru-upload --profiling-group <name>` for direct upload to CodeGuru via `PostAgentProfile` API (`src/codeguru_upload.rs`). Uses the AWS SDK credential chain; requires `sudo -E` to preserve credentials.
 
-### 10c. JFR (Java Flight Recorder) Format — Planned
+### 10c. OTLP Profiles Export ✅ Done (basic)
+
+Export profiles in OpenTelemetry Profiles format via gRPC to OTLP-compatible backends (devfiler, OTel Collector, Pyroscope). Uses `protox` (pure-Rust protobuf compiler, no `protoc` binary needed) and `tonic` for gRPC transport. Supports both streaming and batch modes.
+
+Currently sends pre-symbolized frames (function names from collapse format) using `"go"` as the `profile.frame.type` so devfiler reads names from the proto. A future enhancement could add a `--otlp-raw` mode that sends unsymbolized `"native"` frames with real addresses and mapping/build-ID info, allowing the backend (devfiler, Pyroscope) to perform its own symbolization from the binary. This would enable richer features like inline frame expansion, source-line attribution, and deferred/server-side symbolization.
+
+### 10d. JFR (Java Flight Recorder) Format — Planned
 
 Binary format used by JDK Mission Control, IntelliJ, Grafana/Pyroscope, and Datadog Continuous Profiling. Despite the Java name, async-profiler proves it works for native C/C++/kernel stacks (library name as "Class", symbol as "Method", FrameType=C++/Kernel).
 

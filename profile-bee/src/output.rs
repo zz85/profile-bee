@@ -15,6 +15,11 @@ use crate::event_loop::RawAddressSample;
 use crate::html::{collapse_to_json, generate_html_file};
 use crate::pprof::{collapse_to_pprof, PprofOptions};
 
+#[cfg(feature = "otlp")]
+use crate::otlp::{self, OtlpOptions, ProfilesServiceClient};
+#[cfg(feature = "otlp")]
+use tonic::transport::Channel;
+
 /// Trait for consuming profiling output.
 ///
 /// In batch mode, `write_batch` is called once with the final stacks.
@@ -482,5 +487,160 @@ impl RawCollapseSink {
             })
             .map(|s| s.to_string())
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OTLP gRPC profile export sink
+// ---------------------------------------------------------------------------
+
+/// Sends profiling data to an OTLP-compatible gRPC endpoint.
+///
+/// Compatible with:
+/// - [devfiler](https://github.com/elastic/devfiler) (port 11000)
+/// - OpenTelemetry Collector with profiles receiver
+/// - Grafana Pyroscope (via OTel Collector)
+/// - Any backend implementing `ProfilesService/Export`
+///
+/// Supports both batch mode (single send on `finish()`) and streaming mode
+/// (periodic sends via `write_batch()`).
+#[cfg(feature = "otlp")]
+pub struct OtlpSink {
+    endpoint: String,
+    service_name: String,
+    frequency_hz: u64,
+    off_cpu: bool,
+    duration_ms: u64,
+    /// Lazily initialized gRPC client. Created on first send.
+    client: Option<ProfilesServiceClient<Channel>>,
+    /// Tokio runtime handle for blocking gRPC calls from sync OutputSink methods.
+    runtime: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "otlp")]
+impl OtlpSink {
+    pub fn new(
+        endpoint: String,
+        service_name: String,
+        frequency_hz: u64,
+        off_cpu: bool,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            endpoint,
+            service_name,
+            frequency_hz,
+            off_cpu,
+            duration_ms: 0,
+            client: None,
+            runtime,
+        }
+    }
+
+    /// Send a batch of collapse-format stacks to the OTLP endpoint.
+    fn send_stacks(&mut self, stacks: &[String]) -> Result<()> {
+        if stacks.is_empty() {
+            return Ok(());
+        }
+
+        let opts = OtlpOptions {
+            service_name: self.service_name.clone(),
+            frequency_hz: self.frequency_hz,
+            duration_ms: self.duration_ms,
+            off_cpu: self.off_cpu,
+        };
+
+        let request = otlp::collapse_to_otlp_request(stacks, &opts);
+        let sample_count: usize = request
+            .resource_profiles
+            .iter()
+            .flat_map(|rp| &rp.scope_profiles)
+            .flat_map(|sp| &sp.profiles)
+            .map(|p| p.samples.len())
+            .sum();
+
+        tracing::debug!(
+            "OTLP: sending {} samples ({} stacks) to {}",
+            sample_count,
+            stacks.len(),
+            self.endpoint
+        );
+
+        // Ensure gRPC client is connected.
+        self.ensure_connected()?;
+
+        let client = self.client.as_mut().unwrap();
+        let runtime = self.runtime.clone();
+        let response = tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                client
+                    .export(tonic::Request::new(request))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("OTLP export failed: {}", e))
+            })
+        })?;
+
+        let resp = response.into_inner();
+        if let Some(partial) = resp.partial_success {
+            if partial.rejected_profiles > 0 {
+                tracing::warn!(
+                    "OTLP: server rejected {} profiles: {}",
+                    partial.rejected_profiles,
+                    partial.error_message
+                );
+            }
+        }
+
+        tracing::info!(
+            "OTLP: exported {} samples to {}",
+            sample_count,
+            self.endpoint
+        );
+        Ok(())
+    }
+
+    /// Ensure the gRPC client is connected, connecting lazily if needed.
+    fn ensure_connected(&mut self) -> Result<()> {
+        if self.client.is_some() {
+            return Ok(());
+        }
+
+        let endpoint = self.endpoint.clone();
+        tracing::info!("OTLP: connecting to gRPC endpoint: {}", endpoint);
+
+        let uri = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            endpoint.clone()
+        } else {
+            format!("http://{}", endpoint)
+        };
+
+        let channel = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                tonic::transport::Channel::from_shared(uri)
+                    .map_err(|e| anyhow::anyhow!("invalid OTLP endpoint: {}", e))?
+                    .connect()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to connect to OTLP endpoint: {}", e))
+            })
+        })?;
+
+        self.client = Some(ProfilesServiceClient::new(channel));
+        tracing::info!("OTLP: connected to {}", self.endpoint);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "otlp")]
+impl OutputSink for OtlpSink {
+    fn set_actual_duration_ms(&mut self, duration_ms: u64) {
+        self.duration_ms = duration_ms;
+    }
+
+    fn write_batch(&mut self, stacks: &[String]) -> Result<()> {
+        self.send_stacks(stacks)
+    }
+
+    fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
+        self.send_stacks(final_stacks)
     }
 }

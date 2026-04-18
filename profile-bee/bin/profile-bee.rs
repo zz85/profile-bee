@@ -113,7 +113,11 @@ fn infer_output_format(path: &Path) -> Result<OutputFormat, anyhow::Error> {
   # Off-CPU profiling — measure blocked/waiting time
   sudo probee --off-cpu -o offcpu.svg -t 5000
   sudo probee --off-cpu --tui -p 1234
-  sudo probee --off-cpu --min-block-time 100 -o offcpu.svg -- ./my-app
+   sudo probee --off-cpu --min-block-time 100 -o offcpu.svg -- ./my-app
+
+  # Send profiles to devfiler via OTLP gRPC (build with --features otlp)
+  sudo probee --otlp-endpoint 127.0.0.1:11000 -t 5000
+  sudo probee --otlp-endpoint 127.0.0.1:11000 -o flame.svg -- ./my-app
 
 \x1b[1mLegacy flags (still work, hidden from options list):\x1b[0m
   --svg, --html, --json, --collapse, --pprof, --codeguru
@@ -298,6 +302,23 @@ struct Opt {
     /// Only effective with --off-cpu.
     #[arg(long, default_value_t = u64::MAX)]
     max_block_time: u64,
+
+    /// OTLP gRPC endpoint for profile export (e.g. 127.0.0.1:11000 for devfiler).
+    /// When set, profiles are streamed to the endpoint in OTLP Profiles format.
+    /// Compatible with devfiler, OTel Collector, and Pyroscope (via Collector).
+    #[cfg(feature = "otlp")]
+    #[arg(long)]
+    otlp_endpoint: Option<String>,
+
+    /// Use plaintext (insecure) gRPC for OTLP export. Required for devfiler.
+    #[cfg(feature = "otlp")]
+    #[arg(long, default_value_t = true)]
+    otlp_insecure: bool,
+
+    /// Service name for OTLP resource attribute (defaults to profiled command name).
+    #[cfg(feature = "otlp")]
+    #[arg(long)]
+    otlp_service_name: Option<String>,
 }
 
 impl Opt {
@@ -332,6 +353,8 @@ impl Opt {
             || self.time.is_some()
             // Off-CPU profiling mode
             || self.off_cpu
+            // OTLP export
+            || { #[cfg(feature = "otlp")] { self.otlp_endpoint.is_some() } #[cfg(not(feature = "otlp"))] { false } }
     }
 }
 
@@ -764,6 +787,30 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 tokio::runtime::Handle::current(),
             ),
         ));
+    }
+    // OTLP gRPC export sink
+    #[cfg(feature = "otlp")]
+    if let Some(ref endpoint) = opt.otlp_endpoint {
+        let service_name = opt.otlp_service_name.clone().unwrap_or_else(|| {
+            // Default service name: profiled command name, or "profile-bee"
+            if !opt.command.is_empty() {
+                std::path::Path::new(&opt.command[0])
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "profile-bee".to_string())
+            } else if let Some(pid) = opt.pid {
+                format!("pid-{}", pid)
+            } else {
+                "profile-bee".to_string()
+            }
+        });
+        sinks.push(Box::new(profile_bee::output::OtlpSink::new(
+            endpoint.clone(),
+            service_name,
+            opt.frequency,
+            opt.off_cpu,
+            tokio::runtime::Handle::current(),
+        )));
     }
     if opt.serve {
         sinks.push(Box::new(WebBroadcastSink::new(tx)));

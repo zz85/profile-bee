@@ -62,6 +62,38 @@ fn main() {
         label,
         source.display()
     );
+
+    // Compile OTLP Profiles protobuf definitions when the `otlp` feature is enabled.
+    #[cfg(feature = "otlp")]
+    compile_otlp_protos(&manifest_dir);
+}
+
+#[cfg(feature = "otlp")]
+fn compile_otlp_protos(manifest_dir: &Path) {
+    let proto_dir = manifest_dir.join("proto");
+    let protos = &[
+        proto_dir.join("opentelemetry/proto/collector/profiles/v1development/profiles_service.proto"),
+        proto_dir.join("opentelemetry/proto/profiles/v1development/profiles.proto"),
+    ];
+
+    // Re-run if any proto file changes.
+    for proto in protos {
+        println!("cargo:rerun-if-changed={}", proto.display());
+    }
+    println!("cargo:rerun-if-changed={}", proto_dir.join("opentelemetry/proto/common/v1/common.proto").display());
+    println!("cargo:rerun-if-changed={}", proto_dir.join("opentelemetry/proto/resource/v1/resource.proto").display());
+
+    // Use protox (pure-Rust protobuf compiler) to parse protos — no `protoc` binary needed.
+    let file_descriptors = protox::compile(
+        protos.iter().map(|p| p.to_str().unwrap()),
+        [proto_dir.to_str().unwrap()],
+    )
+    .expect("failed to compile OTLP proto files with protox");
+
+    tonic_build::configure()
+        .build_server(false) // we only need the gRPC client
+        .compile_fds(file_descriptors)
+        .expect("failed to generate Rust code from OTLP protos");
 }
 
 /// Returns `Some(path)` if the file exists, `None` otherwise.
