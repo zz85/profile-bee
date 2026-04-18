@@ -393,6 +393,12 @@ impl TraceHandler {
     ///
     /// Follows the same logic as `get_exp_stacked_frames` for selecting the
     /// best user stack (stacked_pointers vs bpf_get_stackid).
+    ///
+    /// **Note:** Unlike `get_exp_stacked_frames`, this does NOT read
+    /// `pointers.v8_sfi` — the produced `.raw` files will not carry V8
+    /// JavaScript frame names. V8 JS frames will appear as `[unknown]` or
+    /// hex addresses in the re-symbolized output. Use the live symbolized
+    /// pipeline (e.g. `-o output.svg`) for full V8 JS symbol resolution.
     pub fn get_raw_addresses(
         &mut self,
         stack_info: &StackInfo,

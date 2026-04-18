@@ -299,6 +299,13 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         let (ip, bp, len) = dwarf_copy_stack_regs(&*regs, &mut pointer.pointers, tgid);
         (ip, bp, len, (*regs).rsp)
     } else {
+        // Try tail-call-based FP+V8 walking for deep stacks with V8 SFI extraction.
+        // If the tail call succeeds, execution transfers to fp_v8_unwind_step and
+        // this function never continues past this point (the step program handles
+        // finalization, COUNTS insertion, and RING_BUF submission).
+        // If it fails (program not registered, non-perf_event context), we fall
+        // through to the inline FP walker below (without V8 extraction).
+        fp_v8_try_tail_call(&ctx, &*regs, tgid, user_stack_id, kernel_stack_id, cpu);
         copy_stack_regs(&*regs, pointer)
     };
     pointer.len = len;
@@ -1049,6 +1056,12 @@ unsafe fn dwarf_finalize_stack(state: &DwarfUnwindState) {
     }
     pointer.len = len;
 
+    // Clear v8_sfi to prevent stale SFI data from a previous FP+V8
+    // sample leaking into this DWARF sample (STORAGE persists per-CPU).
+    for i in 0..MAX_V8_FRAMES {
+        pointer.v8_sfi[i] = 0;
+    }
+
     let stack_info = StackInfo {
         tgid: state.tgid,
         user_stack_id: state.user_stack_id,
@@ -1195,33 +1208,196 @@ unsafe fn binary_search_unwind_entry(
 }
 
 /// puts the userspace stack in the target pointer slice (from pt_regs directly)
+///
+/// The V8 SFI extraction is handled by the FP+V8 tail-call walker
+/// (fp_v8_try_tail_call → fp_v8_unwind_step) which runs as a separate
+/// tail-call program at PROG_ARRAY index 1. If the tail call succeeds,
+/// collect_trace never reaches this function. If it fails (program not
+/// registered, non-perf_event context), this inline fallback runs without
+/// V8 extraction.
 #[inline(always)]
 unsafe fn copy_stack_regs(regs: &pt_regs, pointer: &mut FramePointers) -> (u64, u64, usize, u64) {
-    let (ip, bp, len, sp) = copy_stack_regs_fp_only(regs, &mut pointer.pointers);
-    pointer.len = len;
+    // Clear v8_sfi to prevent stale SFI values from a previous tail-call
+    // sample leaking through (STORAGE is a PerCpuArray that persists).
+    for i in 0..MAX_V8_FRAMES {
+        pointer.v8_sfi[i] = 0;
+    }
+    copy_stack_regs_fp_only(regs, &mut pointer.pointers)
+}
 
-    // Check if this is a V8 process — look up V8ProcInfo by tgid.
-    // If present, extract JSFunction → SFI pointers from the FP context
-    // for each frame so userspace can resolve JavaScript function names.
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+/// Initialize FP+V8 unwind state and attempt to tail-call into the FP+V8 step
+/// program at PROG_ARRAY index 1.
+///
+/// If the tail call succeeds, execution transfers to fp_v8_unwind_step and this
+/// function never returns. The step program walks the frame pointer chain 5
+/// frames at a time, extracts V8 SFI for each frame, and finalizes by copying
+/// results to STORAGE + submitting to RING_BUF_STACKS.
+///
+/// If the tail call fails (step program not loaded, wrong program type for
+/// kprobe/uprobe), we return to the caller which falls through to the inline
+/// FP walker (copy_stack_regs) without V8 extraction.
+#[inline(always)]
+unsafe fn fp_v8_try_tail_call<C: EbpfContext>(
+    ctx: &C,
+    regs: &pt_regs,
+    tgid: u32,
+    user_stack_id: i32,
+    kernel_stack_id: i32,
+    cpu: u32,
+) {
+    let Some(state) = UNWIND_STATE.get_ptr_mut(0) else {
+        return;
+    };
+
+    // Initialize with first frame (current IP)
+    (*state).pointers[0] = regs.rip;
+    (*state).frame_count = 1;
+    (*state).current_ip = regs.rip;
+    (*state).sp = regs.rsp;
+    (*state).bp = regs.rbp;
+    (*state).tgid = tgid;
+
+    // Zero V8 SFI slot for frame 0 and attempt extraction
+    (*state).v8_sfi[0] = 0;
     if let Some(vi) = V8_PROC_INFO.get(&tgid) {
-        // Re-walk the frame chain to read V8 FP context for each frame.
-        // We re-read bp from regs since copy_stack_regs_fp_only consumed it.
-        let mut frame_bp = regs.rbp;
-        for i in 1..len {
-            if i >= MAX_V8_FRAMES || frame_bp == 0 {
-                break;
-            }
-            // Read V8 SFI from this frame's FP context
-            if let Some(sfi) = try_read_v8_sfi(vi, frame_bp) {
-                pointer.v8_sfi[i] = sfi;
-            }
-            // Advance to next frame (just read the saved bp, don't need the IP)
-            frame_bp = bpf_probe_read(frame_bp as *const u8 as _).unwrap_or(0);
+        if let Some(sfi) = try_read_v8_sfi(vi, regs.rbp) {
+            (*state).v8_sfi[0] = sfi;
         }
     }
 
-    (ip, bp, len, sp)
+    // Save finalization context
+    (*state).user_stack_id = user_stack_id;
+    (*state).kernel_stack_id = kernel_stack_id;
+    (*state).cmd = ctx.command().unwrap_or_default();
+    (*state).cpu = cpu;
+    (*state).initial_ip = regs.rip;
+    (*state).initial_bp = regs.rbp;
+    (*state).initial_sp = regs.rsp;
+
+    // Attempt tail call to FP+V8 step program at index 1.
+    // If successful, we never return.
+    let _ = PROG_ARRAY.tail_call(ctx, 1);
+}
+
+/// Finalize FP+V8 unwinding: copy frame pointers and V8 SFI data from per-CPU
+/// state to STORAGE, build StackInfo, and submit to maps/ring buffer.
+/// Called from fp_v8_unwind_step when walking is complete.
+#[inline(always)]
+unsafe fn fp_v8_finalize_stack(state: &DwarfUnwindState) {
+    let Some(pointer) = STORAGE.get_ptr_mut(0) else {
+        return;
+    };
+    let pointer = &mut *pointer;
+
+    // Copy frame pointers from state to STORAGE
+    let len = state.frame_count;
+    for i in 0..MAX_DWARF_STACK_DEPTH {
+        if i >= len || i >= pointer.pointers.len() {
+            break;
+        }
+        pointer.pointers[i] = state.pointers[i];
+    }
+    pointer.len = len;
+
+    // Copy V8 SFI data
+    for i in 0..MAX_V8_FRAMES {
+        if i >= len {
+            break;
+        }
+        pointer.v8_sfi[i] = state.v8_sfi[i];
+    }
+
+    let stack_info = StackInfo {
+        tgid: state.tgid,
+        user_stack_id: state.user_stack_id,
+        kernel_stack_id: state.kernel_stack_id,
+        cmd: state.cmd,
+        cpu: state.cpu,
+        ip: state.initial_ip,
+        bp: state.initial_bp,
+        sp: state.initial_sp,
+    };
+
+    let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
+
+    let notify_code = notify_type();
+    let mut notify = notify_code == EVENT_TRACE_ALWAYS;
+
+    if let Some(count) = COUNTS.get_ptr_mut(&stack_info) {
+        *count += 1;
+    } else {
+        let _ = COUNTS.insert(&stack_info, &1, 0);
+        notify = true;
+    }
+
+    if notify {
+        if let Some(mut entry) = RING_BUF_STACKS.reserve::<StackInfo>(0) {
+            let _writable = entry.write(stack_info);
+            entry.submit(0);
+        }
+    }
+}
+
+/// FP+V8 unwind step program body. Called via tail-call from collect_trace
+/// (through fp_v8_try_tail_call at PROG_ARRAY index 1).
+///
+/// Walks FRAMES_PER_TAIL_CALL (5) frames per invocation using frame pointer
+/// chaining, and for each frame extracts V8 SFI if the process has V8ProcInfo.
+/// Then either tail-calls itself for more frames or finalizes the stack trace.
+///
+/// This is the FP equivalent of dwarf_unwind_step_impl — same tail-call pattern,
+/// different unwinding logic.
+pub unsafe fn fp_v8_unwind_step_impl<C: EbpfContext>(ctx: C) {
+    let Some(state) = UNWIND_STATE.get_ptr_mut(0) else {
+        return;
+    };
+    let state = &mut *state;
+
+    let mut did_walk = false;
+    for _ in 0..FRAMES_PER_TAIL_CALL {
+        if state.frame_count >= MAX_DWARF_STACK_DEPTH {
+            break;
+        }
+        if state.frame_count >= state.pointers.len() {
+            break;
+        }
+
+        // FP step: read [bp] = next_bp, [bp+8] = return_addr
+        let Some((ra, new_bp)) = try_fp_step(state.bp) else {
+            fp_v8_finalize_stack(state);
+            return;
+        };
+
+        let idx = state.frame_count;
+        state.pointers[idx] = ra;
+
+        // V8 SFI extraction for this frame (the V8 context at new_bp
+        // belongs to the frame we just discovered at pointers[idx])
+        if idx < MAX_V8_FRAMES {
+            state.v8_sfi[idx] = 0;
+            if let Some(vi) = V8_PROC_INFO.get(&state.tgid) {
+                if let Some(sfi) = try_read_v8_sfi(vi, new_bp) {
+                    state.v8_sfi[idx] = sfi;
+                }
+            }
+        }
+
+        state.frame_count = idx + 1;
+        state.bp = new_bp;
+        state.current_ip = ra;
+        did_walk = true;
+    }
+
+    if !did_walk || state.frame_count >= MAX_DWARF_STACK_DEPTH {
+        fp_v8_finalize_stack(state);
+        return;
+    }
+
+    // More frames to walk — tail-call back into ourselves at index 1
+    let _ = PROG_ARRAY.tail_call(&ctx, 1);
+
+    // Tail call failed (max 33 tail calls reached) — finalize with what we have
+    fp_v8_finalize_stack(state);
 }
 
 /// Pure FP-based stack walking without V8 extraction.
@@ -1260,9 +1436,10 @@ unsafe fn copy_stack_regs_fp_only(regs: &pt_regs, pointers: &mut [u64]) -> (u64,
 unsafe fn try_read_v8_sfi(vi: &V8ProcInfo, bp: u64) -> Option<u64> {
     // The fp_function offset is a byte offset within the 64-byte FP context
     // buffer (already mapped from the signed FP-relative offset by userspace).
+    // Ensure the entire 8-byte u64 read fits within the context area.
     let fp_func_offset = vi.fp_function as u64;
-    if fp_func_offset >= V8_FP_CONTEXT_SIZE as u64 {
-        return None; // invalid/sentinel offset
+    if fp_func_offset + core::mem::size_of::<u64>() as u64 > V8_FP_CONTEXT_SIZE as u64 {
+        return None; // read would extend past the FP context boundary
     }
 
     // Read the JSFunction tagged pointer from the FP context

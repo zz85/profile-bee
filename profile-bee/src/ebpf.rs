@@ -182,7 +182,7 @@ fn setup_tail_call_unwinding_inner(bpf: &mut Ebpf) -> Result<(), anyhow::Error> 
         .fd()?
         .try_clone()?;
 
-    // Register the step program at index 0 of PROG_ARRAY
+    // Register the DWARF step program at index 0 of PROG_ARRAY
     let mut prog_array = ProgramArray::try_from(
         bpf.map_mut("prog_array")
             .ok_or(anyhow!("prog_array map not found"))?,
@@ -190,6 +190,36 @@ fn setup_tail_call_unwinding_inner(bpf: &mut Ebpf) -> Result<(), anyhow::Error> 
     prog_array.set(0, &step_fd, 0)?;
 
     tracing::info!("Tail-call DWARF unwinding enabled (up to 165 frames)");
+    Ok(())
+}
+
+/// Load the fp_v8_unwind_step program and register it at PROG_ARRAY index 1
+/// for tail-call FP walking with V8 SFI extraction. Called unconditionally
+/// (not gated on DWARF mode) because the FP+V8 path runs in the NON-DWARF
+/// branch of collect_trace.
+fn setup_fp_v8_tail_call(bpf: &mut Ebpf) -> Result<(), anyhow::Error> {
+    use aya::programs::PerfEvent;
+
+    {
+        let fp_v8_prog: &mut PerfEvent = bpf
+            .program_mut("fp_v8_unwind_step")
+            .ok_or(anyhow!("fp_v8_unwind_step program not found"))?
+            .try_into()?;
+        fp_v8_prog.load()?;
+    }
+    let fp_v8_fd = bpf
+        .program("fp_v8_unwind_step")
+        .ok_or(anyhow!("fp_v8_unwind_step not found after load"))?
+        .fd()?
+        .try_clone()?;
+
+    let mut prog_array = ProgramArray::try_from(
+        bpf.map_mut("prog_array")
+            .ok_or(anyhow!("prog_array map not found"))?,
+    )?;
+    prog_array.set(1, &fp_v8_fd, 0)?;
+
+    tracing::info!("Tail-call FP+V8 walking enabled (up to 165 frames with V8 SFI)");
     Ok(())
 }
 
@@ -353,10 +383,6 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
         // Set up tail-call DWARF unwinding BEFORE attaching perf events.
         // Once attached, samples fire immediately — if PROG_ARRAY isn't populated yet,
         // those samples fall back to the legacy inline DWARF path.
-        //
-        // NOTE: If more pre-attach setup is needed in the future, consider splitting
-        // this function into separate load() and attach() phases (Option B) so callers
-        // can do arbitrary setup between program loading and event attachment.
         if config.dwarf {
             match setup_tail_call_unwinding_inner(&mut bpf) {
                 Ok(()) => {}
@@ -366,6 +392,19 @@ pub fn setup_ebpf_profiler(config: &ProfilerConfig) -> Result<EbpfProfiler, anyh
                         e
                     );
                 }
+            }
+        }
+
+        // Always register the FP+V8 tail-call program (PROG_ARRAY index 1).
+        // This runs in the NON-DWARF path of collect_trace, so it must be
+        // available regardless of whether DWARF mode is enabled.
+        match setup_fp_v8_tail_call(&mut bpf) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "FP+V8 tail-call setup failed, falling back to inline FP path: {:?}",
+                    e
+                );
             }
         }
 
@@ -560,7 +599,7 @@ impl EbpfProfiler {
             Some(map) => {
                 let mut v8_map: HashMap<&mut MapData, u32, V8ProcInfoPod> = HashMap::try_from(map)?;
                 v8_map.insert(tgid, V8ProcInfoPod(*info), 0)?;
-                tracing::info!(
+                tracing::debug!(
                     "loaded V8ProcInfo for pid {} (version={:#x}, JSFunction types [{}, {}])",
                     tgid,
                     info.version,

@@ -403,13 +403,17 @@ impl RawCollapseSink {
         // Header
         writeln!(w, "# profile-bee raw v1")?;
 
-        // Write mappings for each unique PID
-        for (tgid, maps) in &self.mappings_cache {
-            writeln!(w, "# mappings:{}", tgid)?;
-            for line in maps {
-                writeln!(w, "#   {}", line)?;
+        // Write mappings for each unique PID in sorted order for deterministic output
+        let mut sorted_tgids: Vec<u32> = self.mappings_cache.keys().copied().collect();
+        sorted_tgids.sort();
+        for tgid in sorted_tgids {
+            if let Some(maps) = self.mappings_cache.get(&tgid) {
+                writeln!(w, "# mappings:{}", tgid)?;
+                for line in maps {
+                    writeln!(w, "#   {}", line)?;
+                }
+                writeln!(w, "# end_mappings:{}", tgid)?;
             }
-            writeln!(w, "# end_mappings:{}", tgid)?;
         }
         writeln!(w, "#")?;
 
@@ -433,11 +437,15 @@ impl RawCollapseSink {
 
     /// Format a single sample as a collapse-style key string.
     /// Kernel frames get `_k` suffix, user frames are bare hex.
+    /// The tgid is included as a `[pid:N]` prefix after the command name
+    /// so samples from different PIDs with the same command don't collide
+    /// during aggregation. The symbolizer uses this to select the correct
+    /// Process(Pid) source for each sample.
     fn format_sample_key(sample: &RawAddressSample) -> String {
         let mut frames = Vec::new();
 
-        // Process name as root frame
-        frames.push(sample.cmd.clone());
+        // Process name + PID as root frame (prevents cross-PID aggregation collision)
+        frames.push(format!("{}[pid:{}]", sample.cmd, sample.tgid));
 
         // Kernel frames (bottom of stack, reversed for collapse format)
         for addr in sample.kernel_addrs.iter().rev() {
@@ -474,12 +482,5 @@ impl RawCollapseSink {
             })
             .map(|s| s.to_string())
             .collect()
-    }
-
-    /// Also snapshot perf-map files for JIT runtimes.
-    /// Returns the content of /tmp/perf-<pid>.map if it exists.
-    pub fn snapshot_perf_map(tgid: u32) -> Option<String> {
-        let path = format!("/tmp/perf-{}.map", tgid);
-        std::fs::read_to_string(&path).ok()
     }
 }

@@ -82,12 +82,11 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
                 app.flamegraph_view.state.toggle_view_kind();
             }
         }
+        KeyCode::Char('o') if app.has_output() => {
+            app.output_state.show_panel = !app.output_state.show_panel;
+        }
         KeyCode::Char('o') => {
-            if app.has_output() {
-                app.output_state.show_panel = !app.output_state.show_panel;
-            } else {
-                key_handled = false;
-            }
+            key_handled = false;
         }
         KeyCode::Char('/') => {
             app.input_buffer = Some(InputBuffer {

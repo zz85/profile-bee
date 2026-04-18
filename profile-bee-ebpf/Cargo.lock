@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "profile-bee-common"
-version = "0.3.10"
+version = "0.3.12"
 
 [[package]]
 name = "profile-bee-ebpf"

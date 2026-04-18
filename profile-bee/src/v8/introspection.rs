@@ -338,11 +338,23 @@ pub fn read_introspection_data(elf_data: &[u8]) -> Option<V8IntrospectionData> {
     if data.off_map_instance_type == 0
         || data.type_jsfunction == 0
         || data.type_shared_function_info == 0
+        || data.off_jsfunction_shared == 0
+        || data.first_jsfunction_type == 0
+        || data.last_jsfunction_type < data.first_jsfunction_type
     {
         tracing::warn!(
-            "V8 {}.{}.{}: essential v8dbg_* symbols missing (map_instance_type={}, jsfunction={}, sfi={})",
-            version.0, version.1, version.2,
-            data.off_map_instance_type, data.type_jsfunction, data.type_shared_function_info,
+            "V8 {}.{}.{}: essential v8dbg_* symbols missing or invalid \
+             (map_instance_type={}, jsfunction={}, sfi={}, jsfunction_shared={}, \
+             type_range=[{}, {}])",
+            version.0,
+            version.1,
+            version.2,
+            data.off_map_instance_type,
+            data.type_jsfunction,
+            data.type_shared_function_info,
+            data.off_jsfunction_shared,
+            data.first_jsfunction_type,
+            data.last_jsfunction_type,
         );
         return None;
     }
@@ -416,14 +428,30 @@ fn first_of(
 
 /// Read a little-endian u32 at a virtual address by finding which section
 /// contains it and computing the file offset.
+/// Uses checked arithmetic to safely handle malformed ELF metadata.
 fn read_u32_at_vaddr(elf: &ElfFile64<Endianness>, vaddr: u64) -> Option<u32> {
+    // Hoist the loop-invariant vaddr end check — if this overflows,
+    // the address is invalid regardless of section.
+    let vaddr_end = vaddr.checked_add(4)?;
+
     for section in elf.sections() {
         let sec_addr = section.address();
         let sec_size = section.size();
-        if vaddr >= sec_addr && vaddr + 4 <= sec_addr + sec_size {
-            let offset = (vaddr - sec_addr) as usize;
-            let data = section.data().ok()?;
-            if offset + 4 <= data.len() {
+        // Per-section overflow: skip this section, don't abort the search.
+        let Some(sec_end) = sec_addr.checked_add(sec_size) else {
+            continue;
+        };
+        if vaddr >= sec_addr && vaddr_end <= sec_end {
+            let Some(offset) = vaddr.checked_sub(sec_addr).map(|o| o as usize) else {
+                continue;
+            };
+            let Ok(data) = section.data() else {
+                continue;
+            };
+            let Some(end) = offset.checked_add(4) else {
+                continue;
+            };
+            if end <= data.len() {
                 return Some(u32::from_le_bytes([
                     data[offset],
                     data[offset + 1],

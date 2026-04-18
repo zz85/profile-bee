@@ -147,7 +147,7 @@ impl ProfilingEventLoop {
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
     ) -> CollectResult {
-        let (local_counting, stopped) = self.drain_events(rx, timeout);
+        let (local_counting, stopped) = self.drain_events(rx, timeout, true);
         let stacks = self.build_collapse_output(local_counting);
         CollectResult { stacks, stopped }
     }
@@ -179,7 +179,7 @@ impl ProfilingEventLoop {
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
     ) -> RawCollectResult {
-        let (local_counting, stopped) = self.drain_events(rx, timeout);
+        let (local_counting, stopped) = self.drain_events(rx, timeout, true);
         let stacks = self.build_raw_stacks(local_counting);
         RawCollectResult { stacks, stopped }
     }
@@ -199,7 +199,7 @@ impl ProfilingEventLoop {
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
     ) -> UnsymbolizedCollectResult {
-        let (local_counting, stopped) = self.drain_events(rx, timeout);
+        let (local_counting, stopped) = self.drain_events(rx, timeout, false);
         let samples = self.build_raw_address_samples(local_counting);
         UnsymbolizedCollectResult { samples, stopped }
     }
@@ -265,7 +265,13 @@ impl ProfilingEventLoop {
         };
 
         // Build compact V8ProcInfo and load into eBPF map
-        let proc_info = data.to_proc_info();
+        let Some(proc_info) = data.to_proc_info() else {
+            tracing::warn!(
+                "V8ProcInfo for pid {} has offsets out of u8 range, skipping",
+                tgid
+            );
+            return;
+        };
         match self.bpf.map_mut("v8_proc_info") {
             Some(map) => {
                 match aya::maps::HashMap::<&mut MapData, u32, V8ProcInfoPod>::try_from(map) {
@@ -292,15 +298,34 @@ impl ProfilingEventLoop {
         self.trace_handler.register_v8_reader(tgid, data);
     }
 
-    /// Drain events from the PerfWork channel, symbolize stacks on the fly,
-    /// and return `(local_counting, stopped)`.
+    /// Remove the V8ProcInfo entry from the eBPF map for a given PID.
+    /// Called on process exit and exec to prevent the eBPF V8 SFI extraction
+    /// from reading stale V8 layout data for a reused PID.
+    fn remove_v8_proc_info_for_pid(&mut self, tgid: u32) {
+        if let Some(map) = self.bpf.map_mut("v8_proc_info") {
+            if let Ok(mut v8_map) =
+                aya::maps::HashMap::<&mut MapData, u32, V8ProcInfoPod>::try_from(map)
+            {
+                let _ = v8_map.remove(&tgid);
+            }
+        }
+    }
+
+    /// Drain events from the PerfWork channel, optionally symbolize stacks
+    /// on the fly, and return `(local_counting, stopped)`.
     ///
-    /// This is the shared event-draining loop used by both [`collect`] and
-    /// [`collect_raw`].
+    /// When `symbolize` is true, `get_exp_stacked_frames` is called for each
+    /// StackInfo event to prime the symbol cache and read frame pointers.
+    /// When false (used by [`collect_unsymbolized`]), this work is skipped
+    /// so the raw address pipeline runs without symbolization overhead.
+    ///
+    /// This is the shared event-draining loop used by [`collect`],
+    /// [`collect_raw`], and [`collect_unsymbolized`].
     fn drain_events(
         &mut self,
         rx: &mpsc::Receiver<PerfWork>,
         timeout: Option<Duration>,
+        symbolize: bool,
     ) -> (bool, bool) {
         // Evict metadata for PIDs that exited in the PREVIOUS cycle.
         // This gives agents one full collection cycle to read metadata
@@ -366,7 +391,7 @@ impl ProfilingEventLoop {
                     if local_counting {
                         let trace = self.trace_count.entry(stack).or_insert(0);
                         *trace += 1;
-                        if *trace == 1 {
+                        if *trace == 1 && symbolize {
                             self.trace_handler.get_exp_stacked_frames(
                                 &stack,
                                 &self.stack_traces,
@@ -375,7 +400,7 @@ impl ProfilingEventLoop {
                                 &self.stacked_pointers,
                             );
                         }
-                    } else {
+                    } else if symbolize {
                         self.trace_handler.get_exp_stacked_frames(
                             &stack,
                             &self.stack_traces,
@@ -397,6 +422,12 @@ impl ProfilingEventLoop {
                                 let _ = tx.send(DwarfThreadMsg::ProcessExited(event.pid));
                             }
                             self.known_tgids.remove(&event.pid);
+                            // Clean up V8 state for the exiting process to prevent
+                            // stale readers from being used if the PID is reused.
+                            self.trace_handler.invalidate_caches_for_pid(event.pid);
+                            // Also remove the eBPF v8_proc_info entry so the FP walker
+                            // won't try to extract V8 SFI for a reused PID.
+                            self.remove_v8_proc_info_for_pid(event.pid);
                             // Defer metadata cache eviction until after build_raw_stacks()
                             // so agents can still look up metadata for processes that
                             // exited within the collection window.
@@ -420,11 +451,14 @@ impl ProfilingEventLoop {
                             // old addresses against the new binary image.
                             self.trace_count.retain(|k, _| k.tgid != event.pid);
                             // The PID is still alive but with a new binary image.
-                            // Re-add to known_tgids so DWARF tables are reloaded.
+                            // Remove from known_tgids so the next StackInfo for this
+                            // PID triggers try_setup_v8_for_pid and DWARF reloading.
+                            // Do NOT re-insert — let the StackInfo handler do it.
                             self.known_tgids.remove(&event.pid);
-                            self.known_tgids.insert(event.pid);
                             // Invalidate symbol caches for this PID
                             self.trace_handler.invalidate_caches_for_pid(event.pid);
+                            // Remove eBPF v8_proc_info for the old binary
+                            self.remove_v8_proc_info_for_pid(event.pid);
                             if let Some(ref mut cache) = self.process_metadata {
                                 cache.invalidate(event.pid);
                             }

@@ -41,7 +41,13 @@ pub struct FramePointers {
     /// code and `v8_sfi[i]` is the tagged SharedFunctionInfo pointer
     /// extracted from the V8 FP context. Userspace uses this to resolve
     /// JavaScript function names via `process_vm_readv`.
-    /// Only the first MAX_V8_FRAMES entries are populated.
+    ///
+    /// **Only the first `MAX_V8_FRAMES` (64) entries are populated.**
+    /// The eBPF FP walker in `copy_stack_regs` (profile-bee-ebpf `lib.rs`)
+    /// stops extracting V8 SFI data at `i >= MAX_V8_FRAMES`, so deep V8
+    /// stacks (>64 JS frames) will have their tail frames degrade to
+    /// `[unknown]` in the flamegraph.  V8 stacks rarely exceed 64 JS
+    /// frames in practice.
     pub v8_sfi: [u64; MAX_V8_FRAMES],
 }
 
@@ -285,6 +291,11 @@ pub struct ProcInfo {
 /// This structure is stored in a PerCpuArray and persists across tail calls.
 /// It contains both unwinding state and finalization context so the tail-call
 /// step program can complete the work started by collect_trace.
+///
+/// Also reused by the FP+V8 tail-call walker (PROG_ARRAY index 1) which
+/// stores FP walk progress and V8 SFI extraction results in the same struct.
+/// The two paths are mutually exclusive per-sample (DWARF vs FP), so sharing
+/// the per-CPU state is safe.
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct DwarfUnwindState {
@@ -317,4 +328,10 @@ pub struct DwarfUnwindState {
     /// Saved CPU ID (for finalization)
     pub cpu: u32,
     pub _pad2: u32,
+    /// V8 SharedFunctionInfo tagged pointers extracted during FP+V8 tail-call
+    /// walking. Parallel to `pointers[0..MAX_V8_FRAMES]`. Zero means "not a
+    /// V8 frame" or "beyond V8 extraction limit".
+    /// Only used by the FP+V8 step program (PROG_ARRAY index 1); the DWARF
+    /// step program (index 0) ignores this field.
+    pub v8_sfi: [u64; MAX_V8_FRAMES],
 }

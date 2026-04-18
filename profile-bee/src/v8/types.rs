@@ -160,11 +160,26 @@ pub struct V8IntrospectionData {
 
 impl V8IntrospectionData {
     /// Build the compact [`profile_bee_common::V8ProcInfo`] for the eBPF V8 unwinder.
-    pub fn to_proc_info(&self) -> profile_bee_common::V8ProcInfo {
+    ///
+    /// Returns `None` if any u32 offset exceeds the u8 range (255), which would
+    /// indicate an unusual V8 build or parsing error.
+    pub fn to_proc_info(&self) -> Option<profile_bee_common::V8ProcInfo> {
         let (major, minor, patch) = self.version;
         let version = (major << 24) | (minor << 16) | patch;
 
-        profile_bee_common::V8ProcInfo {
+        // Validate that all offsets fit in u8 before constructing
+        if self.off_heap_object_map > 255
+            || self.off_map_instance_type > 255
+            || self.off_jsfunction_shared > 255
+        {
+            tracing::warn!(
+                "V8 offset out of u8 range: heap_object_map={}, map_instance_type={}, jsfunction_shared={}",
+                self.off_heap_object_map, self.off_map_instance_type, self.off_jsfunction_shared,
+            );
+            return None;
+        }
+
+        Some(profile_bee_common::V8ProcInfo {
             version,
             type_jsfunction_first: self.first_jsfunction_type,
             type_jsfunction_last: self.last_jsfunction_type,
@@ -175,7 +190,7 @@ impl V8IntrospectionData {
             off_jsfunction_shared: self.off_jsfunction_shared as u8,
             fp_function: map_fp_offset(self.fp_function),
             _pad: [0; 4],
-        }
+        })
     }
 }
 

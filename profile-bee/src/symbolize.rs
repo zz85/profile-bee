@@ -36,6 +36,13 @@ struct RawLine {
 }
 
 /// Parsed mapping header for a process.
+///
+/// **Limitation:** The captured mapping lines are stored but not yet used during
+/// symbolization. The current implementation uses `Source::Process(Pid)` which
+/// queries the live `/proc/<pid>/maps`, so offline symbolization (process no
+/// longer running) will fail to resolve user-space addresses. A future
+/// improvement would construct a blazesym source from these captured mappings
+/// so `probee symbolize` works on files captured from dead processes.
 #[derive(Debug)]
 struct ProcMappings {
     /// Raw mapping lines from `/proc/<pid>/maps`
@@ -57,55 +64,62 @@ pub fn symbolize_raw_file(path: &Path) -> anyhow::Result<Vec<String>> {
     let symbolizer = Symbolizer::new();
     let mut output = Vec::new();
 
-    // Group samples: for now, symbolize using the first PID found.
-    // In system-wide profiles, each sample's cmd may correspond to a different PID.
-    // We use the PID from the mappings header that matches the sample's process.
-    let target_pid = pids.first().copied();
+    // Fallback PID for samples that don't embed a tgid in their root frame.
+    // Used only when the raw file was produced by an older version without
+    // per-sample PID tagging.
+    let fallback_pid = pids.first().copied();
 
     for sample in &samples {
         let mut frames: Vec<String> = Vec::new();
 
-        // Process name as root
-        frames.push(sample.cmd.clone());
+        // Parse per-sample PID from the root frame if present.
+        // New format: "cmd[pid:1234]", old format: just "cmd".
+        let (cmd_display, sample_pid) = parse_cmd_pid(&sample.cmd);
+        frames.push(cmd_display);
 
-        // Symbolize kernel frames
+        let target_pid = sample_pid.or(fallback_pid);
+
+        // Symbolize kernel frames.
+        // Addresses in the raw file are already in root-to-leaf order
+        // (the writer reverses them from leaf-to-root eBPF order), so we
+        // iterate in order — no .rev() needed.
         if !sample.kernel_addrs.is_empty() {
             let src = Source::Kernel(Kernel::default());
             match symbolizer.symbolize(&src, Input::AbsAddr(&sample.kernel_addrs)) {
                 Ok(syms) => {
-                    for sym in syms.into_iter().rev() {
+                    for sym in syms {
                         frames.push(format_symbolized(sym, true));
                     }
                 }
                 Err(e) => {
                     tracing::debug!("kernel symbolization failed: {}", e);
-                    for addr in sample.kernel_addrs.iter().rev() {
+                    for addr in &sample.kernel_addrs {
                         frames.push(format!("{:#x}_k", addr));
                     }
                 }
             }
         }
 
-        // Symbolize user frames
+        // Symbolize user frames (also already root-to-leaf in the file).
         if !sample.user_addrs.is_empty() {
             if let Some(pid) = target_pid {
                 let src = Source::Process(Process::new(Pid::from(pid)));
                 match symbolizer.symbolize(&src, Input::AbsAddr(&sample.user_addrs)) {
                     Ok(syms) => {
-                        for sym in syms.into_iter().rev() {
+                        for sym in syms {
                             frames.push(format_symbolized(sym, false));
                         }
                     }
                     Err(e) => {
                         tracing::debug!("user symbolization failed for pid {}: {}", pid, e);
-                        for addr in sample.user_addrs.iter().rev() {
+                        for addr in &sample.user_addrs {
                             frames.push(format!("{:#x}", addr));
                         }
                     }
                 }
             } else {
                 // No PID available — keep raw addresses
-                for addr in sample.user_addrs.iter().rev() {
+                for addr in &sample.user_addrs {
                     frames.push(format!("{:#x}", addr));
                 }
             }
@@ -137,16 +151,34 @@ fn parse_raw_collapse(
                 current_mapping_pid = pid_str.trim().parse().ok();
                 current_mapping_lines.clear();
             } else if let Some(pid_str) = trimmed.strip_prefix("end_mappings:") {
+                let parsed_pid: Option<u32> = match pid_str.trim().parse() {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!("malformed end_mappings PID '{}': {}", pid_str.trim(), e);
+                        None
+                    }
+                };
                 if let Some(pid) = current_mapping_pid.take() {
-                    let expected: u32 = pid_str.trim().parse().unwrap_or(0);
-                    if pid == expected {
+                    if parsed_pid == Some(pid) {
                         mappings.insert(
                             pid,
                             ProcMappings {
                                 _lines: std::mem::take(&mut current_mapping_lines),
                             },
                         );
+                    } else {
+                        tracing::warn!(
+                            "end_mappings PID mismatch: expected {}, got {:?} — discarding mapping block",
+                            pid,
+                            parsed_pid,
+                        );
+                        current_mapping_lines.clear();
                     }
+                } else {
+                    tracing::warn!(
+                        "end_mappings:{} without matching mappings: header",
+                        pid_str.trim()
+                    );
                 }
             } else if current_mapping_pid.is_some() && !trimmed.is_empty() {
                 current_mapping_lines.push(trimmed.to_string());
@@ -218,6 +250,23 @@ fn format_symbolized(sym: Symbolized, is_kernel: bool) -> String {
         }
         Symbolized::Unknown(_reason) => "[unknown]".to_string(),
     }
+}
+
+/// Parse per-sample PID from the root frame.
+///
+/// New format (with tgid): `"cmd[pid:1234]"` → `("cmd", Some(1234))`
+/// Old format (without):   `"cmd"` → `("cmd", None)`
+fn parse_cmd_pid(cmd: &str) -> (String, Option<u32>) {
+    if let Some(bracket_start) = cmd.rfind("[pid:") {
+        let after = &cmd[bracket_start + 5..];
+        if let Some(bracket_end) = after.find(']') {
+            if let Ok(pid) = after[..bracket_end].parse::<u32>() {
+                let display = cmd[..bracket_start].to_string();
+                return (display, Some(pid));
+            }
+        }
+    }
+    (cmd.to_string(), None)
 }
 
 #[cfg(test)]
@@ -305,5 +354,28 @@ other;0x400042 5
         assert!(mappings.contains_key(&100));
         assert!(mappings.contains_key(&200));
         assert_eq!(samples.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_cmd_pid_with_tag() {
+        let (cmd, pid) = parse_cmd_pid("node[pid:1234]");
+        assert_eq!(cmd, "node");
+        assert_eq!(pid, Some(1234));
+    }
+
+    #[test]
+    fn test_parse_cmd_pid_without_tag() {
+        let (cmd, pid) = parse_cmd_pid("myapp");
+        assert_eq!(cmd, "myapp");
+        assert_eq!(pid, None);
+    }
+
+    #[test]
+    fn test_parse_sample_line_with_pid_tag() {
+        let line = "node[pid:1234];0xffffffff81234567_k;0x7f000042 42";
+        let sample = parse_sample_line(line).unwrap();
+        // The raw parser sees the whole "node[pid:1234]" as cmd
+        assert_eq!(sample.cmd, "node[pid:1234]");
+        assert_eq!(sample.count, 42);
     }
 }

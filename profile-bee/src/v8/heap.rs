@@ -9,6 +9,20 @@
 use std::collections::HashMap;
 use std::io;
 
+/// Return the largest byte index <= `limit` that is a valid UTF-8 char boundary
+/// in `s`. Equivalent to `str::floor_char_boundary` (nightly-only as of Rust 1.82).
+fn floor_char_boundary(s: &str, limit: usize) -> usize {
+    if limit >= s.len() {
+        return s.len();
+    }
+    let mut pos = limit;
+    // Walk backwards until we find a char boundary
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
 use super::types::{self, V8IntrospectionData};
 
 /// Reader for V8 heap objects in a target process.
@@ -126,7 +140,9 @@ impl V8HeapReader {
         let start = scope_addr + 3 * ptr_size; // skip Map + flags + a couple reserved slots
 
         for i in 0..16u64 {
-            let tagged = self.read_ptr(start + i * ptr_size)?;
+            let Some(tagged) = self.read_ptr(start + i * ptr_size) else {
+                continue; // unreadable slot — skip, don't abort the scan
+            };
             if !types::is_heap_object(tagged) {
                 continue;
             }
@@ -220,6 +236,10 @@ impl V8HeapReader {
         }
 
         if rep_tag == self.data.cons_string_tag {
+            // ConsString cap: limit total concatenated output to prevent
+            // arbitrarily large allocations from deeply nested cons strings.
+            const MAX_CONSSTRING_BYTES: usize = 16 * 1024;
+
             // Cons string = first + second
             let first_tagged = self.read_ptr(addr + self.data.off_cons_string_first as u64)?;
             let second_tagged = self.read_ptr(addr + self.data.off_cons_string_second as u64)?;
@@ -237,7 +257,21 @@ impl V8HeapReader {
                 String::new()
             };
 
-            return Some(format!("{}{}", first, second));
+            let total_len = first.len().saturating_add(second.len());
+            if total_len <= MAX_CONSSTRING_BYTES {
+                return Some(format!("{}{}", first, second));
+            }
+            // Truncate: keep as much of first as fits, then prefix of second
+            let mut result = first;
+            if result.len() < MAX_CONSSTRING_BYTES {
+                let remaining = MAX_CONSSTRING_BYTES - result.len();
+                let end = floor_char_boundary(&second, remaining);
+                result.push_str(&second[..end]);
+            } else {
+                let safe = floor_char_boundary(&result, MAX_CONSSTRING_BYTES);
+                result.truncate(safe);
+            }
+            return Some(result);
         }
 
         if rep_tag == self.data.thin_string_tag {
@@ -266,7 +300,11 @@ impl V8HeapReader {
 
         let chars_addr = addr + self.data.off_seq_one_byte_string_chars as u64;
         let bytes = self.read_bytes(chars_addr, length)?;
-        Some(String::from_utf8_lossy(&bytes).to_string())
+        // V8 SeqOneByteString uses Latin-1 (ISO 8859-1) encoding where each
+        // byte maps directly to the corresponding Unicode code point U+00XX.
+        // from_utf8_lossy would corrupt bytes 0x80–0xFF (valid Latin-1 chars
+        // that are invalid UTF-8 lead bytes).
+        Some(bytes.iter().map(|&b| b as char).collect::<String>())
     }
 
     // ── Low-level memory reading via process_vm_readv ──────────────

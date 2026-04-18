@@ -342,7 +342,32 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // share the profiling flags.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("symbolize") {
-        return run_symbolize_subcommand(&args[2..]);
+        let sub_args = &args[2..];
+        // Handle --help / --version before dispatching to the subcommand
+        // so they don't get rejected as "unknown flag for symbolize".
+        if sub_args.is_empty()
+            || sub_args
+                .first()
+                .map(|s| matches!(s.as_str(), "-h" | "--help"))
+                .unwrap_or(false)
+        {
+            eprintln!(
+                "Usage: {} symbolize <file.raw> [-o output.svg] [-o output.folded]\n\n\
+                 Re-symbolize a raw capture file produced by -o profile.raw.\n\
+                 If no -o flags are given, writes symbolized collapse to stdout.",
+                args[0]
+            );
+            return Ok(());
+        }
+        if sub_args
+            .first()
+            .map(|s| matches!(s.as_str(), "-V" | "--version"))
+            .unwrap_or(false)
+        {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        return run_symbolize_subcommand(sub_args);
     }
 
     let mut opt = Opt::parse();
@@ -787,6 +812,15 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         if let Some(ref mut raw) = raw_sink {
             raw.add_samples(result.samples);
         }
+    } else if raw_sink.is_some() && has_symbolized_sinks {
+        // Mixed mode: both raw and symbolized outputs requested.
+        // The eBPF maps are consumed by the symbolized collection path, so
+        // the raw sink cannot extract addresses from the same collection pass.
+        anyhow::bail!(
+            "Cannot combine .raw output with symbolized formats in the same run — \
+             the .raw file would be empty. Use -o profile.raw alone for raw captures, \
+             then re-symbolize with: probee symbolize profile.raw -o output.svg"
+        );
     } else {
         // Non-serve mode: block until Stop, output once, exit.
         // If raw sink exists alongside symbolized sinks, collect both.
@@ -1266,6 +1300,8 @@ fn spawn_profiling_thread(
                                 }
                                 // Allow PID reuse to trigger a fresh LoadProcess
                                 known_tgids.remove(&event.pid);
+                                // Clean up V8 state and symbol caches for the exiting process
+                                profiler.invalidate_caches_for_pid(event.pid);
                                 // Only stop profiling if this is the monitored target process
                                 if Some(event.pid) == monitor_exit_pid {
                                     tracing::info!(
@@ -1280,8 +1316,11 @@ fn spawn_profiling_thread(
                                 if let Some(tx) = &tgid_request_tx {
                                     let _ = tx.send(DwarfThreadMsg::ProcessExeced(event.pid));
                                 }
+                                // Remove from known_tgids so the next StackInfo triggers
+                                // fresh V8/DWARF setup. Do NOT re-insert.
                                 known_tgids.remove(&event.pid);
-                                known_tgids.insert(event.pid);
+                                // Invalidate symbol caches for the old binary image
+                                profiler.invalidate_caches_for_pid(event.pid);
                             }
                             _ => {}
                         }
