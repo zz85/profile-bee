@@ -28,9 +28,6 @@ struct Header {}
 /// A single function range record.
 #[derive(Clone, PartialEq, Message)]
 struct RangeV1 {
-    /// Delta from previous record's ELF VA (sint64, zigzag encoded)
-    #[prost(sint64, tag = "1")]
-    delta_elf_va: i64,
     /// Length of the function
     #[prost(uint64, tag = "2")]
     length: u64,
@@ -49,6 +46,22 @@ struct RangeV1 {
     /// Inline depth (0 = top-level)
     #[prost(uint32, tag = "7")]
     depth: u32,
+    /// ELF virtual address - either absolute (first record) or delta (subsequent)
+    #[prost(oneof = "range_v1::ElfVa", tags = "1, 12")]
+    elf_va: Option<range_v1::ElfVa>,
+}
+
+pub mod range_v1 {
+    /// Oneof for ELF VA: either delta (relative) or absolute (set).
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum ElfVa {
+        /// Delta from previous record's ELF VA (sint64, zigzag encoded)
+        #[prost(sint64, tag = "1")]
+        DeltaElfVa(i64),
+        /// Absolute ELF VA — used for the first record to establish baseline.
+        #[prost(uint64, tag = "12")]
+        SetElfVa(u64),
+    }
 }
 
 /// String table message — replaces the reader's current table.
@@ -105,11 +118,19 @@ fn write_symbfile_inner<W: Write>(w: &mut W, symbols: &[SymbolRange]) -> anyhow:
         write_message(w, MT_STRING_TABLE_V1, &st)?;
     }
 
-    // Write range records with delta encoding
+    // Write range records: first uses absolute VA, rest use delta encoding
     let mut prev_va: i64 = 0;
+    let mut is_first = true;
     for sym in symbols {
-        let delta = sym.elf_va as i64 - prev_va;
-        prev_va = sym.elf_va as i64;
+        let elf_va = if is_first {
+            is_first = false;
+            prev_va = sym.elf_va as i64;
+            Some(range_v1::ElfVa::SetElfVa(sym.elf_va))
+        } else {
+            let delta = sym.elf_va as i64 - prev_va;
+            prev_va = sym.elf_va as i64;
+            Some(range_v1::ElfVa::DeltaElfVa(delta))
+        };
 
         let (func_str, func_ref) = if let Some(&idx) = string_index.get(&sym.name) {
             (None, Some(idx))
@@ -128,13 +149,13 @@ fn write_symbfile_inner<W: Write>(w: &mut W, symbols: &[SymbolRange]) -> anyhow:
         };
 
         let range = RangeV1 {
-            delta_elf_va: delta,
             length: sym.length,
             func_str,
             func_ref,
             file_str,
             file_ref,
-            depth: 0, // top-level (no inline info for now)
+            depth: 0,
+            elf_va,
         };
         write_message(w, MT_RANGE_V1, &range)?;
     }
@@ -143,13 +164,14 @@ fn write_symbfile_inner<W: Write>(w: &mut W, symbols: &[SymbolRange]) -> anyhow:
 }
 
 /// Write a single ULEB128-prefixed protobuf message.
+///
+/// Format: [ULEB128 body_length] [ULEB128 msg_type] [protobuf body]
+/// The length field is the size of the protobuf body ONLY (excludes the type varint).
 fn write_message<W: Write, M: Message>(w: &mut W, msg_type: u32, msg: &M) -> anyhow::Result<()> {
     let encoded = msg.encode_to_vec();
-    let type_bytes = encode_uleb128(msg_type);
-    let total_len = type_bytes.len() + encoded.len();
-    write_uleb128(w, total_len as u32)?;
-    w.write_all(&type_bytes)?;
-    w.write_all(&encoded)?;
+    write_uleb128(w, encoded.len() as u32)?; // body length only
+    write_uleb128(w, msg_type)?;              // message type
+    w.write_all(&encoded)?;                   // protobuf body
     Ok(())
 }
 
