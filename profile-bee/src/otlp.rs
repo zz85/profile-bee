@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::types::FrameCount;
+
 // Generated protobuf types from tonic-build + protox.
 // Module hierarchy must match the proto package hierarchy so that
 // cross-package `super::super::` references resolve correctly.
@@ -514,6 +516,454 @@ pub fn collapse_to_otlp_request(
     };
 
     // Build the envelope
+    ExportProfilesServiceRequest {
+        resource_profiles: vec![ResourceProfiles {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(
+                            proto::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                                opts.service_name.clone(),
+                            ),
+                        ),
+                    }),
+                    key_strindex: service_name_key,
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_profiles: vec![ScopeProfiles {
+                scope: Some(proto::opentelemetry::proto::common::v1::InstrumentationScope {
+                    name: scope_name,
+                    version: scope_version,
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                }),
+                profiles: vec![profile],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+        dictionary: Some(dictionary),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversion: structured FrameCount -> OTLP with real addresses
+// ---------------------------------------------------------------------------
+
+/// A parsed `/proc/<pid>/maps` entry for a single executable mapping.
+#[derive(Clone)]
+struct ProcMapEntry {
+    start: u64,
+    end: u64,
+    offset: u64,
+    pathname: String,
+}
+
+/// Parse `/proc/<pid>/maps` for executable mappings.
+fn read_proc_maps(pid: u32) -> Vec<ProcMapEntry> {
+    let path = format!("/proc/{}/maps", pid);
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        tracing::debug!("cannot read {}: process may have exited", path);
+        return Vec::new();
+    };
+
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let range = parts.next()?;
+            let perms = parts.next()?;
+            if !perms.contains('x') {
+                return None; // only executable mappings
+            }
+            let offset_str = parts.next()?;
+            let _dev = parts.next()?;
+            let _inode = parts.next()?;
+            let pathname = parts.next().unwrap_or("").to_string();
+            if pathname.is_empty() || pathname.starts_with('[') {
+                return None; // skip anonymous and special mappings like [vdso]
+            }
+
+            let (start_str, end_str) = range.split_once('-')?;
+            let start = u64::from_str_radix(start_str, 16).ok()?;
+            let end = u64::from_str_radix(end_str, 16).ok()?;
+            let offset = u64::from_str_radix(offset_str, 16).ok()?;
+
+            Some(ProcMapEntry {
+                start,
+                end,
+                offset,
+                pathname,
+            })
+        })
+        .collect()
+}
+
+/// Try to read the ELF build ID from a binary file, returning it as a hex string.
+fn read_build_id(path: &str) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let file = object::File::parse(&*data).ok()?;
+    use object::Object;
+    let build_id = file.build_id().ok()??;
+    Some(build_id.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Convert structured `FrameCount` data (with real addresses) into an OTLP
+/// `ExportProfilesServiceRequest` using native frame types and real mappings.
+///
+/// Unlike `collapse_to_otlp_request()` which works from pre-symbolized strings,
+/// this function sends real instruction pointer addresses in `Location.address`
+/// and proper `Mapping` entries from `/proc/<pid>/maps`. The backend (devfiler,
+/// OTel Collector) can then perform its own symbolization from the binary.
+///
+/// Function names from blazesym are ALSO included in `Location.lines` as a
+/// fallback for receivers that don't do server-side symbolization.
+pub fn framecounts_to_otlp_request(
+    frame_counts: &[FrameCount],
+    opts: &OtlpOptions,
+) -> ExportProfilesServiceRequest {
+    let mut strings = StringTable::new();
+
+    // Sample/period type strings
+    let (sample_type_str, sample_unit_str, period_type_str, period_unit_str) = if opts.off_cpu {
+        (
+            strings.intern("off_cpu"),
+            strings.intern("nanoseconds"),
+            strings.intern("off_cpu"),
+            strings.intern("nanoseconds"),
+        )
+    } else {
+        (
+            strings.intern("samples"),
+            strings.intern("count"),
+            strings.intern("cpu"),
+            strings.intern("nanoseconds"),
+        )
+    };
+
+    // Attribute keys
+    let frame_type_key = strings.intern("profile.frame.type");
+    let build_id_key = strings.intern("process.executable.build_id.htlhash");
+
+    // Dictionary tables (index 0 = null entry)
+    let mut func_set = OrderedSet::<FuncKey>::new();
+    let mut functions: Vec<Function> = vec![Function::default()];
+    func_set.insert(FuncKey { name_strindex: 0 });
+
+    let mut loc_set = OrderedSet::<LocationKey>::new();
+    let mut locations: Vec<Location> = vec![Location::default()];
+    loc_set.insert(LocationKey {
+        function_index: 0,
+        is_kernel: false,
+    });
+
+    let mut stack_set = OrderedSet::<StackKey>::new();
+    let mut stack_table: Vec<Stack> = vec![Stack::default()];
+    stack_set.insert(StackKey {
+        location_indices: vec![],
+    });
+
+    // Attribute table
+    let mut attr_table: Vec<KeyValueAndUnit> = vec![KeyValueAndUnit::default()];
+    let mut attr_map: HashMap<(i32, String), i32> = HashMap::new();
+    attr_map.insert((0, String::new()), 0);
+
+    let get_attr_index =
+        |attr_table: &mut Vec<KeyValueAndUnit>,
+         attr_map: &mut HashMap<(i32, String), i32>,
+         key_idx: i32,
+         val_str: &str| {
+            *attr_map
+                .entry((key_idx, val_str.to_owned()))
+                .or_insert_with(|| {
+                    let idx = attr_table.len() as i32;
+                    attr_table.push(KeyValueAndUnit {
+                        key_strindex: key_idx,
+                        value: Some(AnyValue {
+                            value: Some(
+                                proto::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                                    val_str.to_owned(),
+                                ),
+                            ),
+                        }),
+                        unit_strindex: 0,
+                    });
+                    idx
+                })
+        };
+
+    // Use "go" for user-space frames. devfiler skips loc.lines entirely for
+    // "native" frames (unconditional `continue` in ingest_locations) and only
+    // does address-based symbolization from the binary. Since we want devfiler
+    // to read our pre-symbolized function names, we must use a non-native type.
+    // "go" is the closest compiled-language type. Real addresses and mappings
+    // are still sent for proper frame identity and future binary symbolization.
+    let native_attr_idx =
+        get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "go");
+    let kernel_attr_idx =
+        get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "kernel");
+
+    // Mapping table: index 0 = null. Real mappings populated from proc maps.
+    let mut mapping_table: Vec<Mapping> = vec![Mapping::default()];
+    // (pathname, offset) -> mapping index
+    let mut mapping_map: HashMap<(String, u64), i32> = HashMap::new();
+    mapping_map.insert((String::new(), 0), 0);
+    // proc maps cache per pid
+    let mut proc_maps_cache: HashMap<u32, Vec<ProcMapEntry>> = HashMap::new();
+    // build-id cache per path
+    let mut build_id_cache: HashMap<String, Option<String>> = HashMap::new();
+
+    // Helper: find the mapping index for a user address, creating the mapping if needed
+    let find_or_create_mapping = |addr: u64,
+                                  pid: u32,
+                                  proc_maps_cache: &mut HashMap<u32, Vec<ProcMapEntry>>,
+                                  mapping_table: &mut Vec<Mapping>,
+                                  mapping_map: &mut HashMap<(String, u64), i32>,
+                                  build_id_cache: &mut HashMap<String, Option<String>>,
+                                  strings: &mut StringTable,
+                                  attr_table: &mut Vec<KeyValueAndUnit>,
+                                  attr_map: &mut HashMap<(i32, String), i32>,
+                                  build_id_key: i32|
+     -> i32 {
+        let maps = proc_maps_cache
+            .entry(pid)
+            .or_insert_with(|| read_proc_maps(pid));
+
+        // Find the mapping that contains this address
+        let entry = maps.iter().find(|m| addr >= m.start && addr < m.end);
+        let entry = match entry {
+            Some(e) => e.clone(),
+            None => return 0, // null mapping
+        };
+
+        let key = (entry.pathname.clone(), entry.offset);
+        if let Some(&idx) = mapping_map.get(&key) {
+            return idx;
+        }
+
+        // Create new mapping
+        let filename_idx = strings.intern(&entry.pathname);
+
+        // Try to read build ID
+        let build_id = build_id_cache
+            .entry(entry.pathname.clone())
+            .or_insert_with(|| read_build_id(&entry.pathname))
+            .clone();
+
+        let mut mapping_attr_indices = vec![];
+        if let Some(ref bid) = build_id {
+            let bid_attr_idx = get_attr_index(attr_table, attr_map, build_id_key, bid);
+            mapping_attr_indices.push(bid_attr_idx);
+        }
+
+        let idx = mapping_table.len() as i32;
+        mapping_table.push(Mapping {
+            memory_start: entry.start,
+            memory_limit: entry.end,
+            file_offset: entry.offset,
+            filename_strindex: filename_idx,
+            attribute_indices: mapping_attr_indices,
+        });
+        mapping_map.insert(key, idx);
+        idx
+    };
+
+    // Location dedup key: (address, mapping_index) for real addresses
+    #[derive(Hash, Eq, PartialEq, Clone)]
+    struct RealLocationKey {
+        address: u64,
+        mapping_index: i32,
+    }
+    let mut real_loc_map: HashMap<RealLocationKey, i32> = HashMap::new();
+
+    let mut samples: Vec<Sample> = Vec::new();
+
+    for fc in frame_counts {
+        let mut location_indices: Vec<i32> = Vec::with_capacity(fc.frames.len());
+
+        // frames are root-to-leaf after collect_raw(). OTLP wants leaf-first.
+        for frame in fc.frames.iter().rev() {
+            let symbol_name = frame.symbol.as_deref().unwrap_or("[unknown]");
+            let is_kernel = symbol_name.ends_with("_k");
+            let addr = frame.address;
+            let pid = frame.pid as u32;
+
+            // Find or create the mapping for this address
+            let mapping_idx = if is_kernel || addr == 0 {
+                0 // kernel or synthetic frames use null mapping
+            } else {
+                find_or_create_mapping(
+                    addr,
+                    pid,
+                    &mut proc_maps_cache,
+                    &mut mapping_table,
+                    &mut mapping_map,
+                    &mut build_id_cache,
+                    &mut strings,
+                    &mut attr_table,
+                    &mut attr_map,
+                    build_id_key,
+                )
+            };
+
+            // Dedup location by (address, mapping_index)
+            let loc_key = RealLocationKey {
+                address: addr,
+                mapping_index: mapping_idx,
+            };
+
+            let loc_index = if let Some(&idx) = real_loc_map.get(&loc_key) {
+                idx
+            } else {
+                // Intern function name (also include as a Line for fallback symbolization)
+                let func_name = if is_kernel {
+                    &symbol_name[..symbol_name.len() - 2] // strip _k suffix
+                } else {
+                    symbol_name
+                };
+                let name_idx = strings.intern(func_name);
+
+                let func_key = FuncKey {
+                    name_strindex: name_idx,
+                };
+                let func_index = func_set.insert(func_key.clone());
+                if func_index as usize >= functions.len() {
+                    let filename_strindex = frame
+                        .source
+                        .as_deref()
+                        .map(|s| strings.intern(s))
+                        .unwrap_or(0);
+                    functions.push(Function {
+                        name_strindex: name_idx,
+                        system_name_strindex: name_idx,
+                        filename_strindex,
+                        start_line: 0,
+                    });
+                }
+
+                let attr_idx = if is_kernel {
+                    kernel_attr_idx
+                } else {
+                    native_attr_idx
+                };
+
+                let idx = locations.len() as i32;
+                locations.push(Location {
+                    mapping_index: mapping_idx,
+                    address: addr,
+                    lines: vec![Line {
+                        function_index: func_index,
+                        line: 0,
+                        column: 0,
+                    }],
+                    attribute_indices: vec![attr_idx],
+                });
+                real_loc_map.insert(loc_key, idx);
+                idx
+            };
+
+            location_indices.push(loc_index);
+        }
+
+        // Dedup stack
+        let stack_key = StackKey {
+            location_indices: location_indices.clone(),
+        };
+        let stack_index = stack_set.insert(stack_key);
+        if stack_index as usize >= stack_table.len() {
+            stack_table.push(Stack { location_indices });
+        }
+
+        samples.push(Sample {
+            stack_index,
+            attribute_indices: vec![],
+            link_index: 0,
+            values: vec![fc.count as i64],
+            timestamps_unix_nano: vec![],
+        });
+    }
+
+    // Timing
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    let start_nanos = if opts.duration_ms > 0 {
+        now_nanos.saturating_sub(opts.duration_ms as u64 * 1_000_000)
+    } else {
+        now_nanos
+    };
+    let duration_nanos = opts.duration_ms as u64 * 1_000_000;
+
+    let period_nanos = if opts.off_cpu {
+        1
+    } else if opts.frequency_hz > 0 {
+        (1_000_000_000u64) / opts.frequency_hz
+    } else {
+        0
+    };
+
+    // Expand counts into timestamps (devfiler counts timestamps, ignores values)
+    let total_samples: u64 = samples.iter().map(|s| s.values.first().copied().unwrap_or(1).max(1) as u64).sum();
+    for sample in &mut samples {
+        let count = sample.values.first().copied().unwrap_or(1).max(1) as u64;
+        let mut timestamps = Vec::with_capacity(count as usize);
+        if total_samples > 0 && duration_nanos > 0 {
+            let step = duration_nanos / total_samples.max(1);
+            let offset = (sample.stack_index as u64).wrapping_mul(7919) % step.max(1);
+            for i in 0..count {
+                timestamps.push(start_nanos + offset + i * step);
+            }
+        } else {
+            for _ in 0..count {
+                timestamps.push(now_nanos);
+            }
+        }
+        sample.timestamps_unix_nano = timestamps;
+        if !opts.off_cpu {
+            sample.values.clear();
+        }
+    }
+
+    // Build profile
+    let profile = Profile {
+        sample_type: Some(ValueType {
+            type_strindex: sample_type_str,
+            unit_strindex: sample_unit_str,
+        }),
+        samples,
+        time_unix_nano: start_nanos,
+        duration_nano: duration_nanos,
+        period_type: Some(ValueType {
+            type_strindex: period_type_str,
+            unit_strindex: period_unit_str,
+        }),
+        period: period_nanos as i64,
+        profile_id: generate_profile_id(),
+        dropped_attributes_count: 0,
+        original_payload_format: String::new(),
+        original_payload: vec![],
+        attribute_indices: vec![],
+    };
+
+    let service_name_key = strings.intern("service.name");
+    let scope_name = "profile-bee".to_string();
+    let scope_version = env!("CARGO_PKG_VERSION").to_string();
+
+    let dictionary = ProfilesDictionary {
+        mapping_table,
+        location_table: locations,
+        function_table: functions,
+        link_table: vec![proto::opentelemetry::proto::profiles::v1development::Link::default()],
+        string_table: strings.into_vec(),
+        attribute_table: attr_table,
+        stack_table,
+    };
+
     ExportProfilesServiceRequest {
         resource_profiles: vec![ResourceProfiles {
             resource: Some(Resource {

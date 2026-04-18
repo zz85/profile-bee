@@ -519,6 +519,12 @@ impl TraceHandler {
             .ok()
             .unwrap_or_default();
 
+        // Populate raw instruction pointer addresses on each symbolized frame.
+        // These are used by the OTLP exporter to send real addresses to devfiler.
+        for (frame, &addr) in user_syms.iter_mut().zip(addrs.iter()) {
+            frame.address = addr;
+        }
+
         // Override symbols for V8 frames using the heap reader.
         // The v8_sfi array is parallel to the user addresses — if v8_sfi[i] != 0,
         // frame i is a V8 JavaScript frame and we can resolve the SFI pointer
@@ -548,10 +554,15 @@ impl TraceHandler {
         }
 
         let kernel_addrs = kernel_stack.unwrap_or_default();
-        let kernel_syms = self
+        let mut kernel_syms = self
             .symbolize_kernel_stack(&kernel_addrs)
             .ok()
             .unwrap_or_default();
+
+        // Populate raw kernel addresses on each symbolized frame.
+        for (frame, &addr) in kernel_syms.iter_mut().zip(kernel_addrs.iter()) {
+            frame.address = addr;
+        }
 
         let mut combined = kernel_syms.into_iter().chain(user_syms).collect::<Vec<_>>();
 

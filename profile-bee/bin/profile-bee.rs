@@ -788,7 +788,9 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             ),
         ));
     }
-    // OTLP gRPC export sink
+    // OTLP gRPC export sink (native address mode for batch, collapse mode for serve)
+    #[cfg(feature = "otlp")]
+    let mut otlp_native_sink: Option<profile_bee::output::OtlpNativeSink> = None;
     #[cfg(feature = "otlp")]
     if let Some(ref endpoint) = opt.otlp_endpoint {
         let service_name = opt.otlp_service_name.clone().unwrap_or_else(|| {
@@ -804,13 +806,26 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 "profile-bee".to_string()
             }
         });
-        sinks.push(Box::new(profile_bee::output::OtlpSink::new(
-            endpoint.clone(),
-            service_name,
-            opt.frequency,
-            opt.off_cpu,
-            tokio::runtime::Handle::current(),
-        )));
+        if opt.serve {
+            // Serve mode: use collapse-string-based OtlpSink via MultiplexSink
+            // (collect_raw isn't available in streaming mode)
+            sinks.push(Box::new(profile_bee::output::OtlpSink::new(
+                endpoint.clone(),
+                service_name,
+                opt.frequency,
+                opt.off_cpu,
+                tokio::runtime::Handle::current(),
+            )));
+        } else {
+            // Batch mode: use OtlpNativeSink with real addresses via collect_raw()
+            otlp_native_sink = Some(profile_bee::output::OtlpNativeSink::new(
+                endpoint.clone(),
+                service_name,
+                opt.frequency,
+                opt.off_cpu,
+                tokio::runtime::Handle::current(),
+            ));
+        }
     }
     if opt.serve {
         sinks.push(Box::new(WebBroadcastSink::new(tx)));
@@ -827,7 +842,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     let has_symbolized_sinks = resolved_outputs
         .iter()
         .any(|(fmt, _)| *fmt != OutputFormat::Raw)
-        || opt.serve;
+        || opt.serve
+        || { #[cfg(feature = "otlp")] { otlp_native_sink.is_some() } #[cfg(not(feature = "otlp"))] { false } };
 
     if opt.serve {
         // Serve mode: periodically flush data to the web server
@@ -870,13 +886,54 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         );
     } else {
         // Non-serve mode: block until Stop, output once, exit.
-        // If raw sink exists alongside symbolized sinks, collect both.
-        tracing::debug!("batch mode: collecting samples (blocks until Stop)");
-        let result = event_loop.collect(&perf_rx, None);
-        tracing::debug!("batch mode: collected {} stacks", result.stacks.len());
-        sink.write_batch(&result.stacks)?;
-        sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
-        sink.finish(&result.stacks)?;
+        // If OTLP native sink is present, use collect_raw() to get structured
+        // FrameCount data with real addresses. We can derive collapse strings
+        // from FrameCount for the other sinks.
+        #[cfg(feature = "otlp")]
+        let has_otlp = otlp_native_sink.is_some();
+        #[cfg(not(feature = "otlp"))]
+        let has_otlp = false;
+
+        if has_otlp {
+            tracing::debug!("batch mode: collecting structured samples for OTLP native export");
+            let result = event_loop.collect_raw(&perf_rx, None);
+            tracing::debug!("batch mode: collected {} frame counts", result.stacks.len());
+
+            let actual_duration_ms = started.elapsed().as_millis() as u64;
+
+            // Send structured data to OTLP native sink
+            #[cfg(feature = "otlp")]
+            if let Some(ref mut otlp) = otlp_native_sink {
+                otlp.set_actual_duration_ms(actual_duration_ms);
+                if let Err(e) = otlp.send_framecounts(&result.stacks) {
+                    tracing::warn!("OTLP native export error: {}", e);
+                }
+            }
+
+            // Also generate collapse strings for any file-based sinks
+            let collapse_stacks: Vec<String> = result
+                .stacks
+                .iter()
+                .map(|fc| {
+                    let frames: Vec<String> = fc
+                        .frames
+                        .iter()
+                        .map(|f| f.fmt_symbol())
+                        .collect();
+                    format!("{} {}", frames.join(";"), fc.count)
+                })
+                .collect();
+            sink.write_batch(&collapse_stacks)?;
+            sink.set_actual_duration_ms(actual_duration_ms);
+            sink.finish(&collapse_stacks)?;
+        } else {
+            tracing::debug!("batch mode: collecting samples (blocks until Stop)");
+            let result = event_loop.collect(&perf_rx, None);
+            tracing::debug!("batch mode: collected {} stacks", result.stacks.len());
+            sink.write_batch(&result.stacks)?;
+            sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
+            sink.finish(&result.stacks)?;
+        }
 
         // If raw output was also requested, do a second pass for raw addresses.
         // (In this case, the eBPF maps have been drained by `collect` so we
@@ -1265,6 +1322,7 @@ fn spawn_profiling_thread(
     group_by_process: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tui_refresh_ms: u64,
     monitor_exit_pid: Option<u32>,
+    #[cfg(feature = "otlp")] mut otlp_sink: Option<profile_bee::output::OtlpSink>,
 ) {
     std::thread::spawn(move || {
         let mut profiler = TraceHandler::new();
@@ -1468,6 +1526,14 @@ fn spawn_profiling_thread(
             if let Some(ref tx) = web_tx {
                 let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
                 let _ = tx.send(json);
+            }
+
+            // Optionally send to OTLP endpoint
+            #[cfg(feature = "otlp")]
+            if let Some(ref mut sink) = otlp_sink {
+                if let Err(e) = sink.write_batch(&out) {
+                    tracing::warn!("OTLP export error in TUI/serve thread: {}", e);
+                }
             }
         }
     });
@@ -1738,6 +1804,7 @@ async fn run_combined_mode(
         pid_mode_handle.clone(),
         opt.tui_refresh_ms,
         external_pid,
+        #[cfg(feature = "otlp")] None, // OTLP handled via serve mode's MultiplexSink
     );
 
     // TUI event loop
@@ -1833,6 +1900,30 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         }
     });
 
+    // Build OTLP sink for TUI mode if endpoint is configured
+    #[cfg(feature = "otlp")]
+    let tui_otlp_sink = opt.otlp_endpoint.as_ref().map(|endpoint| {
+        let service_name = opt.otlp_service_name.clone().unwrap_or_else(|| {
+            if !opt.command.is_empty() {
+                std::path::Path::new(&opt.command[0])
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "profile-bee".to_string())
+            } else if let Some(pid) = opt.pid {
+                format!("pid-{}", pid)
+            } else {
+                "profile-bee".to_string()
+            }
+        });
+        profile_bee::output::OtlpSink::new(
+            endpoint.clone(),
+            service_name,
+            opt.frequency,
+            opt.off_cpu,
+            tokio::runtime::Handle::current(),
+        )
+    });
+
     // Profiling thread (TUI only, no web feed)
     spawn_profiling_thread(
         ebpf_profiler,
@@ -1846,6 +1937,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         pid_mode_handle.clone(),
         opt.tui_refresh_ms,
         external_pid,
+        #[cfg(feature = "otlp")] tui_otlp_sink,
     );
 
     // TUI event loop
