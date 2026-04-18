@@ -25,6 +25,8 @@ pub mod pprof;
 #[cfg(feature = "otlp")]
 pub mod otlp;
 
+pub mod symbol_upload;
+
 pub mod probe_resolver;
 pub mod probe_spec;
 

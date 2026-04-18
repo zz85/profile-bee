@@ -330,6 +330,14 @@ struct Opt {
     /// Example: --flush-interval 10000 uploads every 10 seconds.
     #[arg(long)]
     flush_interval: Option<u64>,
+
+    /// Symbol server URL to upload binaries to for devfiler symbolization.
+    /// When set, profile-bee automatically POSTs newly-discovered ELF binaries
+    /// (from /proc/<pid>/maps) to this server during profiling.
+    /// The server processes symbols and serves them to devfiler.
+    /// Example: --symbol-server http://localhost:8888
+    #[arg(long)]
+    symbol_server: Option<String>,
 }
 
 impl Opt {
@@ -712,6 +720,24 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     setup_ctrlc_stop(perf_tx.clone(), stopper.clone());
     println!("Waiting for Ctrl-C...");
 
+    // Start symbol uploader if --symbol-server is configured.
+    // Uploads ELF binaries from /proc/<pid>/maps to the symbol server
+    // so devfiler can resolve native frame addresses.
+    let _symbol_uploader = opt.symbol_server.as_ref().map(|url| {
+        let uploader = profile_bee::symbol_upload::SymbolUploader::spawn(
+            url.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        // Upload binaries for the target PID (or all running processes if system-wide)
+        if let Some(target_pid) = pid {
+            uploader.upload_for_pid(target_pid);
+        } else {
+            // System-wide profiling: upload common binaries that are likely to appear.
+            // Individual PIDs will be uploaded as they're discovered during profiling.
+            tracing::info!("symbol uploader: system-wide mode, will upload on discovery");
+        }
+        uploader
+    });
     task::spawn(async move {
         if let Err(e) = setup_ring_buffer_task(ring_buf, perf_tx).await {
             eprintln!("Failed to set up ring buffer: {:?}", e);
