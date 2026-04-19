@@ -105,10 +105,37 @@ impl JitSymbolTable {
     ///
     /// Seeks to `last_read_offset` and reads any new records appended since
     /// the last read. Returns the number of new symbols loaded.
+    ///
+    /// If the file has been truncated or rotated (size < last_read_offset),
+    /// resets state and re-parses from the beginning.
     pub fn reload_from_file(&mut self, path: &Path) -> io::Result<usize> {
         let file = std::fs::File::open(path)?;
-        let mut reader = BufReader::new(file);
+        let file_len = file.metadata()?.len();
 
+        // Detect truncated/rotated file — reset and re-parse from scratch
+        if file_len < self.last_read_offset {
+            tracing::debug!(
+                "JITDump file shrunk ({} < {}), resetting",
+                file_len,
+                self.last_read_offset
+            );
+            self.symbols.clear();
+            self.pending_debug.clear();
+            self.last_read_offset = 0;
+
+            let mut reader = BufReader::new(file);
+            match parse_header(&mut reader) {
+                Ok(_) => {
+                    self.last_read_offset = JITDUMP_HEADER_SIZE;
+                    let before = self.symbols.len();
+                    self.read_records(&mut reader)?;
+                    return Ok(self.symbols.len() - before);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(self.last_read_offset))?;
 
         let before = self.symbols.len();
@@ -216,7 +243,7 @@ impl JitSymbolTable {
         let _vma = read_u64(reader)?;
         let code_addr = read_u64(reader)?;
         let code_size = read_u64(reader)?;
-        let code_index = read_u64(reader)?;
+        let _code_index = read_u64(reader)?;
 
         // Remaining bytes: null-terminated name + code bytes
         let remaining = payload_size - FIXED_SIZE;
@@ -230,8 +257,9 @@ impl JitSymbolTable {
             .unwrap_or(name_and_code.len());
         let name = String::from_utf8_lossy(&name_and_code[..name_end]).to_string();
 
-        // Check for pending debug info
-        let source = self.pending_debug.remove(&code_index);
+        // Check for pending debug info (keyed by code_addr — the same
+        // address that appeared in the preceding JIT_CODE_DEBUG_INFO record)
+        let source = self.pending_debug.remove(&code_addr);
 
         self.symbols.insert(
             code_addr,
@@ -287,7 +315,8 @@ impl JitSymbolTable {
     ///
     /// Per spec, DEBUG_INFO must appear before its corresponding CODE_LOAD.
     /// We store the first entry's (filename, line) in pending_debug keyed by
-    /// code_addr (used as a proxy for code_index).
+    /// `code_addr` — the same address that will appear in the subsequent
+    /// JIT_CODE_LOAD record's `code_addr` field.
     fn parse_debug_info<R: Read>(&mut self, reader: &mut R, payload_size: u64) -> io::Result<()> {
         if payload_size < 16 {
             return Err(io::Error::new(
@@ -340,22 +369,35 @@ impl JitSymbolTable {
 ///
 /// Returns the first matching file path, preferring the standard convention.
 pub fn find_jitdump_for_pid(pid: u32) -> Option<PathBuf> {
-    // Standard convention: /tmp/jit-<pid>.dump
-    let standard = PathBuf::from(format!("/tmp/jit-{}.dump", pid));
+    find_jitdump_for_pid_in_dir(pid, Path::new("/tmp"))
+}
+
+/// Search for a JITDump file for the given PID in the specified directory.
+///
+/// This is the testable core of [`find_jitdump_for_pid`], allowing tests to
+/// use an isolated directory instead of the global `/tmp`.
+pub fn find_jitdump_for_pid_in_dir(pid: u32, dir: &Path) -> Option<PathBuf> {
+    // Standard convention: jit-<pid>.dump
+    let standard = dir.join(format!("jit-{}.dump", pid));
     if standard.exists() {
         return Some(standard);
     }
 
-    // JSC/Bun convention: /tmp/jit-<tid>-<pid>-<random>
-    // Scan /tmp/ for files matching this pattern.
-    let prefix = format!("jit-");
+    // JSC/Bun convention: jit-<tid>-<pid>-<random>
+    // Scan directory for files matching this pattern.
     let pid_str = pid.to_string();
-    if let Ok(entries) = std::fs::read_dir("/tmp") {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             // Match pattern: jit-<digits>-<pid>-<alphanum>
-            if name.starts_with(&prefix) && name.contains(&format!("-{}-", pid_str)) {
+            // Split on '-' and verify PID is in the expected segment (index 2).
+            if !name.starts_with("jit-") {
+                continue;
+            }
+            let parts: Vec<&str> = name.splitn(4, '-').collect();
+            // parts: ["jit", "<tid>", "<pid>", "<random>"]
+            if parts.len() >= 4 && parts[2] == pid_str {
                 return Some(entry.path());
             }
         }
@@ -687,8 +729,41 @@ mod tests {
 
     #[test]
     fn test_find_jitdump_nonexistent() {
-        // PID 0 should never have a JITDump file
-        assert!(find_jitdump_for_pid(0).is_none());
+        // Use an isolated temp directory so stale files in /tmp can't cause false failures
+        let dir = std::env::temp_dir().join("jitdump_test_nonexistent");
+        let _ = std::fs::create_dir_all(&dir);
+        // Clean any leftovers from previous test runs
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+        assert!(find_jitdump_for_pid_in_dir(99999, &dir).is_none());
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_find_jitdump_standard_convention() {
+        let dir = std::env::temp_dir().join("jitdump_test_standard");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("jit-1234.dump");
+        std::fs::write(&path, b"dummy").unwrap();
+        let found = find_jitdump_for_pid_in_dir(1234, &dir);
+        assert_eq!(found, Some(path.clone()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_find_jitdump_jsc_convention() {
+        let dir = std::env::temp_dir().join("jitdump_test_jsc");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("jit-5678-1234-AbCdEf");
+        std::fs::write(&path, b"dummy").unwrap();
+        let found = find_jitdump_for_pid_in_dir(1234, &dir);
+        assert_eq!(found, Some(path.clone()));
+        // Verify it doesn't match wrong PID
+        assert!(find_jitdump_for_pid_in_dir(5678, &dir).is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

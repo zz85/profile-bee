@@ -658,14 +658,13 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         println!("Profiling PID {}..", target_pid);
     }
 
-    // Warn if profiling an existing Node.js process without perf-map file.
-    // When we spawn the process ourselves (--cmd / -- <command>), NODE_OPTIONS
-    // is injected automatically by setup_process_to_profile(). This warning
+    // Warn if profiling an existing Node.js/Bun process without JIT symbol support.
+    // When we spawn the process ourselves (--cmd / -- <command>), env vars are
+    // injected automatically by setup_process_to_profile(). This warning
     // only applies to --pid targeting an already-running process.
     if spawn.is_none() {
         if let Some(target_pid) = pid {
-            warn_nodejs_without_perf_map(target_pid);
-            warn_bun_without_jitdump(target_pid);
+            warn_unsupported_jit_runtimes(target_pid);
         }
     }
 
@@ -1151,6 +1150,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
 
     Ok(())
+}
+
+/// Warn if profiling an already-running JIT runtime process that lacks
+/// the necessary symbol support files. Centralizes checks for all supported
+/// JIT runtimes (Node.js, Bun) into a single call.
+fn warn_unsupported_jit_runtimes(pid: u32) {
+    warn_nodejs_without_perf_map(pid);
+    warn_bun_without_jitdump(pid);
 }
 
 /// Warn if profiling an already-running Node.js process that lacks a perf-map
@@ -1954,8 +1961,7 @@ async fn run_combined_mode(
     // Warn if targeting an existing Node.js/Bun process without JIT symbol support
     if spawn.is_none() {
         if let Some(target_pid) = pid {
-            warn_nodejs_without_perf_map(target_pid);
-            warn_bun_without_jitdump(target_pid);
+            warn_unsupported_jit_runtimes(target_pid);
         }
     }
 
@@ -2089,8 +2095,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     // Warn if targeting an existing Node.js/Bun process without JIT symbol support
     if spawn.is_none() {
         if let Some(target_pid) = pid {
-            warn_nodejs_without_perf_map(target_pid);
-            warn_bun_without_jitdump(target_pid);
+            warn_unsupported_jit_runtimes(target_pid);
         }
     }
 

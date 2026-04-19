@@ -339,8 +339,12 @@ impl ProfilingEventLoop {
     /// functions. For PIDs without an existing table, tries a fresh load.
     /// For PIDs with a table, does an incremental reload from where the
     /// last read left off.
+    ///
+    /// When new symbols are loaded, the symbol cache for that PID is
+    /// invalidated so previously-cached `[unknown]` frames get re-resolved.
     pub fn reload_jitdump_tables(&mut self) {
-        for &tgid in &self.known_tgids.clone() {
+        let tgids: Vec<u32> = self.known_tgids.iter().copied().collect();
+        for tgid in tgids {
             if self.trace_handler.has_jit_table(tgid) {
                 // Incremental reload
                 if let Some(path) = jitdump::find_jitdump_for_pid(tgid) {
@@ -352,6 +356,11 @@ impl ProfilingEventLoop {
                                     n,
                                     tgid
                                 );
+                                // Invalidate cached stacks for this PID so
+                                // previously-[unknown] frames get re-resolved
+                                // with the newly loaded JIT symbols. Use the
+                                // targeted invalidation that keeps the JIT table.
+                                self.trace_handler.invalidate_symbol_cache_for_pid(tgid);
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -547,7 +556,10 @@ impl ProfilingEventLoop {
         // is compiled — the initial load on first PID sight may have found an
         // empty or nonexistent file. This final pass picks up all symbols
         // written during the profiling window.
-        self.reload_jitdump_tables();
+        // Skip when symbolize=false (raw-capture path) to avoid unnecessary I/O.
+        if symbolize {
+            self.reload_jitdump_tables();
+        }
 
         (local_counting, stopped)
     }

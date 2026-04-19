@@ -254,6 +254,15 @@ impl TraceHandler {
         tracing::debug!("invalidated symbol caches for pid {}", tgid);
     }
 
+    /// Invalidate the symbol resolution cache for a PID without removing
+    /// runtime-specific readers (V8, JITDump).
+    ///
+    /// Used when JIT symbols are reloaded — the cached stacks with `[unknown]`
+    /// entries need to be re-resolved, but the JIT table itself should be kept.
+    pub fn invalidate_symbol_cache_for_pid(&mut self, tgid: u32) {
+        self.cache.invalidate_pid(tgid);
+    }
+
     /// Register a V8 heap reader for a Node.js process.
     /// The reader uses the V8 introspection data to resolve SFI pointers
     /// from the eBPF V8 frame extractor to JavaScript function names.

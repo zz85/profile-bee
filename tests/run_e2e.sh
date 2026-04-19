@@ -608,31 +608,6 @@ run_bun_profiler() {
     echo "$collapse_file"
 }
 
-test_bun_samples_collected() {
-    if ! command -v bun &>/dev/null; then
-        echo "  SKIP: bun not found in PATH" >&2
-        return 0
-    fi
-
-    local script="$SCRIPT_DIR/fixtures/src/bun_callstack.js"
-    if [[ ! -f "$script" ]]; then
-        echo "  SKIP: fixture $script not found" >&2
-        return 0
-    fi
-
-    local file
-    file=$(run_bun_profiler "$script" "bun-samples")
-
-    local total
-    total=$(count_samples "$file")
-    if [[ "$total" -gt 0 ]]; then
-        return 0
-    else
-        echo "  No samples collected for Bun (total=$total)" >&2
-        return 1
-    fi
-}
-
 test_bun_jitdump_callstack() {
     if ! command -v bun &>/dev/null; then
         echo "  SKIP: bun not found in PATH" >&2
@@ -648,19 +623,20 @@ test_bun_jitdump_callstack() {
     local file
     file=$(run_bun_profiler "$script" "bun-jitdump-callstack")
 
+    # Basic sanity: we should collect a non-zero number of samples
     local total
     total=$(count_samples "$file")
     if [[ "$total" -le 0 ]]; then
-        echo "  No samples collected for Bun" >&2
+        echo "  No samples collected for Bun (total=$total)" >&2
         return 1
     fi
 
     # Check for JS function names from JITDump (primary goal).
-    # JIT-compiled functions should appear with their JS names.
-    # Also accept Bun/JSC internal frames as proof that stack walking works.
+    # JSC emits JITDump symbols like "JSC-FTL: hot#..." or "JSC-DFG: processData#..."
+    # We look for our fixture function names prefixed with JSC JIT tier markers.
     assert_stack_contains "$file" \
-        "hot\|processData\|handleRequest\|serverLoop" \
-        "Should contain JS function names from JITDump"
+        "JSC.*\bhot\b\|JSC.*\bprocessData\b\|JSC.*\bhandleRequest\b\|JSC.*\bserverLoop\b" \
+        "Should contain JSC JIT-compiled JS function names from JITDump"
 }
 
 # ── Run all tests ────────────────────────────────────────────────────────────
@@ -717,7 +693,6 @@ run_test "Node.js DWARF + FP-only JIT zones"         test_nodejs_dwarf_callstack
 echo ""
 
 echo "── Bun / JITDump ──"
-run_test "Bun samples collected"                     test_bun_samples_collected
 run_test "Bun JS function names via JITDump"         test_bun_jitdump_callstack
 echo ""
 
