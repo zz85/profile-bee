@@ -60,11 +60,24 @@ Implemented via:
 - `--codeguru <path>` flag for local file output (`src/codeguru.rs`)
 - `--codeguru-upload --profiling-group <name>` for direct upload to CodeGuru via `PostAgentProfile` API (`src/codeguru_upload.rs`). Uses the AWS SDK credential chain; requires `sudo -E` to preserve credentials.
 
-### 10c. OTLP Profiles Export ✅ Done (basic)
+### 10c. OTLP Profiles Export ✅ Done
 
-Export profiles in OpenTelemetry Profiles format via gRPC to OTLP-compatible backends (devfiler, OTel Collector, Pyroscope). Uses `protox` (pure-Rust protobuf compiler, no `protoc` binary needed) and `tonic` for gRPC transport. Supports both streaming and batch modes.
+Export profiles in OpenTelemetry Profiles v1development format via gRPC to OTLP-compatible backends. See [docs/otlp_export.md](otlp_export.md) for the full guide.
 
-Currently sends pre-symbolized frames (function names from collapse format) using `"go"` as the `profile.frame.type` so devfiler reads names from the proto. A future enhancement could add a `--otlp-raw` mode that sends unsymbolized `"native"` frames with real addresses and mapping/build-ID info, allowing the backend (devfiler, Pyroscope) to perform its own symbolization from the binary. This would enable richer features like inline frame expansion, source-line attribution, and deferred/server-side symbolization.
+**Implemented:**
+- Pre-symbolized mode (function names in proto, `"go"` frame type) — works with Pyroscope, OTel Collector
+- Native address mode (real ELF VAs, `"native"` frame type, htlhash build IDs) — works with devfiler via symbol server
+- `--flush-interval` for headless continuous profiling
+- `--symbol-server` for automatic binary upload to external symbol server
+- `--symbol-server-listen` for embedded symbol server (single-process mode)
+- Standalone `symbol-server` crate and shared `profile-bee-symbols` library
+- Mode auto-selected: native when symbol server is configured + collect_raw() available, pre-symbolized otherwise
+
+**Future enhancements:**
+- **Pre-extracted symbol upload:** When profile-bee is already doing symbolization (blazesym), it could extract symbols and POST them in symbfile format directly to the symbol server. This avoids the server re-parsing the binary — useful for local-testing workflows where profile-bee already has the binary in memory.
+- **DWARF enrichment in symbol-server:** Add addr2line/gimli-based source file + line number extraction to the symbfile writer for richer devfiler display.
+- **Parca/debuginfod compatibility:** Support the debuginfod protocol for Parca-based backends.
+- **GNU Build ID fallback:** The pre-symbolized path currently uses a synthetic FNV hash as the build ID. Could use GNU Build ID (from `.note.gnu.build-id`) instead when available, which is cheaper to read and more standard for non-devfiler receivers.
 
 ### 10d. JFR (Java Flight Recorder) Format — Planned
 

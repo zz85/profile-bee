@@ -602,6 +602,19 @@ fn read_proc_maps(pid: u32) -> Vec<ProcMapEntry> {
 }
 
 /// Compute the htlhash FileId for an ELF binary — delegates to shared crate.
+///
+/// This is only called in the native-address path (when a symbol server is
+/// configured for devfiler). The pre-symbolized path uses a cheap FNV hash
+/// instead, since Pyroscope and generic OTLP receivers don't need htlhash.
+///
+/// The htlhash requires ~8KB of I/O + SHA-256 per binary, but results are
+/// cached per pathname so each binary is only hashed once per session.
+///
+/// TODO: If profile-bee is already doing symbolization locally (blazesym), it
+/// could also extract symbols and POST them in symbfile format directly to the
+/// symbol server, avoiding the need for the server to re-parse the binary.
+/// This would be an optimization for local-testing workflows where profile-bee
+/// already has the binary loaded in memory.
 fn compute_htlhash(path: &str) -> Option<String> {
     let id = profile_bee_symbols::fileid::FileId::from_path(std::path::Path::new(path)).ok()?;
     let hex = id.format_hex();
