@@ -431,10 +431,8 @@ pub fn collapse_to_otlp_request(
 
     let period_nanos = if opts.off_cpu {
         1
-    } else if opts.frequency_hz > 0 {
-        (1_000_000_000u64) / opts.frequency_hz
     } else {
-        0
+        1_000_000_000u64.checked_div(opts.frequency_hz).unwrap_or(0)
     };
 
     // Expand aggregated counts into individual timestamps.
@@ -975,10 +973,8 @@ pub fn framecounts_to_otlp_request(
 
     let period_nanos = if opts.off_cpu {
         1
-    } else if opts.frequency_hz > 0 {
-        (1_000_000_000u64) / opts.frequency_hz
     } else {
-        0
+        1_000_000_000u64.checked_div(opts.frequency_hz).unwrap_or(0)
     };
 
     // Expand counts into timestamps (devfiler counts timestamps, ignores values)
