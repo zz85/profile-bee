@@ -7,7 +7,7 @@
 //! - `GET /status`          — List stored symbols
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
@@ -30,6 +30,7 @@ pub async fn run(store: SymbolStore, bind: &str, port: u16) -> anyhow::Result<()
         // Devfiler-compatible endpoints: /{prefix1}/{prefix2}/{id}/metadata.json
         .route("/:a/:b/:id/metadata.json", get(handle_metadata))
         .route("/:a/:b/:id/ranges", get(handle_ranges))
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB limit for binary uploads
         .with_state(state);
 
     let addr = format!("{}:{}", bind, port);
