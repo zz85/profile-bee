@@ -61,6 +61,25 @@ impl SymbolUploader {
             }
         }
     }
+
+    /// Scan all running processes and upload their executable mappings.
+    /// Iterates /proc/*/maps for every PID visible on the system.
+    pub fn upload_all_processes(&self) {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return;
+        };
+
+        let mut pids_scanned = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else { continue };
+            let Ok(pid) = name_str.parse::<u32>() else { continue };
+            self.upload_for_pid(pid);
+            pids_scanned += 1;
+        }
+
+        eprintln!("symbol uploader: scanned {} processes for binaries", pids_scanned);
+    }
 }
 
 /// Background upload loop — deduplicates and POSTs binaries to the symbol server.

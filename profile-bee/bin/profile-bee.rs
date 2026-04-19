@@ -733,14 +733,12 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             url.clone(),
             tokio::runtime::Handle::current(),
         );
-        // Upload binaries for the target PID or scan common system binaries
+        // Upload binaries for the target PID or scan all running processes
         if let Some(target_pid) = pid {
             uploader.upload_for_pid(target_pid);
         } else {
-            // System-wide profiling: upload binaries for PID 1 (init) and self
-            // to cover common system libraries (libc, ld-linux, libpthread, etc.)
-            uploader.upload_for_pid(1);
-            uploader.upload_for_pid(std::process::id());
+            // System-wide profiling: scan all running processes
+            uploader.upload_all_processes();
         }
         uploader
     });
