@@ -94,7 +94,11 @@ impl SymbolUploader {
 /// Background upload loop — deduplicates and POSTs binaries to the symbol server.
 async fn upload_loop(server_url: String, mut rx: mpsc::UnboundedReceiver<PathBuf>) {
     let uploaded: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     eprintln!("symbol uploader: started, server={}", server_url);
 
@@ -173,12 +177,16 @@ async fn upload_loop(server_url: String, mut rx: mpsc::UnboundedReceiver<PathBuf
     }
 }
 
-/// Simple percent-encoding for filenames in URLs.
+/// Percent-encode a filename for use in URL query parameters.
+/// Operates on UTF-8 byte sequences to correctly handle non-ASCII characters.
 fn urlencoding(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u32),
+    s.as_bytes()
+        .iter()
+        .map(|&b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
         })
         .collect()
 }

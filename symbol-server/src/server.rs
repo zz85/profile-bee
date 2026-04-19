@@ -14,10 +14,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
 
-use crate::extract;
 use crate::fileid::FileId;
 use crate::store::SymbolStore;
-use crate::symbfile;
 
 type AppState = Arc<SymbolStore>;
 
@@ -86,54 +84,72 @@ async fn handle_upload(
         .into_response();
     }
 
-    // Write to temp file for object crate to parse
-    let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!("symbol-server-{}.elf", file_id.format_hex()));
-    if let Err(e) = std::fs::write(&tmp_path, &body) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to write temp file: {}", e),
-        )
-            .into_response();
-    }
+    // Move blocking I/O and CPU-heavy extraction into a blocking task
+    let filename_clone = filename.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<(Vec<crate::extract::SymbolRange>, Vec<u8>), (StatusCode, String)> {
+            let tmp_dir = std::env::temp_dir();
+            let tmp_path = tmp_dir.join(format!(
+                "symbol-server-{}-{}.elf",
+                file_id.format_hex(),
+                std::process::id()
+            ));
+            if let Err(e) = std::fs::write(&tmp_path, &body) {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to write temp file: {}", e),
+                ));
+            }
 
-    // Extract symbols
-    let symbols = match extract::extract_symbols(&tmp_path) {
-        Ok(s) => s,
-        Err(e) => {
+            let symbols = match crate::extract::extract_symbols(&tmp_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    tracing::warn!(
+                        "upload: failed to extract symbols from '{}': {}",
+                        filename_clone,
+                        e
+                    );
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("failed to extract symbols: {}", e),
+                    ));
+                }
+            };
             let _ = std::fs::remove_file(&tmp_path);
-            tracing::warn!(
-                "upload: failed to extract symbols from '{}': {}",
-                filename,
-                e
-            );
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("failed to extract symbols: {}", e),
-            )
-                .into_response();
-        }
-    };
-    let _ = std::fs::remove_file(&tmp_path);
 
-    if symbols.is_empty() {
-        tracing::warn!("upload: no symbols found in '{}'", filename);
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "no symbols found in binary",
-        )
-            .into_response();
-    }
+            if symbols.is_empty() {
+                tracing::warn!("upload: no symbols found in '{}'", filename_clone);
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "no symbols found in binary".to_string(),
+                ));
+            }
 
-    // Generate symbfile
-    let ranges_data = match symbfile::write_symbfile(&symbols) {
-        Ok(d) => d,
+            let ranges_data = match crate::symbfile::write_symbfile(&symbols) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to generate symbfile: {}", e),
+                    ));
+                }
+            };
+
+            Ok((symbols, ranges_data))
+        },
+    )
+    .await;
+
+    let (symbols, ranges_data) = match result {
+        Ok(Ok(data)) => data,
+        Ok(Err((status, msg))) => return (status, msg).into_response(),
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to generate symbfile: {}", e),
+                format!("task failed: {}", e),
             )
-                .into_response();
+                .into_response()
         }
     };
 

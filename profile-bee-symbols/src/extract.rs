@@ -42,11 +42,18 @@ pub fn extract_symbols(path: &Path) -> anyhow::Result<Vec<SymbolRange>> {
     // If no symtab symbols (stripped binary), try DWARF-only extraction
     if symbols.is_empty() {
         symbols = extract_from_dwarf(&data, &file);
-        tracing::info!(
-            "extracted {} symbols from DWARF in {}",
-            symbols.len(),
-            path.display()
-        );
+        if symbols.is_empty() {
+            tracing::info!(
+                "no symbols in {}: binary is stripped and DWARF extraction is not yet implemented",
+                path.display()
+            );
+        } else {
+            tracing::info!(
+                "extracted {} symbols from DWARF in {}",
+                symbols.len(),
+                path.display()
+            );
+        }
     } else {
         // Enrich existing symbols with source file info from DWARF
         enrich_with_dwarf(&data, &mut symbols);
@@ -122,16 +129,20 @@ fn enrich_with_dwarf(_data: &[u8], _symbols: &mut [SymbolRange]) {
 }
 
 /// Attempt to demangle a C++/Rust symbol name.
+///
+/// C++ Itanium demangling is attempted first because `rustc_demangle` can
+/// mis-parse `_ZN...` C++ names as Rust legacy mangling. Rust v0 names
+/// (`_R...`) are unambiguous and handled correctly by either order.
 fn demangle(name: &str) -> String {
-    // Try Rust demangling
-    if let Ok(demangled) = rustc_demangle::try_demangle(name) {
-        return format!("{:#}", demangled);
-    }
-    // Try C++ demangling
+    // Try C++ demangling first — avoids mis-parsing Itanium names as Rust
     if let Ok(sym) = cpp_demangle::Symbol::new(name) {
         if let Ok(demangled) = sym.demangle(&cpp_demangle::DemangleOptions::default()) {
             return demangled;
         }
+    }
+    // Try Rust demangling
+    if let Ok(demangled) = rustc_demangle::try_demangle(name) {
+        return format!("{:#}", demangled);
     }
     // Return as-is
     name.to_string()

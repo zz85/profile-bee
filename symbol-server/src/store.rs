@@ -54,17 +54,21 @@ impl SymbolStore {
         let dir = self.id_dir(&id);
         std::fs::create_dir_all(&dir)?;
 
-        // Write ranges file
-        std::fs::write(dir.join("ranges"), ranges_data)?;
+        // Write ranges file atomically (temp + rename)
+        let ranges_tmp = dir.join("ranges.tmp");
+        std::fs::write(&ranges_tmp, ranges_data)?;
+        std::fs::rename(&ranges_tmp, dir.join("ranges"))?;
 
-        // Write metadata.json
+        // Write metadata.json atomically
         let metadata = serde_json::json!({
             "version": 1,
             "symbolFileReferences": {
                 "dwarfFileID": id.format_es()
             }
         });
-        std::fs::write(dir.join("metadata.json"), metadata.to_string())?;
+        let meta_tmp = dir.join("metadata.json.tmp");
+        std::fs::write(&meta_tmp, metadata.to_string())?;
+        std::fs::rename(&meta_tmp, dir.join("metadata.json"))?;
 
         // Update index
         let entry = SymbolEntry {
@@ -114,7 +118,9 @@ impl SymbolStore {
                         if let Ok(id_entries) = std::fs::read_dir(sub.path()) {
                             for id_entry in id_entries.flatten() {
                                 let id_path = id_entry.path();
-                                if id_path.join("ranges").exists() {
+                                if id_path.join("ranges").exists()
+                                    && id_path.join("metadata.json").exists()
+                                {
                                     let id_str = id_entry.file_name();
                                     if let Ok(id) = FileId::parse_es(id_str.to_str().unwrap_or(""))
                                     {

@@ -77,9 +77,14 @@ sudo probee --off-cpu --tui -- ./my-server
 # Continuous profiling to Pyroscope (pre-symbolized, simplest setup)
 sudo probee --otlp-endpoint pyroscope:4040 --flush-interval 10000 --skip-idle
 
-# Continuous profiling to devfiler with symbol server
-symbol-server --port 8888 &
-sudo probee --otlp-endpoint 127.0.0.1:11000 --symbol-server http://localhost:8888 --flush-interval 10000 --skip-idle
+# devfiler with embedded symbol server (single process, easiest devfiler setup)
+# Then start devfiler with: ./devfiler --symb-endpoint http://localhost:8888
+sudo probee --otlp-endpoint 127.0.0.1:11000 --symbol-server-listen 8888 --flush-interval 10000 --skip-idle
+
+# devfiler with external symbol server (for shared/production use)
+symbol-server --port 8888 &                    # start standalone daemon
+# devfiler: ./devfiler --symb-endpoint http://localhost:8888
+sudo probee --otlp-endpoint 127.0.0.1:11000 --symbol-server http://localhost:8888 --flush-interval 10000
 
 # One-shot profile to any OTLP receiver
 sudo probee --otlp-endpoint 127.0.0.1:4317 --otlp-service-name my-app --time 5000

@@ -59,7 +59,7 @@ pub fn spawn_embedded_server(port: u16, runtime: tokio::runtime::Handle) {
             .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
             .with_state(state);
 
-        let addr = format!("0.0.0.0:{}", port);
+        let addr = format!("127.0.0.1:{}", port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -108,47 +108,65 @@ async fn handle_upload(
         .into_response();
     }
 
-    // Write to temp file for object crate to parse
-    let tmp_path = std::env::temp_dir().join(format!("probee-symb-{}.elf", file_id.format_hex()));
-    if let Err(e) = std::fs::write(&tmp_path, &body) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to write temp file: {}", e),
-        )
-            .into_response();
-    }
+    // Move blocking I/O and CPU-heavy extraction into a blocking task
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<(Vec<extract::SymbolRange>, Vec<u8>), (StatusCode, String)> {
+            // Write to per-request unique temp file
+            let tmp_path = std::env::temp_dir().join(format!(
+                "probee-symb-{}-{}.elf",
+                file_id.format_hex(),
+                std::process::id()
+            ));
+            if let Err(e) = std::fs::write(&tmp_path, &body) {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to write temp file: {}", e),
+                ));
+            }
 
-    // Extract symbols
-    let symbols = match extract::extract_symbols(&tmp_path) {
-        Ok(s) => s,
-        Err(e) => {
+            let symbols = match extract::extract_symbols(&tmp_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("failed to extract symbols: {}", e),
+                    ));
+                }
+            };
             let _ = std::fs::remove_file(&tmp_path);
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("failed to extract symbols: {}", e),
-            )
-                .into_response();
-        }
-    };
-    let _ = std::fs::remove_file(&tmp_path);
 
-    if symbols.is_empty() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "no symbols found in binary",
-        )
-            .into_response();
-    }
+            if symbols.is_empty() {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "no symbols found in binary".to_string(),
+                ));
+            }
 
-    // Generate symbfile
-    let ranges_data = match write_symbfile(&symbols) {
-        Ok(d) => d,
+            let ranges_data = match write_symbfile(&symbols) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to generate symbfile: {}", e),
+                    ));
+                }
+            };
+
+            Ok((symbols, ranges_data))
+        },
+    )
+    .await;
+
+    let (symbols, ranges_data) = match result {
+        Ok(Ok(data)) => data,
+        Ok(Err((status, msg))) => return (status, msg).into_response(),
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to generate symbfile: {}", e),
+                format!("spawn_blocking failed: {}", e),
             )
-                .into_response();
+                .into_response()
         }
     };
 

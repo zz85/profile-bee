@@ -324,7 +324,15 @@ pub fn collapse_to_otlp_request(
             }
         };
         let count: i64 = match count_str.parse() {
-            Ok(c) => c,
+            Ok(c) if c > 0 => c,
+            Ok(c) => {
+                tracing::warn!(
+                    "OTLP: skipping line with non-positive count {}: {}",
+                    c,
+                    line
+                );
+                continue;
+            }
             Err(_) => {
                 tracing::warn!("OTLP: skipping line with non-numeric count: {}", line);
                 continue;
@@ -782,11 +790,16 @@ pub fn framecounts_to_otlp_request(
         (idx, mem_start, file_offset)
     };
 
-    // Location dedup key: (address, mapping_index) for real addresses
+    // Location dedup key: (address, mapping_index) for mapped frames.
+    // For unmapped frames (mapping_index==0, address==0), include name/source
+    // to avoid colliding all unknown-address frames into a single Location.
     #[derive(Hash, Eq, PartialEq, Clone)]
     struct RealLocationKey {
         address: u64,
         mapping_index: i32,
+        /// Only used when address==0 && mapping_index==0 to disambiguate
+        name_strindex: i32,
+        filename_strindex: i32,
     }
     let mut real_loc_map: HashMap<RealLocationKey, i32> = HashMap::new();
 
@@ -860,37 +873,47 @@ pub fn framecounts_to_otlp_request(
                 }
             };
 
-            // Dedup location by (elf_va, mapping_index)
+            // Dedup location by (elf_va, mapping_index), with name fallback for unmapped
+            let func_name = if is_kernel {
+                &symbol_name[..symbol_name.len() - 2] // strip _k suffix
+            } else {
+                symbol_name
+            };
+            let name_idx = strings.intern(func_name);
+            let file_str_idx = frame
+                .source
+                .as_deref()
+                .map(|s| strings.intern(s))
+                .unwrap_or(0);
+
             let loc_key = RealLocationKey {
                 address: elf_va,
                 mapping_index: mapping_idx,
+                // Include name/source only for unmapped frames to break collisions
+                name_strindex: if mapping_idx == 0 && elf_va == 0 {
+                    name_idx
+                } else {
+                    0
+                },
+                filename_strindex: if mapping_idx == 0 && elf_va == 0 {
+                    file_str_idx
+                } else {
+                    0
+                },
             };
 
             let loc_index = if let Some(&idx) = real_loc_map.get(&loc_key) {
                 idx
             } else {
-                // Intern function name (also include as a Line for fallback symbolization)
-                let func_name = if is_kernel {
-                    &symbol_name[..symbol_name.len() - 2] // strip _k suffix
-                } else {
-                    symbol_name
-                };
-                let name_idx = strings.intern(func_name);
-
                 let func_key = FuncKey {
                     name_strindex: name_idx,
                 };
                 let func_index = func_set.insert(func_key.clone());
                 if func_index as usize >= functions.len() {
-                    let filename_strindex = frame
-                        .source
-                        .as_deref()
-                        .map(|s| strings.intern(s))
-                        .unwrap_or(0);
                     functions.push(Function {
                         name_strindex: name_idx,
                         system_name_strindex: name_idx,
-                        filename_strindex,
+                        filename_strindex: file_str_idx,
                         start_line: 0,
                     });
                 }

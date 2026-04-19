@@ -521,6 +521,12 @@ impl TraceHandler {
 
         // Populate raw instruction pointer addresses on each symbolized frame.
         // These are used by the OTLP exporter to send real addresses to devfiler.
+        debug_assert!(
+            user_syms.len() <= addrs.len(),
+            "symbolize_user_stack returned more frames ({}) than input addresses ({})",
+            user_syms.len(),
+            addrs.len()
+        );
         for (frame, &addr) in user_syms.iter_mut().zip(addrs.iter()) {
             frame.address = addr;
         }

@@ -21,6 +21,10 @@ use crate::otlp::{self, OtlpOptions, ProfilesServiceClient};
 #[cfg(feature = "otlp")]
 use tonic::transport::Channel;
 
+/// Default timeout for OTLP connect and export operations.
+#[cfg(feature = "otlp")]
+const OTLP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Trait for consuming profiling output.
 ///
 /// In batch mode, `write_batch` is called once with the final stacks.
@@ -617,10 +621,13 @@ impl OtlpSink {
 
         let channel = tokio::task::block_in_place(|| {
             self.runtime.block_on(async {
-                tonic::transport::Channel::from_shared(uri)
-                    .map_err(|e| anyhow::anyhow!("invalid OTLP endpoint: {}", e))?
-                    .connect()
+                let ch = tonic::transport::Channel::from_shared(uri)
+                    .map_err(|e| anyhow::anyhow!("invalid OTLP endpoint: {}", e))?;
+                tokio::time::timeout(OTLP_TIMEOUT, ch.connect())
                     .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("OTLP connect timed out after {:?}", OTLP_TIMEOUT)
+                    })?
                     .map_err(|e| anyhow::anyhow!("failed to connect to OTLP endpoint: {}", e))
             })
         })?;
@@ -737,9 +744,9 @@ impl OtlpNativeSink {
         let runtime = self.runtime.clone();
         let response = tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                client
-                    .export(tonic::Request::new(request))
+                tokio::time::timeout(OTLP_TIMEOUT, client.export(tonic::Request::new(request)))
                     .await
+                    .map_err(|_| anyhow::anyhow!("OTLP export timed out after {:?}", OTLP_TIMEOUT))?
                     .map_err(|e| anyhow::anyhow!("OTLP export failed: {}", e))
             })
         });
@@ -786,10 +793,13 @@ impl OtlpNativeSink {
 
         let channel = tokio::task::block_in_place(|| {
             self.runtime.block_on(async {
-                tonic::transport::Channel::from_shared(uri)
-                    .map_err(|e| anyhow::anyhow!("invalid OTLP endpoint: {}", e))?
-                    .connect()
+                let ch = tonic::transport::Channel::from_shared(uri)
+                    .map_err(|e| anyhow::anyhow!("invalid OTLP endpoint: {}", e))?;
+                tokio::time::timeout(OTLP_TIMEOUT, ch.connect())
                     .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("OTLP connect timed out after {:?}", OTLP_TIMEOUT)
+                    })?
                     .map_err(|e| anyhow::anyhow!("failed to connect to OTLP endpoint: {}", e))
             })
         })?;

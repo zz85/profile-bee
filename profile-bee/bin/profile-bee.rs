@@ -894,7 +894,11 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         });
 
         // Can we use collect_raw()? Only in batch/flush-interval modes (not serve/TUI).
-        let can_use_native = !opt.serve && !opt.tui;
+        #[cfg(feature = "tui")]
+        let is_tui = opt.tui;
+        #[cfg(not(feature = "tui"))]
+        let is_tui = false;
+        let can_use_native = !opt.serve && !is_tui;
         // Should we use native mode? Only when a symbol server is available.
         let use_native = can_use_native && effective_symbol_server.is_some();
 
@@ -907,7 +911,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 opt.off_cpu,
                 tokio::runtime::Handle::current(),
             ));
-        } else if !opt.tui {
+        } else if !is_tui {
             // Pre-symbolized mode via MultiplexSink (serve, or any mode without symbol server).
             // TUI handles OTLP separately in spawn_profiling_thread.
             sinks.push(Box::new(profile_bee::output::OtlpSink::new(
