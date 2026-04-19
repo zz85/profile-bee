@@ -69,7 +69,10 @@ impl FileId {
     pub fn parse_es(s: &str) -> anyhow::Result<Self> {
         let bytes = URL_SAFE_NO_PAD.decode(s)?;
         if bytes.len() != 16 {
-            anyhow::bail!("invalid FileId length: expected 16 bytes, got {}", bytes.len());
+            anyhow::bail!(
+                "invalid FileId length: expected 16 bytes, got {}",
+                bytes.len()
+            );
         }
         let mut arr = [0u8; 16];
         arr.copy_from_slice(&bytes);

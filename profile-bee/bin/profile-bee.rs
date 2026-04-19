@@ -853,7 +853,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             // Serve/continuous mode without OTLP: use collapse-string OtlpSink
             // Only used when there's no native sink (i.e., no --otlp-endpoint
             // OR the OtlpNativeSink handles it directly in the flush loop)
-            if !opt.flush_interval.is_some() {
+            if opt.flush_interval.is_none() {
                 sinks.push(Box::new(profile_bee::output::OtlpSink::new(
                     endpoint.clone(),
                     service_name.clone(),
@@ -899,7 +899,16 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         .iter()
         .any(|(fmt, _)| *fmt != OutputFormat::Raw)
         || opt.serve
-        || { #[cfg(feature = "otlp")] { otlp_native_sink.is_some() } #[cfg(not(feature = "otlp"))] { false } };
+        || {
+            #[cfg(feature = "otlp")]
+            {
+                otlp_native_sink.is_some()
+            }
+            #[cfg(not(feature = "otlp"))]
+            {
+                false
+            }
+        };
 
     if opt.serve {
         // Serve mode: periodically flush data to the web server
@@ -952,7 +961,10 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 #[cfg(feature = "otlp")]
                 {
                     if let Some(ref mut otlp) = otlp_native_sink {
-                        eprintln!("sending {} framecounts to OTLP native sink", result.stacks.len());
+                        eprintln!(
+                            "sending {} framecounts to OTLP native sink",
+                            result.stacks.len()
+                        );
                         otlp.set_actual_duration_ms(interval_ms);
                         if let Err(e) = otlp.send_framecounts(&result.stacks) {
                             eprintln!("OTLP export error: {}", e);
@@ -967,11 +979,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                     .stacks
                     .iter()
                     .map(|fc| {
-                        let frames: Vec<String> = fc
-                            .frames
-                            .iter()
-                            .map(|f| f.fmt_symbol())
-                            .collect();
+                        let frames: Vec<String> =
+                            fc.frames.iter().map(|f| f.fmt_symbol()).collect();
                         format!("{} {}", frames.join(";"), fc.count)
                     })
                     .collect();
@@ -1032,11 +1041,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 .stacks
                 .iter()
                 .map(|fc| {
-                    let frames: Vec<String> = fc
-                        .frames
-                        .iter()
-                        .map(|f| f.fmt_symbol())
-                        .collect();
+                    let frames: Vec<String> = fc.frames.iter().map(|f| f.fmt_symbol()).collect();
                     format!("{} {}", frames.join(";"), fc.count)
                 })
                 .collect();
@@ -1921,7 +1926,8 @@ async fn run_combined_mode(
         pid_mode_handle.clone(),
         opt.tui_refresh_ms,
         external_pid,
-        #[cfg(feature = "otlp")] None, // OTLP handled via serve mode's MultiplexSink
+        #[cfg(feature = "otlp")]
+        None, // OTLP handled via serve mode's MultiplexSink
     );
 
     // TUI event loop
@@ -2054,7 +2060,8 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         pid_mode_handle.clone(),
         opt.tui_refresh_ms,
         external_pid,
-        #[cfg(feature = "otlp")] tui_otlp_sink,
+        #[cfg(feature = "otlp")]
+        tui_otlp_sink,
     );
 
     // TUI event loop

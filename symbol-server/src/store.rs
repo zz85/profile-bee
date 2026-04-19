@@ -40,10 +40,7 @@ impl SymbolStore {
     /// Get the directory path for a given FileId.
     fn id_dir(&self, id: &FileId) -> PathBuf {
         let es = id.format_es();
-        self.dir
-            .join(&es[0..2])
-            .join(&es[2..4])
-            .join(&es)
+        self.dir.join(&es[0..2]).join(&es[2..4]).join(&es)
     }
 
     /// Store a processed symbfile for a given FileId.

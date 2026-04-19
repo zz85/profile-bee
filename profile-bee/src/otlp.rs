@@ -256,29 +256,28 @@ pub fn collapse_to_otlp_request(
     // Helper: get or create attribute index for (key, string_value).
     // Uses StringValue (actual string) rather than StringValueStrindex because
     // devfiler and some receivers don't support the strindex variant in attributes.
-    let get_attr_index =
-        |attr_table: &mut Vec<KeyValueAndUnit>,
-         attr_map: &mut HashMap<(i32, String), i32>,
-         key_idx: i32,
-         val_str: &str| {
-            *attr_map
-                .entry((key_idx, val_str.to_owned()))
-                .or_insert_with(|| {
-                    let idx = attr_table.len() as i32;
-                    attr_table.push(KeyValueAndUnit {
-                        key_strindex: key_idx,
-                        value: Some(AnyValue {
-                            value: Some(
-                                proto::opentelemetry::proto::common::v1::any_value::Value::StringValue(
-                                    val_str.to_owned(),
-                                ),
+    let get_attr_index = |attr_table: &mut Vec<KeyValueAndUnit>,
+                          attr_map: &mut HashMap<(i32, String), i32>,
+                          key_idx: i32,
+                          val_str: &str| {
+        *attr_map
+            .entry((key_idx, val_str.to_owned()))
+            .or_insert_with(|| {
+                let idx = attr_table.len() as i32;
+                attr_table.push(KeyValueAndUnit {
+                    key_strindex: key_idx,
+                    value: Some(AnyValue {
+                        value: Some(
+                            proto::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                                val_str.to_owned(),
                             ),
-                        }),
-                        unit_strindex: 0,
-                    });
-                    idx
-                })
-        };
+                        ),
+                    }),
+                    unit_strindex: 0,
+                });
+                idx
+            })
+    };
 
     // Pre-create the two frame-type attributes.
     //
@@ -292,10 +291,8 @@ pub fn collapse_to_otlp_request(
     // label in devfiler's flamegraph UI.
     //
     // "kernel" frames also get their names read from the proto (not address-based).
-    let native_attr_idx =
-        get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "go");
-    let kernel_attr_idx =
-        get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "kernel");
+    let native_attr_idx = get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "go");
+    let kernel_attr_idx = get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "kernel");
 
     // Create build-ID attribute for the user-space mapping so devfiler groups
     // all frames under one executable instead of one per function.
@@ -419,7 +416,7 @@ pub fn collapse_to_otlp_request(
         .as_nanos() as u64;
 
     let start_nanos = if opts.duration_ms > 0 {
-        now_nanos.saturating_sub(opts.duration_ms as u64 * 1_000_000)
+        now_nanos.saturating_sub(opts.duration_ms * 1_000_000)
     } else {
         now_nanos
     };
@@ -437,7 +434,7 @@ pub fn collapse_to_otlp_request(
     // from timestamps_unix_nano.len(), ignoring the `values` field for on-CPU.
     // We spread timestamps evenly across the profiling duration.
     let total_samples: u64 = samples.iter().map(|s| s.values[0].max(0) as u64).sum();
-    let duration_nanos = opts.duration_ms as u64 * 1_000_000;
+    let duration_nanos = opts.duration_ms * 1_000_000;
 
     for sample in &mut samples {
         let count = sample.values[0].max(1) as u64;
@@ -534,12 +531,14 @@ pub fn collapse_to_otlp_request(
                 entity_refs: vec![],
             }),
             scope_profiles: vec![ScopeProfiles {
-                scope: Some(proto::opentelemetry::proto::common::v1::InstrumentationScope {
-                    name: scope_name,
-                    version: scope_version,
-                    attributes: vec![],
-                    dropped_attributes_count: 0,
-                }),
+                scope: Some(
+                    proto::opentelemetry::proto::common::v1::InstrumentationScope {
+                        name: scope_name,
+                        version: scope_version,
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    },
+                ),
                 profiles: vec![profile],
                 schema_url: String::new(),
             }],
@@ -670,39 +669,36 @@ pub fn framecounts_to_otlp_request(
     let mut attr_map: HashMap<(i32, String), i32> = HashMap::new();
     attr_map.insert((0, String::new()), 0);
 
-    let get_attr_index =
-        |attr_table: &mut Vec<KeyValueAndUnit>,
-         attr_map: &mut HashMap<(i32, String), i32>,
-         key_idx: i32,
-         val_str: &str| {
-            *attr_map
-                .entry((key_idx, val_str.to_owned()))
-                .or_insert_with(|| {
-                    let idx = attr_table.len() as i32;
-                    attr_table.push(KeyValueAndUnit {
-                        key_strindex: key_idx,
-                        value: Some(AnyValue {
-                            value: Some(
-                                proto::opentelemetry::proto::common::v1::any_value::Value::StringValue(
-                                    val_str.to_owned(),
-                                ),
+    let get_attr_index = |attr_table: &mut Vec<KeyValueAndUnit>,
+                          attr_map: &mut HashMap<(i32, String), i32>,
+                          key_idx: i32,
+                          val_str: &str| {
+        *attr_map
+            .entry((key_idx, val_str.to_owned()))
+            .or_insert_with(|| {
+                let idx = attr_table.len() as i32;
+                attr_table.push(KeyValueAndUnit {
+                    key_strindex: key_idx,
+                    value: Some(AnyValue {
+                        value: Some(
+                            proto::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                                val_str.to_owned(),
                             ),
-                        }),
-                        unit_strindex: 0,
-                    });
-                    idx
-                })
-        };
+                        ),
+                    }),
+                    unit_strindex: 0,
+                });
+                idx
+            })
+    };
 
     // Use "native" for user-space frames. With the symbol-server providing
     // symbols to devfiler via --symb-endpoint, devfiler can resolve native
     // frames by address using the htlhash build ID to look up symbols.
     // Function names are still included in loc.lines as fallback for receivers
     // that don't do server-side symbolization (e.g., Pyroscope, OTel Collector).
-    let native_attr_idx =
-        get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "native");
-    let kernel_attr_idx =
-        get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "kernel");
+    let native_attr_idx = get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "native");
+    let kernel_attr_idx = get_attr_index(&mut attr_table, &mut attr_map, frame_type_key, "kernel");
 
     // Mapping table: index 0 = null. Real mappings populated from proc maps.
     let mut mapping_table: Vec<Mapping> = vec![Mapping::default()];
@@ -794,7 +790,11 @@ pub fn framecounts_to_otlp_request(
         "OTLP native: {} total frames, {} with non-zero address ({:.1}%)",
         total_frames,
         nonzero_addrs,
-        if total_frames > 0 { nonzero_addrs as f64 / total_frames as f64 * 100.0 } else { 0.0 }
+        if total_frames > 0 {
+            nonzero_addrs as f64 / total_frames as f64 * 100.0
+        } else {
+            0.0
+        }
     );
 
     for fc in frame_counts {
@@ -802,14 +802,23 @@ pub fn framecounts_to_otlp_request(
 
         // Extract pid from the first frame that has one (the process-name root frame).
         // Symbolized frames have pid=0 because map_user_sym_to_stack uses Default.
-        let fc_pid = fc.frames.iter().find(|f| f.pid != 0).map(|f| f.pid as u32).unwrap_or(0);
+        let fc_pid = fc
+            .frames
+            .iter()
+            .find(|f| f.pid != 0)
+            .map(|f| f.pid as u32)
+            .unwrap_or(0);
 
         // frames are root-to-leaf after collect_raw(). OTLP wants leaf-first.
         for frame in fc.frames.iter().rev() {
             let symbol_name = frame.symbol.as_deref().unwrap_or("[unknown]");
             let is_kernel = symbol_name.ends_with("_k");
             let addr = frame.address;
-            let pid = if frame.pid != 0 { frame.pid as u32 } else { fc_pid };
+            let pid = if frame.pid != 0 {
+                frame.pid as u32
+            } else {
+                fc_pid
+            };
 
             // Find or create the mapping for this address and normalize to ELF VA.
             // devfiler expects Location.address to be in ELF VA space (not runtime VA).
@@ -922,11 +931,11 @@ pub fn framecounts_to_otlp_request(
         .as_nanos() as u64;
 
     let start_nanos = if opts.duration_ms > 0 {
-        now_nanos.saturating_sub(opts.duration_ms as u64 * 1_000_000)
+        now_nanos.saturating_sub(opts.duration_ms * 1_000_000)
     } else {
         now_nanos
     };
-    let duration_nanos = opts.duration_ms as u64 * 1_000_000;
+    let duration_nanos = opts.duration_ms * 1_000_000;
 
     let period_nanos = if opts.off_cpu {
         1
@@ -937,7 +946,10 @@ pub fn framecounts_to_otlp_request(
     };
 
     // Expand counts into timestamps (devfiler counts timestamps, ignores values)
-    let total_samples: u64 = samples.iter().map(|s| s.values.first().copied().unwrap_or(1).max(1) as u64).sum();
+    let total_samples: u64 = samples
+        .iter()
+        .map(|s| s.values.first().copied().unwrap_or(1).max(1) as u64)
+        .sum();
     for sample in &mut samples {
         let count = sample.values.first().copied().unwrap_or(1).max(1) as u64;
         let mut timestamps = Vec::with_capacity(count as usize);
@@ -1011,12 +1023,14 @@ pub fn framecounts_to_otlp_request(
                 entity_refs: vec![],
             }),
             scope_profiles: vec![ScopeProfiles {
-                scope: Some(proto::opentelemetry::proto::common::v1::InstrumentationScope {
-                    name: scope_name,
-                    version: scope_version,
-                    attributes: vec![],
-                    dropped_attributes_count: 0,
-                }),
+                scope: Some(
+                    proto::opentelemetry::proto::common::v1::InstrumentationScope {
+                        name: scope_name,
+                        version: scope_version,
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    },
+                ),
                 profiles: vec![profile],
                 schema_url: String::new(),
             }],
@@ -1114,20 +1128,14 @@ mod tests {
         let leaf_loc = &dict.location_table[leaf_loc_idx];
         let leaf_func_idx = leaf_loc.lines[0].function_index as usize;
         let leaf_func = &dict.function_table[leaf_func_idx];
-        assert_eq!(
-            dict.string_table[leaf_func.name_strindex as usize],
-            "bar"
-        );
+        assert_eq!(dict.string_table[leaf_func.name_strindex as usize], "bar");
 
         // Verify root is "main"
         let root_loc_idx = stack.location_indices[2] as usize;
         let root_loc = &dict.location_table[root_loc_idx];
         let root_func_idx = root_loc.lines[0].function_index as usize;
         let root_func = &dict.function_table[root_func_idx];
-        assert_eq!(
-            dict.string_table[root_func.name_strindex as usize],
-            "main"
-        );
+        assert_eq!(dict.string_table[root_func.name_strindex as usize], "main");
 
         // Verify sample type
         let st = profile.sample_type.as_ref().unwrap();
@@ -1136,7 +1144,10 @@ mod tests {
 
         // Resource should have service.name
         let resource = req.resource_profiles[0].resource.as_ref().unwrap();
-        assert!(resource.attributes.iter().any(|kv| kv.key == "service.name"));
+        assert!(resource
+            .attributes
+            .iter()
+            .any(|kv| kv.key == "service.name"));
     }
 
     #[test]
@@ -1215,10 +1226,7 @@ mod tests {
 
         let st = profile.sample_type.as_ref().unwrap();
         assert_eq!(dict.string_table[st.type_strindex as usize], "off_cpu");
-        assert_eq!(
-            dict.string_table[st.unit_strindex as usize],
-            "nanoseconds"
-        );
+        assert_eq!(dict.string_table[st.unit_strindex as usize], "nanoseconds");
     }
 
     #[test]

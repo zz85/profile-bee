@@ -8,16 +8,19 @@
 //! profile-bee ──POST /upload──▶ symbol-server ◀──GET /{id}/ranges── devfiler
 //! ```
 
-mod fileid;
 mod extract;
-mod symbfile;
+mod fileid;
 mod server;
 mod store;
+mod symbfile;
 
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "symbol-server", about = "Devfiler-compatible symbol server for profile-bee")]
+#[command(
+    name = "symbol-server",
+    about = "Devfiler-compatible symbol server for profile-bee"
+)]
 struct Cli {
     /// Port to listen on
     #[arg(short, long, default_value_t = 8888)]

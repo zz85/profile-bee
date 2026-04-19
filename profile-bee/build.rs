@@ -72,7 +72,8 @@ fn main() {
 fn compile_otlp_protos(manifest_dir: &Path) {
     let proto_dir = manifest_dir.join("proto");
     let protos = &[
-        proto_dir.join("opentelemetry/proto/collector/profiles/v1development/profiles_service.proto"),
+        proto_dir
+            .join("opentelemetry/proto/collector/profiles/v1development/profiles_service.proto"),
         proto_dir.join("opentelemetry/proto/profiles/v1development/profiles.proto"),
     ];
 
@@ -80,8 +81,18 @@ fn compile_otlp_protos(manifest_dir: &Path) {
     for proto in protos {
         println!("cargo:rerun-if-changed={}", proto.display());
     }
-    println!("cargo:rerun-if-changed={}", proto_dir.join("opentelemetry/proto/common/v1/common.proto").display());
-    println!("cargo:rerun-if-changed={}", proto_dir.join("opentelemetry/proto/resource/v1/resource.proto").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        proto_dir
+            .join("opentelemetry/proto/common/v1/common.proto")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        proto_dir
+            .join("opentelemetry/proto/resource/v1/resource.proto")
+            .display()
+    );
 
     // Use protox (pure-Rust protobuf compiler) to parse protos — no `protoc` binary needed.
     let file_descriptors = protox::compile(

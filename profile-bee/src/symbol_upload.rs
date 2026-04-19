@@ -51,7 +51,9 @@ impl SymbolUploader {
             let _offset = parts.next();
             let _dev = parts.next();
             let _inode = parts.next();
-            let Some(pathname) = parts.next() else { continue };
+            let Some(pathname) = parts.next() else {
+                continue;
+            };
             if pathname.starts_with('[') || pathname.is_empty() {
                 continue;
             }
@@ -72,13 +74,20 @@ impl SymbolUploader {
         let mut pids_scanned = 0;
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(name_str) = name.to_str() else { continue };
-            let Ok(pid) = name_str.parse::<u32>() else { continue };
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = name_str.parse::<u32>() else {
+                continue;
+            };
             self.upload_for_pid(pid);
             pids_scanned += 1;
         }
 
-        eprintln!("symbol uploader: scanned {} processes for binaries", pids_scanned);
+        eprintln!(
+            "symbol uploader: scanned {} processes for binaries",
+            pids_scanned
+        );
     }
 }
 

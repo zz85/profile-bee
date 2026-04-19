@@ -91,7 +91,8 @@ fn write_symbfile_inner<W: Write>(w: &mut W, symbols: &[SymbolRange]) -> anyhow:
     write_message(w, MT_HEADER, &header)?;
 
     // Build string table for repeated strings
-    let mut string_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut string_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
     for sym in symbols {
         *string_counts.entry(&sym.name).or_default() += 1;
         if let Some(ref f) = sym.file {
@@ -170,8 +171,8 @@ fn write_symbfile_inner<W: Write>(w: &mut W, symbols: &[SymbolRange]) -> anyhow:
 fn write_message<W: Write, M: Message>(w: &mut W, msg_type: u32, msg: &M) -> anyhow::Result<()> {
     let encoded = msg.encode_to_vec();
     write_uleb128(w, encoded.len() as u32)?; // body length only
-    write_uleb128(w, msg_type)?;              // message type
-    w.write_all(&encoded)?;                   // protobuf body
+    write_uleb128(w, msg_type)?; // message type
+    w.write_all(&encoded)?; // protobuf body
     Ok(())
 }
 

@@ -71,6 +71,25 @@ sudo probee -e uprobe:malloc -t 1000 -o malloc.svg
 sudo probee --off-cpu --tui -- ./my-server
 ```
 
+### OTLP Export (Pyroscope / devfiler)
+
+```bash
+# Continuous profiling to Pyroscope (pre-symbolized, simplest setup)
+sudo probee --otlp-endpoint pyroscope:4040 --flush-interval 10000 --skip-idle
+
+# Continuous profiling to devfiler with symbol server
+symbol-server --port 8888 &
+sudo probee --otlp-endpoint 127.0.0.1:11000 --symbol-server http://localhost:8888 --flush-interval 10000 --skip-idle
+
+# One-shot profile to any OTLP receiver
+sudo probee --otlp-endpoint 127.0.0.1:4317 --otlp-service-name my-app --time 5000
+
+# Combine OTLP + local SVG output
+sudo probee --otlp-endpoint pyroscope:4040 -o flame.svg --flush-interval 10000
+```
+
+See [docs/otlp_export.md](docs/otlp_export.md) for the full guide including architecture, symbol server setup, and ecosystem comparison.
+
 Run `probee` with no arguments or `probee --help` for the full list of options and examples.
 
 ## Features
@@ -78,6 +97,8 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 - **Interactive TUI** — real-time flamegraph viewer with vim-style navigation, search, zoom, and mouse support (click, scroll, double-click to zoom)
 - **Off-CPU profiling** (`--off-cpu`) — trace context switches via `finish_task_switch` kprobe to find where threads block on I/O, locks, or sleep. Configurable block-time filters.
 - **Multiple output formats** — SVG, HTML, JSON (d3), [stackcollapse](https://www.speedscope.app/), and [pprof](https://github.com/google/pprof) protobuf (`.pb.gz`)
+- **OTLP Profiles export** (`--otlp-endpoint`) — stream profiles via gRPC to [Pyroscope](https://grafana.com/oss/pyroscope/), [devfiler](https://github.com/elastic/devfiler), or any OTLP-compatible backend. Supports continuous profiling with `--flush-interval`
+- **Symbol server** (`--symbol-server`) — automatic binary upload for server-side symbolization in devfiler. Includes standalone `symbol-server` daemon
 - **AWS CodeGuru integration** (`--codeguru-upload`) — upload profiles directly to AWS CodeGuru Profiler with proper thread-state counter types (RUNNABLE/WAITING)
 - **Frame pointer unwinding** (default) — fast eBPF-based stack walking via `bpf_get_stackid`
 - **DWARF unwinding** (`--dwarf`) — profiles `-O2`/`-O3` binaries without frame pointers using `.eh_frame` tables loaded into eBPF maps

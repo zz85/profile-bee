@@ -6,5 +6,5 @@
 //! - `fileid`: htlhash FileId computation compatible with devfiler/Elastic
 //! - `extract`: ELF symbol extraction from .symtab/.dynsym with demangling
 
-pub mod fileid;
 pub mod extract;
+pub mod fileid;

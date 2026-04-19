@@ -102,7 +102,11 @@ async fn handle_upload(
         Ok(s) => s,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp_path);
-            tracing::warn!("upload: failed to extract symbols from '{}': {}", filename, e);
+            tracing::warn!(
+                "upload: failed to extract symbols from '{}': {}",
+                filename,
+                e
+            );
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("failed to extract symbols: {}", e),
@@ -114,7 +118,11 @@ async fn handle_upload(
 
     if symbols.is_empty() {
         tracing::warn!("upload: no symbols found in '{}'", filename);
-        return (StatusCode::UNPROCESSABLE_ENTITY, "no symbols found in binary").into_response();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no symbols found in binary",
+        )
+            .into_response();
     }
 
     // Generate symbfile
@@ -162,7 +170,11 @@ async fn handle_metadata(
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    tracing::info!("  resolved to FileId hex={}, has_symbols={}", file_id.format_hex(), store.has_symbols(&file_id));
+    tracing::info!(
+        "  resolved to FileId hex={}, has_symbols={}",
+        file_id.format_hex(),
+        store.has_symbols(&file_id)
+    );
 
     match store.get_metadata(&file_id) {
         Some(metadata) => (
