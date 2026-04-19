@@ -64,35 +64,23 @@ impl OutputSink for MultiplexSink {
     }
 
     fn write_batch(&mut self, stacks: &[String]) -> Result<()> {
-        let mut first_err: Option<anyhow::Error> = None;
         for sink in &mut self.sinks {
             if let Err(e) = sink.write_batch(stacks) {
+                // Log but don't propagate — other sinks should keep working
+                // even if one fails (e.g., OTLP endpoint is temporarily down).
                 tracing::warn!("MultiplexSink: write_batch error: {:#}", e);
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
             }
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
-        let mut first_err: Option<anyhow::Error> = None;
         for sink in &mut self.sinks {
             if let Err(e) = sink.finish(final_stacks) {
                 tracing::warn!("MultiplexSink: finish error: {:#}", e);
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
             }
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -568,7 +556,11 @@ impl OtlpSink {
         );
 
         // Ensure gRPC client is connected.
-        self.ensure_connected()?;
+        if let Err(e) = self.ensure_connected() {
+            // Reset client so we retry connection on next send.
+            self.client = None;
+            return Err(e);
+        }
 
         let client = self.client.as_mut().unwrap();
         let runtime = self.runtime.clone();
@@ -579,25 +571,33 @@ impl OtlpSink {
                     .await
                     .map_err(|e| anyhow::anyhow!("OTLP export failed: {}", e))
             })
-        })?;
+        });
 
-        let resp = response.into_inner();
-        if let Some(partial) = resp.partial_success {
-            if partial.rejected_profiles > 0 {
-                tracing::warn!(
-                    "OTLP: server rejected {} profiles: {}",
-                    partial.rejected_profiles,
-                    partial.error_message
+        match response {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if let Some(partial) = resp.partial_success {
+                    if partial.rejected_profiles > 0 {
+                        tracing::warn!(
+                            "OTLP: server rejected {} profiles: {}",
+                            partial.rejected_profiles,
+                            partial.error_message
+                        );
+                    }
+                }
+                tracing::info!(
+                    "OTLP: exported {} samples to {}",
+                    sample_count,
+                    self.endpoint
                 );
+                Ok(())
+            }
+            Err(e) => {
+                // Reset client so we reconnect on next attempt.
+                self.client = None;
+                Err(e)
             }
         }
-
-        tracing::info!(
-            "OTLP: exported {} samples to {}",
-            sample_count,
-            self.endpoint
-        );
-        Ok(())
     }
 
     /// Ensure the gRPC client is connected, connecting lazily if needed.
@@ -728,7 +728,10 @@ impl OtlpNativeSink {
             self.endpoint
         );
 
-        self.ensure_connected()?;
+        if let Err(e) = self.ensure_connected() {
+            self.client = None;
+            return Err(e);
+        }
 
         let client = self.client.as_mut().unwrap();
         let runtime = self.runtime.clone();
@@ -739,25 +742,32 @@ impl OtlpNativeSink {
                     .await
                     .map_err(|e| anyhow::anyhow!("OTLP export failed: {}", e))
             })
-        })?;
+        });
 
-        let resp = response.into_inner();
-        if let Some(partial) = resp.partial_success {
-            if partial.rejected_profiles > 0 {
-                tracing::warn!(
-                    "OTLP: server rejected {} profiles: {}",
-                    partial.rejected_profiles,
-                    partial.error_message
+        match response {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if let Some(partial) = resp.partial_success {
+                    if partial.rejected_profiles > 0 {
+                        tracing::warn!(
+                            "OTLP: server rejected {} profiles: {}",
+                            partial.rejected_profiles,
+                            partial.error_message
+                        );
+                    }
+                }
+                tracing::info!(
+                    "OTLP native: exported {} samples to {}",
+                    sample_count,
+                    self.endpoint
                 );
+                Ok(())
+            }
+            Err(e) => {
+                self.client = None;
+                Err(e)
             }
         }
-
-        tracing::info!(
-            "OTLP native: exported {} samples to {}",
-            sample_count,
-            self.endpoint
-        );
-        Ok(())
     }
 
     fn ensure_connected(&mut self) -> Result<()> {
