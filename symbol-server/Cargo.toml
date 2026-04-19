@@ -1,0 +1,39 @@
+[package]
+name = "symbol-server"
+version = "0.3.12"
+edition = "2021"
+description = "Devfiler-compatible symbol server for profile-bee"
+
+[[bin]]
+name = "symbol-server"
+path = "src/main.rs"
+
+[dependencies]
+# Shared symbol extraction
+profile-bee-symbols = { version = "0.3.12", path = "../profile-bee-symbols" }
+
+# HTTP server
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Protobuf encoding for symbfile format
+prost = "0.13"
+
+# Compression
+zstd = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Misc
+anyhow = "1"
+parking_lot = "0.12"

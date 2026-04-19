@@ -60,7 +60,26 @@ Implemented via:
 - `--codeguru <path>` flag for local file output (`src/codeguru.rs`)
 - `--codeguru-upload --profiling-group <name>` for direct upload to CodeGuru via `PostAgentProfile` API (`src/codeguru_upload.rs`). Uses the AWS SDK credential chain; requires `sudo -E` to preserve credentials.
 
-### 10c. JFR (Java Flight Recorder) Format — Planned
+### 10c. OTLP Profiles Export ✅ Done
+
+Export profiles in OpenTelemetry Profiles v1development format via gRPC to OTLP-compatible backends. See [docs/otlp_export.md](otlp_export.md) for the full guide.
+
+**Implemented:**
+- Pre-symbolized mode (function names in proto, `"go"` frame type) — works with Pyroscope, OTel Collector
+- Native address mode (real ELF VAs, `"native"` frame type, htlhash build IDs) — works with devfiler via symbol server
+- `--flush-interval` for headless continuous profiling
+- `--symbol-server` for automatic binary upload to external symbol server
+- `--symbol-server-listen` for embedded symbol server (single-process mode)
+- Standalone `symbol-server` crate and shared `profile-bee-symbols` library
+- Mode auto-selected: native when symbol server is configured + collect_raw() available, pre-symbolized otherwise
+
+**Future enhancements:**
+- **Pre-extracted symbol upload:** When profile-bee is already doing symbolization (blazesym), it could extract symbols and POST them in symbfile format directly to the symbol server. This avoids the server re-parsing the binary — useful for local-testing workflows where profile-bee already has the binary in memory.
+- **DWARF enrichment in symbol-server:** Add addr2line/gimli-based source file + line number extraction to the symbfile writer for richer devfiler display.
+- **Parca/debuginfod compatibility:** Support the debuginfod protocol for Parca-based backends.
+- **GNU Build ID fallback:** The pre-symbolized path currently uses a synthetic FNV hash as the build ID. Could use GNU Build ID (from `.note.gnu.build-id`) instead when available, which is cheaper to read and more standard for non-devfiler receivers.
+
+### 10d. JFR (Java Flight Recorder) Format — Planned
 
 Binary format used by JDK Mission Control, IntelliJ, Grafana/Pyroscope, and Datadog Continuous Profiling. Despite the Java name, async-profiler proves it works for native C/C++/kernel stacks (library name as "Class", symbol as "Method", FrameType=C++/Kernel).
 

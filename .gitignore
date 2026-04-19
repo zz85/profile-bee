@@ -12,3 +12,4 @@ target/
 
 # Test fixture binaries (rebuilt via tests/build_fixtures.sh)
 tests/fixtures/bin/
+symbols/

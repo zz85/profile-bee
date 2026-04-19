@@ -15,12 +15,14 @@ include = [
   "bin/**/*.rs",
   "assets/**",
   "ebpf-bin/profile-bee.bpf.o",
+  "proto/**",
 ]
 
 [dependencies]
 aya = { package = "profile-bee-aya", version = "0.13.2" }
 aya-log = { package = "profile-bee-aya-log", version = "0.2.2" }
 profile-bee-common = { version = "0.3.12", path = "../profile-bee-common", features=["user"] }
+profile-bee-symbols = { version = "0.3.12", path = "../profile-bee-symbols" }
 profile-bee-tui = { version = "0.3.12", path = "../profile-bee-tui", optional = true }
 anyhow = "1.0.42"
 clap = { version = "4.0", features = ["derive"] }
@@ -47,13 +49,24 @@ lru = "0.12"
 prost = "0.13"
 flate2 = "1"
 strip-ansi-escapes = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+parking_lot = "0.12"
+axum = { version = "0.7", optional = true }
+zstd = { version = "0.13", optional = true }
 aws-sdk-codeguruprofiler = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+tonic = { version = "0.12", features = ["gzip", "transport"], optional = true }
+
+[build-dependencies]
+tonic-build = { version = "0.12", default-features = false, features = ["prost", "transport"], optional = true }
+protox = { version = "0.7", optional = true }
 
 [features]
-default = ["tui", "aws"]
+default = ["tui", "aws", "otlp", "symbol-server"]
 tui = ["dep:profile-bee-tui"]
 aws = ["dep:aws-sdk-codeguruprofiler", "dep:aws-config"]
+otlp = ["dep:tonic", "dep:tonic-build", "dep:protox"]
+symbol-server = ["dep:zstd", "dep:axum"]
 
 [[bin]]
 name = "probee"

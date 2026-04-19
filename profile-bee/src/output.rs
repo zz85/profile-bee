@@ -14,6 +14,16 @@ use crate::codeguru::{collapse_to_codeguru, CodeGuruOptions, CounterType};
 use crate::event_loop::RawAddressSample;
 use crate::html::{collapse_to_json, generate_html_file};
 use crate::pprof::{collapse_to_pprof, PprofOptions};
+use crate::types::FrameCount;
+
+#[cfg(feature = "otlp")]
+use crate::otlp::{self, OtlpOptions, ProfilesServiceClient};
+#[cfg(feature = "otlp")]
+use tonic::transport::Channel;
+
+/// Default timeout for OTLP connect and export operations.
+#[cfg(feature = "otlp")]
+const OTLP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Trait for consuming profiling output.
 ///
@@ -58,35 +68,23 @@ impl OutputSink for MultiplexSink {
     }
 
     fn write_batch(&mut self, stacks: &[String]) -> Result<()> {
-        let mut first_err: Option<anyhow::Error> = None;
         for sink in &mut self.sinks {
             if let Err(e) = sink.write_batch(stacks) {
+                // Log but don't propagate — other sinks should keep working
+                // even if one fails (e.g., OTLP endpoint is temporarily down).
                 tracing::warn!("MultiplexSink: write_batch error: {:#}", e);
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
             }
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
-        let mut first_err: Option<anyhow::Error> = None;
         for sink in &mut self.sinks {
             if let Err(e) = sink.finish(final_stacks) {
                 tracing::warn!("MultiplexSink: finish error: {:#}", e);
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
             }
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -482,5 +480,332 @@ impl RawCollapseSink {
             })
             .map(|s| s.to_string())
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OTLP gRPC profile export sink
+// ---------------------------------------------------------------------------
+
+/// Sends profiling data to an OTLP-compatible gRPC endpoint.
+///
+/// Compatible with:
+/// - [devfiler](https://github.com/elastic/devfiler) (port 11000)
+/// - OpenTelemetry Collector with profiles receiver
+/// - Grafana Pyroscope (via OTel Collector)
+/// - Any backend implementing `ProfilesService/Export`
+///
+/// Supports both batch mode (single send on `finish()`) and streaming mode
+/// (periodic sends via `write_batch()`).
+#[cfg(feature = "otlp")]
+pub struct OtlpSink {
+    endpoint: String,
+    service_name: String,
+    frequency_hz: u64,
+    off_cpu: bool,
+    duration_ms: u64,
+    /// Lazily initialized gRPC client. Created on first send.
+    client: Option<ProfilesServiceClient<Channel>>,
+    /// Tokio runtime handle for blocking gRPC calls from sync OutputSink methods.
+    runtime: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "otlp")]
+impl OtlpSink {
+    pub fn new(
+        endpoint: String,
+        service_name: String,
+        frequency_hz: u64,
+        off_cpu: bool,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            endpoint,
+            service_name,
+            frequency_hz,
+            off_cpu,
+            duration_ms: 0,
+            client: None,
+            runtime,
+        }
+    }
+
+    /// Send a batch of collapse-format stacks to the OTLP endpoint.
+    fn send_stacks(&mut self, stacks: &[String]) -> Result<()> {
+        if stacks.is_empty() {
+            return Ok(());
+        }
+
+        let opts = OtlpOptions {
+            service_name: self.service_name.clone(),
+            frequency_hz: self.frequency_hz,
+            duration_ms: self.duration_ms,
+            off_cpu: self.off_cpu,
+        };
+
+        let request = otlp::collapse_to_otlp_request(stacks, &opts);
+        let sample_count: usize = request
+            .resource_profiles
+            .iter()
+            .flat_map(|rp| &rp.scope_profiles)
+            .flat_map(|sp| &sp.profiles)
+            .map(|p| p.samples.len())
+            .sum();
+
+        tracing::debug!(
+            "OTLP: sending {} samples ({} stacks) to {}",
+            sample_count,
+            stacks.len(),
+            self.endpoint
+        );
+
+        // Ensure gRPC client is connected.
+        if let Err(e) = self.ensure_connected() {
+            // Reset client so we retry connection on next send.
+            self.client = None;
+            return Err(e);
+        }
+
+        let client = self.client.as_mut().unwrap();
+        let runtime = self.runtime.clone();
+        let response = tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                client
+                    .export(tonic::Request::new(request))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("OTLP export failed: {}", e))
+            })
+        });
+
+        match response {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if let Some(partial) = resp.partial_success {
+                    if partial.rejected_profiles > 0 {
+                        tracing::warn!(
+                            "OTLP: server rejected {} profiles: {}",
+                            partial.rejected_profiles,
+                            partial.error_message
+                        );
+                    }
+                }
+                tracing::info!(
+                    "OTLP: exported {} samples to {}",
+                    sample_count,
+                    self.endpoint
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Reset client so we reconnect on next attempt.
+                self.client = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// Ensure the gRPC client is connected, connecting lazily if needed.
+    fn ensure_connected(&mut self) -> Result<()> {
+        if self.client.is_some() {
+            return Ok(());
+        }
+
+        let endpoint = self.endpoint.clone();
+        tracing::info!("OTLP: connecting to gRPC endpoint: {}", endpoint);
+
+        let uri = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            endpoint.clone()
+        } else {
+            format!("http://{}", endpoint)
+        };
+
+        let channel = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                let ch = tonic::transport::Channel::from_shared(uri)
+                    .map_err(|e| anyhow::anyhow!("invalid OTLP endpoint: {}", e))?;
+                tokio::time::timeout(OTLP_TIMEOUT, ch.connect())
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("OTLP connect timed out after {:?}", OTLP_TIMEOUT)
+                    })?
+                    .map_err(|e| anyhow::anyhow!("failed to connect to OTLP endpoint: {}", e))
+            })
+        })?;
+
+        self.client = Some(ProfilesServiceClient::new(channel));
+        tracing::info!("OTLP: connected to {}", self.endpoint);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "otlp")]
+impl OutputSink for OtlpSink {
+    fn set_actual_duration_ms(&mut self, duration_ms: u64) {
+        self.duration_ms = duration_ms;
+    }
+
+    fn write_batch(&mut self, stacks: &[String]) -> Result<()> {
+        self.send_stacks(stacks)
+    }
+
+    fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
+        self.send_stacks(final_stacks)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OTLP native-address profile export sink
+// ---------------------------------------------------------------------------
+
+/// Sends profiling data with real instruction pointer addresses and proc-map
+/// mappings to an OTLP-compatible gRPC endpoint.
+///
+/// Unlike `OtlpSink` (which sends pre-symbolized collapse strings), this sink
+/// consumes structured `FrameCount` data from `collect_raw()` and builds OTLP
+/// profiles with:
+/// - Real `Location.address` values (instruction pointers)
+/// - Real `Mapping` entries from `/proc/<pid>/maps` with build IDs
+/// - `profile.frame.type = "native"` so devfiler can do its own symbolization
+/// - Function names in `Location.lines` as a fallback for receivers that don't
+///   symbolize server-side
+///
+/// This sink operates outside the `OutputSink` trait since it receives
+/// `Vec<FrameCount>` rather than `&[String]`.
+#[cfg(feature = "otlp")]
+pub struct OtlpNativeSink {
+    endpoint: String,
+    service_name: String,
+    frequency_hz: u64,
+    off_cpu: bool,
+    duration_ms: u64,
+    client: Option<ProfilesServiceClient<Channel>>,
+    runtime: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "otlp")]
+impl OtlpNativeSink {
+    pub fn new(
+        endpoint: String,
+        service_name: String,
+        frequency_hz: u64,
+        off_cpu: bool,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            endpoint,
+            service_name,
+            frequency_hz,
+            off_cpu,
+            duration_ms: 0,
+            client: None,
+            runtime,
+        }
+    }
+
+    pub fn set_actual_duration_ms(&mut self, duration_ms: u64) {
+        self.duration_ms = duration_ms;
+    }
+
+    /// Send structured frame counts with real addresses to the OTLP endpoint.
+    pub fn send_framecounts(&mut self, frame_counts: &[FrameCount]) -> Result<()> {
+        if frame_counts.is_empty() {
+            return Ok(());
+        }
+
+        let opts = OtlpOptions {
+            service_name: self.service_name.clone(),
+            frequency_hz: self.frequency_hz,
+            duration_ms: self.duration_ms,
+            off_cpu: self.off_cpu,
+        };
+
+        let request = otlp::framecounts_to_otlp_request(frame_counts, &opts);
+        let sample_count: usize = request
+            .resource_profiles
+            .iter()
+            .flat_map(|rp| &rp.scope_profiles)
+            .flat_map(|sp| &sp.profiles)
+            .map(|p| p.samples.len())
+            .sum();
+
+        tracing::debug!(
+            "OTLP native: sending {} samples ({} stacks) to {}",
+            sample_count,
+            frame_counts.len(),
+            self.endpoint
+        );
+
+        if let Err(e) = self.ensure_connected() {
+            self.client = None;
+            return Err(e);
+        }
+
+        let client = self.client.as_mut().unwrap();
+        let runtime = self.runtime.clone();
+        let response = tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                tokio::time::timeout(OTLP_TIMEOUT, client.export(tonic::Request::new(request)))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("OTLP export timed out after {:?}", OTLP_TIMEOUT))?
+                    .map_err(|e| anyhow::anyhow!("OTLP export failed: {}", e))
+            })
+        });
+
+        match response {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if let Some(partial) = resp.partial_success {
+                    if partial.rejected_profiles > 0 {
+                        tracing::warn!(
+                            "OTLP: server rejected {} profiles: {}",
+                            partial.rejected_profiles,
+                            partial.error_message
+                        );
+                    }
+                }
+                tracing::info!(
+                    "OTLP native: exported {} samples to {}",
+                    sample_count,
+                    self.endpoint
+                );
+                Ok(())
+            }
+            Err(e) => {
+                self.client = None;
+                Err(e)
+            }
+        }
+    }
+
+    fn ensure_connected(&mut self) -> Result<()> {
+        if self.client.is_some() {
+            return Ok(());
+        }
+
+        let endpoint = self.endpoint.clone();
+        tracing::info!("OTLP native: connecting to gRPC endpoint: {}", endpoint);
+
+        let uri = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            endpoint.clone()
+        } else {
+            format!("http://{}", endpoint)
+        };
+
+        let channel = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                let ch = tonic::transport::Channel::from_shared(uri)
+                    .map_err(|e| anyhow::anyhow!("invalid OTLP endpoint: {}", e))?;
+                tokio::time::timeout(OTLP_TIMEOUT, ch.connect())
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("OTLP connect timed out after {:?}", OTLP_TIMEOUT)
+                    })?
+                    .map_err(|e| anyhow::anyhow!("failed to connect to OTLP endpoint: {}", e))
+            })
+        })?;
+
+        self.client = Some(ProfilesServiceClient::new(channel));
+        tracing::info!("OTLP native: connected to {}", self.endpoint);
+        Ok(())
     }
 }
