@@ -725,7 +725,8 @@ pub fn framecounts_to_otlp_request(
                                   attr_table: &mut Vec<KeyValueAndUnit>,
                                   attr_map: &mut HashMap<(i32, String), i32>,
                                   build_id_key: i32|
-     -> i32 {
+     -> (i32, u64, u64) {
+        // Returns (mapping_index, memory_start, file_offset)
         let maps = proc_maps_cache
             .entry(pid)
             .or_insert_with(|| read_proc_maps(pid));
@@ -734,12 +735,15 @@ pub fn framecounts_to_otlp_request(
         let entry = maps.iter().find(|m| addr >= m.start && addr < m.end);
         let entry = match entry {
             Some(e) => e.clone(),
-            None => return 0, // null mapping
+            None => return (0, 0, 0), // null mapping
         };
+
+        let mem_start = entry.start;
+        let file_offset = entry.offset;
 
         let key = (entry.pathname.clone(), entry.offset);
         if let Some(&idx) = mapping_map.get(&key) {
-            return idx;
+            return (idx, mem_start, file_offset);
         }
 
         // Create new mapping
@@ -766,7 +770,7 @@ pub fn framecounts_to_otlp_request(
             attribute_indices: mapping_attr_indices,
         });
         mapping_map.insert(key, idx);
-        idx
+        (idx, mem_start, file_offset)
     };
 
     // Location dedup key: (address, mapping_index) for real addresses
@@ -807,11 +811,13 @@ pub fn framecounts_to_otlp_request(
             let addr = frame.address;
             let pid = if frame.pid != 0 { frame.pid as u32 } else { fc_pid };
 
-            // Find or create the mapping for this address
-            let mapping_idx = if is_kernel || addr == 0 {
-                0 // kernel or synthetic frames use null mapping
+            // Find or create the mapping for this address and normalize to ELF VA.
+            // devfiler expects Location.address to be in ELF VA space (not runtime VA).
+            // The OTel eBPF profiler normalizes in the BPF code; we do it here.
+            let (mapping_idx, elf_va) = if is_kernel || addr == 0 {
+                (0, addr) // kernel addresses stay as-is (already absolute)
             } else {
-                find_or_create_mapping(
+                let (idx, mem_start, file_offset) = find_or_create_mapping(
                     addr,
                     pid,
                     &mut proc_maps_cache,
@@ -822,12 +828,19 @@ pub fn framecounts_to_otlp_request(
                     &mut attr_table,
                     &mut attr_map,
                     build_id_key,
-                )
+                );
+                if idx == 0 {
+                    (0, addr) // no mapping found, use raw address
+                } else {
+                    // Normalize: elf_va = runtime_addr - mapping_start + file_offset
+                    let normalized = addr.saturating_sub(mem_start) + file_offset;
+                    (idx, normalized)
+                }
             };
 
-            // Dedup location by (address, mapping_index)
+            // Dedup location by (elf_va, mapping_index)
             let loc_key = RealLocationKey {
-                address: addr,
+                address: elf_va,
                 mapping_index: mapping_idx,
             };
 
@@ -869,7 +882,7 @@ pub fn framecounts_to_otlp_request(
                 let idx = locations.len() as i32;
                 locations.push(Location {
                     mapping_index: mapping_idx,
-                    address: addr,
+                    address: elf_va,
                     lines: vec![Line {
                         function_index: func_index,
                         line: 0,
