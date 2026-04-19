@@ -1,4 +1,5 @@
 use crate::ebpf::{FramePointersPod, StackInfoPod};
+use crate::jitdump::{self, JitSymbolTable};
 use crate::v8::{V8HeapReader, V8IntrospectionData};
 use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
 use aya::maps::MapData;
@@ -203,6 +204,10 @@ pub struct TraceHandler {
     /// V8 heap readers per PID, for resolving JavaScript function names
     /// from SFI pointers extracted by the eBPF V8 frame extractor.
     v8_readers: HashMap<u32, V8HeapReader>,
+    /// JITDump symbol tables per PID, for resolving JIT-compiled function
+    /// names from runtimes that write `/tmp/jit-<pid>.dump` (Bun/JSC,
+    /// Java HotSpot, LuaJIT, etc.).
+    jit_tables: HashMap<u32, JitSymbolTable>,
 }
 
 impl Default for TraceHandler {
@@ -217,6 +222,7 @@ impl TraceHandler {
             symbolizer: Symbolizer::new(),
             cache: Default::default(),
             v8_readers: HashMap::new(),
+            jit_tables: HashMap::new(),
         }
     }
 
@@ -244,6 +250,7 @@ impl TraceHandler {
     pub fn invalidate_caches_for_pid(&mut self, tgid: u32) {
         self.cache.invalidate_pid(tgid);
         self.v8_readers.remove(&tgid);
+        self.jit_tables.remove(&tgid);
         tracing::debug!("invalidated symbol caches for pid {}", tgid);
     }
 
@@ -259,6 +266,32 @@ impl TraceHandler {
             data.version.2,
         );
         self.v8_readers.insert(tgid, V8HeapReader::new(tgid, data));
+    }
+
+    /// Register a JITDump symbol table for a process.
+    ///
+    /// Used for resolving JIT-compiled function names from runtimes
+    /// that write `/tmp/jit-<pid>.dump` (Bun/JSC, Java HotSpot, LuaJIT).
+    pub fn register_jit_table(&mut self, tgid: u32, table: JitSymbolTable) {
+        tracing::info!(
+            "registered JITDump symbol table for pid {} ({} symbols)",
+            tgid,
+            table.len(),
+        );
+        self.jit_tables.insert(tgid, table);
+    }
+
+    /// Check if a JITDump symbol table is registered for a process.
+    pub fn has_jit_table(&self, tgid: u32) -> bool {
+        self.jit_tables.contains_key(&tgid)
+    }
+
+    /// Get a mutable reference to the JITDump symbol table for a process.
+    ///
+    /// Used by streaming modes (TUI/serve) to incrementally reload
+    /// JITDump files for newly-compiled functions.
+    pub fn jit_table_mut(&mut self, tgid: u32) -> Option<&mut JitSymbolTable> {
+        self.jit_tables.get_mut(&tgid)
     }
 
     pub fn print_stats(&self) {
@@ -542,6 +575,23 @@ impl TraceHandler {
                             v8sym.function_name.clone()
                         };
                         user_syms[i].symbol = Some(display);
+                    }
+                }
+            }
+        }
+
+        // Override remaining [unknown] symbols using JITDump if available.
+        // JITDump provides address-to-symbol mappings for JIT-compiled code
+        // from runtimes like Bun (JSC), Java HotSpot, and LuaJIT.
+        // This runs after V8 SFI resolution: V8 heap reader takes priority
+        // for Node.js (richer data), JITDump is for non-V8 runtimes.
+        if let Some(jit_table) = self.jit_tables.get(&pid) {
+            for (i, sym) in user_syms.iter_mut().enumerate() {
+                if sym.symbol.as_deref() == Some("[unknown]") {
+                    if let Some(addr) = addrs.get(i) {
+                        if let Some(jit_sym) = jit_table.resolve(*addr) {
+                            sym.symbol = Some(jitdump::format_jit_symbol(jit_sym));
+                        }
                     }
                 }
             }
