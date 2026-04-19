@@ -133,7 +133,11 @@ async fn handle_upload(
     let _ = std::fs::remove_file(&tmp_path);
 
     if symbols.is_empty() {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "no symbols found in binary").into_response();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no symbols found in binary",
+        )
+            .into_response();
     }
 
     // Generate symbfile
@@ -306,7 +310,10 @@ fn write_symbfile(symbols: &[extract::SymbolRange]) -> anyhow::Result<Vec<u8>> {
     Ok(output)
 }
 
-fn write_symbfile_inner<W: Write>(w: &mut W, symbols: &[extract::SymbolRange]) -> anyhow::Result<()> {
+fn write_symbfile_inner<W: Write>(
+    w: &mut W,
+    symbols: &[extract::SymbolRange],
+) -> anyhow::Result<()> {
     w.write_all(MAGIC)?;
     write_message(w, MT_HEADER, &Header {})?;
 
@@ -328,7 +335,13 @@ fn write_symbfile_inner<W: Write>(w: &mut W, symbols: &[extract::SymbolRange]) -
         }
     }
     if !string_table.is_empty() {
-        write_message(w, MT_STRING_TABLE_V1, &StringTableV1 { strings: string_table })?;
+        write_message(
+            w,
+            MT_STRING_TABLE_V1,
+            &StringTableV1 {
+                strings: string_table,
+            },
+        )?;
     }
 
     // Range records
@@ -360,15 +373,19 @@ fn write_symbfile_inner<W: Write>(w: &mut W, symbols: &[extract::SymbolRange]) -
             (None, None)
         };
 
-        write_message(w, MT_RANGE_V1, &RangeV1 {
-            length: sym.length,
-            func_str,
-            func_ref,
-            file_str,
-            file_ref,
-            depth: 0,
-            elf_va,
-        })?;
+        write_message(
+            w,
+            MT_RANGE_V1,
+            &RangeV1 {
+                length: sym.length,
+                func_str,
+                func_ref,
+                file_str,
+                file_ref,
+                depth: 0,
+                elf_va,
+            },
+        )?;
     }
     Ok(())
 }

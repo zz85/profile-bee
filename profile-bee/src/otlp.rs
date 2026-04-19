@@ -605,7 +605,7 @@ fn read_proc_maps(pid: u32) -> Vec<ProcMapEntry> {
 fn compute_htlhash(path: &str) -> Option<String> {
     let id = profile_bee_symbols::fileid::FileId::from_path(std::path::Path::new(path)).ok()?;
     let hex = id.format_hex();
-    eprintln!("htlhash: {} -> {}", path, hex);
+    tracing::debug!("htlhash: {} -> {}", path, hex);
     Some(hex)
 }
 
@@ -786,7 +786,7 @@ pub fn framecounts_to_otlp_request(
         .flat_map(|fc| &fc.frames)
         .filter(|f| f.address != 0)
         .count();
-    eprintln!(
+    tracing::debug!(
         "OTLP native: {} total frames, {} with non-zero address ({:.1}%)",
         total_frames,
         nonzero_addrs,

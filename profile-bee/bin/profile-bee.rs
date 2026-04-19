@@ -748,7 +748,8 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // Determine the effective symbol server URL (explicit --symbol-server or embedded)
     #[cfg(feature = "symbol-server")]
     let effective_symbol_server = opt.symbol_server.clone().or_else(|| {
-        opt.symbol_server_listen.map(|port| format!("http://127.0.0.1:{}", port))
+        opt.symbol_server_listen
+            .map(|port| format!("http://127.0.0.1:{}", port))
     });
     #[cfg(not(feature = "symbol-server"))]
     let effective_symbol_server = opt.symbol_server.clone();
@@ -859,13 +860,27 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             ),
         ));
     }
-    // OTLP gRPC export sink (native address mode for batch, collapse mode for serve)
+    // -----------------------------------------------------------------------
+    // OTLP export setup
+    //
+    // Two modes, chosen automatically based on context:
+    //
+    // 1. Pre-symbolized ("go" frame type): sends function names in the proto.
+    //    Works with any OTLP receiver (Pyroscope, OTel Collector, devfiler).
+    //    Used in: --serve, --tui, or any mode without a symbol server.
+    //
+    // 2. Native ELF VAs ("native" frame type): sends real addresses + mappings.
+    //    Requires a symbol server so devfiler can resolve addresses server-side.
+    //    Used in: batch and --flush-interval modes when --symbol-server is set.
+    //
+    // collect_raw() is needed for native mode (returns FrameCount with addresses).
+    // serve/TUI consume collapse strings internally, so they always use pre-symbolized.
+    // -----------------------------------------------------------------------
     #[cfg(feature = "otlp")]
     let mut otlp_native_sink: Option<profile_bee::output::OtlpNativeSink> = None;
     #[cfg(feature = "otlp")]
     if let Some(ref endpoint) = opt.otlp_endpoint {
         let service_name = opt.otlp_service_name.clone().unwrap_or_else(|| {
-            // Default service name: profiled command name, or "profile-bee"
             if !opt.command.is_empty() {
                 std::path::Path::new(&opt.command[0])
                     .file_name()
@@ -877,31 +892,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 "profile-bee".to_string()
             }
         });
-        if opt.serve || opt.flush_interval.is_some() {
-            // Serve/continuous mode without OTLP: use collapse-string OtlpSink
-            // Only used when there's no native sink (i.e., no --otlp-endpoint
-            // OR the OtlpNativeSink handles it directly in the flush loop)
-            if opt.flush_interval.is_none() {
-                sinks.push(Box::new(profile_bee::output::OtlpSink::new(
-                    endpoint.clone(),
-                    service_name.clone(),
-                    opt.frequency,
-                    opt.off_cpu,
-                    tokio::runtime::Handle::current(),
-                )));
-            }
-            // For flush-interval mode, use OtlpNativeSink with collect_raw()
-            if opt.flush_interval.is_some() {
-                otlp_native_sink = Some(profile_bee::output::OtlpNativeSink::new(
-                    endpoint.clone(),
-                    service_name,
-                    opt.frequency,
-                    opt.off_cpu,
-                    tokio::runtime::Handle::current(),
-                ));
-            }
-        } else {
-            // Batch mode: use OtlpNativeSink with real addresses via collect_raw()
+
+        // Can we use collect_raw()? Only in batch/flush-interval modes (not serve/TUI).
+        let can_use_native = !opt.serve && !opt.tui;
+        // Should we use native mode? Only when a symbol server is available.
+        let use_native = can_use_native && effective_symbol_server.is_some();
+
+        if use_native {
+            // Native mode: send real ELF VAs via OtlpNativeSink + collect_raw()
             otlp_native_sink = Some(profile_bee::output::OtlpNativeSink::new(
                 endpoint.clone(),
                 service_name,
@@ -909,6 +907,16 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
                 opt.off_cpu,
                 tokio::runtime::Handle::current(),
             ));
+        } else if !opt.tui {
+            // Pre-symbolized mode via MultiplexSink (serve, or any mode without symbol server).
+            // TUI handles OTLP separately in spawn_profiling_thread.
+            sinks.push(Box::new(profile_bee::output::OtlpSink::new(
+                endpoint.clone(),
+                service_name,
+                opt.frequency,
+                opt.off_cpu,
+                tokio::runtime::Handle::current(),
+            )));
         }
     }
     if opt.serve {
@@ -968,56 +976,79 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         let mut last_stacks = Vec::new();
         let mut cycle_count: u64 = 0;
 
+        #[cfg(feature = "otlp")]
+        let use_native_otlp = otlp_native_sink.is_some();
+        #[cfg(not(feature = "otlp"))]
+        let use_native_otlp = false;
+
         eprintln!(
-            "continuous mode: flushing every {}ms (Ctrl-C to stop)",
-            interval_ms
+            "continuous mode: flushing every {}ms{}",
+            interval_ms,
+            if use_native_otlp {
+                " (native OTLP + symbol server)"
+            } else {
+                ""
+            }
         );
 
         loop {
-            let result = event_loop.collect_raw(&perf_rx, Some(flush_interval));
-            cycle_count += 1;
+            if use_native_otlp {
+                // Native mode: use collect_raw() for real addresses
+                let result = event_loop.collect_raw(&perf_rx, Some(flush_interval));
+                cycle_count += 1;
 
-            if !result.stacks.is_empty() {
-                eprintln!(
-                    "flush #{}: {} stacks (elapsed {:.1}s)",
-                    cycle_count,
-                    result.stacks.len(),
-                    started.elapsed().as_secs_f64()
-                );
+                if !result.stacks.is_empty() {
+                    eprintln!(
+                        "flush #{}: {} stacks (elapsed {:.1}s)",
+                        cycle_count,
+                        result.stacks.len(),
+                        started.elapsed().as_secs_f64()
+                    );
 
-                // Send structured data to OTLP native sink (real addresses)
-                #[cfg(feature = "otlp")]
-                {
+                    #[cfg(feature = "otlp")]
                     if let Some(ref mut otlp) = otlp_native_sink {
-                        eprintln!(
-                            "sending {} framecounts to OTLP native sink",
-                            result.stacks.len()
-                        );
                         otlp.set_actual_duration_ms(interval_ms);
                         if let Err(e) = otlp.send_framecounts(&result.stacks) {
                             eprintln!("OTLP export error: {}", e);
                         }
-                    } else {
-                        eprintln!("WARNING: otlp_native_sink is None!");
                     }
+
+                    // Derive collapse strings for any file-based sinks
+                    let collapse_stacks: Vec<String> = result
+                        .stacks
+                        .iter()
+                        .map(|fc| {
+                            let frames: Vec<String> =
+                                fc.frames.iter().map(|f| f.fmt_symbol()).collect();
+                            format!("{} {}", frames.join(";"), fc.count)
+                        })
+                        .collect();
+                    sink.write_batch(&collapse_stacks)?;
+                    last_stacks = collapse_stacks;
                 }
 
-                // Derive collapse strings for any file-based sinks
-                let collapse_stacks: Vec<String> = result
-                    .stacks
-                    .iter()
-                    .map(|fc| {
-                        let frames: Vec<String> =
-                            fc.frames.iter().map(|f| f.fmt_symbol()).collect();
-                        format!("{} {}", frames.join(";"), fc.count)
-                    })
-                    .collect();
-                sink.write_batch(&collapse_stacks)?;
-                last_stacks = collapse_stacks;
-            }
+                if result.stopped {
+                    break;
+                }
+            } else {
+                // Pre-symbolized mode: use collect() for collapse strings
+                let result = event_loop.collect(&perf_rx, Some(flush_interval));
+                cycle_count += 1;
 
-            if result.stopped {
-                break;
+                if !result.stacks.is_empty() {
+                    eprintln!(
+                        "flush #{}: {} stacks (elapsed {:.1}s)",
+                        cycle_count,
+                        result.stacks.len(),
+                        started.elapsed().as_secs_f64()
+                    );
+                    sink.write_batch(&result.stacks)?;
+                    last_stacks = result.stacks;
+                }
+
+                if result.stopped {
+                    break;
+                }
             }
         }
         sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
@@ -1039,32 +1070,28 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
              then re-symbolize with: probee symbolize profile.raw -o output.svg"
         );
     } else {
-        // Non-serve mode: block until Stop, output once, exit.
-        // If OTLP native sink is present, use collect_raw() to get structured
-        // FrameCount data with real addresses. We can derive collapse strings
-        // from FrameCount for the other sinks.
+        // Batch mode: block until Stop, output once, exit.
         #[cfg(feature = "otlp")]
-        let has_otlp = otlp_native_sink.is_some();
+        let has_native_otlp = otlp_native_sink.is_some();
         #[cfg(not(feature = "otlp"))]
-        let has_otlp = false;
+        let has_native_otlp = false;
 
-        if has_otlp {
-            tracing::debug!("batch mode: collecting structured samples for OTLP native export");
+        if has_native_otlp {
+            // Native OTLP: use collect_raw() for real addresses
+            tracing::debug!("batch mode: collecting structured samples for native OTLP export");
             let result = event_loop.collect_raw(&perf_rx, None);
-            tracing::debug!("batch mode: collected {} frame counts", result.stacks.len());
 
             let actual_duration_ms = started.elapsed().as_millis() as u64;
 
-            // Send structured data to OTLP native sink
             #[cfg(feature = "otlp")]
             if let Some(ref mut otlp) = otlp_native_sink {
                 otlp.set_actual_duration_ms(actual_duration_ms);
                 if let Err(e) = otlp.send_framecounts(&result.stacks) {
-                    tracing::warn!("OTLP native export error: {}", e);
+                    eprintln!("OTLP native export error: {}", e);
                 }
             }
 
-            // Also generate collapse strings for any file-based sinks
+            // Derive collapse strings for any file-based sinks
             let collapse_stacks: Vec<String> = result
                 .stacks
                 .iter()
@@ -1077,19 +1104,15 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             sink.set_actual_duration_ms(actual_duration_ms);
             sink.finish(&collapse_stacks)?;
         } else {
-            tracing::debug!("batch mode: collecting samples (blocks until Stop)");
+            // Pre-symbolized: use collect() for collapse strings
+            tracing::debug!("batch mode: collecting samples");
             let result = event_loop.collect(&perf_rx, None);
-            tracing::debug!("batch mode: collected {} stacks", result.stacks.len());
             sink.write_batch(&result.stacks)?;
             sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
             sink.finish(&result.stacks)?;
         }
 
-        // If raw output was also requested, do a second pass for raw addresses.
-        // (In this case, the eBPF maps have been drained by `collect` so we
-        // can't re-extract raw addresses. The raw sink captures what it can
-        // from the symbolized path. For full raw capture, use .raw alone.)
-        // TODO: unified collect path that produces both simultaneously
+        // TODO: unified collect path that produces both raw + symbolized simultaneously
     }
 
     // Write raw collapse file if requested
