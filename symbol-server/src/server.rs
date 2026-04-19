@@ -12,10 +12,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use axum::Router;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::fileid::FileId;
 use crate::store::SymbolStore;
+
+/// Atomic counter for unique temp file names across concurrent requests.
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type AppState = Arc<SymbolStore>;
 
@@ -89,10 +93,12 @@ async fn handle_upload(
     let result = tokio::task::spawn_blocking(
         move || -> Result<(Vec<crate::extract::SymbolRange>, Vec<u8>), (StatusCode, String)> {
             let tmp_dir = std::env::temp_dir();
+            let nonce = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tmp_path = tmp_dir.join(format!(
-                "symbol-server-{}-{}.elf",
+                "symbol-server-{}-{}-{}.elf",
                 file_id.format_hex(),
-                std::process::id()
+                std::process::id(),
+                nonce
             ));
             if let Err(e) = std::fs::write(&tmp_path, &body) {
                 return Err((

@@ -737,12 +737,12 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // Start embedded symbol server if --symbol-server-listen is set.
     #[cfg(feature = "symbol-server")]
     if let Some(port) = opt.symbol_server_listen {
-        profile_bee::embedded_symbol_server::spawn_embedded_server(
+        let ready_rx = profile_bee::embedded_symbol_server::spawn_embedded_server(
             port,
             tokio::runtime::Handle::current(),
         );
-        // Give the server a moment to bind
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Wait for the server to bind before starting the symbol uploader
+        let _ = ready_rx.await;
     }
 
     // Determine the effective symbol server URL (explicit --symbol-server or embedded)
@@ -1968,6 +1968,30 @@ async fn run_combined_mode(
         }
     });
 
+    // Build OTLP sink for combined mode if endpoint is configured
+    #[cfg(feature = "otlp")]
+    let combined_otlp_sink = opt.otlp_endpoint.as_ref().map(|endpoint| {
+        let service_name = opt.otlp_service_name.clone().unwrap_or_else(|| {
+            if !opt.command.is_empty() {
+                std::path::Path::new(&opt.command[0])
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "profile-bee".to_string())
+            } else if let Some(pid) = opt.pid {
+                format!("pid-{}", pid)
+            } else {
+                "profile-bee".to_string()
+            }
+        });
+        profile_bee::output::OtlpSink::new(
+            endpoint.clone(),
+            service_name,
+            opt.frequency,
+            opt.off_cpu,
+            tokio::runtime::Handle::current(),
+        )
+    });
+
     // Profiling thread (feeds both TUI and web server)
     spawn_profiling_thread(
         ebpf_profiler,
@@ -1982,7 +2006,7 @@ async fn run_combined_mode(
         opt.tui_refresh_ms,
         external_pid,
         #[cfg(feature = "otlp")]
-        None, // OTLP handled via serve mode's MultiplexSink
+        combined_otlp_sink,
     );
 
     // TUI event loop

@@ -8,7 +8,11 @@
 //! Uses the same `profile-bee-symbols` crate as the standalone `symbol-server` binary.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Atomic counter for unique temp file names across concurrent requests.
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -46,8 +50,12 @@ impl EmbeddedStore {
 type AppState = Arc<EmbeddedStore>;
 
 /// Start the embedded symbol server on the given port.
-/// Returns a handle that can be used to check if the server is running.
-pub fn spawn_embedded_server(port: u16, runtime: tokio::runtime::Handle) {
+/// Returns a oneshot receiver that is signaled once the server has bound.
+pub fn spawn_embedded_server(
+    port: u16,
+    runtime: tokio::runtime::Handle,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     runtime.spawn(async move {
         let state: AppState = Arc::new(EmbeddedStore::new());
 
@@ -68,10 +76,12 @@ pub fn spawn_embedded_server(port: u16, runtime: tokio::runtime::Handle) {
             }
         };
         eprintln!("embedded symbol-server: listening on {}", addr);
+        let _ = ready_tx.send(());
         if let Err(e) = axum::serve(listener, app).await {
             eprintln!("embedded symbol-server: error: {}", e);
         }
     });
+    ready_rx
 }
 
 /// Handle binary upload.
@@ -112,10 +122,12 @@ async fn handle_upload(
     let result = tokio::task::spawn_blocking(
         move || -> Result<(Vec<extract::SymbolRange>, Vec<u8>), (StatusCode, String)> {
             // Write to per-request unique temp file
+            let nonce = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tmp_path = std::env::temp_dir().join(format!(
-                "probee-symb-{}-{}.elf",
+                "probee-symb-{}-{}-{}.elf",
                 file_id.format_hex(),
-                std::process::id()
+                std::process::id(),
+                nonce
             ));
             if let Err(e) = std::fs::write(&tmp_path, &body) {
                 return Err((
