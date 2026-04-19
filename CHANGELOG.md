@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.3.13
+
+### New Features
+
+- **OTLP Profiles export** (`--otlp-endpoint`) — stream profiling data via gRPC in OpenTelemetry Profiles v1development format to Pyroscope, devfiler, OTel Collector, or any OTLP-compatible backend. Proto compilation uses `protox` (pure-Rust, no `protoc` binary needed) with `tonic` for gRPC transport.
+- **Two export modes, auto-selected** — pre-symbolized mode sends function names directly (works with Pyroscope out of the box); native-address mode sends real ELF virtual addresses with `/proc/pid/maps` mappings and htlhash build IDs (for devfiler's server-side symbolization). Mode is chosen automatically based on whether a symbol server is configured.
+- **Symbol server** (`symbol-server` crate) — standalone daemon that accepts ELF binary uploads from profile-bee, extracts symbols from `.symtab`/`.dynsym` with Rust/C++ demangling, and serves devfiler-compatible symbfiles (zstd-compressed protobuf with delta-encoded address ranges). Devfiler auto-fetches symbols via `--symb-endpoint`.
+- **Embedded symbol server** (`--symbol-server-listen <port>`) — runs the symbol server inside the profile-bee process for single-binary workflows. No separate daemon needed. Feature-gated behind `symbol-server` (default on).
+- **Automatic binary upload** (`--symbol-server <url>`) — discovers ELF binaries from `/proc/*/maps` for all running processes and uploads them to the symbol server in the background. Deduplicates by path, verifies ELF magic, with connect/request timeouts.
+- **Continuous profiling mode** (`--flush-interval <ms>`) — run indefinitely (or until `--time` expires), uploading a batch of samples every N milliseconds. Headless alternative to `--serve` without HTTP server overhead.
+- **Shared `profile-bee-symbols` crate** — htlhash FileId computation (SHA-256 of head+tail+length, compatible with devfiler/Elastic) and ELF symbol extraction, shared between profile-bee and symbol-server.
+
+### Improvements
+
+- **OTLP works in all modes** — `--tui`, `--serve`, `--tui --serve` (combined), batch, and `--flush-interval` all support OTLP export via `--otlp-endpoint`.
+- **Real instruction pointer addresses** — `StackFrameInfo.address` is now populated with raw IPs after blazesym symbolization, enabling the native-address OTLP path.
+- **ELF VA normalization** — runtime virtual addresses are normalized to ELF VA space (`runtime_addr - mapping_start + file_offset`) so devfiler's SymTree interval lookups resolve correctly.
+- **Non-fatal OTLP errors** — transport failures log a warning and reset the gRPC client for automatic reconnection on the next flush cycle. Profiling and local output sinks continue uninterrupted.
+- **10-second timeouts** on all OTLP `connect()` and `export()` calls via `tokio::time::timeout` to prevent indefinite blocking.
+- **Atomic symbfile writes** — symbol-server uses temp+rename for ranges and metadata.json to prevent partial entries.
+- **Blocking work off async workers** — both symbol-server and embedded server use `tokio::task::spawn_blocking` for ELF parsing and symbfile generation.
+- **Readiness signal for embedded server** — `spawn_embedded_server` returns a `oneshot::Receiver<()>` that fires after `TcpListener::bind` succeeds, eliminating the startup race.
+- **C++ demangling priority** — C++ Itanium demangling is attempted before Rust to prevent `_ZN...` names from being mis-parsed by `rustc_demangle`.
+- **Feature independence** — `opt.tui` is cfg-gated in the OTLP block so `otlp` compiles without `tui` feature.
+
+### New CLI Flags
+
+| Flag | Description |
+|------|-------------|
+| `--otlp-endpoint <host:port>` | OTLP gRPC endpoint for profile export |
+| `--otlp-insecure` | Use plaintext gRPC (default: true) |
+| `--otlp-service-name <name>` | Service name for resource attributes |
+| `--symbol-server <url>` | External symbol server URL for binary upload |
+| `--symbol-server-listen <port>` | Embedded symbol server port |
+| `--flush-interval <ms>` | Continuous profiling flush interval |
+
+### Documentation
+
+- New `docs/otlp_export.md` — full guide covering architecture, CLI flags, Pyroscope/devfiler setup, symbol server endpoints, and symbolization approaches across the ecosystem (devfiler, Pyroscope, Parca, OTel Collector, Grafana Alloy).
+- Updated `docs/NEXT_STEPS.md` with OTLP export status and future enhancement roadmap.
+- Updated README with OTLP and symbol-server feature descriptions and quick-start examples.
+
 ## v0.3.12
 
 ### New Features
