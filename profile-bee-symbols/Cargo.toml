@@ -1,0 +1,23 @@
+[package]
+name = "profile-bee-symbols"
+version = "0.1.0"
+edition = "2021"
+description = "Shared symbol extraction and FileId computation for profile-bee ecosystem"
+
+[dependencies]
+# ELF parsing
+object = { version = "0.37", features = ["read"] }
+
+# Hashing (htlhash = SHA-256 of head+tail+length)
+sha2 = "0.10"
+
+# Base64 for FileId encoding
+base64 = "0.22"
+
+# Demangling
+rustc-demangle = "0.1"
+cpp_demangle = "0.4"
+
+# Error handling + logging
+anyhow = "1"
+tracing = "0.1"

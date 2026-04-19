@@ -602,42 +602,10 @@ fn read_proc_maps(pid: u32) -> Vec<ProcMapEntry> {
         .collect()
 }
 
-/// Compute the htlhash FileId for an ELF binary — compatible with devfiler.
-///
-/// Algorithm: SHA-256(first_4096_bytes || last_4096_bytes || big_endian_u64_length)[0:16]
-/// Serialized as lowercase hex for the `process.executable.build_id.htlhash` attribute.
+/// Compute the htlhash FileId for an ELF binary — delegates to shared crate.
 fn compute_htlhash(path: &str) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::{Read, Seek, SeekFrom};
-
-    const PARTIAL_HASH_SIZE: u64 = 4096;
-
-    let mut file = std::fs::File::open(path).ok()?;
-    let file_len = file.seek(SeekFrom::End(0)).ok()?;
-    file.seek(SeekFrom::Start(0)).ok()?;
-
-    let mut hasher = Sha256::new();
-
-    // Hash head (first 4096 bytes or less)
-    let head_size = file_len.min(PARTIAL_HASH_SIZE) as usize;
-    let mut head_buf = vec![0u8; head_size];
-    file.read_exact(&mut head_buf).ok()?;
-    hasher.update(&head_buf);
-
-    // Hash tail (last 4096 bytes or less)
-    let tail_start = file_len.saturating_sub(PARTIAL_HASH_SIZE);
-    file.seek(SeekFrom::Start(tail_start)).ok()?;
-    let tail_size = (file_len - tail_start) as usize;
-    let mut tail_buf = vec![0u8; tail_size];
-    file.read_exact(&mut tail_buf).ok()?;
-    hasher.update(&tail_buf);
-
-    // Hash file length as big-endian u64
-    hasher.update(file_len.to_be_bytes());
-
-    // Truncate SHA-256 to 128 bits, format as hex
-    let digest = hasher.finalize();
-    let hex: String = digest[..16].iter().map(|b| format!("{:02x}", b)).collect();
+    let id = profile_bee_symbols::fileid::FileId::from_path(std::path::Path::new(path)).ok()?;
+    let hex = id.format_hex();
     eprintln!("htlhash: {} -> {}", path, hex);
     Some(hex)
 }

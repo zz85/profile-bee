@@ -2545,6 +2545,7 @@ dependencies = [
  "profile-bee-aya",
  "profile-bee-aya-log",
  "profile-bee-common",
+ "profile-bee-symbols",
  "profile-bee-tui",
  "prost",
  "protox",
@@ -2552,7 +2553,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "strip-ansi-escapes",
  "thiserror 1.0.69",
  "tokio",
@@ -2621,6 +2621,19 @@ name = "profile-bee-common"
 version = "0.3.12"
 dependencies = [
  "aya",
+]
+
+[[package]]
+name = "profile-bee-symbols"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "cpp_demangle 0.4.5",
+ "object 0.37.3",
+ "rustc-demangle",
+ "sha2",
+ "tracing",
 ]
 
 [[package]]
@@ -3457,17 +3470,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
  "clap 4.6.1",
- "cpp_demangle 0.4.5",
- "gimli 0.31.1",
- "object 0.37.3",
  "parking_lot",
+ "profile-bee-symbols",
  "prost",
- "rustc-demangle",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "tower-http 0.5.2",
  "tracing",
