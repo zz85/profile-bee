@@ -338,6 +338,15 @@ struct Opt {
     /// Example: --symbol-server http://localhost:8888
     #[arg(long)]
     symbol_server: Option<String>,
+
+    /// Start an embedded symbol server on this port.
+    /// Combines the profiler and symbol server into a single process —
+    /// useful for debugging and local development without running a separate daemon.
+    /// Example: --symbol-server-listen 8888
+    /// Then point devfiler at: --symb-endpoint http://localhost:8888
+    #[cfg(feature = "symbol-server")]
+    #[arg(long)]
+    symbol_server_listen: Option<u16>,
 }
 
 impl Opt {
@@ -725,10 +734,29 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         println!("Waiting for Ctrl-C...");
     }
 
+    // Start embedded symbol server if --symbol-server-listen is set.
+    #[cfg(feature = "symbol-server")]
+    if let Some(port) = opt.symbol_server_listen {
+        profile_bee::embedded_symbol_server::spawn_embedded_server(
+            port,
+            tokio::runtime::Handle::current(),
+        );
+        // Give the server a moment to bind
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Determine the effective symbol server URL (explicit --symbol-server or embedded)
+    #[cfg(feature = "symbol-server")]
+    let effective_symbol_server = opt.symbol_server.clone().or_else(|| {
+        opt.symbol_server_listen.map(|port| format!("http://127.0.0.1:{}", port))
+    });
+    #[cfg(not(feature = "symbol-server"))]
+    let effective_symbol_server = opt.symbol_server.clone();
+
     // Start symbol uploader if --symbol-server is configured.
     // Uploads ELF binaries from /proc/<pid>/maps to the symbol server
     // so devfiler can resolve native frame addresses.
-    let _symbol_uploader = opt.symbol_server.as_ref().map(|url| {
+    let _symbol_uploader = effective_symbol_server.as_ref().map(|url| {
         let uploader = profile_bee::symbol_upload::SymbolUploader::spawn(
             url.clone(),
             tokio::runtime::Handle::current(),

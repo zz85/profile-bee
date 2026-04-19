@@ -27,6 +27,9 @@ pub mod otlp;
 
 pub mod symbol_upload;
 
+#[cfg(feature = "symbol-server")]
+pub mod embedded_symbol_server;
+
 pub mod probe_resolver;
 pub mod probe_spec;
 

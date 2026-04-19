@@ -2529,6 +2529,7 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-codeguruprofiler",
+ "axum",
  "blazesym",
  "bytes",
  "clap 4.6.1",
@@ -2562,6 +2563,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "warp",
+ "zstd",
 ]
 
 [[package]]
