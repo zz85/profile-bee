@@ -96,7 +96,9 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
         KeyCode::Tab => {
             if app.is_live() {
                 if app.has_output() {
-                    app.flamegraph_view.state.toggle_live_view_kind_with_output();
+                    app.flamegraph_view
+                        .state
+                        .toggle_live_view_kind_with_output();
                 } else {
                     app.flamegraph_view.state.toggle_live_view_kind();
                 }

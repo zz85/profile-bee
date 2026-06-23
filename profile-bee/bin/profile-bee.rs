@@ -1741,16 +1741,15 @@ fn spawn_profiling_thread(
 
             // Optionally feed the web server
             if let Some(ref tx) = web_tx {
-                let json = collapse_to_json(
-                    &aggregate_out.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
-                );
+                let json =
+                    collapse_to_json(&aggregate_out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
                 let _ = tx.send(json);
             }
 
             // Optionally send to OTLP endpoint
             #[cfg(feature = "otlp")]
             if let Some(ref mut sink) = otlp_sink {
-                if let Err(e) = sink.write_batch(&out) {
+                if let Err(e) = sink.write_batch(&aggregate_out) {
                     tracing::warn!("OTLP export error in TUI/serve thread: {}", e);
                 }
             }

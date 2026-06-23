@@ -268,8 +268,7 @@ impl App {
                 elapsed,
                 collected_at,
             } = parsed;
-            self.elapsed
-                .insert("flamegraph".to_string(), elapsed);
+            self.elapsed.insert("flamegraph".to_string(), elapsed);
             self.push_history(flamegraph.clone(), collected_at);
             self.push_bucket(bucket_flamegraph, collapsed_data, collected_at);
             if self.flamegraph_view.state.view_kind == crate::state::ViewKind::Heatmap {
@@ -632,7 +631,12 @@ impl App {
         }
     }
 
-    fn push_bucket(&mut self, flamegraph: FlameGraph, collapsed_data: String, collected_at: Instant) {
+    fn push_bucket(
+        &mut self,
+        flamegraph: FlameGraph,
+        collapsed_data: String,
+        collected_at: Instant,
+    ) {
         let sample_count = flamegraph.total_count();
         self.buckets.push_back(HistoricalBucket {
             flamegraph,
@@ -693,7 +697,10 @@ impl App {
     fn build_heatmap_flamegraph(&self) -> Option<FlameGraph> {
         let (start, end) = self.current_heatmap_range()?;
         if start == end {
-            return self.buckets.get(start).map(|bucket| bucket.flamegraph.clone());
+            return self
+                .buckets
+                .get(start)
+                .map(|bucket| bucket.flamegraph.clone());
         }
         let collapsed_data = self
             .buckets
@@ -770,7 +777,10 @@ mod tests {
 
         assert_eq!(app.buckets.len(), LIVE_HISTORY_LIMIT);
         let (start, end) = app.current_heatmap_range().unwrap();
-        assert_eq!((start, end), (LIVE_HISTORY_LIMIT - 1, LIVE_HISTORY_LIMIT - 1));
+        assert_eq!(
+            (start, end),
+            (LIVE_HISTORY_LIMIT - 1, LIVE_HISTORY_LIMIT - 1)
+        );
         assert!(app
             .buckets
             .front()
@@ -793,8 +803,14 @@ mod tests {
 
         app.select_heatmap_range(0, 1);
 
-        assert!(app.flamegraph().get_stack_by_full_name("alpha;shared").is_some());
-        assert!(app.flamegraph().get_stack_by_full_name("beta;shared").is_some());
+        assert!(app
+            .flamegraph()
+            .get_stack_by_full_name("alpha;shared")
+            .is_some());
+        assert!(app
+            .flamegraph()
+            .get_stack_by_full_name("beta;shared")
+            .is_some());
         assert!(app.flamegraph().get_stack_by_full_name("gamma").is_none());
     }
 }

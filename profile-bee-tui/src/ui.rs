@@ -337,7 +337,10 @@ impl<'a> FlamelensWidget<'a> {
         let heatmap_height = area.height.saturating_div(3).max(4).min(8);
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(vec![Constraint::Length(heatmap_height), Constraint::Fill(1)])
+            .constraints(vec![
+                Constraint::Length(heatmap_height),
+                Constraint::Fill(1),
+            ])
             .split(area);
         self.render_heatmap(layout[0], buf, state);
         self.render_flamegraph(layout[1], buf, state);
@@ -362,7 +365,8 @@ impl<'a> FlamelensWidget<'a> {
 
         let columns = self.app.heatmap_columns(inner.width as usize);
         if columns.is_empty() {
-            let msg = Line::from("Waiting for samples...").style(Style::default().fg(Color::DarkGray));
+            let msg =
+                Line::from("Waiting for samples...").style(Style::default().fg(Color::DarkGray));
             let x = inner
                 .x
                 .saturating_add(inner.width.saturating_sub(msg.width() as u16) / 2);
@@ -371,7 +375,11 @@ impl<'a> FlamelensWidget<'a> {
             return;
         }
 
-        let max_samples = columns.iter().map(|column| column.sample_count).max().unwrap_or(1);
+        let max_samples = columns
+            .iter()
+            .map(|column| column.sample_count)
+            .max()
+            .unwrap_or(1);
         let selected_range = self.app.current_heatmap_range();
 
         for (idx, column) in columns.iter().enumerate() {
@@ -928,7 +936,7 @@ impl<'a> FlamelensWidget<'a> {
 
     fn get_heatmap_color(ratio: f64, selected: bool) -> Color {
         let ratio = ratio.clamp(0.0, 1.0);
-        let (r, g, b) = if ratio < 0.33 {
+        let (r, g, b): (u8, u8, u8) = if ratio < 0.33 {
             (40, (80.0 + ratio * 160.0) as u8, 220)
         } else if ratio < 0.66 {
             (((ratio - 0.33) * 255.0 / 0.33) as u8, 200, 120)
@@ -936,7 +944,11 @@ impl<'a> FlamelensWidget<'a> {
             (240, ((1.0 - ratio) * 180.0) as u8, 80)
         };
         if selected {
-            Color::Rgb(r.saturating_add(10), g.saturating_add(10), b.saturating_add(10))
+            Color::Rgb(
+                r.saturating_add(10),
+                g.saturating_add(10),
+                b.saturating_add(10),
+            )
         } else {
             Color::Rgb(r, g, b)
         }
