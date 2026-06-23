@@ -28,6 +28,8 @@ pub struct StackPosition {
 #[derive(Debug)]
 pub struct ParsedFlameGraph {
     pub flamegraph: FlameGraph,
+    pub bucket_flamegraph: FlameGraph,
+    pub collapsed_data: String,
     pub elapsed: Duration,
     pub collected_at: Instant,
 }
@@ -38,12 +40,53 @@ struct HistoricalFlameGraph {
     collected_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct HistoricalBucket {
+    flamegraph: FlameGraph,
+    collapsed_data: String,
+    collected_at: Instant,
+    sample_count: u64,
+}
+
 const LIVE_HISTORY_LIMIT: usize = 120;
 
 #[derive(Debug)]
 pub struct InputBuffer {
     pub buffer: tui_input::Input,
     pub cursor: Option<(u16, u16)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeatmapPosition {
+    pub start_index: usize,
+    pub end_index: usize,
+    pub x: u16,
+    pub y: u16,
+    pub height: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeatmapColumn {
+    pub start_index: usize,
+    pub end_index: usize,
+    pub sample_count: u64,
+}
+
+#[derive(Debug, Clone)]
+struct HeatmapState {
+    follow_live: bool,
+    cursor: Option<usize>,
+    range: Option<(usize, usize)>,
+}
+
+impl Default for HeatmapState {
+    fn default() -> Self {
+        Self {
+            follow_live: true,
+            cursor: None,
+            range: None,
+        }
+    }
 }
 
 /// Application.
@@ -69,14 +112,20 @@ pub struct App {
     next_flamegraph: Arc<Mutex<Option<ParsedFlameGraph>>>,
     /// Recently collected live flamegraph snapshots, oldest first.
     history: VecDeque<HistoricalFlameGraph>,
+    /// Per-refresh live buckets used by the heatmap view, oldest first.
+    buckets: VecDeque<HistoricalBucket>,
     /// Snapshot being viewed in history mode. `None` means follow live/latest.
     history_cursor: Option<usize>,
+    /// Heatmap selection state for the live heatmap view.
+    heatmap_state: HeatmapState,
     /// Shared update mode for the profiling thread
     update_mode_handle: Arc<Mutex<UpdateMode>>,
     /// Shared pid-mode flag for the profiling thread (toggled with 'p')
     pid_mode_handle: Arc<AtomicBool>,
     /// Stack positions from last render (for mouse click handling)
     pub stack_positions: Vec<StackPosition>,
+    /// Heatmap positions from last render (for mouse click handling)
+    pub heatmap_positions: Vec<HeatmapPosition>,
     /// Last click for double-click detection
     pub last_click: Option<(std::time::Instant, u16, u16)>,
     /// Shared process output buffer (None when no child process)
@@ -99,10 +148,13 @@ impl App {
             dirty: true,
             next_flamegraph: Arc::new(Mutex::new(None)),
             history: VecDeque::new(),
+            buckets: VecDeque::new(),
             history_cursor: None,
+            heatmap_state: HeatmapState::default(),
             update_mode_handle: Arc::new(Mutex::new(UpdateMode::default())),
             pid_mode_handle: Arc::new(AtomicBool::new(false)),
             stack_positions: Vec::new(),
+            heatmap_positions: Vec::new(),
             last_click: None,
             process_output: None,
             output_state: ProcessOutputState::default(),
@@ -135,8 +187,11 @@ impl App {
             update_mode_handle,
             pid_mode_handle: Arc::new(AtomicBool::new(false)),
             history: VecDeque::new(),
+            buckets: VecDeque::new(),
             history_cursor: None,
+            heatmap_state: HeatmapState::default(),
             stack_positions: Vec::new(),
+            heatmap_positions: Vec::new(),
             last_click: None,
             process_output: None,
             output_state: ProcessOutputState::default(),
@@ -177,12 +232,18 @@ impl App {
         self.pid_mode_handle.clone()
     }
 
+    pub fn is_live(&self) -> bool {
+        matches!(self.flamegraph_input, FlameGraphInput::Live)
+    }
+
     /// Update flamegraph with new data
     pub fn update_flamegraph(&self, data: String) {
         let tic = std::time::Instant::now();
-        let flamegraph = FlameGraph::from_string(data, true);
+        let flamegraph = FlameGraph::from_string(data.clone(), true);
         let parsed = ParsedFlameGraph {
+            bucket_flamegraph: flamegraph.clone(),
             flamegraph,
+            collapsed_data: data,
             elapsed: tic.elapsed(),
             collected_at: Instant::now(),
         };
@@ -200,12 +261,22 @@ impl App {
 
         let next_flamegraph = self.next_flamegraph.lock().unwrap().take();
         if let Some(parsed) = next_flamegraph {
+            let ParsedFlameGraph {
+                flamegraph,
+                bucket_flamegraph,
+                collapsed_data,
+                elapsed,
+                collected_at,
+            } = parsed;
             self.elapsed
-                .insert("flamegraph".to_string(), parsed.elapsed);
-            self.push_history(parsed.flamegraph.clone(), parsed.collected_at);
-            if !self.flamegraph_view.state.freeze && self.history_cursor.is_none() {
+                .insert("flamegraph".to_string(), elapsed);
+            self.push_history(flamegraph.clone(), collected_at);
+            self.push_bucket(bucket_flamegraph, collapsed_data, collected_at);
+            if self.flamegraph_view.state.view_kind == crate::state::ViewKind::Heatmap {
+                self.apply_heatmap_selection();
+            } else if !self.flamegraph_view.state.freeze && self.history_cursor.is_none() {
                 let tic = Instant::now();
-                self.flamegraph_view.replace_flamegraph(parsed.flamegraph);
+                self.flamegraph_view.replace_flamegraph(flamegraph);
                 self.elapsed
                     .insert("replacement".to_string(), tic.elapsed());
             }
@@ -363,6 +434,191 @@ impl App {
         Some(format!("{label} ({age:.1}s ago)"))
     }
 
+    pub fn heatmap_status(&self) -> Option<String> {
+        let bucket_count = self.buckets.len();
+        if bucket_count == 0 {
+            return None;
+        }
+        let (start, end) = self.current_heatmap_range()?;
+        let sample_count = self
+            .buckets
+            .iter()
+            .skip(start)
+            .take(end - start + 1)
+            .map(|bucket| bucket.sample_count)
+            .sum::<u64>();
+        let age = self.buckets.get(end)?.collected_at.elapsed().as_secs_f32();
+        if self.heatmap_state.follow_live {
+            Some(format!(
+                "live bucket {}/{} ({sample_count} samples, {age:.1}s ago)",
+                end + 1,
+                bucket_count
+            ))
+        } else if start == end {
+            Some(format!(
+                "bucket {}/{} ({sample_count} samples, {age:.1}s ago)",
+                start + 1,
+                bucket_count
+            ))
+        } else {
+            Some(format!(
+                "range {}-{} / {} ({} buckets, {sample_count} samples, {age:.1}s ago)",
+                start + 1,
+                end + 1,
+                bucket_count,
+                end - start + 1,
+            ))
+        }
+    }
+
+    pub fn current_heatmap_range(&self) -> Option<(usize, usize)> {
+        let len = self.buckets.len();
+        if len == 0 {
+            return None;
+        }
+        if self.heatmap_state.follow_live {
+            return Some((len.saturating_sub(1), len.saturating_sub(1)));
+        }
+        if let Some((start, end)) = self.heatmap_state.range {
+            let start = start.min(end).min(len.saturating_sub(1));
+            let end = start.max(end.min(len.saturating_sub(1)));
+            return Some((start, end));
+        }
+        let cursor = self
+            .heatmap_state
+            .cursor
+            .unwrap_or_else(|| len.saturating_sub(1))
+            .min(len.saturating_sub(1));
+        Some((cursor, cursor))
+    }
+
+    pub fn heatmap_columns(&self, max_columns: usize) -> Vec<HeatmapColumn> {
+        let len = self.buckets.len();
+        if len == 0 || max_columns == 0 {
+            return Vec::new();
+        }
+        let groups = len.min(max_columns);
+        let group_size = len.div_ceil(groups);
+        let mut start = 0;
+        let mut columns = Vec::new();
+        while start < len {
+            let end = (start + group_size).min(len) - 1;
+            let sample_count = self
+                .buckets
+                .iter()
+                .skip(start)
+                .take(end - start + 1)
+                .map(|bucket| bucket.sample_count)
+                .sum::<u64>();
+            columns.push(HeatmapColumn {
+                start_index: start,
+                end_index: end,
+                sample_count,
+            });
+            start = end + 1;
+        }
+        columns
+    }
+
+    pub fn move_heatmap_previous(&mut self) {
+        let len = self.buckets.len();
+        if len == 0 {
+            return;
+        }
+        self.heatmap_state.follow_live = false;
+        let next = self
+            .heatmap_state
+            .cursor
+            .unwrap_or_else(|| len.saturating_sub(1))
+            .saturating_sub(1);
+        self.heatmap_state.cursor = Some(next);
+        self.heatmap_state.range = None;
+        self.apply_heatmap_selection();
+    }
+
+    pub fn move_heatmap_next(&mut self) {
+        let len = self.buckets.len();
+        if len == 0 {
+            return;
+        }
+        self.heatmap_state.follow_live = false;
+        let next = self
+            .heatmap_state
+            .cursor
+            .unwrap_or_else(|| len.saturating_sub(1))
+            .saturating_add(1)
+            .min(len.saturating_sub(1));
+        self.heatmap_state.cursor = Some(next);
+        self.heatmap_state.range = None;
+        self.apply_heatmap_selection();
+    }
+
+    pub fn expand_heatmap_left(&mut self) {
+        let len = self.buckets.len();
+        if len == 0 {
+            return;
+        }
+        self.heatmap_state.follow_live = false;
+        let cursor = self
+            .heatmap_state
+            .cursor
+            .unwrap_or_else(|| len.saturating_sub(1))
+            .min(len.saturating_sub(1));
+        let (start, end) = self.heatmap_state.range.unwrap_or((cursor, cursor));
+        self.heatmap_state.cursor = Some(cursor);
+        self.heatmap_state.range = Some((start.saturating_sub(1), end));
+        self.apply_heatmap_selection();
+    }
+
+    pub fn expand_heatmap_right(&mut self) {
+        let len = self.buckets.len();
+        if len == 0 {
+            return;
+        }
+        self.heatmap_state.follow_live = false;
+        let cursor = self
+            .heatmap_state
+            .cursor
+            .unwrap_or_else(|| len.saturating_sub(1))
+            .min(len.saturating_sub(1));
+        let (start, end) = self.heatmap_state.range.unwrap_or((cursor, cursor));
+        self.heatmap_state.cursor = Some(cursor);
+        self.heatmap_state.range = Some((start, end.saturating_add(1).min(len.saturating_sub(1))));
+        self.apply_heatmap_selection();
+    }
+
+    pub fn follow_heatmap_live(&mut self) {
+        self.heatmap_state = HeatmapState::default();
+        self.apply_heatmap_selection();
+    }
+
+    pub fn select_heatmap_range(&mut self, start_index: usize, end_index: usize) {
+        let len = self.buckets.len();
+        if len == 0 {
+            return;
+        }
+        self.heatmap_state.follow_live = false;
+        if start_index == end_index {
+            self.heatmap_state.cursor = Some(start_index.min(len.saturating_sub(1)));
+            self.heatmap_state.range = None;
+        } else {
+            self.heatmap_state.cursor = Some(start_index.min(end_index).min(len.saturating_sub(1)));
+            self.heatmap_state.range = Some((
+                start_index.min(end_index).min(len.saturating_sub(1)),
+                start_index.max(end_index).min(len.saturating_sub(1)),
+            ));
+        }
+        self.apply_heatmap_selection();
+    }
+
+    pub fn sync_active_flamegraph(&mut self) {
+        if self.flamegraph_view.state.view_kind == crate::state::ViewKind::Heatmap {
+            self.apply_heatmap_selection();
+        } else {
+            self.apply_history_cursor();
+        }
+    }
+
     fn push_history(&mut self, flamegraph: FlameGraph, collected_at: Instant) {
         self.history.push_back(HistoricalFlameGraph {
             flamegraph,
@@ -373,6 +629,37 @@ impl App {
             if let Some(cursor) = self.history_cursor.as_mut() {
                 *cursor = cursor.saturating_sub(1);
             }
+        }
+    }
+
+    fn push_bucket(&mut self, flamegraph: FlameGraph, collapsed_data: String, collected_at: Instant) {
+        let sample_count = flamegraph.total_count();
+        self.buckets.push_back(HistoricalBucket {
+            flamegraph,
+            collapsed_data,
+            collected_at,
+            sample_count,
+        });
+        if self.buckets.len() > LIVE_HISTORY_LIMIT {
+            self.buckets.pop_front();
+            self.reindex_heatmap_state_after_trim();
+        }
+        if self.heatmap_state.follow_live {
+            self.heatmap_state.cursor = self.buckets.len().checked_sub(1);
+        }
+    }
+
+    fn reindex_heatmap_state_after_trim(&mut self) {
+        let Some(last_index) = self.buckets.len().checked_sub(1) else {
+            self.heatmap_state = HeatmapState::default();
+            return;
+        };
+        if let Some(cursor) = self.heatmap_state.cursor.as_mut() {
+            *cursor = cursor.saturating_sub(1).min(last_index);
+        }
+        if let Some((start, end)) = self.heatmap_state.range.as_mut() {
+            *start = start.saturating_sub(1).min(last_index);
+            *end = end.saturating_sub(1).min(last_index);
         }
     }
 
@@ -392,6 +679,33 @@ impl App {
         }
     }
 
+    fn apply_heatmap_selection(&mut self) {
+        let Some(flamegraph) = self.build_heatmap_flamegraph() else {
+            return;
+        };
+        let tic = Instant::now();
+        self.flamegraph_view.replace_flamegraph(flamegraph);
+        self.elapsed
+            .insert("replacement".to_string(), tic.elapsed());
+        self.dirty = true;
+    }
+
+    fn build_heatmap_flamegraph(&self) -> Option<FlameGraph> {
+        let (start, end) = self.current_heatmap_range()?;
+        if start == end {
+            return self.buckets.get(start).map(|bucket| bucket.flamegraph.clone());
+        }
+        let collapsed_data = self
+            .buckets
+            .iter()
+            .skip(start)
+            .take(end - start + 1)
+            .map(|bucket| bucket.collapsed_data.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(FlameGraph::from_string(collapsed_data, true))
+    }
+
     /// Find the stack at the given screen coordinates
     pub fn find_stack_at_position(&self, x: u16, y: u16) -> Option<StackIdentifier> {
         // Find the last (topmost) stack that contains this position
@@ -404,6 +718,13 @@ impl App {
                 x >= pos.x && x < end && y == pos.y
             })
             .map(|pos| pos.stack_id)
+    }
+
+    pub fn find_heatmap_at_position(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        self.heatmap_positions
+            .iter()
+            .find(|pos| x == pos.x && y >= pos.y && y < pos.y.saturating_add(pos.height))
+            .map(|pos| (pos.start_index, pos.end_index))
     }
 }
 
@@ -436,5 +757,44 @@ mod tests {
         app.show_next_snapshot();
         assert_eq!(app.history_cursor, None);
         assert!(app.flamegraph().get_stack_by_full_name("beta").is_some());
+    }
+
+    #[test]
+    fn trims_heatmap_buckets_and_keeps_latest_selection() {
+        let mut app = App::with_live();
+
+        for idx in 0..(LIVE_HISTORY_LIMIT + 5) {
+            app.update_flamegraph(collapsed(&format!("bucket-{idx}"), 1));
+            app.tick();
+        }
+
+        assert_eq!(app.buckets.len(), LIVE_HISTORY_LIMIT);
+        let (start, end) = app.current_heatmap_range().unwrap();
+        assert_eq!((start, end), (LIVE_HISTORY_LIMIT - 1, LIVE_HISTORY_LIMIT - 1));
+        assert!(app
+            .buckets
+            .front()
+            .unwrap()
+            .flamegraph
+            .get_stack_by_full_name("bucket-5")
+            .is_some());
+    }
+
+    #[test]
+    fn builds_heatmap_range_flamegraph_from_multiple_buckets() {
+        let mut app = App::with_live();
+
+        app.update_flamegraph(collapsed("alpha;shared", 2));
+        app.tick();
+        app.update_flamegraph(collapsed("beta;shared", 3));
+        app.tick();
+        app.update_flamegraph(collapsed("gamma", 5));
+        app.tick();
+
+        app.select_heatmap_range(0, 1);
+
+        assert!(app.flamegraph().get_stack_by_full_name("alpha;shared").is_some());
+        assert!(app.flamegraph().get_stack_by_full_name("beta;shared").is_some());
+        assert!(app.flamegraph().get_stack_by_full_name("gamma").is_none());
     }
 }

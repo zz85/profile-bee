@@ -33,6 +33,7 @@ pub struct FlamelensWidgetState {
     render_time: Duration,
     cursor_position: Option<(u16, u16)>,
     pub stack_positions: Vec<crate::app::StackPosition>,
+    pub heatmap_positions: Vec<crate::app::HeatmapPosition>,
     /// Rendered height of the output view (full tab or split panel).
     /// Used by the key handler for accurate page-up/page-down.
     pub output_view_height: u16,
@@ -63,6 +64,7 @@ impl StatefulWidget for FlamelensWidget<'_> {
 
 impl<'a> FlamelensWidget<'a> {
     fn render_all(self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) {
+        state.heatmap_positions.clear();
         let view_kind_indicator = self.get_view_kind_indicator();
         let version_indicator = self.get_version_indicator();
 
@@ -157,7 +159,9 @@ impl<'a> FlamelensWidget<'a> {
                 .constraints(vec![Constraint::Percentage(70), Constraint::Percentage(30)])
                 .split(main_area);
 
-            if self.is_flamegraph_view() {
+            if self.is_heatmap_view() {
+                self.render_heatmap_view(split[0], buf, state);
+            } else if self.is_flamegraph_view() {
                 self.render_flamegraph(split[0], buf, state);
             } else if self.is_table_view() || self.is_process_list_view() {
                 if self.app.flamegraph_state().tree_mode {
@@ -178,6 +182,8 @@ impl<'a> FlamelensWidget<'a> {
         } else if self.is_output_view() {
             self.render_output(main_area, buf);
             state.output_view_height = main_area.height;
+        } else if self.is_heatmap_view() {
+            self.render_heatmap_view(main_area, buf, state);
         } else if self.is_flamegraph_view() {
             self.render_flamegraph(main_area, buf, state);
         } else if self.is_table_view() || self.is_process_list_view() {
@@ -232,6 +238,21 @@ impl<'a> FlamelensWidget<'a> {
                 }
                 help_tags.add("m", "update mode");
                 help_tags.add("[/]", "history");
+            }
+            if self.app.has_output() {
+                help_tags.add("o", "output panel");
+            }
+        } else if self.is_heatmap_view() {
+            help_tags.add("hjkl", "move cursor");
+            help_tags.add("enter/esc", "zoom");
+            help_tags.add("[/]", "prev/next bucket");
+            help_tags.add("{/}", "expand range");
+            help_tags.add("c", "follow live");
+            help_tags.add("/", "search");
+            help_tags.add("#", "search like cursor");
+            if let FlameGraphInput::Live = self.app.flamegraph_input {
+                help_tags.add("z", "freeze");
+                help_tags.add("m", "update mode");
             }
             if self.app.has_output() {
                 help_tags.add("o", "output panel");
@@ -310,6 +331,91 @@ impl<'a> FlamelensWidget<'a> {
             state,
         );
         has_more_rows_to_render
+    }
+
+    fn render_heatmap_view(&self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) {
+        let heatmap_height = area.height.saturating_div(3).max(4).min(8);
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(vec![Constraint::Length(heatmap_height), Constraint::Fill(1)])
+            .split(area);
+        self.render_heatmap(layout[0], buf, state);
+        self.render_flamegraph(layout[1], buf, state);
+    }
+
+    fn render_heatmap(&self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) {
+        let title = self
+            .app
+            .heatmap_status()
+            .unwrap_or_else(|| "Heatmap".to_string());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Heatmap ({title}) "))
+            .title_style(Style::default().bold().yellow());
+        let inner = block.inner(area);
+        block.render(area, buf);
+        state.heatmap_positions.clear();
+
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let columns = self.app.heatmap_columns(inner.width as usize);
+        if columns.is_empty() {
+            let msg = Line::from("Waiting for samples...").style(Style::default().fg(Color::DarkGray));
+            let x = inner
+                .x
+                .saturating_add(inner.width.saturating_sub(msg.width() as u16) / 2);
+            let y = inner.y + inner.height / 2;
+            buf.set_line(x, y, &msg, inner.width);
+            return;
+        }
+
+        let max_samples = columns.iter().map(|column| column.sample_count).max().unwrap_or(1);
+        let selected_range = self.app.current_heatmap_range();
+
+        for (idx, column) in columns.iter().enumerate() {
+            let x = inner.x + idx as u16;
+            let ratio = if max_samples == 0 {
+                0.0
+            } else {
+                column.sample_count as f64 / max_samples as f64
+            };
+            let fill_height = if column.sample_count == 0 {
+                0
+            } else {
+                ((ratio * inner.height as f64).ceil() as u16).max(1)
+            };
+            let selected = selected_range
+                .map(|(start, end)| column.start_index <= end && column.end_index >= start)
+                .unwrap_or(false);
+            let color = Self::get_heatmap_color(ratio, selected);
+            let style = if selected {
+                Style::default()
+                    .fg(color)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+
+            state.heatmap_positions.push(crate::app::HeatmapPosition {
+                start_index: column.start_index,
+                end_index: column.end_index,
+                x,
+                y: inner.y,
+                height: inner.height,
+            });
+
+            for row in 0..inner.height {
+                let y = inner.bottom().saturating_sub(row + 1);
+                if row < fill_height {
+                    buf.set_string(x, y, "█", style);
+                } else if selected {
+                    buf.set_string(x, y, " ", Style::default().bg(Color::DarkGray));
+                }
+            }
+        }
     }
 
     fn render_table(&self, area: Rect, buf: &mut Buffer) {
@@ -820,6 +926,22 @@ impl<'a> FlamelensWidget<'a> {
         }
     }
 
+    fn get_heatmap_color(ratio: f64, selected: bool) -> Color {
+        let ratio = ratio.clamp(0.0, 1.0);
+        let (r, g, b) = if ratio < 0.33 {
+            (40, (80.0 + ratio * 160.0) as u8, 220)
+        } else if ratio < 0.66 {
+            (((ratio - 0.33) * 255.0 / 0.33) as u8, 200, 120)
+        } else {
+            (240, ((1.0 - ratio) * 180.0) as u8, 80)
+        };
+        if selected {
+            Color::Rgb(r.saturating_add(10), g.saturating_add(10), b.saturating_add(10))
+        } else {
+            Color::Rgb(r, g, b)
+        }
+    }
+
     fn get_view_kind_indicator(&self) -> Line<'_> {
         let mut header_bottom_title_spans = vec![Span::from(" ")];
 
@@ -841,6 +963,14 @@ impl<'a> FlamelensWidget<'a> {
             ViewKind::FlameGraph,
             self.app.flamegraph_state().view_kind,
         ));
+        if self.app.is_live() {
+            header_bottom_title_spans.push(Span::from(" | "));
+            header_bottom_title_spans.push(_get_view_kind_span(
+                "Heatmap",
+                ViewKind::Heatmap,
+                self.app.flamegraph_state().view_kind,
+            ));
+        }
         header_bottom_title_spans.push(Span::from(" | "));
         header_bottom_title_spans.push(_get_view_kind_span(
             "Top",
@@ -992,6 +1122,11 @@ impl<'a> FlamelensWidget<'a> {
                         lines.push(("Time", Line::from(snapshot_status)));
                     }
                 }
+                if self.is_heatmap_view() {
+                    if let Some(heatmap_status) = self.app.heatmap_status() {
+                        lines.push(("Window", Line::from(heatmap_status)));
+                    }
+                }
                 lines
             }
             None => vec![("Info", Line::from("No stack selected"))],
@@ -1030,6 +1165,10 @@ impl<'a> FlamelensWidget<'a> {
 
     fn is_flamegraph_view(&self) -> bool {
         self.view_kind() == ViewKind::FlameGraph
+    }
+
+    fn is_heatmap_view(&self) -> bool {
+        self.view_kind() == ViewKind::Heatmap
     }
 
     fn is_output_view(&self) -> bool {
@@ -1093,4 +1232,5 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
     // Copy stack positions for mouse click handling
     app.stack_positions = flamelens_state.stack_positions;
+    app.heatmap_positions = flamelens_state.heatmap_positions;
 }

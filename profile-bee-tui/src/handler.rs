@@ -32,6 +32,9 @@ pub fn handle_command(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
             ViewKind::FlameGraph => {
                 key_handled = handle_command_flamegraph(key_event, app)?;
             }
+            ViewKind::Heatmap => {
+                key_handled = handle_command_heatmap(key_event, app)?;
+            }
             ViewKind::Table | ViewKind::ProcessList if tree_mode => {
                 key_handled = handle_command_tree_view(key_event, app)?;
             }
@@ -67,6 +70,7 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
         }
         KeyCode::Char('z') => {
             app.toggle_freeze();
+            app.sync_active_flamegraph();
         }
         KeyCode::Char('m') => {
             app.flamegraph_view.state.cycle_update_mode();
@@ -76,17 +80,32 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
             }
         }
         KeyCode::Char('[') if matches!(app.flamegraph_input, FlameGraphInput::Live) => {
-            app.show_previous_snapshot();
+            if app.flamegraph_state().view_kind == ViewKind::Heatmap {
+                app.move_heatmap_previous();
+            } else {
+                app.show_previous_snapshot();
+            }
         }
         KeyCode::Char(']') if matches!(app.flamegraph_input, FlameGraphInput::Live) => {
-            app.show_next_snapshot();
+            if app.flamegraph_state().view_kind == ViewKind::Heatmap {
+                app.move_heatmap_next();
+            } else {
+                app.show_next_snapshot();
+            }
         }
         KeyCode::Tab => {
-            if app.has_output() {
+            if app.is_live() {
+                if app.has_output() {
+                    app.flamegraph_view.state.toggle_live_view_kind_with_output();
+                } else {
+                    app.flamegraph_view.state.toggle_live_view_kind();
+                }
+            } else if app.has_output() {
                 app.flamegraph_view.state.toggle_view_kind_with_output();
             } else {
                 app.flamegraph_view.state.toggle_view_kind();
             }
+            app.sync_active_flamegraph();
         }
         KeyCode::Char('o') if app.has_output() => {
             app.output_state.show_panel = !app.output_state.show_panel;
@@ -114,6 +133,25 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
         }
         _ => {
             key_handled = false;
+        }
+    }
+    Ok(key_handled)
+}
+
+fn handle_command_heatmap(key_event: KeyEvent, app: &mut App) -> AppResult<bool> {
+    let mut key_handled = true;
+    match key_event.code {
+        KeyCode::Char('{') => {
+            app.expand_heatmap_left();
+        }
+        KeyCode::Char('}') => {
+            app.expand_heatmap_right();
+        }
+        KeyCode::Char('c') => {
+            app.follow_heatmap_live();
+        }
+        _ => {
+            key_handled = handle_command_flamegraph(key_event, app)?;
         }
     }
     Ok(key_handled)
@@ -393,8 +431,8 @@ pub fn handle_input_buffer(key_event: KeyEvent, app: &mut App) -> AppResult<()> 
 /// Handles mouse events and updates the state of [`App`].
 /// Returns `Ok(true)` if the event caused a state change requiring a redraw.
 pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<bool> {
-    // Only handle mouse events in flamegraph view
-    if app.flamegraph_state().view_kind != ViewKind::FlameGraph {
+    let view_kind = app.flamegraph_state().view_kind;
+    if !matches!(view_kind, ViewKind::FlameGraph | ViewKind::Heatmap) {
         return Ok(false);
     }
 
@@ -406,6 +444,13 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
                 MouseButton::Left => {
                     let x = mouse_event.column;
                     let y = mouse_event.row;
+                    if view_kind == ViewKind::Heatmap {
+                        if let Some((start, end)) = app.find_heatmap_at_position(x, y) {
+                            app.select_heatmap_range(start, end);
+                            app.last_click = Some((Instant::now(), x, y));
+                            return Ok(true);
+                        }
+                    }
                     let now = Instant::now();
 
                     // Check for double-click
@@ -447,6 +492,10 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
                     changed
                 }
                 MouseButton::Right => {
+                    if view_kind == ViewKind::Heatmap {
+                        app.follow_heatmap_live();
+                        return Ok(true);
+                    }
                     // Right click: zoom into the stack at this position
                     let x = mouse_event.column;
                     let y = mouse_event.row;
