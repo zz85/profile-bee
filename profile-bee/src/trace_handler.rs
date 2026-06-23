@@ -166,7 +166,10 @@ impl SymbolFormatter {
     }
 
     fn kernel_symbol_name(frame: &StackFrameInfo) -> Option<&str> {
-        frame.symbol.as_deref().and_then(|sym| sym.strip_suffix("_k"))
+        frame
+            .symbol
+            .as_deref()
+            .and_then(|sym| sym.strip_suffix("_k"))
     }
 
     fn classify_softirq_symbol(symbol: &str) -> Option<&'static str> {
@@ -180,11 +183,15 @@ impl SymbolFormatter {
             "blk_done_softirq" => Some("softirq:block_k"),
             "blk_iopoll_softirq" => Some("softirq:block_iopoll_k"),
             "rcu_core_si" | "rcu_process_callbacks" => Some("softirq:rcu_k"),
-            "__softirqentry_text_start" | "handle_softirqs" | "do_softirq" | "run_ksoftirqd" => {
-                Some("softirq_k")
-            }
             _ => None,
         }
+    }
+
+    fn is_generic_softirq_symbol(symbol: &str) -> bool {
+        matches!(
+            symbol,
+            "__softirqentry_text_start" | "handle_softirqs" | "do_softirq" | "run_ksoftirqd"
+        )
     }
 
     fn classify_interrupt_symbol(symbol: &str) -> Option<&'static str> {
@@ -221,16 +228,24 @@ impl SymbolFormatter {
 
     fn infer_kernel_context_label(kernel_syms: &[StackFrameInfo]) -> Option<&'static str> {
         for frame in kernel_syms {
-            if let Some(symbol) = kernel_symbol_name(frame) {
-                if let Some(label) = classify_softirq_symbol(symbol) {
+            if let Some(symbol) = Self::kernel_symbol_name(frame) {
+                if let Some(label) = Self::classify_softirq_symbol(symbol) {
                     return Some(label);
                 }
             }
         }
 
         for frame in kernel_syms {
-            if let Some(symbol) = kernel_symbol_name(frame) {
-                if let Some(label) = classify_interrupt_symbol(symbol) {
+            if let Some(symbol) = Self::kernel_symbol_name(frame) {
+                if Self::is_generic_softirq_symbol(symbol) {
+                    return Some("softirq_k");
+                }
+            }
+        }
+
+        for frame in kernel_syms {
+            if let Some(symbol) = Self::kernel_symbol_name(frame) {
+                if let Some(label) = Self::classify_interrupt_symbol(symbol) {
                     return Some(label);
                 }
             }
@@ -645,7 +660,7 @@ impl TraceHandler {
         }
 
         let mut combined = kernel_syms.into_iter().chain(user_syms).collect::<Vec<_>>();
-        if let Some(label) = infer_kernel_context_label(&combined) {
+        if let Some(label) = SymbolFormatter::infer_kernel_context_label(&combined) {
             combined.push(StackFrameInfo {
                 symbol: Some(label.to_string()),
                 ..Default::default()
@@ -802,7 +817,10 @@ mod tests {
             kernel_frame("__softirqentry_text_start_k"),
             kernel_frame("net_rx_action_k"),
         ];
-        assert_eq!(infer_kernel_context_label(&frames), Some("softirq:net_rx_k"));
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("softirq:net_rx_k")
+        );
     }
 
     #[test]
@@ -812,14 +830,17 @@ mod tests {
             kernel_frame("scheduler_tick_k"),
         ];
         assert_eq!(
-            infer_kernel_context_label(&frames),
+            SymbolFormatter::infer_kernel_context_label(&frames),
             Some("interrupt:timer_k")
         );
     }
 
     #[test]
     fn test_infer_kernel_context_label_none_for_regular_kernel_stack() {
-        let frames = vec![kernel_frame("finish_task_switch_k"), kernel_frame("schedule_k")];
-        assert_eq!(infer_kernel_context_label(&frames), None);
+        let frames = vec![
+            kernel_frame("finish_task_switch_k"),
+            kernel_frame("schedule_k"),
+        ];
+        assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
     }
 }
