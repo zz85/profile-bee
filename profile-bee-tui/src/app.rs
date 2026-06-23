@@ -198,7 +198,8 @@ impl App {
             }
         }
 
-        if let Some(parsed) = self.next_flamegraph.lock().unwrap().take() {
+        let next_flamegraph = self.next_flamegraph.lock().unwrap().take();
+        if let Some(parsed) = next_flamegraph {
             self.elapsed
                 .insert("flamegraph".to_string(), parsed.elapsed);
             self.push_history(parsed.flamegraph.clone(), parsed.collected_at);
@@ -346,10 +347,16 @@ impl App {
 
         let (label, collected_at) = if let Some(cursor) = self.history_cursor {
             let entry = self.history.get(cursor)?;
-            (format!("snapshot {}/{}", cursor + 1, snapshot_count), entry.collected_at)
+            (
+                format!("snapshot {}/{}", cursor + 1, snapshot_count),
+                entry.collected_at,
+            )
         } else {
             let entry = self.history.back()?;
-            (format!("live {}/{}", snapshot_count, snapshot_count), entry.collected_at)
+            (
+                format!("live {}/{}", snapshot_count, snapshot_count),
+                entry.collected_at,
+            )
         };
 
         let age = collected_at.elapsed().as_secs_f32();
@@ -398,36 +405,36 @@ impl App {
             })
             .map(|pos| pos.stack_id)
     }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        fn collapsed(name: &str, count: u64) -> String {
-            format!("{name} {count}")
-        }
+    fn collapsed(name: &str, count: u64) -> String {
+        format!("{name} {count}")
+    }
 
-        #[test]
-        fn stores_live_history_and_navigates_snapshots() {
-            let mut app = App::with_live();
+    #[test]
+    fn stores_live_history_and_navigates_snapshots() {
+        let mut app = App::with_live();
 
-            app.update_flamegraph(collapsed("alpha", 1));
-            app.tick();
-            app.update_flamegraph(collapsed("beta", 2));
-            app.tick();
+        app.update_flamegraph(collapsed("alpha", 1));
+        app.tick();
+        app.update_flamegraph(collapsed("beta", 2));
+        app.tick();
 
-            assert_eq!(app.history.len(), 2);
-            assert!(app.history_cursor.is_none());
-            assert!(app.flamegraph().get_stack_by_full_name("beta").is_some());
+        assert_eq!(app.history.len(), 2);
+        assert!(app.history_cursor.is_none());
+        assert!(app.flamegraph().get_stack_by_full_name("beta").is_some());
 
-            app.show_previous_snapshot();
-            assert_eq!(app.history_cursor, Some(0));
-            assert!(app.flamegraph().get_stack_by_full_name("alpha").is_some());
-            assert!(app.flamegraph().get_stack_by_full_name("beta").is_none());
+        app.show_previous_snapshot();
+        assert_eq!(app.history_cursor, Some(0));
+        assert!(app.flamegraph().get_stack_by_full_name("alpha").is_some());
+        assert!(app.flamegraph().get_stack_by_full_name("beta").is_none());
 
-            app.show_next_snapshot();
-            assert_eq!(app.history_cursor, None);
-            assert!(app.flamegraph().get_stack_by_full_name("beta").is_some());
-        }
+        app.show_next_snapshot();
+        assert_eq!(app.history_cursor, None);
+        assert!(app.flamegraph().get_stack_by_full_name("beta").is_some());
     }
 }
