@@ -231,6 +231,7 @@ impl<'a> FlamelensWidget<'a> {
                     help_tags.add("z", "freeze");
                 }
                 help_tags.add("m", "update mode");
+                help_tags.add("[/]", "history");
             }
             if self.app.has_output() {
                 help_tags.add("o", "output panel");
@@ -882,6 +883,9 @@ impl<'a> FlamelensWidget<'a> {
                 if self.app.flamegraph_state().freeze {
                     out += " [Frozen; press 'z' again to unfreeze]";
                 }
+                if let Some(snapshot_status) = self.app.snapshot_status() {
+                    out += &format!(" [{snapshot_status}]");
+                }
                 out
             }
         };
@@ -982,6 +986,11 @@ impl<'a> FlamelensWidget<'a> {
                 }
                 if let Some(transient_message) = &self.app.transient_message {
                     lines.push(("Info", Line::from(transient_message.as_str())));
+                }
+                if let FlameGraphInput::Live = self.app.flamegraph_input {
+                    if let Some(snapshot_status) = self.app.snapshot_status() {
+                        lines.push(("Time", Line::from(snapshot_status)));
+                    }
                 }
                 lines
             }

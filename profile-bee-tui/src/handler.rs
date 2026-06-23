@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::{
-    app::{App, AppResult, InputBuffer},
+    app::{App, AppResult, FlameGraphInput, InputBuffer},
     state::ViewKind,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -66,7 +66,7 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
             }
         }
         KeyCode::Char('z') => {
-            app.flamegraph_view.state.toggle_freeze();
+            app.toggle_freeze();
         }
         KeyCode::Char('m') => {
             app.flamegraph_view.state.cycle_update_mode();
@@ -74,6 +74,12 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
             if let Ok(mut mode) = app.get_update_mode_handle().lock() {
                 *mode = app.flamegraph_view.state.update_mode;
             }
+        }
+        KeyCode::Char('[') if matches!(app.flamegraph_input, FlameGraphInput::Live) => {
+            app.show_previous_snapshot();
+        }
+        KeyCode::Char(']') if matches!(app.flamegraph_input, FlameGraphInput::Live) => {
+            app.show_next_snapshot();
         }
         KeyCode::Tab => {
             if app.has_output() {

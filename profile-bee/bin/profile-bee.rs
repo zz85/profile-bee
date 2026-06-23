@@ -1693,6 +1693,7 @@ fn spawn_profiling_thread(
             let parsed = profile_bee_tui::app::ParsedFlameGraph {
                 flamegraph,
                 elapsed: tic.elapsed(),
+                collected_at: std::time::Instant::now(),
             };
             *update_handle.lock().unwrap_or_else(|e| {
                 eprintln!("Mutex poisoned: {}", e);

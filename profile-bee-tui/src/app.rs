@@ -2,11 +2,11 @@ use crate::flame::{FlameGraph, SearchPattern, StackIdentifier};
 use crate::output::{ProcessOutputState, SharedOutputBuffer};
 use crate::state::{FlameGraphState, UpdateMode};
 use crate::view::FlameGraphView;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Application result type.
 pub type AppResult<T> = std::result::Result<T, Box<dyn error::Error>>;
@@ -29,7 +29,16 @@ pub struct StackPosition {
 pub struct ParsedFlameGraph {
     pub flamegraph: FlameGraph,
     pub elapsed: Duration,
+    pub collected_at: Instant,
 }
+
+#[derive(Debug, Clone)]
+struct HistoricalFlameGraph {
+    flamegraph: FlameGraph,
+    collected_at: Instant,
+}
+
+const LIVE_HISTORY_LIMIT: usize = 120;
 
 #[derive(Debug)]
 pub struct InputBuffer {
@@ -58,6 +67,10 @@ pub struct App {
     pub dirty: bool,
     /// Next flamegraph to swap in
     next_flamegraph: Arc<Mutex<Option<ParsedFlameGraph>>>,
+    /// Recently collected live flamegraph snapshots, oldest first.
+    history: VecDeque<HistoricalFlameGraph>,
+    /// Snapshot being viewed in history mode. `None` means follow live/latest.
+    history_cursor: Option<usize>,
     /// Shared update mode for the profiling thread
     update_mode_handle: Arc<Mutex<UpdateMode>>,
     /// Shared pid-mode flag for the profiling thread (toggled with 'p')
@@ -85,6 +98,8 @@ impl App {
             debug: false,
             dirty: true,
             next_flamegraph: Arc::new(Mutex::new(None)),
+            history: VecDeque::new(),
+            history_cursor: None,
             update_mode_handle: Arc::new(Mutex::new(UpdateMode::default())),
             pid_mode_handle: Arc::new(AtomicBool::new(false)),
             stack_positions: Vec::new(),
@@ -119,6 +134,8 @@ impl App {
             dirty: true,
             update_mode_handle,
             pid_mode_handle: Arc::new(AtomicBool::new(false)),
+            history: VecDeque::new(),
+            history_cursor: None,
             stack_positions: Vec::new(),
             last_click: None,
             process_output: None,
@@ -167,6 +184,7 @@ impl App {
         let parsed = ParsedFlameGraph {
             flamegraph,
             elapsed: tic.elapsed(),
+            collected_at: Instant::now(),
         };
         *self.next_flamegraph.lock().unwrap() = Some(parsed);
     }
@@ -180,17 +198,17 @@ impl App {
             }
         }
 
-        // Replace flamegraph
-        if !self.flamegraph_view.state.freeze {
-            if let Some(parsed) = self.next_flamegraph.lock().unwrap().take() {
-                self.elapsed
-                    .insert("flamegraph".to_string(), parsed.elapsed);
-                let tic = std::time::Instant::now();
+        if let Some(parsed) = self.next_flamegraph.lock().unwrap().take() {
+            self.elapsed
+                .insert("flamegraph".to_string(), parsed.elapsed);
+            self.push_history(parsed.flamegraph.clone(), parsed.collected_at);
+            if !self.flamegraph_view.state.freeze && self.history_cursor.is_none() {
+                let tic = Instant::now();
                 self.flamegraph_view.replace_flamegraph(parsed.flamegraph);
                 self.elapsed
                     .insert("replacement".to_string(), tic.elapsed());
-                self.dirty = true;
             }
+            self.dirty = true;
         }
 
         // Check for new process output
@@ -282,6 +300,91 @@ impl App {
         self.debug = !self.debug;
     }
 
+    pub fn toggle_freeze(&mut self) {
+        let was_frozen = self.flamegraph_view.state.freeze;
+        self.flamegraph_view.state.toggle_freeze();
+
+        if was_frozen {
+            self.history_cursor = None;
+            self.apply_history_cursor();
+        } else if self.history_cursor.is_none() && !self.history.is_empty() {
+            self.history_cursor = Some(self.history.len().saturating_sub(1));
+        }
+    }
+
+    pub fn show_previous_snapshot(&mut self) {
+        if self.history.len() < 2 {
+            return;
+        }
+
+        let next_cursor = match self.history_cursor {
+            Some(cursor) => cursor.saturating_sub(1),
+            None => self.history.len().saturating_sub(2),
+        };
+        self.history_cursor = Some(next_cursor);
+        self.apply_history_cursor();
+    }
+
+    pub fn show_next_snapshot(&mut self) {
+        let Some(cursor) = self.history_cursor else {
+            return;
+        };
+
+        if cursor + 1 >= self.history.len().saturating_sub(1) {
+            self.history_cursor = None;
+        } else {
+            self.history_cursor = Some(cursor + 1);
+        }
+        self.apply_history_cursor();
+    }
+
+    pub fn snapshot_status(&self) -> Option<String> {
+        let snapshot_count = self.history.len();
+        if snapshot_count == 0 {
+            return None;
+        }
+
+        let (label, collected_at) = if let Some(cursor) = self.history_cursor {
+            let entry = self.history.get(cursor)?;
+            (format!("snapshot {}/{}", cursor + 1, snapshot_count), entry.collected_at)
+        } else {
+            let entry = self.history.back()?;
+            (format!("live {}/{}", snapshot_count, snapshot_count), entry.collected_at)
+        };
+
+        let age = collected_at.elapsed().as_secs_f32();
+        Some(format!("{label} ({age:.1}s ago)"))
+    }
+
+    fn push_history(&mut self, flamegraph: FlameGraph, collected_at: Instant) {
+        self.history.push_back(HistoricalFlameGraph {
+            flamegraph,
+            collected_at,
+        });
+        if self.history.len() > LIVE_HISTORY_LIMIT {
+            self.history.pop_front();
+            if let Some(cursor) = self.history_cursor.as_mut() {
+                *cursor = cursor.saturating_sub(1);
+            }
+        }
+    }
+
+    fn apply_history_cursor(&mut self) {
+        let selected = match self.history_cursor {
+            Some(cursor) => self.history.get(cursor),
+            None => self.history.back(),
+        };
+
+        if let Some(entry) = selected {
+            let tic = Instant::now();
+            self.flamegraph_view
+                .replace_flamegraph(entry.flamegraph.clone());
+            self.elapsed
+                .insert("replacement".to_string(), tic.elapsed());
+            self.dirty = true;
+        }
+    }
+
     /// Find the stack at the given screen coordinates
     pub fn find_stack_at_position(&self, x: u16, y: u16) -> Option<StackIdentifier> {
         // Find the last (topmost) stack that contains this position
@@ -294,5 +397,37 @@ impl App {
                 x >= pos.x && x < end && y == pos.y
             })
             .map(|pos| pos.stack_id)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn collapsed(name: &str, count: u64) -> String {
+            format!("{name} {count}")
+        }
+
+        #[test]
+        fn stores_live_history_and_navigates_snapshots() {
+            let mut app = App::with_live();
+
+            app.update_flamegraph(collapsed("alpha", 1));
+            app.tick();
+            app.update_flamegraph(collapsed("beta", 2));
+            app.tick();
+
+            assert_eq!(app.history.len(), 2);
+            assert!(app.history_cursor.is_none());
+            assert!(app.flamegraph().get_stack_by_full_name("beta").is_some());
+
+            app.show_previous_snapshot();
+            assert_eq!(app.history_cursor, Some(0));
+            assert!(app.flamegraph().get_stack_by_full_name("alpha").is_some());
+            assert!(app.flamegraph().get_stack_by_full_name("beta").is_none());
+
+            app.show_next_snapshot();
+            assert_eq!(app.history_cursor, None);
+            assert!(app.flamegraph().get_stack_by_full_name("beta").is_some());
+        }
     }
 }
