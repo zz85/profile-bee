@@ -165,6 +165,80 @@ impl SymbolFormatter {
         }
     }
 
+    fn kernel_symbol_name(frame: &StackFrameInfo) -> Option<&str> {
+        frame.symbol.as_deref().and_then(|sym| sym.strip_suffix("_k"))
+    }
+
+    fn classify_softirq_symbol(symbol: &str) -> Option<&'static str> {
+        match symbol {
+            "net_rx_action" => Some("softirq:net_rx_k"),
+            "net_tx_action" => Some("softirq:net_tx_k"),
+            "run_timer_softirq" => Some("softirq:timer_k"),
+            "hrtimer_run_softirq" => Some("softirq:hrtimer_k"),
+            "tasklet_action" => Some("softirq:tasklet_k"),
+            "tasklet_hi_action" => Some("softirq:tasklet_hi_k"),
+            "blk_done_softirq" => Some("softirq:block_k"),
+            "blk_iopoll_softirq" => Some("softirq:block_iopoll_k"),
+            "rcu_core_si" | "rcu_process_callbacks" => Some("softirq:rcu_k"),
+            "__softirqentry_text_start" | "handle_softirqs" | "do_softirq" | "run_ksoftirqd" => {
+                Some("softirq_k")
+            }
+            _ => None,
+        }
+    }
+
+    fn classify_interrupt_symbol(symbol: &str) -> Option<&'static str> {
+        match symbol {
+            "sysvec_apic_timer_interrupt"
+            | "asm_sysvec_apic_timer_interrupt"
+            | "local_apic_timer_interrupt" => Some("interrupt:timer_k"),
+            "sysvec_reschedule_ipi" | "asm_sysvec_reschedule_ipi" => {
+                Some("interrupt:reschedule_ipi_k")
+            }
+            "sysvec_call_function_single" | "sysvec_call_function_single_interrupt" => {
+                Some("interrupt:call_function_single_k")
+            }
+            "sysvec_call_function" | "sysvec_call_function_interrupt" => {
+                Some("interrupt:call_function_k")
+            }
+            "sysvec_irq_work" => Some("interrupt:irq_work_k"),
+            "sysvec_thermal" => Some("interrupt:thermal_k"),
+            "sysvec_error_interrupt" => Some("interrupt:error_k"),
+            "sysvec_spurious_apic_interrupt" => Some("interrupt:spurious_k"),
+            "common_interrupt"
+            | "__common_interrupt"
+            | "asm_common_interrupt"
+            | "handle_irq_event"
+            | "handle_irq_event_percpu"
+            | "__handle_irq_event_percpu"
+            | "handle_edge_irq"
+            | "handle_level_irq"
+            | "__handle_domain_irq"
+            | "do_IRQ" => Some("interrupt_k"),
+            _ => None,
+        }
+    }
+
+    fn infer_kernel_context_label(kernel_syms: &[StackFrameInfo]) -> Option<&'static str> {
+        for frame in kernel_syms {
+            if let Some(symbol) = kernel_symbol_name(frame) {
+                if let Some(label) = classify_softirq_symbol(symbol) {
+                    return Some(label);
+                }
+            }
+        }
+
+        for frame in kernel_syms {
+            if let Some(symbol) = kernel_symbol_name(frame) {
+                if let Some(label) = classify_interrupt_symbol(symbol) {
+                    return Some(label);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Symbol name with V8 perf-map formatting applied when detected.
     fn map_user_sym_to_stack(sym: Symbolized) -> StackFrameInfo {
         let sym = match sym {
@@ -571,6 +645,12 @@ impl TraceHandler {
         }
 
         let mut combined = kernel_syms.into_iter().chain(user_syms).collect::<Vec<_>>();
+        if let Some(label) = infer_kernel_context_label(&combined) {
+            combined.push(StackFrameInfo {
+                symbol: Some(label.to_string()),
+                ..Default::default()
+            });
+        }
 
         let pid_info = StackFrameInfo::process_only(stack_info);
         combined.push(pid_info);
@@ -706,5 +786,40 @@ mod tests {
             format_short_source("node:internal/modules/cjs/loader.js"),
             "loader.js"
         );
+    }
+
+    fn kernel_frame(symbol: &str) -> StackFrameInfo {
+        StackFrameInfo {
+            symbol: Some(symbol.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_infer_kernel_context_label_prefers_softirq() {
+        let frames = vec![
+            kernel_frame("common_interrupt_k"),
+            kernel_frame("__softirqentry_text_start_k"),
+            kernel_frame("net_rx_action_k"),
+        ];
+        assert_eq!(infer_kernel_context_label(&frames), Some("softirq:net_rx_k"));
+    }
+
+    #[test]
+    fn test_infer_kernel_context_label_detects_interrupt() {
+        let frames = vec![
+            kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
+            kernel_frame("scheduler_tick_k"),
+        ];
+        assert_eq!(
+            infer_kernel_context_label(&frames),
+            Some("interrupt:timer_k")
+        );
+    }
+
+    #[test]
+    fn test_infer_kernel_context_label_none_for_regular_kernel_stack() {
+        let frames = vec![kernel_frame("finish_task_switch_k"), kernel_frame("schedule_k")];
+        assert_eq!(infer_kernel_context_label(&frames), None);
     }
 }
