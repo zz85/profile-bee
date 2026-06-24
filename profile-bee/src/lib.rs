@@ -33,6 +33,7 @@ pub mod embedded_symbol_server;
 pub mod probe_resolver;
 pub mod probe_spec;
 
+pub mod jitdump;
 pub mod v8;
 
 mod trace_handler;

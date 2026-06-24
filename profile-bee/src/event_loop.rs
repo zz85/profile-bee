@@ -13,6 +13,7 @@ use aya::Ebpf;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS, PROCESS_EVENT_EXEC, PROCESS_EVENT_EXIT};
 
 use crate::ebpf::{apply_dwarf_refresh, FramePointersPod, StackInfoPod, V8ProcInfoPod};
+use crate::jitdump::{self, JitSymbolTable};
 use crate::pipeline::{DwarfThreadMsg, PerfWork};
 use crate::process_metadata::ProcessMetadataCache;
 use crate::trace_handler::TraceHandler;
@@ -95,6 +96,9 @@ pub struct ProfilingEventLoop {
     // Persistent state across calls
     trace_count: HashMap<StackInfo, usize>,
     known_tgids: HashSet<u32>,
+    /// PIDs that have already been warned about missing JITDump files.
+    /// Prevents repeated warnings for the same Bun process.
+    warned_jitdump_pids: HashSet<u32>,
     /// Optional process metadata cache, maintained via eBPF lifecycle events.
     process_metadata: Option<ProcessMetadataCache>,
     /// PIDs that exited during the current drain_events() call.
@@ -129,6 +133,7 @@ impl ProfilingEventLoop {
             monitor_exit_pid: config.monitor_exit_pid,
             trace_count: HashMap::new(),
             known_tgids: HashSet::new(),
+            warned_jitdump_pids: HashSet::new(),
             process_metadata: if config.enable_process_metadata {
                 Some(ProcessMetadataCache::new(4096))
             } else {
@@ -311,6 +316,114 @@ impl ProfilingEventLoop {
         }
     }
 
+    /// Try to load a JITDump symbol table for a newly-seen PID.
+    ///
+    /// Checks for `/tmp/jit-<pid>.dump` and, if found, parses it and
+    /// registers the symbol table in the trace handler. This enables
+    /// resolution of JIT-compiled function names from runtimes like
+    /// Bun (JavaScriptCore), Java HotSpot, and LuaJIT.
+    ///
+    /// If the PID is a Bun process and no JITDump file exists, emits a
+    /// warning so the user knows to restart Bun with `BUN_JSC_useJITDump=1`.
+    fn try_load_jitdump_for_pid(&mut self, tgid: u32) {
+        if self.trace_handler.has_jit_table(tgid) {
+            return;
+        }
+        if let Some(path) = jitdump::find_jitdump_for_pid(tgid) {
+            match JitSymbolTable::load_from_file(&path) {
+                Ok(table) if !table.is_empty() => {
+                    self.trace_handler.register_jit_table(tgid, table);
+                }
+                Ok(_) => tracing::debug!("JITDump for pid {} is empty", tgid),
+                Err(e) => tracing::debug!("JITDump read failed for pid {}: {}", tgid, e),
+            }
+        } else {
+            // No JITDump file — check if this is a Bun process and warn
+            self.warn_bun_missing_jitdump(tgid);
+        }
+    }
+
+    /// Emit a one-time warning if a PID is a Bun process without JITDump.
+    ///
+    /// Bun (JavaScriptCore) only writes JITDump files when started with
+    /// `BUN_JSC_useJITDump=1`. Without this, JIT-compiled JS functions
+    /// appear as `[unknown]`. This warning fires during system-wide and
+    /// `--pid` profiling where probee can't inject the env var itself.
+    fn warn_bun_missing_jitdump(&mut self, tgid: u32) {
+        if self.warned_jitdump_pids.contains(&tgid) {
+            return;
+        }
+        let exe_link = format!("/proc/{}/exe", tgid);
+        let exe_path = match std::fs::read_link(&exe_link) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let basename = exe_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if !crate::spawn::is_bun_program(basename) {
+            return;
+        }
+        self.warned_jitdump_pids.insert(tgid);
+        tracing::warn!(
+            "Bun process (PID {}) detected without JITDump file. \
+             JS function names will show as [unknown]. \
+             Restart Bun with: BUN_JSC_useJITDump=1 bun <script>",
+            tgid
+        );
+        eprintln!(
+            "\x1b[33mWarning: Bun process (PID {}) has no JITDump file.\x1b[0m",
+            tgid
+        );
+        eprintln!("  JS function names will appear as [unknown] in the flamegraph.");
+        eprintln!("  Restart Bun with: BUN_JSC_useJITDump=1 bun <script>");
+        eprintln!("  Or use probee's auto-injection: probee -- bun <script>");
+    }
+
+    /// Reload JITDump symbol tables for all known PIDs.
+    ///
+    /// Used by streaming modes (TUI/serve) to pick up newly JIT-compiled
+    /// functions. For PIDs without an existing table, tries a fresh load.
+    /// For PIDs with a table, does an incremental reload from where the
+    /// last read left off.
+    ///
+    /// When new symbols are loaded, the symbol cache for that PID is
+    /// invalidated so previously-cached `[unknown]` frames get re-resolved.
+    pub fn reload_jitdump_tables(&mut self) {
+        let tgids: Vec<u32> = self.known_tgids.iter().copied().collect();
+        for tgid in tgids {
+            if self.trace_handler.has_jit_table(tgid) {
+                // Incremental reload
+                if let Some(path) = jitdump::find_jitdump_for_pid(tgid) {
+                    if let Some(table) = self.trace_handler.jit_table_mut(tgid) {
+                        match table.reload_from_file(&path) {
+                            Ok(n) if n > 0 => {
+                                tracing::debug!(
+                                    "reloaded {} new JITDump symbols for pid {}",
+                                    n,
+                                    tgid
+                                );
+                                // Invalidate cached stacks for this PID so
+                                // previously-[unknown] frames get re-resolved
+                                // with the newly loaded JIT symbols. Use the
+                                // targeted invalidation that keeps the JIT table.
+                                self.trace_handler.invalidate_symbol_cache_for_pid(tgid);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::debug!("JITDump reload failed for pid {}: {}", tgid, e)
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Try fresh load
+                self.try_load_jitdump_for_pid(tgid);
+            }
+        }
+    }
+
     /// Drain events from the PerfWork channel, optionally symbolize stacks
     /// on the fly, and return `(local_counting, stopped)`.
     ///
@@ -383,10 +496,14 @@ impl ProfilingEventLoop {
                             // V8 introspection (eBPF FP context extraction +
                             // userspace heap reader for JS symbol resolution).
                             self.try_setup_v8_for_pid(stack.tgid);
+                            // Try loading JITDump symbols for runtimes like
+                            // Bun (JSC), Java HotSpot, and LuaJIT.
+                            self.try_load_jitdump_for_pid(stack.tgid);
                         }
                     } else if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
                         // Even without DWARF thread, detect V8 processes
                         self.try_setup_v8_for_pid(stack.tgid);
+                        self.try_load_jitdump_for_pid(stack.tgid);
                     }
                     if local_counting {
                         let trace = self.trace_count.entry(stack).or_insert(0);
@@ -481,6 +598,17 @@ impl ProfilingEventLoop {
         }
 
         tracing::debug!("drain_events: processed {} events", queue_processed);
+
+        // Reload JITDump symbol tables at the end of the collection window.
+        // JIT runtimes (Bun, Java, etc.) write symbols incrementally as code
+        // is compiled — the initial load on first PID sight may have found an
+        // empty or nonexistent file. This final pass picks up all symbols
+        // written during the profiling window.
+        // Skip when symbolize=false (raw-capture path) to avoid unnecessary I/O.
+        if symbolize {
+            self.reload_jitdump_tables();
+        }
+
         (local_counting, stopped)
     }
 
