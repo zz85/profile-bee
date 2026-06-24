@@ -145,6 +145,107 @@ fn is_v8_symbol(name: &str) -> bool {
     V8_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+/// Demangle a Zig symbol name by stripping compiler-generated suffixes.
+///
+/// Zig symbols are already fairly human-readable (e.g. `io.reader.Reader.readAll`)
+/// but the compiler appends hash/type suffixes for internal disambiguation:
+///
+/// - `__anon_<hex>` — anonymous function/closure instantiation hash
+/// - `__struct_<hex>` — struct instantiation hash
+/// - `__<hex>` — trailing hex hash (generic instantiation, e.g. `func__a1b2c3d4`)
+///
+/// This function strips these suffixes when detected, returning `Some(cleaned)`
+/// if the name was modified, or `None` if it doesn't look like a Zig symbol.
+///
+/// No existing `zig-demangle` crate exists in the Rust ecosystem. OTel eBPF
+/// Profiler and Parca/LightSwitch have zero Zig-specific demangling code —
+/// they rely on standard C++/Rust demanglers only.
+fn demangle_zig(name: &str) -> Option<String> {
+    // Zig symbols use dots as namespace separators (e.g. `std.mem.Allocator.alloc`).
+    // C and C++ symbols don't contain dots (they use `::` or `_Z` mangling).
+    // Rust mangled symbols start with `_ZN` or `_R`. If the name doesn't
+    // contain a dot, it's unlikely to be a Zig symbol.
+    if !name.contains('.') {
+        return None;
+    }
+
+    // Also skip C++ mangled names that somehow contain dots
+    if name.starts_with("_Z") || name.starts_with("_R") {
+        return None;
+    }
+
+    let mut cleaned = name;
+
+    // Strip __anon_<hex> suffix
+    if let Some(pos) = cleaned.rfind("__anon_") {
+        let suffix = &cleaned[pos + 7..]; // after "__anon_"
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            cleaned = &cleaned[..pos];
+        }
+    }
+
+    // Strip __struct_<hex> suffix
+    if let Some(pos) = cleaned.rfind("__struct_") {
+        let suffix = &cleaned[pos + 9..]; // after "__struct_"
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            cleaned = &cleaned[..pos];
+        }
+    }
+
+    // Strip trailing __<hex> hash (generic instantiation suffix).
+    // Only match if the suffix after the last `__` is pure hex and
+    // at least 4 chars (to avoid false positives on short names).
+    if let Some(pos) = cleaned.rfind("__") {
+        let suffix = &cleaned[pos + 2..];
+        if suffix.len() >= 4 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            cleaned = &cleaned[..pos];
+        }
+    }
+
+    if cleaned != name {
+        Some(cleaned.to_string())
+    } else {
+        None
+    }
+}
+
+/// Strip GCC/LLVM clone suffixes from symbol names.
+///
+/// Compilers append suffixes like `.cold`, `.constprop.0`, `.isra.0`,
+/// `.part.0`, `.clone.0`, and `.llvm.<hex>` to distinguish compiler-generated
+/// variants of functions. These are noise in profiler output.
+///
+/// Matches the approach used by OTel eBPF Profiler's `strip_clone_suffixes`.
+fn strip_clone_suffixes(name: &str) -> &str {
+    let mut result = name;
+    loop {
+        let prev = result;
+        for suffix in &[".cold", ".constprop", ".isra", ".part", ".clone"] {
+            if let Some(pos) = result.rfind(suffix) {
+                let after = &result[pos + suffix.len()..];
+                // Accept ".suffix" or ".suffix.N" where N is digits
+                if after.is_empty()
+                    || after.starts_with('.')
+                        && after[1..].bytes().all(|b| b.is_ascii_digit())
+                {
+                    result = &result[..pos];
+                }
+            }
+        }
+        // Strip .llvm.<hex> suffix
+        if let Some(pos) = result.rfind(".llvm.") {
+            let after = &result[pos + 6..];
+            if !after.is_empty() && after.bytes().all(|b| b.is_ascii_hexdigit()) {
+                result = &result[..pos];
+            }
+        }
+        if result == prev {
+            break;
+        }
+    }
+    result
+}
+
 pub struct SymbolFormatter;
 
 impl SymbolFormatter {
@@ -160,8 +261,9 @@ impl SymbolFormatter {
             }
         };
 
+        let name = strip_clone_suffixes(&sym.name);
         StackFrameInfo {
-            symbol: Some(format!("{}_k", sym.name)),
+            symbol: Some(format!("{}_k", name)),
             ..Default::default()
         }
     }
@@ -181,8 +283,10 @@ impl SymbolFormatter {
         let name = sym.name.to_string();
         let display_name = if is_v8_symbol(&name) {
             format_v8_symbol(&name).unwrap_or(name)
+        } else if let Some(demangled) = demangle_zig(&name) {
+            demangled
         } else {
-            name
+            strip_clone_suffixes(&name).to_string()
         };
 
         StackFrameInfo {
@@ -765,5 +869,94 @@ mod tests {
             format_short_source("node:internal/modules/cjs/loader.js"),
             "loader.js"
         );
+    }
+
+    // ── Zig demangling tests ──
+
+    #[test]
+    fn test_demangle_zig_anon_suffix() {
+        assert_eq!(
+            demangle_zig("io.reader.Reader.readAll__anon_abc123"),
+            Some("io.reader.Reader.readAll".to_string())
+        );
+    }
+
+    #[test]
+    fn test_demangle_zig_struct_suffix() {
+        assert_eq!(
+            demangle_zig("hash_map.HashMap.put__struct_5678abcd"),
+            Some("hash_map.HashMap.put".to_string())
+        );
+    }
+
+    #[test]
+    fn test_demangle_zig_hex_hash() {
+        assert_eq!(
+            demangle_zig("mem.Allocator.alloc__a1b2c3d4"),
+            Some("mem.Allocator.alloc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_demangle_zig_no_suffix() {
+        // Already clean Zig symbol — should return None
+        assert_eq!(demangle_zig("debug.dumpStackTrace"), None);
+    }
+
+    #[test]
+    fn test_demangle_zig_not_zig() {
+        // C symbol — no dots, should return None
+        assert_eq!(demangle_zig("malloc"), None);
+        // C++ mangled — should return None
+        assert_eq!(demangle_zig("_ZN3std4main"), None);
+        // Rust mangled — should return None
+        assert_eq!(demangle_zig("_RNvC3std4main"), None);
+    }
+
+    #[test]
+    fn test_demangle_zig_short_hex_not_stripped() {
+        // Only 2 hex chars after __ — too short, don't strip
+        assert_eq!(demangle_zig("std.io.read__ab"), None);
+    }
+
+    // ── Clone suffix stripping tests ──
+
+    #[test]
+    fn test_strip_clone_cold() {
+        assert_eq!(strip_clone_suffixes("func.cold"), "func");
+    }
+
+    #[test]
+    fn test_strip_clone_constprop() {
+        assert_eq!(strip_clone_suffixes("func.constprop.0"), "func");
+    }
+
+    #[test]
+    fn test_strip_clone_isra() {
+        assert_eq!(strip_clone_suffixes("func.isra.0"), "func");
+    }
+
+    #[test]
+    fn test_strip_clone_llvm() {
+        assert_eq!(strip_clone_suffixes("func.llvm.12345678"), "func");
+    }
+
+    #[test]
+    fn test_strip_clone_multiple() {
+        assert_eq!(
+            strip_clone_suffixes("func.constprop.0.isra.0"),
+            "func"
+        );
+    }
+
+    #[test]
+    fn test_strip_clone_none() {
+        assert_eq!(strip_clone_suffixes("normal_func"), "normal_func");
+    }
+
+    #[test]
+    fn test_strip_clone_preserves_name() {
+        // Don't strip if "cold" is part of the actual name
+        assert_eq!(strip_clone_suffixes("get_cold_data"), "get_cold_data");
     }
 }

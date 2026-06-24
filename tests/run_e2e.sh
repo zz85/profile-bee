@@ -632,7 +632,8 @@ test_bun_jitdump_callstack() {
     fi
 
     # Check for JS function names from JITDump (primary goal).
-    # JSC emits JITDump symbols like "JSC-FTL: hot#..." or "JSC-DFG: processData#..."
+    # JSC emits JITDump symbols like "JSC-FTL: hot" or "JSC-DFG: processData"
+    # (JSC hash suffixes like #DdCypB are stripped during formatting).
     # We look for our fixture function names prefixed with JSC JIT tier markers.
     assert_stack_contains "$file" \
         "JSC.*\bhot\b\|JSC.*\bprocessData\b\|JSC.*\bhandleRequest\b\|JSC.*\bserverLoop\b" \

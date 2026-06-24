@@ -408,18 +408,38 @@ pub fn find_jitdump_for_pid_in_dir(pid: u32, dir: &Path) -> Option<PathBuf> {
 
 /// Format a JIT symbol for display in flamegraphs.
 ///
+/// Cleans up JSC-specific noise from the symbol name:
+/// - Strips `#<hash>` suffixes (JSC JIT code version hashes, e.g. `hello#DdCypB` → `hello`)
+///
 /// If source file info is available: `functionName (file.js:42)`
 /// Otherwise just: `functionName`
 pub fn format_jit_symbol(sym: &JitSymbol) -> String {
+    let name = strip_jsc_hash(&sym.name);
     if let Some((ref file, line)) = sym.source {
         let basename = Path::new(file)
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or(file);
-        format!("{} ({}:{})", sym.name, basename, line)
+        format!("{} ({}:{})", name, basename, line)
     } else {
-        sym.name.clone()
+        name.to_string()
     }
+}
+
+/// Strip JSC JIT code version hash from a symbol name.
+///
+/// JSC appends `#<alphanumeric>` to JIT-compiled function names to
+/// disambiguate recompilations (e.g. `hello#DdCypB`, `/tmp/test.js#B9UAQK`).
+/// This is internal noise that obscures the actual function name.
+fn strip_jsc_hash(name: &str) -> &str {
+    if let Some(pos) = name.rfind('#') {
+        let suffix = &name[pos + 1..];
+        // Only strip if the suffix is non-empty alphanumeric (JSC hash format)
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return &name[..pos];
+        }
+    }
+    name
 }
 
 // ── Binary reading helpers ──────────────────────────────────────────────────
@@ -710,7 +730,7 @@ mod tests {
         let sym = JitSymbol {
             code_addr: 0x1000,
             code_size: 0x100,
-            name: "handleRequest".to_string(),
+            name: "handleRequest#AbCdEf".to_string(),
             source: Some(("/home/user/app/server.js".to_string(), 42)),
         };
         assert_eq!(format_jit_symbol(&sym), "handleRequest (server.js:42)");
@@ -721,10 +741,30 @@ mod tests {
         let sym = JitSymbol {
             code_addr: 0x1000,
             code_size: 0x100,
+            name: "hello#DdCypB".to_string(),
+            source: None,
+        };
+        assert_eq!(format_jit_symbol(&sym), "hello");
+    }
+
+    #[test]
+    fn test_format_jit_symbol_no_hash() {
+        let sym = JitSymbol {
+            code_addr: 0x1000,
+            code_size: 0x100,
             name: "anonymous".to_string(),
             source: None,
         };
         assert_eq!(format_jit_symbol(&sym), "anonymous");
+    }
+
+    #[test]
+    fn test_strip_jsc_hash() {
+        assert_eq!(strip_jsc_hash("hello#DdCypB"), "hello");
+        assert_eq!(strip_jsc_hash("/tmp/test.js#B9UAQK"), "/tmp/test.js");
+        assert_eq!(strip_jsc_hash("no_hash"), "no_hash");
+        // Don't strip if suffix contains non-alphanumeric
+        assert_eq!(strip_jsc_hash("color#ff-00"), "color#ff-00");
     }
 
     #[test]

@@ -96,6 +96,9 @@ pub struct ProfilingEventLoop {
     // Persistent state across calls
     trace_count: HashMap<StackInfo, usize>,
     known_tgids: HashSet<u32>,
+    /// PIDs that have already been warned about missing JITDump files.
+    /// Prevents repeated warnings for the same Bun process.
+    warned_jitdump_pids: HashSet<u32>,
     /// Optional process metadata cache, maintained via eBPF lifecycle events.
     process_metadata: Option<ProcessMetadataCache>,
     /// PIDs that exited during the current drain_events() call.
@@ -130,6 +133,7 @@ impl ProfilingEventLoop {
             monitor_exit_pid: config.monitor_exit_pid,
             trace_count: HashMap::new(),
             known_tgids: HashSet::new(),
+            warned_jitdump_pids: HashSet::new(),
             process_metadata: if config.enable_process_metadata {
                 Some(ProcessMetadataCache::new(4096))
             } else {
@@ -318,6 +322,9 @@ impl ProfilingEventLoop {
     /// registers the symbol table in the trace handler. This enables
     /// resolution of JIT-compiled function names from runtimes like
     /// Bun (JavaScriptCore), Java HotSpot, and LuaJIT.
+    ///
+    /// If the PID is a Bun process and no JITDump file exists, emits a
+    /// warning so the user knows to restart Bun with `BUN_JSC_useJITDump=1`.
     fn try_load_jitdump_for_pid(&mut self, tgid: u32) {
         if self.trace_handler.has_jit_table(tgid) {
             return;
@@ -330,7 +337,48 @@ impl ProfilingEventLoop {
                 Ok(_) => tracing::debug!("JITDump for pid {} is empty", tgid),
                 Err(e) => tracing::debug!("JITDump read failed for pid {}: {}", tgid, e),
             }
+        } else {
+            // No JITDump file — check if this is a Bun process and warn
+            self.warn_bun_missing_jitdump(tgid);
         }
+    }
+
+    /// Emit a one-time warning if a PID is a Bun process without JITDump.
+    ///
+    /// Bun (JavaScriptCore) only writes JITDump files when started with
+    /// `BUN_JSC_useJITDump=1`. Without this, JIT-compiled JS functions
+    /// appear as `[unknown]`. This warning fires during system-wide and
+    /// `--pid` profiling where probee can't inject the env var itself.
+    fn warn_bun_missing_jitdump(&mut self, tgid: u32) {
+        if self.warned_jitdump_pids.contains(&tgid) {
+            return;
+        }
+        let exe_link = format!("/proc/{}/exe", tgid);
+        let exe_path = match std::fs::read_link(&exe_link) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let basename = exe_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if !crate::spawn::is_bun_program(basename) {
+            return;
+        }
+        self.warned_jitdump_pids.insert(tgid);
+        tracing::warn!(
+            "Bun process (PID {}) detected without JITDump file. \
+             JS function names will show as [unknown]. \
+             Restart Bun with: BUN_JSC_useJITDump=1 bun <script>",
+            tgid
+        );
+        eprintln!(
+            "\x1b[33mWarning: Bun process (PID {}) has no JITDump file.\x1b[0m",
+            tgid
+        );
+        eprintln!("  JS function names will appear as [unknown] in the flamegraph.");
+        eprintln!("  Restart Bun with: BUN_JSC_useJITDump=1 bun <script>");
+        eprintln!("  Or use probee's auto-injection: probee -- bun <script>");
     }
 
     /// Reload JITDump symbol tables for all known PIDs.

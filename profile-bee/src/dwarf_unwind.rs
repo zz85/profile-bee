@@ -56,6 +56,62 @@ pub enum DwarfUnwindError {
     VdsoInvalidRange,
 }
 
+/// Detect if an ELF binary is a Zig-compiled executable and return the
+/// virtual address of its `_start` function.
+///
+/// Zig is detected by the presence of any symbol with a `__zig` prefix.
+/// The `_start` address is needed to apply a stop-unwinding override that
+/// fixes bogus `.eh_frame` data emitted by older Zig compilers.
+///
+/// Returns `Some(start_vaddr)` if both a `__zig*` symbol and `_start` are found,
+/// `None` otherwise.
+///
+/// Reference: LightSwitch applies the same fix (see `lightswitch-object/src/object.rs`).
+fn detect_zig_start_address(obj: &object::File) -> Option<u64> {
+    use object::ObjectSymbol;
+
+    let mut is_zig = false;
+    let mut start_addr = None;
+
+    for symbol in obj.symbols() {
+        let Ok(name) = symbol.name() else { continue };
+        if name.starts_with("__zig") {
+            is_zig = true;
+        }
+        if name == "_start" && symbol.size() > 0 {
+            start_addr = Some(symbol.address());
+        }
+        // Early exit once both conditions are met
+        if is_zig && start_addr.is_some() {
+            break;
+        }
+    }
+
+    // Also check dynamic symbols if static symbols didn't have what we need
+    if !is_zig || start_addr.is_none() {
+        for symbol in obj.dynamic_symbols() {
+            let Ok(name) = symbol.name() else { continue };
+            if !is_zig && name.starts_with("__zig") {
+                is_zig = true;
+            }
+            if start_addr.is_none() && name == "_start" && symbol.size() > 0 {
+                start_addr = Some(symbol.address());
+            }
+            if is_zig && start_addr.is_some() {
+                break;
+            }
+        }
+    }
+
+    if is_zig {
+        if let Some(addr) = start_addr {
+            tracing::debug!("detected Zig binary with _start at {:#x}", addr);
+            return Some(addr);
+        }
+    }
+    None
+}
+
 /// Holds binary data either as a memory-mapped file or a heap-allocated buffer (for vdso).
 /// Using mmap avoids copying the entire ELF binary into userspace heap memory,
 /// eliminating page fault storms from anonymous page allocation + zeroing.
@@ -335,6 +391,12 @@ pub fn generate_unwind_table_from_bytes(
     // Extract build ID first
     let build_id = extract_build_id(data);
 
+    // Detect Zig binaries and find _start address for the unwind override.
+    // Older Zig compilers emit bogus .eh_frame data for _start, causing the
+    // unwinder to produce garbage frames at the stack bottom. We replace
+    // _start's unwind entry with a stop marker.
+    let zig_start_override = detect_zig_start_address(&obj);
+
     // Find the base virtual address (first PT_LOAD segment with file offset 0)
     // For non-PIE executables this is typically 0x400000, for PIE/shared libs it's 0.
     // We subtract this from .eh_frame PCs to make entries file-relative.
@@ -466,6 +528,28 @@ pub fn generate_unwind_table_from_bytes(
 
     // Sort by PC address for binary search
     entries.sort_by_key(|e| e.pc);
+
+    // Apply Zig _start override: replace unwind entries within _start's range
+    // with a stop marker. This causes the eBPF unwinder to terminate cleanly
+    // at the stack bottom instead of following bogus CFA rules.
+    if let Some(start_pc) = zig_start_override {
+        let start_pc_relative = (start_pc - base_vaddr) as u32;
+        for entry in entries.iter_mut() {
+            if entry.pc == start_pc_relative {
+                // CFA_REG_EXPRESSION is never emitted for valid entries (filtered above).
+                // The eBPF unwinder treats it as an unknown type → `return false` (stop).
+                entry.cfa_type = CFA_REG_EXPRESSION;
+                entry.cfa_offset = 0;
+                entry.rbp_type = REG_RULE_UNDEFINED;
+                entry.rbp_offset = 0;
+                tracing::debug!(
+                    "applied Zig _start stop-unwind override at relative PC {:#x}",
+                    start_pc_relative
+                );
+                break;
+            }
+        }
+    }
 
     // Deduplicate consecutive entries with identical unwind rules.
     // The binary search finds the last entry with pc <= target, so keeping
@@ -936,6 +1020,49 @@ mod tests {
     fn test_generate_unwind_table_invalid_elf() {
         let result = generate_unwind_table_from_bytes(b"not an elf file");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_detect_zig_start_address_not_zig() {
+        // The test binary (Rust) should NOT be detected as Zig
+        let exe = std::env::current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let obj = object::File::parse(&*data).unwrap();
+        let result = detect_zig_start_address(&obj);
+        assert!(
+            result.is_none(),
+            "Rust test binary should not be detected as Zig"
+        );
+    }
+
+    #[test]
+    fn test_detect_zig_start_address_bun() {
+        // Bun is a Zig-compiled binary — if installed, verify detection
+        let candidates = [
+            std::path::PathBuf::from("/usr/local/bin/bun"),
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".bun/bin/bun"))
+                .unwrap_or_default(),
+        ];
+        let path = match candidates.iter().find(|p| p.exists()) {
+            Some(p) => p.clone(),
+            None => return, // Bun not installed, skip
+        };
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let obj = match object::File::parse(&*data) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        let result = detect_zig_start_address(&obj);
+        // Bun is compiled with Zig so it should have __zig* symbols
+        // and _start. However, Bun is stripped so _start may not have size > 0.
+        // We just verify the function doesn't crash on a real Zig binary.
+        if result.is_some() {
+            assert!(result.unwrap() > 0);
+        }
     }
 
     #[test]
