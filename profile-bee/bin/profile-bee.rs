@@ -1681,7 +1681,7 @@ fn spawn_profiling_thread(
                         .collect::<Vec<_>>()
                         .join(";");
                     let count = frames.count;
-                    format!("{} {}", &key, count)
+                    format!("{} {}", key, count)
                 })
                 .collect::<Vec<_>>();
             out.sort();
