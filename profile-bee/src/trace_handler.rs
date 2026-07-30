@@ -306,6 +306,70 @@ impl Default for TraceHandler {
 }
 
 impl TraceHandler {
+    fn stack_cache_key(
+        tgid: u32,
+        ktrace_id: i32,
+        utrace_id: i32,
+        cpu: u32,
+    ) -> Option<(u32, i32, i32)> {
+        if tgid == 0 {
+            // Idle-task output depends on the kernel stack *and* the CPU: every
+            // formatted idle stack carries CPU-specific frames (`cpu_NN`,
+            // `swapper/N`). All CPUs idle through the same code path, so they
+            // share one kernel stack hash — keying on the hash alone would let
+            // one CPU's frames be served for every other CPU's idle samples.
+            //
+            // User stack IDs are negative error codes here (swapper has no user
+            // stack), so the third slot is free to carry the CPU instead.
+            (ktrace_id >= 0).then_some((tgid, ktrace_id, cpu as i32))
+        } else if ktrace_id >= 0 && utrace_id >= 0 {
+            Some((tgid, ktrace_id, utrace_id))
+        } else {
+            None
+        }
+    }
+
+    fn populate_frame_addresses(frames: &mut [StackFrameInfo], addrs: &[u64]) {
+        for (frame, &addr) in frames.iter_mut().zip(addrs.iter()) {
+            frame.address = addr;
+        }
+    }
+
+    fn format_idle_context_stack(
+        stack_info: &StackInfo,
+        mut kernel_syms: Vec<StackFrameInfo>,
+        kernel_addrs: &[u64],
+        context_label: &str,
+        group_by_cpu: bool,
+    ) -> Vec<StackFrameInfo> {
+        Self::populate_frame_addresses(&mut kernel_syms, kernel_addrs);
+
+        let mut combined = kernel_syms;
+        combined.push(StackFrameInfo {
+            symbol: Some(context_label.to_string()),
+            ..Default::default()
+        });
+
+        // Label as swapper/idle process context
+        let mut proc_frame = StackFrameInfo::process_only(stack_info);
+        if let Some(cpu_id) = stack_info.get_cpu_id() {
+            proc_frame.symbol = Some(format!("swapper/{}", cpu_id));
+        }
+        combined.push(proc_frame);
+
+        if group_by_cpu {
+            if let Some(cpu_id) = stack_info.get_cpu_id() {
+                combined.push(StackFrameInfo {
+                    symbol: Some(format!("cpu_{:02}", cpu_id)),
+                    ..Default::default()
+                });
+            }
+        }
+
+        combined.reverse();
+        combined
+    }
+
     pub fn new() -> Self {
         TraceHandler {
             symbolizer: Symbolizer::new(),
@@ -403,13 +467,19 @@ impl TraceHandler {
     /// Prefers custom-unwound frames from the stacked_pointers eBPF map
     /// (populated by either FP walking or DWARF unwinding) when they
     /// contain more frames than bpf_get_stackid.
-    /// Results are cached by (tgid, kernel_stack_id, user_stack_id) to avoid
-    /// redundant BPF map lookups and blazesym symbolization on repeated stacks.
+    /// Results are cached by a derived stack key to avoid redundant BPF map
+    /// lookups and blazesym symbolization on repeated stacks.
     ///
-    /// Caching is only safe when both stack IDs are non-negative, meaning
-    /// `bpf_get_stackid` succeeded and the IDs are actual hashes of the stack
-    /// frames. When negative (FP walking failed), the ID is an error code and
-    /// many distinct stacks share the same value — caching would be incorrect.
+    /// For normal user processes, caching is only safe when both stack IDs are
+    /// non-negative, meaning `bpf_get_stackid` succeeded and the IDs are actual
+    /// hashes of the stack frames. When negative (FP walking failed), the ID is
+    /// an error code and many distinct stacks share the same value.
+    ///
+    /// For the idle task (`tgid == 0`), the user stack ID is always a negative
+    /// error code (swapper has no user stack), so that slot is replaced by the
+    /// sample's CPU. The CPU must be part of the key: idle output carries
+    /// CPU-specific frames (`cpu_NN`, `swapper/N`) while all CPUs idle through
+    /// the same kernel path and therefore share one kernel stack hash.
     pub fn get_exp_stacked_frames(
         &mut self,
         stack_info: &StackInfo,
@@ -422,13 +492,10 @@ impl TraceHandler {
         let ktrace_id = stack_info.kernel_stack_id;
         let utrace_id = stack_info.user_stack_id;
 
-        // Only cache when both stack IDs are valid hashes (non-negative).
-        // Negative IDs are error codes from bpf_get_stackid — many different
-        // stacks map to the same negative value, so caching would be incorrect.
-        let cacheable = ktrace_id >= 0 && utrace_id >= 0;
+        let cache_key = Self::stack_cache_key(tgid, ktrace_id, utrace_id, stack_info.cpu);
 
-        if cacheable {
-            if let Some(cached) = self.cache.get(tgid, ktrace_id, utrace_id) {
+        if let Some((cache_tgid, cache_ktrace_id, cache_utrace_id)) = cache_key {
+            if let Some(cached) = self.cache.get(cache_tgid, cache_ktrace_id, cache_utrace_id) {
                 return cached.clone();
             }
         }
@@ -470,9 +537,9 @@ impl TraceHandler {
             group_by_process,
         );
 
-        if cacheable {
+        if let Some((cache_tgid, cache_ktrace_id, cache_utrace_id)) = cache_key {
             self.cache
-                .insert(tgid, ktrace_id, utrace_id, result.clone());
+                .insert(cache_tgid, cache_ktrace_id, cache_utrace_id, result.clone());
         }
 
         result
@@ -585,6 +652,30 @@ impl TraceHandler {
         group_by_process: bool,
     ) -> Vec<StackFrameInfo> {
         if stack_info.tgid == 0 {
+            // The idle task (swapper) has tgid==0. However, softirqs and interrupts
+            // can fire while the CPU is idle and execute real work (e.g., network RX,
+            // timers) before returning to idle. We must check the kernel stack to
+            // distinguish true idle from softirq/interrupt work on an idle CPU.
+            let kernel_addrs = kernel_stack.unwrap_or_default();
+            let kernel_syms = self
+                .symbolize_kernel_stack(&kernel_addrs)
+                .ok()
+                .unwrap_or_default();
+
+            let context_label = SymbolFormatter::infer_kernel_context_label(&kernel_syms);
+
+            if let Some(label) = context_label {
+                // This is softirq/interrupt work on an idle CPU — show the real stack.
+                return Self::format_idle_context_stack(
+                    stack_info,
+                    kernel_syms,
+                    &kernel_addrs,
+                    label,
+                    group_by_cpu,
+                );
+            }
+
+            // True idle — no softirq/interrupt detected in kernel stack.
             let mut idle = StackFrameInfo::prepare(stack_info);
             idle.symbol = Some("idle".into());
             let mut idle_cpu = StackFrameInfo::process_only(stack_info);
@@ -660,9 +751,7 @@ impl TraceHandler {
             .unwrap_or_default();
 
         // Populate raw kernel addresses on each symbolized frame.
-        for (frame, &addr) in kernel_syms.iter_mut().zip(kernel_addrs.iter()) {
-            frame.address = addr;
-        }
+        Self::populate_frame_addresses(&mut kernel_syms, &kernel_addrs);
 
         // Infer context label from kernel frames only (before combining) to avoid
         // false-positives from userspace symbols that happen to end in `_k`.
@@ -817,6 +906,126 @@ mod tests {
             symbol: Some(symbol.to_string()),
             ..Default::default()
         }
+    }
+
+    fn stack_info(tgid: u32, ktrace_id: i32, utrace_id: i32, cpu: u32, cmd: &str) -> StackInfo {
+        let mut cmd_buf = [0u8; 16];
+        let bytes = cmd.as_bytes();
+        let len = bytes.len().min(cmd_buf.len().saturating_sub(1));
+        cmd_buf[..len].copy_from_slice(&bytes[..len]);
+
+        StackInfo {
+            tgid,
+            user_stack_id: utrace_id,
+            kernel_stack_id: ktrace_id,
+            cmd: cmd_buf,
+            cpu,
+            bp: 0,
+            ip: 0,
+            sp: 0,
+        }
+    }
+
+    #[test]
+    fn test_stack_cache_key_allows_idle_kernel_only_caching() {
+        assert_eq!(
+            TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, 3),
+            Some((0, 42, 3))
+        );
+        assert_eq!(TraceHandler::stack_cache_key(0, -1, -libc::EFAULT, 3), None);
+        assert_eq!(
+            TraceHandler::stack_cache_key(1234, 42, -libc::EFAULT, 3),
+            None
+        );
+        assert_eq!(
+            TraceHandler::stack_cache_key(1234, 42, 7, 3),
+            Some((1234, 42, 7))
+        );
+    }
+
+    #[test]
+    fn test_stack_cache_key_distinguishes_idle_cpus() {
+        // All CPUs idle through the same kernel path, so they share one kernel
+        // stack hash. Since idle output carries CPU-specific frames, samples
+        // from different CPUs must not collide on the same cache key.
+        let cpu0 = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, 0);
+        let cpu1 = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, 1);
+        assert_ne!(cpu0, cpu1);
+        assert_eq!(cpu0, Some((0, 42, 0)));
+        assert_eq!(cpu1, Some((0, 42, 1)));
+    }
+
+    #[test]
+    fn test_idle_cross_cpu_samples_retain_own_cpu_frames() {
+        // A cache keyed without the CPU would serve cpu_00's frames for cpu_01's
+        // idle samples, since both share kernel stack id 42.
+        let mut cache = PointerStackFramesCache::default();
+
+        for cpu in 0..4u32 {
+            let info = stack_info(0, 42, -libc::EFAULT, cpu, "swapper/0");
+            let frames = TraceHandler::format_idle_context_stack(
+                &info,
+                vec![kernel_frame("net_rx_action_k")],
+                &[0x1000],
+                "softirq:net_rx_k",
+                true,
+            );
+            let key = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, cpu)
+                .expect("idle sample with a valid kernel stack id should be cacheable");
+            cache.insert(key.0, key.1, key.2, frames);
+        }
+
+        for cpu in 0..4u32 {
+            let key = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, cpu).unwrap();
+            let cached = cache
+                .get(key.0, key.1, key.2)
+                .expect("each CPU should have its own cache entry");
+            let symbols: Vec<&str> = cached
+                .iter()
+                .map(|f| f.symbol.as_deref().unwrap_or("[missing]"))
+                .collect();
+            assert_eq!(
+                symbols,
+                vec![
+                    format!("cpu_{:02}", cpu).as_str(),
+                    format!("swapper/{}", cpu).as_str(),
+                    "softirq:net_rx_k",
+                    "net_rx_action_k",
+                ],
+                "cpu {} served frames belonging to another CPU",
+                cpu
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_idle_context_stack_preserves_kernel_addresses() {
+        let stack_info = stack_info(0, 42, -libc::EFAULT, 3, "swapper/3");
+        let kernel_syms = vec![kernel_frame("net_rx_action_k"), kernel_frame("napi_poll_k")];
+        let frames = TraceHandler::format_idle_context_stack(
+            &stack_info,
+            kernel_syms,
+            &[0x1000, 0x2000],
+            "softirq:net_rx_k",
+            true,
+        );
+
+        let symbols: Vec<&str> = frames
+            .iter()
+            .map(|f| f.symbol.as_deref().unwrap_or("[missing]"))
+            .collect();
+        assert_eq!(
+            symbols,
+            vec![
+                "cpu_03",
+                "swapper/3",
+                "softirq:net_rx_k",
+                "napi_poll_k",
+                "net_rx_action_k",
+            ]
+        );
+        assert_eq!(frames[3].address, 0x2000);
+        assert_eq!(frames[4].address, 0x1000);
     }
 
     #[test]
