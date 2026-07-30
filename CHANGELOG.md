@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.15
+
+### Bug Fixes
+
+- **Fix idle-CPU softirq/interrupt attribution** — samples taken while the CPU is idle (tgid==0) but executing softirq or interrupt work were previously mislabeled as "idle". The kernel stack is now symbolized and checked for softirq/interrupt context before falling back to the idle label. This means `net_rx_action`, timer softirqs, and hardware interrupts running on idle CPUs now show their real kernel stack traces in flamegraphs instead of being hidden in the "idle" bucket.
+
 ## v0.3.14
 
 ### Improvements
