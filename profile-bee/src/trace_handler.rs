@@ -196,6 +196,9 @@ impl SymbolFormatter {
                 | "handle_softirqs"
                 | "do_softirq"
                 | "run_ksoftirqd"
+                // aarch64: do_softirq_own_stack hands ____do_softirq to
+                // call_on_irq_stack as a signature-matching trampoline.
+                | "____do_softirq"
         )
     }
 
@@ -217,7 +220,19 @@ impl SymbolFormatter {
             "sysvec_thermal" => Some("interrupt:thermal_k"),
             "sysvec_error_interrupt" => Some("interrupt:error_k"),
             "sysvec_spurious_apic_interrupt" => Some("interrupt:spurious_k"),
-            "common_interrupt"
+            // aarch64 has no per-vector entry symbols the way x86 does — the EL1
+            // IRQ vector dispatches every interrupt through one path, so these
+            // can only yield the generic label.
+            "el1h_64_irq"
+            | "el1h_64_irq_handler"
+            | "el1_interrupt"
+            | "__el1_irq"
+            | "el0t_64_irq"
+            | "el0t_64_irq_handler"
+            | "el0_interrupt"
+            | "do_interrupt_handler"
+            | "gic_handle_irq"
+            | "common_interrupt"
             | "__common_interrupt"
             | "asm_common_interrupt"
             | "handle_irq_event"
@@ -225,6 +240,7 @@ impl SymbolFormatter {
             | "__handle_irq_event_percpu"
             | "handle_edge_irq"
             | "handle_level_irq"
+            | "handle_domain_irq"
             | "__handle_domain_irq"
             | "do_IRQ" => Some("interrupt_k"),
             _ => None,
@@ -240,18 +256,28 @@ impl SymbolFormatter {
     fn is_interrupt_entry_symbol(symbol: &str) -> bool {
         matches!(
             symbol,
+            // x86_64
             "asm_sysvec_apic_timer_interrupt"
                 | "sysvec_apic_timer_interrupt"
                 | "local_apic_timer_interrupt"
                 | "asm_common_interrupt"
                 | "common_interrupt"
                 | "__common_interrupt"
-                | "irq_enter_rcu"
-                | "irq_exit_rcu"
-                | "do_softirq_own_stack"
                 | "asm_call_irq_on_stack"
                 | "error_entry"
                 | "error_return"
+                // aarch64 EL1 (kernel-mode) IRQ vector and its dispatch layer
+                | "el1h_64_irq"
+                | "el1h_64_irq_handler"
+                | "el1_interrupt"
+                | "__el1_irq"
+                | "call_on_irq_stack"
+                // architecture-neutral hardirq enter/exit
+                | "irq_enter_rcu"
+                | "irq_exit_rcu"
+                | "__irq_exit_rcu"
+                | "irq_exit"
+                | "do_softirq_own_stack"
         )
     }
 
@@ -1194,6 +1220,89 @@ mod tests {
             },
             kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
             kernel_frame("default_idle_k"),
+        ];
+        assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
+    }
+
+    #[test]
+    fn test_arm64_idle_net_rx_softirq_stack() {
+        // Real aarch64 capture (leaf-first). Reaches the specific softirq label via
+        // net_rx_action, which is architecture-neutral generic code.
+        let frames = vec![
+            kernel_frame("napi_alloc_skb_k"),
+            kernel_frame("ena_alloc_skb_k"),
+            kernel_frame("ena_rx_skb_k"),
+            kernel_frame("ena_clean_rx_irq_k"),
+            kernel_frame("ena_io_poll_k"),
+            kernel_frame("__napi_poll_k"),
+            kernel_frame("net_rx_action_k"),
+            kernel_frame("handle_softirqs_k"),
+            kernel_frame("__do_softirq_k"),
+            kernel_frame("____do_softirq_k"),
+            kernel_frame("call_on_irq_stack_k"),
+            kernel_frame("do_softirq_own_stack_k"),
+            kernel_frame("__irq_exit_rcu_k"),
+            kernel_frame("irq_exit_rcu_k"),
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("el1h_64_irq_handler_k"),
+            kernel_frame("el1h_64_irq_k"),
+            kernel_frame("default_idle_call_k"),
+            kernel_frame("cpuidle_idle_call_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("softirq:net_rx_k")
+        );
+    }
+
+    #[test]
+    fn test_arm64_generic_softirq_via_arch_trampoline() {
+        // ____do_softirq is arm64's stack-switching trampoline. Without it in the
+        // generic-softirq list, this stack would fall through to no label at all.
+        let frames = vec![
+            kernel_frame("some_unlisted_handler_k"),
+            kernel_frame("____do_softirq_k"),
+            kernel_frame("do_softirq_own_stack_k"),
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("softirq_k")
+        );
+    }
+
+    #[test]
+    fn test_arm64_device_irq_work_is_labeled() {
+        // An aarch64 device IRQ doing real work, no softirq involved. Before the
+        // arm64 symbols were added this matched nothing and fell through to "idle".
+        let frames = vec![
+            kernel_frame("ena_intr_msix_io_k"),
+            kernel_frame("__handle_irq_event_percpu_k"),
+            kernel_frame("handle_irq_event_k"),
+            kernel_frame("gic_handle_irq_k"),
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("el1h_64_irq_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("interrupt_k")
+        );
+    }
+
+    #[test]
+    fn test_arm64_bare_irq_entry_is_not_labeled_interrupt() {
+        // aarch64 counterpart of the sampling-timer guard: bare EL1 IRQ entry with
+        // no handler work beneath it earns no label.
+        let frames = vec![
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("el1h_64_irq_handler_k"),
+            kernel_frame("el1h_64_irq_k"),
+            kernel_frame("default_idle_call_k"),
+            kernel_frame("cpuidle_idle_call_k"),
+            kernel_frame("do_idle_k"),
         ];
         assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
     }
