@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.14
+
+### Improvements
+
+- **Kernel/softirq/interrupt context labels** — stack traces are now annotated with execution context labels (`softirq:net_rx_k`, `interrupt:timer_k`, etc.) when kernel frames match known softirq handlers or interrupt vectors. This makes softirq and interrupt CPU time visually identifiable in flamegraphs.
+- **Softirq classification** — identifies specific softirq handlers: NET_RX, NET_TX, TIMER, HRTIMER, TASKLET, BLOCK, BLOCK_IOPOLL, RCU, and SCHED (`run_rebalance_domains`).
+- **Interrupt classification** — identifies APIC timer, reschedule IPI, call_function, irq_work, thermal, and generic hardware interrupts.
+- **Priority-based labeling** — specific softirq > generic softirq > interrupt, ensuring the most informative label is selected.
+- **Kernel-only frame scanning** — context classification only inspects kernel frames (identified by `_k` suffix), avoiding false-positives from userspace symbols.
+- **Broad kernel version support** — covers both modern (`handle_softirqs`, kernel >= 5.19) and legacy (`__do_softirq`) softirq entry symbols.
+
 ## v0.3.13
 
 ### New Features

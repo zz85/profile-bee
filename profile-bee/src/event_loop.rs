@@ -569,7 +569,7 @@ impl ProfilingEventLoop {
                     .map(|s| s.fmt_symbol())
                     .collect::<Vec<_>>()
                     .join(";");
-                format!("{} {}", &key, frames.count)
+                format!("{} {}", key, frames.count)
             })
             .collect();
         out.sort();
@@ -700,7 +700,7 @@ where
         .iter()
         .map(|fc| {
             let key = fc.frames.iter().map(&fmt).collect::<Vec<_>>().join(";");
-            format!("{} {}", &key, fc.count)
+            format!("{} {}", key, fc.count)
         })
         .collect();
     out.sort();

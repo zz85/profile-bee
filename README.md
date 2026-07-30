@@ -2,6 +2,10 @@
 
 Profile Bee is an eBPF-based CPU profiler that ships as a single binary — no BCC, libbpf, or perf tooling needed on the target host. Built with Rust and [aya](https://aya-rs.dev/).
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/zz85/profile-bee/main/install.sh | bash
+```
+
 ![Architecture](https://raw.githubusercontent.com/zz85/profile-bee/main/docs/architecture-sketch.png)
 
 - Just `cargo install`, `sudo probee --tui`, and you're looking at a live flamegraph — no package manager dance, no Python dependencies, no separate visualization step
@@ -28,12 +32,6 @@ Download and install the latest release with a single command:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zz85/profile-bee/main/install.sh | bash
-```
-
-Or with wget:
-
-```bash
-wget -qO- https://raw.githubusercontent.com/zz85/profile-bee/main/install.sh | bash
 ```
 
 This installs pre-built binaries to `~/.local/bin`. No Rust toolchain required.

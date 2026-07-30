@@ -136,12 +136,9 @@ verify_installation() {
         echo ""
         echo -e "${GREEN}Installation verified!${NC}"
         echo ""
-        echo "Run 'probee --help' to get started"
-        echo "Note: profile-bee requires root privileges to run (uses eBPF)"
-        echo ""
         echo "Quick start:"
-        echo "  sudo probee --tui              # Interactive TUI flamegraph"
-        echo "  sudo probee --svg out.svg      # Generate SVG flamegraph"
+        echo "  sudo ${INSTALL_DIR}/probee --tui              # Interactive TUI flamegraph"
+        echo "  sudo ${INSTALL_DIR}/probee -o out.svg         # Generate SVG flamegraph"
         echo ""
         return 0
     else
