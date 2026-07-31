@@ -303,7 +303,19 @@ impl SymbolFormatter {
     /// `interrupt:timer_k` would invent CPU time that the workload never spent.
     /// When real frames sit beneath it, the interrupt did genuine work and the
     /// label is earned.
+    ///
+    /// The frame at `entry_idx` must itself be an interrupt entry symbol — this
+    /// prevents dispatch functions (e.g. `gic_handle_irq`) that classify as
+    /// `interrupt_k` but are not entry trampolines from being suppressed when
+    /// they appear as the leaf frame (where the prefix `[..0]` is empty).
     fn is_sampling_induced_interrupt(kernel_syms: &[StackFrameInfo], entry_idx: usize) -> bool {
+        // The classified frame itself must be an entry trampoline.
+        let dominated = Self::kernel_symbol_name(&kernel_syms[entry_idx])
+            .is_some_and(Self::is_interrupt_entry_symbol);
+        if !dominated {
+            return false;
+        }
+
         kernel_syms[..entry_idx].iter().all(|frame| {
             Self::kernel_symbol_name(frame).is_none_or(Self::is_interrupt_entry_symbol)
         })
@@ -1305,6 +1317,25 @@ mod tests {
             kernel_frame("do_idle_k"),
         ];
         assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
+    }
+
+    #[test]
+    fn test_leaf_dispatch_symbol_not_suppressed_by_empty_prefix() {
+        // gic_handle_irq is a real dispatch function (classifies as interrupt_k)
+        // but is NOT an interrupt entry trampoline. When it appears as the leaf
+        // frame (idx=0), the empty prefix [..0] must NOT trigger the
+        // sampling-induced suppression — the frame is doing real work.
+        let frames = vec![
+            kernel_frame("gic_handle_irq_k"),
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("el1h_64_irq_handler_k"),
+            kernel_frame("el1h_64_irq_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("interrupt_k")
+        );
     }
 
     #[test]

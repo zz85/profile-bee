@@ -31,14 +31,17 @@ Context is inferred in `profile-bee/src/trace_handler.rs`:
 
 The lists are architecture-specific by nature. Most of `classify_interrupt_symbol`
 is x86_64-only (`sysvec_*`, `asm_sysvec_*`, `common_interrupt`, `do_IRQ`); the
-aarch64 equivalents (`el1h_64_irq_handler`, `el1_interrupt`, `____do_softirq`,
+aarch64 IRQ entry symbols (`el1h_64_irq_handler`, `el1_interrupt`,
 `call_on_irq_stack`) were added as an interim measure and can only ever produce a
 generic `interrupt_k`, because aarch64 dispatches every interrupt through one EL1
-vector rather than per-vector entry points.
+vector rather than per-vector entry points. `____do_softirq` is separate — it
+lives in `is_generic_softirq_symbol` and produces the appropriate generic
+`softirq_k` fallback, since it is aarch64's `do_softirq_own_stack` trampoline
+into the softirq path, not an interrupt entry.
 
 The kernel's canonical answer is `preempt_count` (`include/linux/preempt.h`):
 
-```
+```text
 PREEMPT_BITS 8   shift 0    mask 0x000000ff
 SOFTIRQ_BITS 8   shift 8    mask 0x0000ff00
 HARDIRQ_BITS 4   shift 16   mask 0x000f0000
@@ -110,7 +113,7 @@ BTF reader scope — only what is needed, not a general library:
 
 **aarch64 resolution:**
 
-```
+```text
 byte_offset = offsetof(task_struct, thread_info)      // expect 0, but read it
             + offsetof(thread_info, preempt_count)     // varies with CONFIG_ARM64_SW_TTBR0_PAN
 ```
@@ -135,7 +138,7 @@ Then kallsyms `__per_cpu_offset` (type `D`) gives the absolute address of the
 per-CPU offset array — this cannot come from BTF, which carries no addresses.
 eBPF computes:
 
-```
+```text
 percpu_base   = *(u64 *)(per_cpu_offset_array + cpu * 8)
 preempt_count = *(u32 *)(percpu_base + var_offset)
 ```
@@ -196,7 +199,7 @@ unsafe fn current_exec_context(cpu: u32) -> u32 {
         // CRITICAL: x86 stores PREEMPT_NEED_RESCHED (0x80000000) inside
         // __preempt_count, inverted. preempt_count() masks it off.
         v & !0x8000_0000u32
-    } else {
+    } else if mode == 2 {
         let off = core::ptr::read_volatile(&PREEMPT_TASK_BYTE_OFFSET);
         let task = bpf_get_current_task_btf() as *const u8;
         if task.is_null() { return EXEC_CTX_UNKNOWN; }
@@ -204,6 +207,8 @@ unsafe fn current_exec_context(cpu: u32) -> u32 {
             return EXEC_CTX_UNKNOWN;
         };
         v   // arm64 keeps need_resched in a separate u32 — no masking
+    } else {
+        return EXEC_CTX_UNKNOWN;
     };
 
     normalize_exec_context(raw)
@@ -229,11 +234,16 @@ not do this.
 unsafe fn normalize_exec_context(raw: u32) -> u32 {
     let nmi     = (raw & 0x00f0_0000) >> 20;
     let hardirq = (raw & 0x000f_0000) >> 16;
-    let softirq_serving = (raw & 0x0000_0100) != 0;   // bit 8 ONLY
+    let softirq = (raw & 0x0000_ff00) >> 8;
 
     let nmi     = nmi.saturating_sub(read_volatile(&PREEMPT_SELF_NMI) as u32);
     let hardirq = hardirq.saturating_sub(read_volatile(&PREEMPT_SELF_HARDIRQ) as u32);
-    let softirq_serving = softirq_serving && read_volatile(&PREEMPT_SELF_SOFTIRQ) == 0;
+    let softirq = softirq.saturating_sub(read_volatile(&PREEMPT_SELF_SOFTIRQ) as u32);
+
+    // Bit 0 of the softirq field (bit 8 of raw preempt_count) is the
+    // "serving softirq" flag.  After subtracting the profiler's own
+    // contribution, check both the flag AND remaining count > 0.
+    let softirq_serving = (softirq & 1) != 0 && softirq > 0;
 
     if nmi > 0              { EXEC_CTX_NMI }
     else if hardirq > 0     { EXEC_CTX_HARDIRQ }
@@ -250,7 +260,7 @@ interrupt itself.
 
 ### 3.1 Current layout (verified: zero implicit padding)
 
-```
+```text
 tgid            u32     @  0
 user_stack_id   i32     @  4
 kernel_stack_id i32     @  8
@@ -451,7 +461,7 @@ A hidden `PROBEE_DEBUG_CONTEXT=1` / `--debug-context` that records
 `(context_from_preempt_count, context_from_symbols)` per sample and prints a
 confusion matrix at shutdown:
 
-```
+```text
 context agreement: 48213/49001 (98.4%)
   pc=HARDIRQ sym=none      : 612   <-- likely self-interrupt over-subtraction
   pc=TASK    sym=softirq_k : 176   <-- likely PREEMPT_RT or bit-8 subtlety
@@ -593,7 +603,9 @@ Dev host is 5.10, `CONFIG_PREEMPT_NONE=y`, `CONFIG_DEBUG_INFO_BTF=y`,
   ≥95% of samples on CPU N report `EXEC_CTX_TASK`. **The single most important
   test** — it directly detects a broken self-adjustment.
 - **Agreement matrix** (§5.3) above a threshold; start permissive (90%).
-- **Fallback path:** force `mode = 0` via `PROBEE_DISABLE_PREEMPT_CTX=1` and
+- **Fallback path:** set the environment variable `PROBEE_DISABLE_PREEMPT_CTX=1`
+  (checked at startup; any non-empty value forces `PREEMPT_CTX_MODE = 0` before
+  `override_global`, so the eBPF programs never attempt preempt_count reads) and
   assert output matches the pre-change golden files in `tests/output/*.collapse`.
 - **Verifier regression:** assert `verified_insns` for `profile_cpu` stays under
   a checked-in ceiling.
