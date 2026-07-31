@@ -1,5 +1,7 @@
 # Changelog
 
+## v0.3.16
+
 ## v0.3.15
 
 ### Bug Fixes
