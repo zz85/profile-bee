@@ -196,6 +196,9 @@ impl SymbolFormatter {
                 | "handle_softirqs"
                 | "do_softirq"
                 | "run_ksoftirqd"
+                // aarch64: do_softirq_own_stack hands ____do_softirq to
+                // call_on_irq_stack as a signature-matching trampoline.
+                | "____do_softirq"
         )
     }
 
@@ -217,7 +220,19 @@ impl SymbolFormatter {
             "sysvec_thermal" => Some("interrupt:thermal_k"),
             "sysvec_error_interrupt" => Some("interrupt:error_k"),
             "sysvec_spurious_apic_interrupt" => Some("interrupt:spurious_k"),
-            "common_interrupt"
+            // aarch64 has no per-vector entry symbols the way x86 does — the EL1
+            // IRQ vector dispatches every interrupt through one path, so these
+            // can only yield the generic label.
+            "el1h_64_irq"
+            | "el1h_64_irq_handler"
+            | "el1_interrupt"
+            | "__el1_irq"
+            | "el0t_64_irq"
+            | "el0t_64_irq_handler"
+            | "el0_interrupt"
+            | "do_interrupt_handler"
+            | "gic_handle_irq"
+            | "common_interrupt"
             | "__common_interrupt"
             | "asm_common_interrupt"
             | "handle_irq_event"
@@ -225,10 +240,85 @@ impl SymbolFormatter {
             | "__handle_irq_event_percpu"
             | "handle_edge_irq"
             | "handle_level_irq"
+            | "handle_domain_irq"
             | "__handle_domain_irq"
             | "do_IRQ" => Some("interrupt_k"),
             _ => None,
         }
+    }
+
+    /// Interrupt *entry* trampolines — the frames the CPU passes through on its
+    /// way into an interrupt handler, before any handler work runs.
+    ///
+    /// These carry no work of their own, which is what makes them useful for
+    /// recognising a sample that landed on interrupt entry itself. See
+    /// [`Self::is_sampling_induced_interrupt`].
+    fn is_interrupt_entry_symbol(symbol: &str) -> bool {
+        matches!(
+            symbol,
+            // x86_64
+            "asm_sysvec_apic_timer_interrupt"
+                | "sysvec_apic_timer_interrupt"
+                | "local_apic_timer_interrupt"
+                | "asm_common_interrupt"
+                | "common_interrupt"
+                | "__common_interrupt"
+                | "asm_call_irq_on_stack"
+                | "error_entry"
+                | "error_return"
+                // aarch64 EL1 (kernel-mode) IRQ vector and its dispatch layer
+                | "el1h_64_irq"
+                | "el1h_64_irq_handler"
+                | "el1_interrupt"
+                | "__el1_irq"
+                | "call_on_irq_stack"
+                // architecture-neutral hardirq enter/exit
+                | "irq_enter_rcu"
+                | "irq_exit_rcu"
+                | "__irq_exit_rcu"
+                | "irq_exit"
+                | "do_softirq_own_stack"
+        )
+    }
+
+    /// Whether an interrupt classification at `entry_idx` is an artifact of the
+    /// profiler's own sampling rather than real interrupt work.
+    ///
+    /// `kernel_syms` is leaf-first, as returned by `bpf_get_stackid` — index 0 is
+    /// the innermost frame and larger indices walk out toward the root. Anything
+    /// the interrupt handler actually *did* therefore sits at indices strictly
+    /// below `entry_idx`.
+    ///
+    /// profile-bee samples via a perf timer interrupt, so on a timer tick the
+    /// interrupt entry trampoline appears in the captured stack unconditionally —
+    /// it is how the sample was taken, not something the workload was doing. The
+    /// kernel unwind begins at the interrupted context, so the sampler's own
+    /// frames (`perf_swevent_hrtimer`, `__perf_event_overflow`, `bpf_get_stackid`)
+    /// are never present to key off; the entry trampoline is the only trace it
+    /// leaves.
+    ///
+    /// The distinction that matters is whether the interrupt went on to do work.
+    /// When every frame deeper than the entry point is itself an entry trampoline,
+    /// the sample landed on bare interrupt entry and attributing it to
+    /// `interrupt:timer_k` would invent CPU time that the workload never spent.
+    /// When real frames sit beneath it, the interrupt did genuine work and the
+    /// label is earned.
+    ///
+    /// The frame at `entry_idx` must itself be an interrupt entry symbol — this
+    /// prevents dispatch functions (e.g. `gic_handle_irq`) that classify as
+    /// `interrupt_k` but are not entry trampolines from being suppressed when
+    /// they appear as the leaf frame (where the prefix `[..0]` is empty).
+    fn is_sampling_induced_interrupt(kernel_syms: &[StackFrameInfo], entry_idx: usize) -> bool {
+        // The classified frame itself must be an entry trampoline.
+        let dominated = Self::kernel_symbol_name(&kernel_syms[entry_idx])
+            .is_some_and(Self::is_interrupt_entry_symbol);
+        if !dominated {
+            return false;
+        }
+
+        kernel_syms[..entry_idx].iter().all(|frame| {
+            Self::kernel_symbol_name(frame).is_none_or(Self::is_interrupt_entry_symbol)
+        })
     }
 
     fn infer_kernel_context_label(kernel_syms: &[StackFrameInfo]) -> Option<&'static str> {
@@ -248,9 +338,16 @@ impl SymbolFormatter {
             }
         }
 
-        for frame in kernel_syms {
+        // Softirq work is checked first (above) because softirqs run nested inside
+        // interrupt exit, so a softirq stack also contains interrupt entry frames
+        // and the softirq label is the more specific of the two.
+        for (idx, frame) in kernel_syms.iter().enumerate() {
             if let Some(symbol) = Self::kernel_symbol_name(frame) {
                 if let Some(label) = Self::classify_interrupt_symbol(symbol) {
+                    if Self::is_sampling_induced_interrupt(kernel_syms, idx) {
+                        // Bare sampling-timer entry with no handler work beneath.
+                        return None;
+                    }
                     return Some(label);
                 }
             }
@@ -1043,13 +1140,201 @@ mod tests {
 
     #[test]
     fn test_infer_kernel_context_label_detects_interrupt() {
+        // Leaf-first: scheduler_tick is called *by* the timer interrupt, so it is
+        // the inner frame. (This test previously listed the two in the opposite
+        // order, which no real capture produces.)
         let frames = vec![
-            kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
             kernel_frame("scheduler_tick_k"),
+            kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
         ];
         assert_eq!(
             SymbolFormatter::infer_kernel_context_label(&frames),
             Some("interrupt:timer_k")
+        );
+    }
+
+    #[test]
+    fn test_bare_sampling_timer_entry_is_not_labeled_interrupt() {
+        // Leaf-first: the sample landed on interrupt entry itself, with nothing
+        // beneath it but more entry trampolines. This is the profiler's own timer
+        // tick, so labeling it interrupt:timer_k would invent CPU time.
+        let frames = vec![
+            kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
+            kernel_frame("default_idle_k"),
+            kernel_frame("default_idle_call_k"),
+            kernel_frame("cpuidle_idle_call_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
+    }
+
+    #[test]
+    fn test_sampling_entry_with_real_handler_work_is_still_labeled() {
+        // Same timer entry, but real handler work sits beneath it (leaf-first), so
+        // the interrupt genuinely consumed CPU and the label is earned.
+        let frames = vec![
+            kernel_frame("tick_sched_handle_k"),
+            kernel_frame("update_process_times_k"),
+            kernel_frame("sysvec_apic_timer_interrupt_k"),
+            kernel_frame("default_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("interrupt:timer_k")
+        );
+    }
+
+    #[test]
+    fn test_device_interrupt_work_is_unaffected() {
+        // A device IRQ doing real work must keep its label — the suppression is
+        // scoped to bare entry, not to interrupts generally.
+        let frames = vec![
+            kernel_frame("ena_io_poll_k"),
+            kernel_frame("handle_irq_event_k"),
+            kernel_frame("common_interrupt_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("interrupt_k")
+        );
+    }
+
+    #[test]
+    fn test_softirq_under_sampling_timer_entry_still_wins() {
+        // Real RCU softirq work nested inside timer-interrupt exit. Softirq is
+        // checked first, so this keeps its specific label and never reaches the
+        // sampling-induced check. This is the common shape on a live system.
+        let frames = vec![
+            kernel_frame("kmem_cache_free_k"),
+            kernel_frame("rcu_do_batch_k"),
+            kernel_frame("rcu_core_k"),
+            kernel_frame("__do_softirq_k"),
+            kernel_frame("asm_call_irq_on_stack_k"),
+            kernel_frame("do_softirq_own_stack_k"),
+            kernel_frame("irq_exit_rcu_k"),
+            kernel_frame("sysvec_apic_timer_interrupt_k"),
+            kernel_frame("default_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("softirq_k")
+        );
+    }
+
+    #[test]
+    fn test_unresolved_frames_above_entry_do_not_earn_a_label() {
+        // Unsymbolized frames ([unknown], no _k suffix) carry no evidence of work,
+        // so they must not be mistaken for real handler activity.
+        let frames = vec![
+            StackFrameInfo {
+                symbol: Some("[unknown]".to_string()),
+                ..Default::default()
+            },
+            kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
+            kernel_frame("default_idle_k"),
+        ];
+        assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
+    }
+
+    #[test]
+    fn test_arm64_idle_net_rx_softirq_stack() {
+        // Real aarch64 capture (leaf-first). Reaches the specific softirq label via
+        // net_rx_action, which is architecture-neutral generic code.
+        let frames = vec![
+            kernel_frame("napi_alloc_skb_k"),
+            kernel_frame("ena_alloc_skb_k"),
+            kernel_frame("ena_rx_skb_k"),
+            kernel_frame("ena_clean_rx_irq_k"),
+            kernel_frame("ena_io_poll_k"),
+            kernel_frame("__napi_poll_k"),
+            kernel_frame("net_rx_action_k"),
+            kernel_frame("handle_softirqs_k"),
+            kernel_frame("__do_softirq_k"),
+            kernel_frame("____do_softirq_k"),
+            kernel_frame("call_on_irq_stack_k"),
+            kernel_frame("do_softirq_own_stack_k"),
+            kernel_frame("__irq_exit_rcu_k"),
+            kernel_frame("irq_exit_rcu_k"),
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("el1h_64_irq_handler_k"),
+            kernel_frame("el1h_64_irq_k"),
+            kernel_frame("default_idle_call_k"),
+            kernel_frame("cpuidle_idle_call_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("softirq:net_rx_k")
+        );
+    }
+
+    #[test]
+    fn test_arm64_generic_softirq_via_arch_trampoline() {
+        // ____do_softirq is arm64's stack-switching trampoline. Without it in the
+        // generic-softirq list, this stack would fall through to no label at all.
+        let frames = vec![
+            kernel_frame("some_unlisted_handler_k"),
+            kernel_frame("____do_softirq_k"),
+            kernel_frame("do_softirq_own_stack_k"),
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("softirq_k")
+        );
+    }
+
+    #[test]
+    fn test_arm64_device_irq_work_is_labeled() {
+        // An aarch64 device IRQ doing real work, no softirq involved. Before the
+        // arm64 symbols were added this matched nothing and fell through to "idle".
+        let frames = vec![
+            kernel_frame("ena_intr_msix_io_k"),
+            kernel_frame("__handle_irq_event_percpu_k"),
+            kernel_frame("handle_irq_event_k"),
+            kernel_frame("gic_handle_irq_k"),
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("el1h_64_irq_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("interrupt_k")
+        );
+    }
+
+    #[test]
+    fn test_arm64_bare_irq_entry_is_not_labeled_interrupt() {
+        // aarch64 counterpart of the sampling-timer guard: bare EL1 IRQ entry with
+        // no handler work beneath it earns no label.
+        let frames = vec![
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("el1h_64_irq_handler_k"),
+            kernel_frame("el1h_64_irq_k"),
+            kernel_frame("default_idle_call_k"),
+            kernel_frame("cpuidle_idle_call_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
+    }
+
+    #[test]
+    fn test_leaf_dispatch_symbol_not_suppressed_by_empty_prefix() {
+        // gic_handle_irq is a real dispatch function (classifies as interrupt_k)
+        // but is NOT an interrupt entry trampoline. When it appears as the leaf
+        // frame (idx=0), the empty prefix [..0] must NOT trigger the
+        // sampling-induced suppression — the frame is doing real work.
+        let frames = vec![
+            kernel_frame("gic_handle_irq_k"),
+            kernel_frame("el1_interrupt_k"),
+            kernel_frame("el1h_64_irq_handler_k"),
+            kernel_frame("el1h_64_irq_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(
+            SymbolFormatter::infer_kernel_context_label(&frames),
+            Some("interrupt_k")
         );
     }
 

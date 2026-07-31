@@ -1,10 +1,13 @@
 # Changelog
 
+## v0.3.16
+
 ## v0.3.15
 
 ### Bug Fixes
 
 - **Fix idle-CPU softirq/interrupt attribution** — samples taken while the CPU is idle (tgid==0) but executing softirq or interrupt work were previously mislabeled as "idle". The kernel stack is now symbolized and checked for softirq/interrupt context before falling back to the idle label. This means `net_rx_action`, timer softirqs, and hardware interrupts running on idle CPUs now show their real kernel stack traces in flamegraphs instead of being hidden in the "idle" bucket.
+- **Don't attribute the profiler's own sampling timer to interrupt work** — profile-bee samples via a perf timer interrupt, so the interrupt entry trampoline appears in a captured stack whenever the sample lands on a timer tick, whether or not the interrupt did anything. Stacks whose only interrupt frames are bare entry trampolines are no longer labeled `interrupt:timer_k`, so the profiler no longer reports CPU time for the act of measuring. Interrupts that go on to do real work, and softirqs nested inside interrupt exit, keep their labels.
 
 ## v0.3.14
 

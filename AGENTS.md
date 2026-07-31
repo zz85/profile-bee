@@ -330,5 +330,6 @@ sudo tests/run_e2e.sh --filter dwarf
 | `docs/dwarf_correctness_issues.md` | Fixed and open DWARF correctness issues |
 | `docs/dwarf_unwinding_literature_and_improvements.md` | Comparison with parca-agent, OTel profiler, async-profiler |
 | `docs/kprobe_tracepoint_examples.md` | Example kprobe and tracepoint commands |
+| `docs/preempt_count_context_detection.md` | Plan: replace symbol-matching context inference with preempt_count |
 | `docs/NEXT_STEPS.md` | Feature roadmap |
 | `CHANGELOG.md` | Release notes |
