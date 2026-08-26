@@ -40,6 +40,7 @@ pub mod proto {
             }
             pub mod collector {
                 pub mod profiles {
+                    #[allow(clippy::result_large_err)]
                     pub mod v1development {
                         tonic::include_proto!(
                             "opentelemetry.proto.collector.profiles.v1development"
