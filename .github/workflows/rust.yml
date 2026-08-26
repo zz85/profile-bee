@@ -38,7 +38,7 @@ jobs:
       - name: Install LLVM
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm clang
+          sudo apt-get install -y llvm-dev clang
       - name: Install bpf-linker
         run: cargo install bpf-linker
       - uses: Swatinem/rust-cache@v2
@@ -63,7 +63,7 @@ jobs:
       - name: Install LLVM
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm clang
+          sudo apt-get install -y llvm-dev clang
       - name: Install bpf-linker
         run: cargo install bpf-linker
       - uses: Swatinem/rust-cache@v2
@@ -91,7 +91,7 @@ jobs:
       - name: Install LLVM
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm clang
+          sudo apt-get install -y llvm-dev clang
       - name: Install bpf-linker
         run: cargo install bpf-linker
       - uses: Swatinem/rust-cache@v2
