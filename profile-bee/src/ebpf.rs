@@ -124,6 +124,91 @@ pub struct ProfilerConfig {
     pub max_block_us: u64,
 }
 
+/// Values injected into the eBPF `PREEMPT_*` globals for execution-context
+/// detection, derived from the resolved [`crate::kernel_layout::KernelLayout`]
+/// and the profiler configuration.
+struct PreemptGlobals {
+    mode: u8,
+    percpu_offset_array: u64,
+    percpu_var_offset: u64,
+    task_byte_offset: u32,
+    /// Hardirq levels contributed by the profiler's own sampling interrupt.
+    self_hardirq: u8,
+    self_nmi: u8,
+    self_softirq: u8,
+}
+
+impl PreemptGlobals {
+    fn from_layout(layout: &crate::kernel_layout::KernelLayout, config: &ProfilerConfig) -> Self {
+        use crate::kernel_layout::PreemptSource;
+
+        let (mode, percpu_offset_array, percpu_var_offset, task_byte_offset) = match &layout.preempt
+        {
+            PreemptSource::PerCpu {
+                per_cpu_offset_array,
+                var_offset,
+            } => (1u8, *per_cpu_offset_array, *var_offset, 0u32),
+            PreemptSource::TaskStruct { byte_offset } => (2u8, 0, 0, *byte_offset),
+            PreemptSource::Unavailable(_) => (0u8, 0, 0, 0),
+        };
+
+        // The perf software-clock hrtimer runs inside the APIC timer hardirq, so
+        // that sampling path contributes +1 hardirq level that must be subtracted.
+        // Only the default perf_event `profile_cpu` path samples that way; kprobe/
+        // uprobe/tracepoint/raw_tp/off-cpu programs do not (they don't set
+        // `context` at all, so the value is moot there, but keep it 0).
+        let is_perf_event_path = config.kprobe.is_none()
+            && config.uprobe.is_none()
+            && config.smart_uprobe.is_none()
+            && config.tracepoint.is_none()
+            && config.raw_tracepoint.is_none()
+            && config.raw_tracepoint_task_regs.is_none()
+            && config.raw_tracepoint_generic.is_none()
+            && !config.off_cpu;
+
+        let self_hardirq = if is_perf_event_path && mode != 0 {
+            1
+        } else {
+            0
+        };
+
+        PreemptGlobals {
+            mode,
+            percpu_offset_array,
+            percpu_var_offset,
+            task_byte_offset,
+            self_hardirq,
+            self_nmi: 0,
+            self_softirq: 0,
+        }
+    }
+
+    fn log(&self, layout: &crate::kernel_layout::KernelLayout) {
+        use crate::kernel_layout::PreemptSource;
+        match &layout.preempt {
+            PreemptSource::Unavailable(reason) => {
+                tracing::info!(
+                    "preempt_count context detection disabled: {} (falling back to symbol heuristics)",
+                    reason
+                );
+            }
+            _ => {
+                tracing::info!(
+                    "preempt_count context detection enabled (mode={}, self_hardirq={}, softirq_bits_valid={}{})",
+                    self.mode,
+                    self.self_hardirq,
+                    layout.softirq_bits_valid,
+                    if layout.is_preempt_rt {
+                        ", PREEMPT_RT: softirq from symbol heuristics"
+                    } else {
+                        ""
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Creates an aya Ebpf object
 pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
     // The eBPF object file is selected by build.rs: it uses a freshly-built
@@ -136,6 +221,14 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
     let off_cpu_enabled = if config.off_cpu { 1u8 } else { 0u8 };
     let target_syscall_nr: i64 = config.target_syscall_nr;
 
+    // preempt_count-based execution-context detection. Resolve the kernel layout
+    // in userspace and inject the offsets as globals; the eBPF side does the
+    // reads. On any failure the layout is Unavailable → mode 0 → the eBPF side
+    // reports EXEC_CTX_UNKNOWN and userspace falls back to symbol heuristics.
+    let layout = crate::kernel_layout::detect_cached();
+    let preempt = PreemptGlobals::from_layout(layout, config);
+    preempt.log(layout);
+
     let bpf = EbpfLoader::new()
         .override_global("SKIP_IDLE", &skip_idle, true)
         .override_global("NOTIFY_TYPE", &config.stream_mode, true)
@@ -144,6 +237,21 @@ pub fn load_ebpf(config: &ProfilerConfig) -> Result<Ebpf, anyhow::Error> {
         .override_global("OFF_CPU_ENABLED", &off_cpu_enabled, true)
         .override_global("MIN_BLOCK_US", &config.min_block_us, true)
         .override_global("MAX_BLOCK_US", &config.max_block_us, true)
+        .override_global("PREEMPT_CTX_MODE", &preempt.mode, true)
+        .override_global(
+            "PREEMPT_PERCPU_OFFSET_ARRAY",
+            &preempt.percpu_offset_array,
+            true,
+        )
+        .override_global(
+            "PREEMPT_PERCPU_VAR_OFFSET",
+            &preempt.percpu_var_offset,
+            true,
+        )
+        .override_global("PREEMPT_TASK_BYTE_OFFSET", &preempt.task_byte_offset, true)
+        .override_global("PREEMPT_SELF_HARDIRQ", &preempt.self_hardirq, true)
+        .override_global("PREEMPT_SELF_NMI", &preempt.self_nmi, true)
+        .override_global("PREEMPT_SELF_SOFTIRQ", &preempt.self_softirq, true)
         .btf(Btf::from_sys_fs().ok().as_ref())
         .load(data)
         .map_err(|e| {

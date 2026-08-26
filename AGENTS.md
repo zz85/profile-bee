@@ -58,6 +58,7 @@ src/
   lib.rs                    Re-exports; declares modules
   ebpf.rs                   EbpfProfiler: load/attach eBPF, map I/O, DWARF table loading
   dwarf_unwind.rs           DwarfUnwindManager: .eh_frame → UnwindEntry tables → eBPF shards
+  kernel_layout.rs          preempt_count layout detection (BTF reader + kallsyms) for exec-context
   trace_handler.rs          TraceHandler: address → symbol resolution (blazesym), caching
   types.rs                  StackFrameInfo, FrameCount, StackInfoExt trait
   cache.rs                  ProcessCache, AddrCache, PointerStackFramesCache (LRU-style)
@@ -330,6 +331,5 @@ sudo tests/run_e2e.sh --filter dwarf
 | `docs/dwarf_correctness_issues.md` | Fixed and open DWARF correctness issues |
 | `docs/dwarf_unwinding_literature_and_improvements.md` | Comparison with parca-agent, OTel profiler, async-profiler |
 | `docs/kprobe_tracepoint_examples.md` | Example kprobe and tracepoint commands |
-| `docs/preempt_count_context_detection.md` | Plan: replace symbol-matching context inference with preempt_count |
 | `docs/NEXT_STEPS.md` | Feature roadmap |
 | `CHANGELOG.md` | Release notes |
