@@ -294,28 +294,50 @@ fn uname_version() -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Minimal `/proc/kallsyms` reader: symbol name → address.
+///
+/// `/proc/kallsyms` has 100k+ lines but only two symbols are ever needed
+/// (`__per_cpu_offset`, `__preempt_count`), so `load` streams the file and
+/// retains only those rather than buffering the whole file and every symbol.
 struct Kallsyms {
     map: std::collections::HashMap<String, u64>,
 }
 
+/// The only symbols the layout resolver looks up. Streaming `load` keeps just
+/// these; other consumers should extend this list rather than retaining all.
+const WANTED_SYMBOLS: [&str; 2] = ["__per_cpu_offset", "__preempt_count"];
+
 impl Kallsyms {
     fn load() -> std::io::Result<Self> {
-        let text = fs::read_to_string("/proc/kallsyms")?;
-        Ok(Self::parse(&text))
+        use std::io::BufRead;
+        let file = fs::File::open("/proc/kallsyms")?;
+        let mut map = std::collections::HashMap::new();
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
+            if let Some((name, addr)) = Self::parse_line(&line) {
+                if WANTED_SYMBOLS.contains(&name) {
+                    // First definition wins; kernel symbols are unique enough
+                    // for the two names we care about.
+                    map.entry(name.to_string()).or_insert(addr);
+                }
+            }
+        }
+        Ok(Kallsyms { map })
     }
 
+    /// Parse one `/proc/kallsyms` line into `(name, address)`.
+    /// Format: "<hex addr> <type> <name>[\t<module>]".
+    fn parse_line(line: &str) -> Option<(&str, u64)> {
+        let mut parts = line.split_whitespace();
+        let (addr, _ty, name) = (parts.next()?, parts.next()?, parts.next()?);
+        let addr = u64::from_str_radix(addr, 16).ok()?;
+        Some((name, addr))
+    }
+
+    #[cfg(test)]
     fn parse(text: &str) -> Self {
         let mut map = std::collections::HashMap::new();
         for line in text.lines() {
-            // Format: "<hex addr> <type> <name>[\t<module>]"
-            let mut parts = line.split_whitespace();
-            let (Some(addr), Some(_ty), Some(name)) = (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            if let Ok(addr) = u64::from_str_radix(addr, 16) {
-                // First definition wins; kernel symbols are unique enough for
-                // the two names we care about.
+            if let Some((name, addr)) = Self::parse_line(line) {
                 map.entry(name.to_string()).or_insert(addr);
             }
         }
@@ -358,10 +380,13 @@ const BTF_KIND_ENUM64: u32 = 19;
 struct BtfMember {
     name_off: u32,
     type_id: u32,
-    /// For non-bitfield structs this is a bit offset; the caller divides by 8.
-    /// For bitfield structs the low 24 bits are the bit offset.
+    /// Bit offset of the member from the start of the composite; the caller
+    /// divides by 8. For a `kind_flag` struct this is the low 24 bits of the
+    /// encoded offset word (the high 8 bitfield-size bits are stripped at parse).
     offset: u32,
-    /// True if the containing struct uses the bitfield encoding (kind_flag).
+    /// True only for an actual bitfield (a `kind_flag` struct member whose
+    /// encoded size is nonzero). Normal members of a `kind_flag` struct — size
+    /// zero — are not bitfields.
     bitfield: bool,
 }
 
@@ -459,11 +484,23 @@ impl Btf {
                         if base + 12 > buf.len() {
                             return Err("truncated BTF member".into());
                         }
+                        // For a `kind_flag` struct the offset word packs the
+                        // bitfield size in the high 8 bits and the bit offset in
+                        // the low 24. A member with size 0 is a *normal* field
+                        // (only its bit offset is meaningful); a nonzero size
+                        // marks an actual bitfield. Without kind_flag the whole
+                        // word is the bit offset.
+                        let raw_off = rd32(buf, base + 8);
+                        let (offset, bitfield) = if kind_flag {
+                            (raw_off & 0x00ff_ffff, (raw_off >> 24) != 0)
+                        } else {
+                            (raw_off, false)
+                        };
                         members.push(BtfMember {
                             name_off: rd32(buf, base),
                             type_id: rd32(buf, base + 4),
-                            offset: rd32(buf, base + 8),
-                            bitfield: kind_flag,
+                            offset,
+                            bitfield,
                         });
                     }
                     consumed += vlen as usize * 12;
@@ -886,17 +923,42 @@ mod tests {
         b.int(n_int); // id 1
         let n_s = b.str("bitty");
         let m_x = b.str("x");
-        // Manually emit a bitfield struct (kind_flag = true).
+        // Manually emit a kind_flag struct with an actual bitfield member:
+        // the offset word packs bitfield size in the high 8 bits (nonzero => a
+        // real bitfield) and the bit offset in the low 24 bits (here zero).
         b.push32(n_s);
         b.push32(BtfBuilder::info(BTF_KIND_STRUCT, 1, true));
         b.push32(4);
         b.push32(m_x);
         b.push32(1);
-        b.push32(0);
+        b.push32(4 << 24); // size=4 bits, bit offset=0 => bitfield
         let blob = b.build();
 
         let btf = Btf::parse(&blob).expect("parse");
         assert_eq!(btf.member_offset("bitty", "x"), None);
+    }
+
+    #[test]
+    fn member_offset_normal_member_in_kind_flag_struct() {
+        // A kind_flag struct may still contain normal (non-bitfield) members:
+        // encoded size 0 means the offset word is a plain bit offset. Such a
+        // member must resolve, not be refused.
+        let mut b = BtfBuilder::new();
+        let n_int = b.str("int");
+        b.int(n_int); // id 1
+        let n_s = b.str("mixed");
+        let m_y = b.str("y");
+        // kind_flag struct, one member at bit offset 64 (byte 8), size 0.
+        b.push32(n_s);
+        b.push32(BtfBuilder::info(BTF_KIND_STRUCT, 1, true));
+        b.push32(16);
+        b.push32(m_y);
+        b.push32(1);
+        b.push32(64); // size=0, bit offset=64 => normal member
+        let blob = b.build();
+
+        let btf = Btf::parse(&blob).expect("parse");
+        assert_eq!(btf.member_offset("mixed", "y"), Some(8));
     }
 
     #[test]
