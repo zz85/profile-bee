@@ -2,6 +2,12 @@
 
 ## v0.3.16
 
+### Improvements
+
+- **preempt_count-based execution context detection** — each sample's execution context (task/softirq/hardirq/NMI) is now classified from the kernel's canonical `preempt_count` instead of matching kernel symbol names. Since the kernel exposes no BPF helper for `preempt_count`, userspace resolves the necessary offsets (via BTF and kallsyms) and injects them into eBPF as globals; the eBPF side reads them with `bpf_probe_read_kernel` and normalizes the result, subtracting the profiler's own sampling-timer interrupt so it is not misattributed to hardirq/NMI. Off by default, enabled automatically at load when the layout resolves; degrades gracefully to the previous symbol heuristics when the layout is unresolvable (e.g. non-root, `kptr_restrict`). Resolver supports x86_64 (per-CPU `__preempt_count`) and aarch64 (`task_struct` field).
+- **Robust BTF member decoding** — fixed `kind_flag` struct/union member offset decoding so normal (non-bitfield) members are no longer misclassified as bitfields with corrupted offsets.
+- **Streaming kallsyms parsing** — `/proc/kallsyms` (100k+ lines) is now streamed, retaining only the symbols the resolver needs instead of buffering the entire file into a HashMap.
+
 ## v0.3.15
 
 ### Bug Fixes
