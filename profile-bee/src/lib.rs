@@ -8,6 +8,7 @@ pub mod codeguru_upload;
 pub mod ebpf;
 pub mod event_loop;
 pub mod html;
+pub mod kernel_layout;
 pub mod process_metadata;
 pub mod session;
 pub mod spawn;

@@ -243,6 +243,12 @@ struct Opt {
     #[arg(long)]
     list_probes: Option<String>,
 
+    /// [hidden] Print the resolved kernel preempt_count layout and exit. Runs
+    /// the userspace layout detection with zero eBPF risk — useful for
+    /// validating context detection on a new kernel/architecture.
+    #[arg(long, hide = true)]
+    print_kernel_layout: bool,
+
     /// [hidden] tracepoint (use -e tracepoint:<cat:name> instead)
     #[arg(long, hide = true)]
     tracepoint: Option<String>,
@@ -377,6 +383,8 @@ impl Opt {
             || !self.uprobe.is_empty()
             || self.tracepoint.is_some()
             || self.list_probes.is_some()
+            // Debug/discovery flags
+            || self.print_kernel_layout
             // Explicit time means the user wants to profile
             || self.time.is_some()
             // Off-CPU profiling mode
@@ -543,6 +551,25 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // Handle --list-probes discovery mode (print and exit)
     if let Some(ref probe_str) = opt.list_probes {
         return handle_list_probes(probe_str, opt.pid, opt.uprobe_pid);
+    }
+
+    // Handle --print-kernel-layout (print resolved preempt_count layout and exit)
+    if opt.print_kernel_layout {
+        // detect_cached honors PROBEE_DISABLE_PREEMPT_CTX, so this previews
+        // exactly what the loader will inject.
+        let layout = profile_bee::kernel_layout::detect_cached();
+        println!("Kernel preempt_count layout:");
+        println!("  mode:              {}", layout.mode());
+        println!("  preempt source:    {:?}", layout.preempt);
+        println!("  softirq_bits_valid: {}", layout.softirq_bits_valid);
+        println!("  is_preempt_rt:     {}", layout.is_preempt_rt);
+        if layout.mode() == 0 {
+            println!(
+                "  note: context detection will fall back to symbol heuristics \
+                 (root + kptr_restrict != 2 required on x86_64)"
+            );
+        }
+        return Ok(());
     }
 
     // profile_bee::load(&opt.cmd.unwrap()).unwrap();

@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 use core::mem::size_of;
 
@@ -18,10 +18,82 @@ pub struct StackInfo {
     pub bp: u64,
     pub ip: u64,
     pub sp: u64,
+    /// Normalized execution context of the sampled code: one of the `EXEC_CTX_*`
+    /// constants. Derived in eBPF from `preempt_count` (see `normalize_exec_context`)
+    /// when the kernel layout is available, otherwise `EXEC_CTX_UNKNOWN`.
+    ///
+    /// Stored `u32` rather than `u8` to keep the struct layout explicit and free
+    /// of implicit padding — `StackInfo` is used as a raw-byte BPF hash map key.
+    pub context: u32,
+    /// MUST always be 0. This struct is a BPF hash map key compared as raw bytes;
+    /// a nonzero or uninitialized value would create phantom keys and lookup
+    /// misses. Present only to keep the layout padding-free (size 64, align 8).
+    pub _reserved: u32,
 }
 
 impl StackInfo {
     pub const STRUCT_SIZE: usize = size_of::<StackInfo>();
+}
+
+/// Normalized execution context stored in [`StackInfo::context`].
+///
+/// `EXEC_CTX_UNKNOWN` means the kernel `preempt_count` layout was unavailable
+/// (or a read failed) and userspace should fall back to symbol heuristics.
+pub const EXEC_CTX_UNKNOWN: u32 = 0;
+pub const EXEC_CTX_TASK: u32 = 1;
+pub const EXEC_CTX_SOFTIRQ: u32 = 2;
+pub const EXEC_CTX_HARDIRQ: u32 = 3;
+pub const EXEC_CTX_NMI: u32 = 4;
+
+/// Normalize a raw `preempt_count` value into one of the `EXEC_CTX_*` constants.
+///
+/// `preempt_count` layout (`include/linux/preempt.h`):
+/// ```text
+/// PREEMPT  bits 0..8    mask 0x000000ff
+/// SOFTIRQ  bits 8..16   mask 0x0000ff00
+/// HARDIRQ  bits 16..20  mask 0x000f0000
+/// NMI      bits 20..24  mask 0x00f00000
+/// ```
+///
+/// `interrupt_context_level()` picks the highest active level. Softirq uses
+/// **bit 8 only** (`SOFTIRQ_OFFSET`, i.e. `in_serving_softirq()`): masking the
+/// whole softirq field would misclassify every `spin_lock_bh()` / `local_bh_disable()`
+/// section as a softirq.
+///
+/// `self_*` are the levels contributed by the profiler's own sampling interrupt
+/// (see the sampling-interrupt problem in the design notes): they are subtracted
+/// off so the profiler's own timer tick is not reported as hardirq/NMI. Genuine
+/// nesting only *adds* levels, so `saturating_sub` keeps a real nested hardirq
+/// (`hardirq_count() >= 2` with `self_hardirq == 1`) classified as hardirq.
+///
+/// This is a pure function in `#![no_std]`-compatible code so both the eBPF and
+/// userspace sides (and unit tests) share exactly one implementation.
+#[inline(always)]
+pub fn normalize_exec_context(
+    raw: u32,
+    self_nmi: u32,
+    self_hardirq: u32,
+    self_softirq: u32,
+) -> u32 {
+    // x86 stores PREEMPT_NEED_RESCHED (0x80000000, inverted) inside __preempt_count;
+    // callers that read x86 __preempt_count must mask it before calling. We defensively
+    // ignore the top byte here too — no valid preempt_count sets bits 24..32.
+    let raw = raw & 0x00ff_ffff;
+
+    let nmi = ((raw & 0x00f0_0000) >> 20).saturating_sub(self_nmi);
+    let hardirq = ((raw & 0x000f_0000) >> 16).saturating_sub(self_hardirq);
+    // Bit 8 only — "serving softirq", not merely "BH disabled".
+    let softirq_serving = (raw & 0x0000_0100) != 0 && self_softirq == 0;
+
+    if nmi > 0 {
+        EXEC_CTX_NMI
+    } else if hardirq > 0 {
+        EXEC_CTX_HARDIRQ
+    } else if softirq_serving {
+        EXEC_CTX_SOFTIRQ
+    } else {
+        EXEC_CTX_TASK
+    }
 }
 
 pub static EVENT_TRACE_ALWAYS: u8 = 1;
@@ -328,10 +400,113 @@ pub struct DwarfUnwindState {
     /// Saved CPU ID (for finalization)
     pub cpu: u32,
     pub _pad2: u32,
+    /// Reserved. Originally intended to thread the normalized execution context
+    /// through the tail-call chain, but the finalizers read `preempt_count`
+    /// directly instead (threading it from `collect_trace` forked verifier state
+    /// through the FP-walk loop and blew the instruction limit). Kept for layout
+    /// stability; tail calls preserve interrupt context so the direct read is
+    /// equivalent.
+    pub context: u32,
+    pub _pad3: u32,
     /// V8 SharedFunctionInfo tagged pointers extracted during FP+V8 tail-call
     /// walking. Parallel to `pointers[0..MAX_V8_FRAMES]`. Zero means "not a
     /// V8 frame" or "beyond V8 extraction limit".
     /// Only used by the FP+V8 step program (PROG_ARRAY index 1); the DWARF
     /// step program (index 0) ignores this field.
     pub v8_sfi: [u64; MAX_V8_FRAMES],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::{align_of, size_of};
+
+    #[test]
+    fn stack_info_layout_is_padding_free() {
+        // StackInfo is a raw-byte BPF hash map key. Implicit padding would carry
+        // uninitialized stack bytes on the eBPF side, producing phantom keys.
+        // Guard the property: sum of field sizes must equal size_of.
+        let field_sum = size_of::<u32>()      // tgid
+            + size_of::<i32>()                // user_stack_id
+            + size_of::<i32>()                // kernel_stack_id
+            + size_of::<[u8; 16]>()           // cmd
+            + size_of::<u32>()                // cpu
+            + size_of::<u64>()                // bp
+            + size_of::<u64>()                // ip
+            + size_of::<u64>()                // sp
+            + size_of::<u32>()                // context
+            + size_of::<u32>(); // _reserved
+        assert_eq!(size_of::<StackInfo>(), 64);
+        assert_eq!(align_of::<StackInfo>(), 8);
+        assert_eq!(
+            field_sum,
+            size_of::<StackInfo>(),
+            "StackInfo has implicit padding"
+        );
+    }
+
+    #[test]
+    fn normalize_task_context() {
+        // Plain task context.
+        assert_eq!(normalize_exec_context(0, 0, 0, 0), EXEC_CTX_TASK);
+        // PREEMPT depth (preempt_disable/rcu_read_lock) is still task context.
+        assert_eq!(normalize_exec_context(0x0000_0005, 0, 0, 0), EXEC_CTX_TASK);
+        // x86 need-resched bit set with PREEMPT depth 5 — masked, still task.
+        assert_eq!(normalize_exec_context(0x8000_0005, 0, 0, 0), EXEC_CTX_TASK);
+    }
+
+    #[test]
+    fn normalize_softirq_bit8_only() {
+        // Bit 8 set = serving a softirq.
+        assert_eq!(
+            normalize_exec_context(0x0000_0100, 0, 0, 0),
+            EXEC_CTX_SOFTIRQ
+        );
+        // Only BH disabled (SOFTIRQ_DISABLE_OFFSET = 2<<8, bit 9) — NOT serving.
+        assert_eq!(normalize_exec_context(0x0000_0200, 0, 0, 0), EXEC_CTX_TASK);
+        // BH disabled AND serving (bit 8 set) — softirq.
+        assert_eq!(
+            normalize_exec_context(0x0000_0300, 0, 0, 0),
+            EXEC_CTX_SOFTIRQ
+        );
+    }
+
+    #[test]
+    fn normalize_hardirq_self_subtraction() {
+        // Single hardirq level attributable to the sampling interrupt -> task.
+        assert_eq!(normalize_exec_context(0x0001_0000, 0, 1, 0), EXEC_CTX_TASK);
+        // Nested hardirq (count 2) with self=1 -> genuine hardirq.
+        assert_eq!(
+            normalize_exec_context(0x0002_0000, 0, 1, 0),
+            EXEC_CTX_HARDIRQ
+        );
+        // Without self-subtraction, one hardirq level is hardirq.
+        assert_eq!(
+            normalize_exec_context(0x0001_0000, 0, 0, 0),
+            EXEC_CTX_HARDIRQ
+        );
+    }
+
+    #[test]
+    fn normalize_nmi_self_subtraction() {
+        assert_eq!(normalize_exec_context(0x0010_0000, 1, 0, 0), EXEC_CTX_TASK);
+        assert_eq!(normalize_exec_context(0x0020_0000, 1, 0, 0), EXEC_CTX_NMI);
+    }
+
+    #[test]
+    fn normalize_softirq_self_suppression() {
+        // Sampling hrtimer ran from the timer softirq: bit 8 attributable to self.
+        assert_eq!(normalize_exec_context(0x0000_0100, 0, 0, 1), EXEC_CTX_TASK);
+    }
+
+    #[test]
+    fn normalize_highest_level_wins() {
+        // NMI dominates hardirq and softirq. Top byte (need-resched) masked off.
+        assert_eq!(normalize_exec_context(0x8010_0100, 0, 0, 0), EXEC_CTX_NMI);
+        // Hardirq dominates softirq.
+        assert_eq!(
+            normalize_exec_context(0x0001_0100, 0, 0, 0),
+            EXEC_CTX_HARDIRQ
+        );
+    }
 }

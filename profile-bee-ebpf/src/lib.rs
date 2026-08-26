@@ -19,12 +19,12 @@ use aya_ebpf::{
 
 // use aya_log_ebpf::info;
 use profile_bee_common::{
-    DwarfUnwindState, ExecMapping, ExecMappingKey, FramePointers, StackInfo, UnwindEntry,
-    V8ProcInfo, CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP, EVENT_TRACE_ALWAYS,
-    EXEC_MAPPING_KEY_BITS, FRAMES_PER_TAIL_CALL, LEGACY_MAX_DWARF_STACK_DEPTH,
-    MAX_BIN_SEARCH_DEPTH, MAX_DWARF_STACK_DEPTH, MAX_EXEC_MAPPING_ENTRIES, MAX_SHARD_ENTRIES,
-    MAX_UNWIND_SHARDS, MAX_V8_FRAMES, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, SHARD_NONE,
-    V8_FP_CONTEXT_SIZE,
+    normalize_exec_context, DwarfUnwindState, ExecMapping, ExecMappingKey, FramePointers,
+    StackInfo, UnwindEntry, V8ProcInfo, CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP,
+    EVENT_TRACE_ALWAYS, EXEC_CTX_UNKNOWN, EXEC_MAPPING_KEY_BITS, FRAMES_PER_TAIL_CALL,
+    LEGACY_MAX_DWARF_STACK_DEPTH, MAX_BIN_SEARCH_DEPTH, MAX_DWARF_STACK_DEPTH,
+    MAX_EXEC_MAPPING_ENTRIES, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, MAX_V8_FRAMES, REG_RULE_OFFSET,
+    REG_RULE_SAME_VALUE, SHARD_NONE, V8_FP_CONTEXT_SIZE,
 };
 
 // Force LLVM to retain the full type definition of UnwindEntry during LTO.
@@ -77,6 +77,44 @@ static MAX_BLOCK_US: u64 = 0xFFFFFFFFFFFFFFFF;
 #[no_mangle]
 static TARGET_SYSCALL_NR: i64 = -1;
 
+/* preempt_count-based execution context detection.
+ *
+ * All resolved by userspace (see profile-bee/src/kernel_layout.rs) and injected
+ * via override_global. When PREEMPT_CTX_MODE == 0 the feature is disabled and
+ * current_exec_context() returns EXEC_CTX_UNKNOWN without any reads. */
+
+/// 0 = disabled, 1 = x86 per-CPU var, 2 = arm64 task_struct field.
+#[no_mangle]
+static PREEMPT_CTX_MODE: u8 = 0;
+
+/// x86 mode: absolute kernel address of the `__per_cpu_offset[]` array.
+#[no_mangle]
+static PREEMPT_PERCPU_OFFSET_ARRAY: u64 = 0;
+
+/// x86 mode: per-CPU section offset of `__preempt_count`.
+#[no_mangle]
+static PREEMPT_PERCPU_VAR_OFFSET: u64 = 0;
+
+/// arm64 mode: byte offset of `preempt_count` from the task pointer.
+#[no_mangle]
+static PREEMPT_TASK_BYTE_OFFSET: u32 = 0;
+
+/// Hardirq levels contributed by the profiler's own sampling interrupt.
+/// The perf software-clock hrtimer usually fires inside the APIC timer hardirq,
+/// so this defaults to 1 for the perf_event path (set by userspace).
+#[no_mangle]
+static PREEMPT_SELF_HARDIRQ: u8 = 0;
+
+/// NMI levels contributed by the profiler's own sampling interrupt
+/// (nonzero only if sampling via a hardware PMU event).
+#[no_mangle]
+static PREEMPT_SELF_NMI: u8 = 0;
+
+/// Softirq "serving" bit contributed by the profiler's own sampling interrupt
+/// (nonzero only when the sampling hrtimer runs from the timer softirq).
+#[no_mangle]
+static PREEMPT_SELF_SOFTIRQ: u8 = 0;
+
 /// Target PID to profile (0 = profile all processes)
 /// Stored in an Array map so userspace can update it after process spawn.
 #[map(name = "target_pid_map")]
@@ -122,6 +160,72 @@ unsafe fn min_block_us() -> u64 {
 #[inline]
 unsafe fn max_block_us() -> u64 {
     core::ptr::read_volatile(&MAX_BLOCK_US)
+}
+
+/// Normalized execution context (`EXEC_CTX_*`) of the *sampled* code, derived
+/// from the kernel `preempt_count`.
+///
+/// Returns `EXEC_CTX_UNKNOWN` when the layout is disabled (`PREEMPT_CTX_MODE == 0`)
+/// or any kernel read fails, so userspace falls back to symbol heuristics.
+///
+/// Kept branch-light and loop-free: two `bpf_probe_read_kernel` calls at most,
+/// a handful of `.rodata` reads, and straight-line ALU. When the feature is
+/// disabled the `mode == 0` early return lets the verifier prune the body via
+/// `.rodata` constant folding.
+///
+/// `#[inline(never)]` is load-bearing: `collect_trace` is `#[inline(always)]`
+/// and instantiated into several programs, and the branches here (two fallible
+/// `bpf_probe_read_kernel` calls plus the mode/plausibility checks) would
+/// multiply the verifier's explored-state count through the FP-walker loop that
+/// follows, pushing `profile_cpu` past the 1M-instruction limit. Emitting it as
+/// a single bpf-to-bpf subprogram verifies the body once and leaves each caller
+/// with only a call instruction.
+#[inline(never)]
+unsafe fn current_exec_context(cpu: u32) -> u32 {
+    let mode = core::ptr::read_volatile(&PREEMPT_CTX_MODE);
+    if mode == 0 {
+        return EXEC_CTX_UNKNOWN;
+    }
+
+    let raw: u32 = if mode == 1 {
+        // x86 per-CPU variable.
+        let arr = core::ptr::read_volatile(&PREEMPT_PERCPU_OFFSET_ARRAY);
+        let voff = core::ptr::read_volatile(&PREEMPT_PERCPU_VAR_OFFSET);
+        let Ok(base) = bpf_probe_read_kernel((arr + (cpu as u64) * 8) as *const u64) else {
+            return EXEC_CTX_UNKNOWN;
+        };
+        let Ok(v) = bpf_probe_read_kernel((base + voff) as *const u32) else {
+            return EXEC_CTX_UNKNOWN;
+        };
+        // x86 stores PREEMPT_NEED_RESCHED (0x80000000, inverted) inside
+        // __preempt_count; preempt_count() masks it off. normalize_exec_context
+        // also masks the top byte defensively, but do it here too for clarity.
+        v & !0x8000_0000u32
+    } else {
+        // arm64 task_struct field.
+        let off = core::ptr::read_volatile(&PREEMPT_TASK_BYTE_OFFSET);
+        let task = bpf_get_current_task_btf() as *const u8;
+        if task.is_null() {
+            return EXEC_CTX_UNKNOWN;
+        }
+        let Ok(v) = bpf_probe_read_kernel(task.add(off as usize) as *const u32) else {
+            return EXEC_CTX_UNKNOWN;
+        };
+        // arm64 keeps need_resched in a separate u32 — no masking needed.
+        v
+    };
+
+    // Plausibility guard: no valid preempt_count sets bits 24..32 (after the
+    // x86 need-resched mask). A bad injected offset surfaces as UNKNOWN rather
+    // than a confidently-wrong context.
+    if raw & 0xff00_0000 != 0 {
+        return EXEC_CTX_UNKNOWN;
+    }
+
+    let self_nmi = core::ptr::read_volatile(&PREEMPT_SELF_NMI) as u32;
+    let self_hardirq = core::ptr::read_volatile(&PREEMPT_SELF_HARDIRQ) as u32;
+    let self_softirq = core::ptr::read_volatile(&PREEMPT_SELF_SOFTIRQ) as u32;
+    normalize_exec_context(raw, self_nmi, self_hardirq, self_softirq)
 }
 
 #[inline]
@@ -266,6 +370,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     }
 
     let cpu = bpf_get_smp_processor_id();
+
     let user_stack_id = STACK_TRACES
         .get_stackid::<C>(&ctx, BPF_F_USER_STACK.into())
         .map_or(-1, |stack_id| stack_id as i32);
@@ -310,6 +415,13 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
     };
     pointer.len = len;
 
+    // Read execution context here — the *latest* point before building the key.
+    // current_exec_context contains fallible kernel reads; placing it earlier
+    // would fork verifier state through the FP-walk loop above and blow the
+    // instruction limit. The tail-call paths (which never return here) read it
+    // in their finalizers instead — tail calls preserve interrupt context.
+    let context = current_exec_context(cpu);
+
     let cmd = ctx.command().unwrap_or_default();
     let stack_info = StackInfo {
         tgid,
@@ -320,6 +432,8 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         ip: ip, // frame pointer
         bp: bp,
         sp: sp, // stack pointer
+        context,
+        _reserved: 0,
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
@@ -451,6 +565,11 @@ unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &pt_r
         ip,
         bp,
         sp,
+        // Raw-syscall tracepoint path: context read not wired here (kept scoped
+        // to the perf_event collect_trace to bound verifier cost). Userspace
+        // falls back to symbol heuristics.
+        context: EXEC_CTX_UNKNOWN,
+        _reserved: 0,
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
@@ -520,6 +639,10 @@ pub unsafe fn collect_trace_stackid_only<C: EbpfContext>(ctx: C) {
         ip: 0,
         bp: 0,
         sp: 0,
+        // Tracepoint/raw_tp stackid-only path: context not wired; userspace
+        // falls back to symbol heuristics.
+        context: EXEC_CTX_UNKNOWN,
+        _reserved: 0,
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
@@ -600,6 +723,8 @@ pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
             ip: 0,
             bp: 0,
             sp: 0,
+            context: EXEC_CTX_UNKNOWN,
+            _reserved: 0,
         };
         let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
         let notify_code = notify_type();
@@ -637,6 +762,9 @@ pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
         ip,
         bp,
         sp,
+        // Generic raw_tp with task pt_regs: context not wired here.
+        context: EXEC_CTX_UNKNOWN,
+        _reserved: 0,
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
@@ -1062,6 +1190,9 @@ unsafe fn dwarf_finalize_stack(state: &DwarfUnwindState) {
         pointer.v8_sfi[i] = 0;
     }
 
+    // Tail calls preserve interrupt context, so preempt_count read here reflects
+    // the sampled code's context, just as it would in collect_trace.
+    let context = current_exec_context(state.cpu);
     let stack_info = StackInfo {
         tgid: state.tgid,
         user_stack_id: state.user_stack_id,
@@ -1071,6 +1202,8 @@ unsafe fn dwarf_finalize_stack(state: &DwarfUnwindState) {
         ip: state.initial_ip,
         bp: state.initial_bp,
         sp: state.initial_sp,
+        context,
+        _reserved: 0,
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
@@ -1307,6 +1440,8 @@ unsafe fn fp_v8_finalize_stack(state: &DwarfUnwindState) {
         pointer.v8_sfi[i] = state.v8_sfi[i];
     }
 
+    // Tail calls preserve interrupt context (see dwarf_finalize_stack).
+    let context = current_exec_context(state.cpu);
     let stack_info = StackInfo {
         tgid: state.tgid,
         user_stack_id: state.user_stack_id,
@@ -1316,6 +1451,8 @@ unsafe fn fp_v8_finalize_stack(state: &DwarfUnwindState) {
         ip: state.initial_ip,
         bp: state.initial_bp,
         sp: state.initial_sp,
+        context,
+        _reserved: 0,
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);
@@ -1657,6 +1794,11 @@ unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
         ip,
         bp,
         sp,
+        // Off-CPU path (finish_task_switch kprobe): the sampled context is the
+        // waking thread, not an interrupt; context detection is not meaningful
+        // here, so leave it unknown.
+        context: EXEC_CTX_UNKNOWN,
+        _reserved: 0,
     };
 
     let _ = STACK_ID_TO_TRACES.insert(&stack_info, pointer, 0);

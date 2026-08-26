@@ -92,19 +92,21 @@ const DEFAULT_CACHE_CAPACITY: usize = 16384;
 
 /// LRU cache for formatted stack traces.
 ///
-/// Maps (tgid, kernel_stack_id, user_stack_id) to fully resolved stack frame
-/// information to avoid repeated expensive symbol resolution, BPF map lookups,
-/// and formatting operations.
+/// Maps (tgid, kernel_stack_id, user_stack_id, context) to fully resolved stack
+/// frame information to avoid repeated expensive symbol resolution, BPF map
+/// lookups, and formatting operations.
 ///
 /// The cache key includes `tgid` because symbolization is per-process (different
 /// processes map different binaries at different addresses). The stack IDs come
 /// from `bpf_get_stackid()` which hashes the raw instruction pointers — same ID
-/// means same stack frames.
+/// means same stack frames. `context` (the normalized `EXEC_CTX_*` value)
+/// distinguishes samples that share a kernel stack id but ran in different
+/// execution contexts and therefore get different context labels.
 ///
 /// Uses an LRU eviction policy to bound memory for long-running sessions
 /// (--serve, --tui) that profile many processes over time.
 pub struct PointerStackFramesCache {
-    map: lru::LruCache<(u32, i32, i32), Vec<crate::types::StackFrameInfo>>,
+    map: lru::LruCache<(u32, i32, i32, u32), Vec<crate::types::StackFrameInfo>>,
     total: usize,
     miss: usize,
 }
@@ -134,8 +136,9 @@ impl PointerStackFramesCache {
         tgid: u32,
         ktrace_id: i32,
         utrace_id: i32,
+        context: u32,
     ) -> Option<&Vec<crate::types::StackFrameInfo>> {
-        let key = (tgid, ktrace_id, utrace_id);
+        let key = (tgid, ktrace_id, utrace_id, context);
         self.total += 1;
 
         if let Some(hit) = self.map.get(&key) {
@@ -152,9 +155,10 @@ impl PointerStackFramesCache {
         tgid: u32,
         ktrace_id: i32,
         utrace_id: i32,
+        context: u32,
         stacks: Vec<crate::types::StackFrameInfo>,
     ) {
-        self.map.put((tgid, ktrace_id, utrace_id), stacks);
+        self.map.put((tgid, ktrace_id, utrace_id, context), stacks);
     }
 
     pub fn stats(&self) -> String {
@@ -175,10 +179,10 @@ impl PointerStackFramesCache {
     /// all cached symbol resolutions for that PID are stale.
     pub fn invalidate_pid(&mut self, tgid: u32) {
         // Collect keys to remove (can't mutate while iterating)
-        let keys_to_remove: Vec<(u32, i32, i32)> = self
+        let keys_to_remove: Vec<(u32, i32, i32, u32)> = self
             .map
             .iter()
-            .filter(|(&(t, _, _), _)| t == tgid)
+            .filter(|(&(t, _, _, _), _)| t == tgid)
             .map(|(&k, _)| k)
             .collect();
         for key in keys_to_remove {

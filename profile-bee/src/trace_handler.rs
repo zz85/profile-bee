@@ -321,7 +321,78 @@ impl SymbolFormatter {
         })
     }
 
-    fn infer_kernel_context_label(kernel_syms: &[StackFrameInfo]) -> Option<&'static str> {
+    /// Determine the context label for a kernel stack.
+    ///
+    /// `ctx` is the normalized `EXEC_CTX_*` value the eBPF side derived from
+    /// `preempt_count`; `softirq_bits_valid` is false under `CONFIG_PREEMPT_RT`
+    /// (where softirq state is not tracked in `preempt_count`).
+    ///
+    /// When `ctx` is authoritative (`preempt_count` was readable), it decides
+    /// task/softirq/hardirq/NMI and the symbol lists only refine *which* softirq
+    /// or IRQ vector. When `ctx == EXEC_CTX_UNKNOWN` (layout unavailable), the
+    /// behaviour is the pre-feature symbol-heuristic path, bit-for-bit.
+    fn infer_kernel_context_label(
+        kernel_syms: &[StackFrameInfo],
+        ctx: u32,
+        softirq_bits_valid: bool,
+    ) -> Option<&'static str> {
+        use profile_bee_common::{EXEC_CTX_HARDIRQ, EXEC_CTX_NMI, EXEC_CTX_SOFTIRQ, EXEC_CTX_TASK};
+
+        match ctx {
+            EXEC_CTX_NMI => Some("nmi_k"),
+            EXEC_CTX_HARDIRQ => {
+                // preempt_count already established hardirq — the symbol list only
+                // names the vector. Never None: is_sampling_induced_interrupt is
+                // not consulted, since the self-interrupt was already subtracted.
+                Some(Self::classify_specific_interrupt(kernel_syms).unwrap_or("interrupt_k"))
+            }
+            EXEC_CTX_SOFTIRQ => {
+                // preempt_count says softirq; the symbol list says which one.
+                Some(Self::classify_specific_softirq(kernel_syms).unwrap_or("softirq_k"))
+            }
+            EXEC_CTX_TASK => {
+                // Genuine task context — no label, UNLESS softirq bits are not
+                // tracked (PREEMPT_RT), where softirqs run in task context and
+                // only the symbol heuristics can identify them.
+                if softirq_bits_valid {
+                    None
+                } else {
+                    Self::classify_specific_softirq(kernel_syms)
+                        .or_else(|| Self::generic_softirq_label(kernel_syms))
+                }
+            }
+            // EXEC_CTX_UNKNOWN (or any unexpected value): pre-feature behaviour.
+            _ => Self::infer_from_symbols(kernel_syms),
+        }
+    }
+
+    /// Specific softirq label from a handler symbol (`net_rx` etc.), if present.
+    fn classify_specific_softirq(kernel_syms: &[StackFrameInfo]) -> Option<&'static str> {
+        kernel_syms.iter().find_map(|frame| {
+            Self::kernel_symbol_name(frame).and_then(Self::classify_softirq_symbol)
+        })
+    }
+
+    /// Generic `softirq_k` label if any generic softirq frame is present.
+    fn generic_softirq_label(kernel_syms: &[StackFrameInfo]) -> Option<&'static str> {
+        kernel_syms
+            .iter()
+            .filter_map(Self::kernel_symbol_name)
+            .any(Self::is_generic_softirq_symbol)
+            .then_some("softirq_k")
+    }
+
+    /// Specific interrupt vector label from an entry symbol, if present.
+    fn classify_specific_interrupt(kernel_syms: &[StackFrameInfo]) -> Option<&'static str> {
+        kernel_syms.iter().find_map(|frame| {
+            Self::kernel_symbol_name(frame).and_then(Self::classify_interrupt_symbol)
+        })
+    }
+
+    /// Pre-feature symbol-heuristic context inference. Used when `preempt_count`
+    /// is unavailable (`EXEC_CTX_UNKNOWN`). Preserved bit-for-bit so hosts
+    /// without the layout behave exactly as before.
+    fn infer_from_symbols(kernel_syms: &[StackFrameInfo]) -> Option<&'static str> {
         for frame in kernel_syms {
             if let Some(symbol) = Self::kernel_symbol_name(frame) {
                 if let Some(label) = Self::classify_softirq_symbol(symbol) {
@@ -394,6 +465,10 @@ pub struct TraceHandler {
     /// V8 heap readers per PID, for resolving JavaScript function names
     /// from SFI pointers extracted by the eBPF V8 frame extractor.
     v8_readers: HashMap<u32, V8HeapReader>,
+    /// Whether `preempt_count` softirq bits are valid on this kernel. False under
+    /// `CONFIG_PREEMPT_RT`, where softirq state is not in `preempt_count` and the
+    /// softirq symbol heuristics must run even for `EXEC_CTX_TASK` samples.
+    softirq_bits_valid: bool,
 }
 
 impl Default for TraceHandler {
@@ -408,7 +483,8 @@ impl TraceHandler {
         ktrace_id: i32,
         utrace_id: i32,
         cpu: u32,
-    ) -> Option<(u32, i32, i32)> {
+        context: u32,
+    ) -> Option<(u32, i32, i32, u32)> {
         if tgid == 0 {
             // Idle-task output depends on the kernel stack *and* the CPU: every
             // formatted idle stack carries CPU-specific frames (`cpu_NN`,
@@ -418,9 +494,15 @@ impl TraceHandler {
             //
             // User stack IDs are negative error codes here (swapper has no user
             // stack), so the third slot is free to carry the CPU instead.
-            (ktrace_id >= 0).then_some((tgid, ktrace_id, cpu as i32))
+            //
+            // `context` must also be part of the key: two samples with the same
+            // kernel stack id but different execution contexts (e.g. softirq vs
+            // task on an idle CPU) get different labels, so serving one's cached
+            // frames for the other would mislabel it (same class of bug as the
+            // CPU-key collision fixed in 7d5209e).
+            (ktrace_id >= 0).then_some((tgid, ktrace_id, cpu as i32, context))
         } else if ktrace_id >= 0 && utrace_id >= 0 {
-            Some((tgid, ktrace_id, utrace_id))
+            Some((tgid, ktrace_id, utrace_id, context))
         } else {
             None
         }
@@ -468,11 +550,21 @@ impl TraceHandler {
     }
 
     pub fn new() -> Self {
+        // Default to the detected kernel layout's softirq validity so callers
+        // that don't explicitly configure it still get correct behaviour.
+        let softirq_bits_valid = crate::kernel_layout::detect_cached().softirq_bits_valid;
         TraceHandler {
             symbolizer: Symbolizer::new(),
             cache: Default::default(),
             v8_readers: HashMap::new(),
+            softirq_bits_valid,
         }
+    }
+
+    /// Override whether `preempt_count` softirq bits are valid (false under
+    /// PREEMPT_RT). Defaults to the detected kernel layout.
+    pub fn set_softirq_bits_valid(&mut self, valid: bool) {
+        self.softirq_bits_valid = valid;
     }
 
     /// Pre-warm kernel symbol resolution by triggering the initial parse of
@@ -589,10 +681,19 @@ impl TraceHandler {
         let ktrace_id = stack_info.kernel_stack_id;
         let utrace_id = stack_info.user_stack_id;
 
-        let cache_key = Self::stack_cache_key(tgid, ktrace_id, utrace_id, stack_info.cpu);
+        let cache_key = Self::stack_cache_key(
+            tgid,
+            ktrace_id,
+            utrace_id,
+            stack_info.cpu,
+            stack_info.context,
+        );
 
-        if let Some((cache_tgid, cache_ktrace_id, cache_utrace_id)) = cache_key {
-            if let Some(cached) = self.cache.get(cache_tgid, cache_ktrace_id, cache_utrace_id) {
+        if let Some((cache_tgid, cache_ktrace_id, cache_utrace_id, cache_ctx)) = cache_key {
+            if let Some(cached) =
+                self.cache
+                    .get(cache_tgid, cache_ktrace_id, cache_utrace_id, cache_ctx)
+            {
                 return cached.clone();
             }
         }
@@ -634,9 +735,14 @@ impl TraceHandler {
             group_by_process,
         );
 
-        if let Some((cache_tgid, cache_ktrace_id, cache_utrace_id)) = cache_key {
-            self.cache
-                .insert(cache_tgid, cache_ktrace_id, cache_utrace_id, result.clone());
+        if let Some((cache_tgid, cache_ktrace_id, cache_utrace_id, cache_ctx)) = cache_key {
+            self.cache.insert(
+                cache_tgid,
+                cache_ktrace_id,
+                cache_utrace_id,
+                cache_ctx,
+                result.clone(),
+            );
         }
 
         result
@@ -759,7 +865,11 @@ impl TraceHandler {
                 .ok()
                 .unwrap_or_default();
 
-            let context_label = SymbolFormatter::infer_kernel_context_label(&kernel_syms);
+            let context_label = SymbolFormatter::infer_kernel_context_label(
+                &kernel_syms,
+                stack_info.context,
+                self.softirq_bits_valid,
+            );
 
             if let Some(label) = context_label {
                 // This is softirq/interrupt work on an idle CPU — show the real stack.
@@ -852,7 +962,11 @@ impl TraceHandler {
 
         // Infer context label from kernel frames only (before combining) to avoid
         // false-positives from userspace symbols that happen to end in `_k`.
-        let context_label = SymbolFormatter::infer_kernel_context_label(&kernel_syms);
+        let context_label = SymbolFormatter::infer_kernel_context_label(
+            &kernel_syms,
+            stack_info.context,
+            self.softirq_bits_valid,
+        );
 
         let mut combined = kernel_syms.into_iter().chain(user_syms).collect::<Vec<_>>();
         if let Some(label) = context_label {
@@ -1020,40 +1134,94 @@ mod tests {
             bp: 0,
             ip: 0,
             sp: 0,
+            context: profile_bee_common::EXEC_CTX_UNKNOWN,
+            _reserved: 0,
         }
+    }
+
+    /// Test wrapper: infer with an unknown context, exercising the pre-feature
+    /// symbol-heuristic fallback path (softirq bits valid).
+    fn infer_unknown(frames: &[StackFrameInfo]) -> Option<&'static str> {
+        SymbolFormatter::infer_kernel_context_label(
+            frames,
+            profile_bee_common::EXEC_CTX_UNKNOWN,
+            true,
+        )
     }
 
     #[test]
     fn test_stack_cache_key_allows_idle_kernel_only_caching() {
+        use profile_bee_common::EXEC_CTX_UNKNOWN;
         assert_eq!(
-            TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, 3),
-            Some((0, 42, 3))
+            TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, 3, EXEC_CTX_UNKNOWN),
+            Some((0, 42, 3, EXEC_CTX_UNKNOWN))
         );
-        assert_eq!(TraceHandler::stack_cache_key(0, -1, -libc::EFAULT, 3), None);
         assert_eq!(
-            TraceHandler::stack_cache_key(1234, 42, -libc::EFAULT, 3),
+            TraceHandler::stack_cache_key(0, -1, -libc::EFAULT, 3, EXEC_CTX_UNKNOWN),
             None
         );
         assert_eq!(
-            TraceHandler::stack_cache_key(1234, 42, 7, 3),
-            Some((1234, 42, 7))
+            TraceHandler::stack_cache_key(1234, 42, -libc::EFAULT, 3, EXEC_CTX_UNKNOWN),
+            None
+        );
+        assert_eq!(
+            TraceHandler::stack_cache_key(1234, 42, 7, 3, EXEC_CTX_UNKNOWN),
+            Some((1234, 42, 7, EXEC_CTX_UNKNOWN))
         );
     }
 
     #[test]
     fn test_stack_cache_key_distinguishes_idle_cpus() {
+        use profile_bee_common::EXEC_CTX_UNKNOWN;
         // All CPUs idle through the same kernel path, so they share one kernel
         // stack hash. Since idle output carries CPU-specific frames, samples
         // from different CPUs must not collide on the same cache key.
-        let cpu0 = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, 0);
-        let cpu1 = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, 1);
+        let cpu0 = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, 0, EXEC_CTX_UNKNOWN);
+        let cpu1 = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, 1, EXEC_CTX_UNKNOWN);
         assert_ne!(cpu0, cpu1);
-        assert_eq!(cpu0, Some((0, 42, 0)));
-        assert_eq!(cpu1, Some((0, 42, 1)));
+        assert_eq!(cpu0, Some((0, 42, 0, EXEC_CTX_UNKNOWN)));
+        assert_eq!(cpu1, Some((0, 42, 1, EXEC_CTX_UNKNOWN)));
+    }
+
+    #[test]
+    fn test_stack_cache_key_distinguishes_contexts() {
+        use profile_bee_common::{EXEC_CTX_SOFTIRQ, EXEC_CTX_TASK};
+        // Same normal process, stack ids, and CPU, but different execution
+        // contexts must not collide — otherwise a softirq sample would be served
+        // a task sample's cached (unlabeled) frames, or vice versa.
+        let task = TraceHandler::stack_cache_key(1234, 42, 7, 3, EXEC_CTX_TASK);
+        let softirq = TraceHandler::stack_cache_key(1234, 42, 7, 3, EXEC_CTX_SOFTIRQ);
+        assert_ne!(task, softirq);
+    }
+
+    #[test]
+    fn test_cache_distinguishes_entries_differing_only_in_context() {
+        use profile_bee_common::{EXEC_CTX_SOFTIRQ, EXEC_CTX_TASK};
+        let mut cache = PointerStackFramesCache::default();
+        cache.insert(
+            1234,
+            42,
+            7,
+            EXEC_CTX_TASK,
+            vec![kernel_frame("task_work_k")],
+        );
+        cache.insert(
+            1234,
+            42,
+            7,
+            EXEC_CTX_SOFTIRQ,
+            vec![kernel_frame("net_rx_action_k")],
+        );
+
+        let task = cache.get(1234, 42, 7, EXEC_CTX_TASK).unwrap().clone();
+        let softirq = cache.get(1234, 42, 7, EXEC_CTX_SOFTIRQ).unwrap().clone();
+        assert_eq!(task[0].symbol.as_deref(), Some("task_work_k"));
+        assert_eq!(softirq[0].symbol.as_deref(), Some("net_rx_action_k"));
     }
 
     #[test]
     fn test_idle_cross_cpu_samples_retain_own_cpu_frames() {
+        use profile_bee_common::EXEC_CTX_UNKNOWN;
         // A cache keyed without the CPU would serve cpu_00's frames for cpu_01's
         // idle samples, since both share kernel stack id 42.
         let mut cache = PointerStackFramesCache::default();
@@ -1067,15 +1235,16 @@ mod tests {
                 "softirq:net_rx_k",
                 true,
             );
-            let key = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, cpu)
+            let key = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, cpu, EXEC_CTX_UNKNOWN)
                 .expect("idle sample with a valid kernel stack id should be cacheable");
-            cache.insert(key.0, key.1, key.2, frames);
+            cache.insert(key.0, key.1, key.2, key.3, frames);
         }
 
         for cpu in 0..4u32 {
-            let key = TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, cpu).unwrap();
+            let key =
+                TraceHandler::stack_cache_key(0, 42, -libc::EFAULT, cpu, EXEC_CTX_UNKNOWN).unwrap();
             let cached = cache
-                .get(key.0, key.1, key.2)
+                .get(key.0, key.1, key.2, key.3)
                 .expect("each CPU should have its own cache entry");
             let symbols: Vec<&str> = cached
                 .iter()
@@ -1132,10 +1301,7 @@ mod tests {
             kernel_frame("__softirqentry_text_start_k"),
             kernel_frame("net_rx_action_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("softirq:net_rx_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("softirq:net_rx_k"));
     }
 
     #[test]
@@ -1147,10 +1313,7 @@ mod tests {
             kernel_frame("scheduler_tick_k"),
             kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("interrupt:timer_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("interrupt:timer_k"));
     }
 
     #[test]
@@ -1165,7 +1328,7 @@ mod tests {
             kernel_frame("cpuidle_idle_call_k"),
             kernel_frame("do_idle_k"),
         ];
-        assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
+        assert_eq!(infer_unknown(&frames), None);
     }
 
     #[test]
@@ -1178,10 +1341,7 @@ mod tests {
             kernel_frame("sysvec_apic_timer_interrupt_k"),
             kernel_frame("default_idle_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("interrupt:timer_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("interrupt:timer_k"));
     }
 
     #[test]
@@ -1193,10 +1353,7 @@ mod tests {
             kernel_frame("handle_irq_event_k"),
             kernel_frame("common_interrupt_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("interrupt_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("interrupt_k"));
     }
 
     #[test]
@@ -1215,10 +1372,7 @@ mod tests {
             kernel_frame("sysvec_apic_timer_interrupt_k"),
             kernel_frame("default_idle_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("softirq_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("softirq_k"));
     }
 
     #[test]
@@ -1233,7 +1387,7 @@ mod tests {
             kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
             kernel_frame("default_idle_k"),
         ];
-        assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
+        assert_eq!(infer_unknown(&frames), None);
     }
 
     #[test]
@@ -1262,10 +1416,7 @@ mod tests {
             kernel_frame("cpuidle_idle_call_k"),
             kernel_frame("do_idle_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("softirq:net_rx_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("softirq:net_rx_k"));
     }
 
     #[test]
@@ -1279,10 +1430,7 @@ mod tests {
             kernel_frame("el1_interrupt_k"),
             kernel_frame("do_idle_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("softirq_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("softirq_k"));
     }
 
     #[test]
@@ -1298,10 +1446,7 @@ mod tests {
             kernel_frame("el1h_64_irq_k"),
             kernel_frame("do_idle_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("interrupt_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("interrupt_k"));
     }
 
     #[test]
@@ -1316,7 +1461,7 @@ mod tests {
             kernel_frame("cpuidle_idle_call_k"),
             kernel_frame("do_idle_k"),
         ];
-        assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
+        assert_eq!(infer_unknown(&frames), None);
     }
 
     #[test]
@@ -1332,10 +1477,7 @@ mod tests {
             kernel_frame("el1h_64_irq_k"),
             kernel_frame("do_idle_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("interrupt_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("interrupt_k"));
     }
 
     #[test]
@@ -1344,7 +1486,7 @@ mod tests {
             kernel_frame("finish_task_switch_k"),
             kernel_frame("schedule_k"),
         ];
-        assert_eq!(SymbolFormatter::infer_kernel_context_label(&frames), None);
+        assert_eq!(infer_unknown(&frames), None);
     }
 
     #[test]
@@ -1354,10 +1496,7 @@ mod tests {
             kernel_frame("__do_softirq_k"),
             kernel_frame("some_handler_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("softirq_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("softirq_k"));
     }
 
     #[test]
@@ -1366,10 +1505,7 @@ mod tests {
             kernel_frame("handle_softirqs_k"),
             kernel_frame("run_rebalance_domains_k"),
         ];
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&frames),
-            Some("softirq:sched_k")
-        );
+        assert_eq!(infer_unknown(&frames), Some("softirq:sched_k"));
     }
 
     #[test]
@@ -1380,18 +1516,122 @@ mod tests {
         // If this were mistakenly passed with user frames mixed in, it would
         // match. But since we now only pass kernel_syms, this test validates
         // the function works correctly on kernel-only input.
-        assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&user_frames),
-            Some("softirq:net_rx_k")
-        );
+        assert_eq!(infer_unknown(&user_frames), Some("softirq:net_rx_k"));
 
         // Frames without _k suffix (actual userspace symbols) are ignored
         let user_only = vec![StackFrameInfo {
             symbol: Some("net_rx_action".to_string()),
             ..Default::default()
         }];
+        assert_eq!(infer_unknown(&user_only), None);
+    }
+
+    // --- preempt_count context matrix -------------------------------------
+
+    use profile_bee_common::{EXEC_CTX_HARDIRQ, EXEC_CTX_NMI, EXEC_CTX_SOFTIRQ, EXEC_CTX_TASK};
+
+    fn infer(frames: &[StackFrameInfo], ctx: u32, rt_ok: bool) -> Option<&'static str> {
+        SymbolFormatter::infer_kernel_context_label(frames, ctx, rt_ok)
+    }
+
+    #[test]
+    fn test_ctx_nmi_ignores_symbols() {
+        // NMI is authoritative; symbol lists are not consulted.
+        let frames = vec![kernel_frame("net_rx_action_k")];
+        assert_eq!(infer(&frames, EXEC_CTX_NMI, true), Some("nmi_k"));
+        // Even with no useful symbols.
+        assert_eq!(infer(&[], EXEC_CTX_NMI, true), Some("nmi_k"));
+    }
+
+    #[test]
+    fn test_ctx_hardirq_refines_vector_never_none() {
+        // Specific vector when the entry symbol is present...
+        let specific = vec![
+            kernel_frame("scheduler_tick_k"),
+            kernel_frame("sysvec_apic_timer_interrupt_k"),
+        ];
         assert_eq!(
-            SymbolFormatter::infer_kernel_context_label(&user_only),
+            infer(&specific, EXEC_CTX_HARDIRQ, true),
+            Some("interrupt:timer_k")
+        );
+        // ...generic interrupt_k when no vector symbol matches (never None).
+        let generic = vec![kernel_frame("some_driver_isr_k")];
+        assert_eq!(infer(&generic, EXEC_CTX_HARDIRQ, true), Some("interrupt_k"));
+    }
+
+    #[test]
+    fn test_ctx_hardirq_not_suppressed_as_sampling_induced() {
+        // Bare timer entry that the symbol heuristic would suppress: with
+        // preempt_count saying HARDIRQ (self-interrupt already subtracted), the
+        // label is earned and must NOT be suppressed.
+        let frames = vec![
+            kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
+            kernel_frame("default_idle_k"),
+        ];
+        assert_eq!(
+            infer(&frames, EXEC_CTX_HARDIRQ, true),
+            Some("interrupt:timer_k")
+        );
+    }
+
+    #[test]
+    fn test_ctx_softirq_refines_which() {
+        let specific = vec![
+            kernel_frame("net_rx_action_k"),
+            kernel_frame("__do_softirq_k"),
+        ];
+        assert_eq!(
+            infer(&specific, EXEC_CTX_SOFTIRQ, true),
+            Some("softirq:net_rx_k")
+        );
+        // No specific handler symbol -> generic softirq_k.
+        let generic = vec![kernel_frame("some_handler_k")];
+        assert_eq!(infer(&generic, EXEC_CTX_SOFTIRQ, true), Some("softirq_k"));
+    }
+
+    #[test]
+    fn test_ctx_task_no_label_when_softirq_bits_valid() {
+        // Genuine task context on a non-RT kernel: no context label even if a
+        // softirq-looking symbol is present (it isn't actually running one).
+        let frames = vec![kernel_frame("net_rx_action_k")];
+        assert_eq!(infer(&frames, EXEC_CTX_TASK, true), None);
+    }
+
+    #[test]
+    fn test_ctx_task_runs_softirq_heuristics_under_preempt_rt() {
+        // On PREEMPT_RT (softirq_bits_valid=false) softirqs run in task context,
+        // so the softirq symbol heuristics must still run for EXEC_CTX_TASK.
+        let specific = vec![kernel_frame("net_rx_action_k")];
+        assert_eq!(
+            infer(&specific, EXEC_CTX_TASK, false),
+            Some("softirq:net_rx_k")
+        );
+        let generic = vec![kernel_frame("__do_softirq_k")];
+        assert_eq!(infer(&generic, EXEC_CTX_TASK, false), Some("softirq_k"));
+        // No softirq evidence -> still None.
+        let none = vec![kernel_frame("schedule_k")];
+        assert_eq!(infer(&none, EXEC_CTX_TASK, false), None);
+    }
+
+    #[test]
+    fn test_ctx_unknown_matches_pre_feature_behaviour() {
+        // EXEC_CTX_UNKNOWN must reproduce the symbol-heuristic path exactly.
+        let softirq = vec![
+            kernel_frame("net_rx_action_k"),
+            kernel_frame("__do_softirq_k"),
+        ];
+        assert_eq!(
+            infer(&softirq, profile_bee_common::EXEC_CTX_UNKNOWN, true),
+            infer_unknown(&softirq)
+        );
+        // Bare sampling-timer entry: heuristic suppresses it, and UNKNOWN too.
+        let bare = vec![
+            kernel_frame("asm_sysvec_apic_timer_interrupt_k"),
+            kernel_frame("default_idle_k"),
+            kernel_frame("do_idle_k"),
+        ];
+        assert_eq!(
+            infer(&bare, profile_bee_common::EXEC_CTX_UNKNOWN, true),
             None
         );
     }
