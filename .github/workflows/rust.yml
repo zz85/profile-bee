@@ -40,7 +40,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-dev clang
       - name: Install bpf-linker
-        run: cargo install bpf-linker
+        run: |
+          curl -L https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst -o /tmp/bpf-linker.tar.zst
+          mkdir -p "$HOME/.local/bin"
+          tar -xpf /tmp/bpf-linker.tar.zst -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -65,7 +69,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-dev clang
       - name: Install bpf-linker
-        run: cargo install bpf-linker
+        run: |
+          curl -L https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst -o /tmp/bpf-linker.tar.zst
+          mkdir -p "$HOME/.local/bin"
+          tar -xpf /tmp/bpf-linker.tar.zst -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -93,7 +101,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-dev clang
       - name: Install bpf-linker
-        run: cargo install bpf-linker
+        run: |
+          curl -L https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst -o /tmp/bpf-linker.tar.zst
+          mkdir -p "$HOME/.local/bin"
+          tar -xpf /tmp/bpf-linker.tar.zst -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
