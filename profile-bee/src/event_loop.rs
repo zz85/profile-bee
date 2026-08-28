@@ -222,6 +222,23 @@ impl ProfilingEventLoop {
         }
     }
 
+    /// Detect language runtimes for a newly seen PID (V8, JVM, generic JIT maps).
+    fn try_setup_runtimes_for_pid(&mut self, tgid: u32) {
+        self.try_setup_v8_for_pid(tgid);
+        self.try_setup_java_for_pid(tgid);
+        // Always arm perf-map discovery — cheap if the file is absent, and
+        // helps any JIT runtime that writes /tmp/perf-<pid>.map.
+        self.trace_handler.register_perf_map(tgid);
+    }
+
+    /// Detect HotSpot/OpenJDK processes and enable Java JIT symbolization.
+    fn try_setup_java_for_pid(&mut self, tgid: u32) {
+        if !crate::java::is_jvm_process(tgid) {
+            return;
+        }
+        self.trace_handler.register_jvm(tgid);
+    }
+
     /// Detect if a new PID is a Node.js/V8 process and set up V8 introspection.
     ///
     /// Reads `/proc/<pid>/exe` to find the binary, then reads `v8dbg_*` ELF
@@ -379,14 +396,12 @@ impl ProfilingEventLoop {
                     if let Some(tx) = &self.tgid_request_tx {
                         if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
                             let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
-                            // Check if this is a Node.js/V8 process and set up
-                            // V8 introspection (eBPF FP context extraction +
-                            // userspace heap reader for JS symbol resolution).
-                            self.try_setup_v8_for_pid(stack.tgid);
+                            // Detect V8 / JVM / JIT perf-maps for this process.
+                            self.try_setup_runtimes_for_pid(stack.tgid);
                         }
                     } else if stack.tgid != 0 && self.known_tgids.insert(stack.tgid) {
-                        // Even without DWARF thread, detect V8 processes
-                        self.try_setup_v8_for_pid(stack.tgid);
+                        // Even without DWARF thread, detect language runtimes.
+                        self.try_setup_runtimes_for_pid(stack.tgid);
                     }
                     if local_counting {
                         let trace = self.trace_count.entry(stack).or_insert(0);
@@ -452,7 +467,7 @@ impl ProfilingEventLoop {
                             self.trace_count.retain(|k, _| k.tgid != event.pid);
                             // The PID is still alive but with a new binary image.
                             // Remove from known_tgids so the next StackInfo for this
-                            // PID triggers try_setup_v8_for_pid and DWARF reloading.
+                            // PID triggers try_setup_runtimes_for_pid and DWARF reloading.
                             // Do NOT re-insert — let the StackInfo handler do it.
                             self.known_tgids.remove(&event.pid);
                             // Invalidate symbol caches for this PID
