@@ -105,6 +105,7 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 - **AWS CodeGuru integration** (`--codeguru-upload`) — upload profiles directly to AWS CodeGuru Profiler with proper thread-state counter types (RUNNABLE/WAITING)
 - **Frame pointer unwinding** (default) — fast eBPF-based stack walking via `bpf_get_stackid`
 - **DWARF unwinding** (`--dwarf`) — profiles `-O2`/`-O3` binaries without frame pointers using `.eh_frame` tables loaded into eBPF maps
+- **HotSpot JVM native/JIT integration** — `probee -- java ...` automatically enables `-XX:+PreserveFramePointer`. A JVMTI agent may publish JIT code-cache symbols to `/tmp/perf-<pid>.map`, which is resolved through the normal process-symbol pipeline. Without that map, native and kernel frames remain available but Java JIT methods are shown as `[unknown]`.
 - **Smart uprobes** — GDB-style symbol resolution with glob, regex, demangled name matching, and multi-attach
 - **kprobe & tracepoint** support — profile kernel functions and tracepoint events
 - **Real-time web server** (`--serve`) — live flamegraph updates over HTTP with interactive controls

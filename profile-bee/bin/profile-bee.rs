@@ -6,6 +6,7 @@ use profile_bee::ebpf::{
 };
 use profile_bee::event_loop::{EventLoopConfig, ProfilingEventLoop};
 use profile_bee::html::collapse_to_json;
+use profile_bee::java::{is_hotspot_binary, perf_map_path};
 use profile_bee::output::{
     CodeGuruSink, CollapseSink, HtmlSink, JsonFileSink, MultiplexSink, OutputSink, PprofSink,
     RawCollapseSink, SvgSink, WebBroadcastSink,
@@ -664,7 +665,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // only applies to --pid targeting an already-running process.
     if spawn.is_none() {
         if let Some(target_pid) = pid {
-            warn_nodejs_without_perf_map(target_pid);
+            warn_runtime_without_perf_map(target_pid);
         }
     }
 
@@ -1156,7 +1157,7 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
 /// file. Without `--perf-prof`, V8 JIT-compiled JavaScript functions show as
 /// `[unknown]` in flamegraphs because there is no symbol information for
 /// dynamically generated machine code in anonymous memory mappings.
-fn warn_nodejs_without_perf_map(pid: u32) {
+fn warn_runtime_without_perf_map(pid: u32) {
     // Check if the target is a Node.js process by reading /proc/<pid>/exe
     let exe_link = format!("/proc/{}/exe", pid);
     let exe_path = match std::fs::read_link(&exe_link) {
@@ -1164,24 +1165,38 @@ fn warn_nodejs_without_perf_map(pid: u32) {
         Err(_) => return,
     };
     let basename = exe_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if !matches!(basename, "node" | "nodejs" | "nsolid") {
+    let is_nodejs = matches!(basename, "node" | "nodejs" | "nsolid");
+    let is_hotspot = is_hotspot_binary(&exe_path);
+    if !is_nodejs && !is_hotspot {
         return;
     }
 
     // Check for perf-map file
-    let perf_map = format!("/tmp/perf-{}.map", pid);
-    if std::path::Path::new(&perf_map).exists() {
+    if perf_map_path(pid).exists() {
         return; // perf-map file present, JIT symbols will be resolved
     }
 
-    eprintln!(
-        "\n\x1b[33mWarning: Profiling Node.js process (PID {}) without JIT symbol support.\x1b[0m",
-        pid
-    );
-    eprintln!("JavaScript function names will appear as [unknown] in the flamegraph.");
-    eprintln!("To enable JIT symbol resolution, restart Node.js with:");
-    eprintln!("  node --perf-basic-prof --interpreted-frames-native-stack <script>");
-    eprintln!("Or use profile-bee's auto-injection: probee -- node <script>\n");
+    if is_nodejs {
+        eprintln!(
+            "\n\x1b[33mWarning: Profiling Node.js process (PID {}) without JIT symbol support.\x1b[0m",
+            pid
+        );
+        eprintln!("JavaScript function names will appear as [unknown] in the flamegraph.");
+        eprintln!("To enable JIT symbol resolution, restart Node.js with:");
+        eprintln!("  node --perf-basic-prof --interpreted-frames-native-stack <script>");
+        eprintln!("Or use profile-bee's auto-injection: probee -- node <script>\n");
+    } else {
+        eprintln!(
+            "\n\x1b[33mWarning: Profiling HotSpot JVM (PID {}) without JIT symbol support.\x1b[0m",
+            pid
+        );
+        eprintln!("Compiled Java methods will appear as [unknown] in the flamegraph.");
+        eprintln!(
+            "Restart with -XX:+PreserveFramePointer and a JVMTI perf-map agent that writes {}.",
+            perf_map_path(pid).display()
+        );
+        eprintln!("Use `probee -- java ...` to inject -XX:+PreserveFramePointer automatically.\n");
+    }
 }
 
 /// Handle `probee symbolize <file.raw> [-o output.svg] [-o output.folded]`.
@@ -1924,7 +1939,7 @@ async fn run_combined_mode(
     // Warn if targeting an existing Node.js process without perf-map
     if spawn.is_none() {
         if let Some(target_pid) = pid {
-            warn_nodejs_without_perf_map(target_pid);
+            warn_runtime_without_perf_map(target_pid);
         }
     }
 
@@ -2058,7 +2073,7 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
     // Warn if targeting an existing Node.js process without perf-map
     if spawn.is_none() {
         if let Some(target_pid) = pid {
-            warn_nodejs_without_perf_map(target_pid);
+            warn_runtime_without_perf_map(target_pid);
         }
     }
 

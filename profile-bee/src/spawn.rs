@@ -6,6 +6,8 @@ use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
+use crate::java::{is_hotspot_binary, java_tool_options_with_frame_pointers};
+
 pub struct Nothing;
 
 #[derive(Clone)]
@@ -221,6 +223,15 @@ fn build_runtime_env(program: &str) -> Vec<(&'static str, String)> {
         env.push(("NODE_OPTIONS", value));
     }
 
+    if is_hotspot_binary(Path::new(program)) {
+        let value = java_tool_options_with_frame_pointers(std::env::var("JAVA_TOOL_OPTIONS").ok());
+        tracing::info!(
+            "HotSpot JVM detected: injecting JAVA_TOOL_OPTIONS=\"{}\" for native stack unwinding",
+            value
+        );
+        env.push(("JAVA_TOOL_OPTIONS", value));
+    }
+
     env
 }
 
@@ -233,8 +244,8 @@ fn build_runtime_env(program: &str) -> Vec<(&'static str, String)> {
 /// the caller can read them (e.g. for TUI display).  Use
 /// [`SpawnProcess::take_stdout`] / [`take_stderr`] to obtain the handles.
 ///
-/// For Node.js commands, automatically injects `NODE_OPTIONS` environment
-/// variables to enable JIT symbol resolution via perf-map files.
+/// For Node.js commands, injects perf-map options; for HotSpot commands,
+/// injects the frame-pointer option needed to preserve native JVM stacks.
 pub fn setup_process_to_profile(
     cmd: &Option<String>,
     command: &[String],
