@@ -25,6 +25,7 @@ This code is forked from flamelens by Yung Siang Liau:
 
 - Interactive navigation with vim-style keybindings
 - Real-time flamegraph updates during profiling
+- Live heatmap view with Flamescope-style time buckets and range selection
 - Search and highlight frames using regex patterns
 - Zoom into specific stack frames
 - Freeze/unfreeze live updates
@@ -41,6 +42,8 @@ cargo build --release --features tui
 # Use the TUI viewer
 sudo ./target/release/profile-bee --tui -- your-command
 ```
+
+In live mode, the TUI now includes a **Heatmap** tab. Use `[` and `]` to move across time buckets, `{` and `}` to expand the selected range, and `c` to return the detail pane to live-follow mode.
 
 ## Architecture
 

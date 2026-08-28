@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.17
+
+### New Features
+
+- **Live heatmap view (TUI)** — a Flamescope-style timeline showing CPU utilization over time as a row of buckets above the selected interval's flamegraph. Available in live mode; cycle to it with `Tab`.
+  - **Utilization-based heat** — a bucket's heat is its CPU utilization (busy ÷ total samples), not raw sample volume. Idle-task samples (the kernel swapper, rendered as `idle;cpu_NN` / `cpu_NN;idle`) are excluded via an order-independent detector, so an idle machine reads cool instead of maxing out every bucket. Colored on a light → orange → red thermal ramp with an `idle..busy` legend.
+  - **Two render styles, toggled with `v`** — a GitHub-contribution-style grid of cells (default) and the vertical "slice bar" timeline. The selected bucket(s) light up in place by brightening the heat color (no overlay or accent line).
+  - **Arrow-key navigation across panes** — `↓` enters the flamegraph / descends to a child, `↑` returns to the grid at the root, `←`/`→` step buckets or siblings, `Shift`+`←`/`→` widen the selected time range, `Home` follows live.
+- **Snapshot history (TUI)** — scrub backward and forward through recent live flamegraph refreshes with `[` / `]`.
+
 ## v0.3.16
 
 ### Improvements

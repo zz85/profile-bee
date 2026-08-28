@@ -43,6 +43,7 @@ impl ZoomState {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ViewKind {
     FlameGraph,
+    Heatmap,
     Table,
     Output,
     ProcessList,
@@ -161,6 +162,7 @@ impl FlameGraphState {
     pub fn toggle_view_kind(&mut self) {
         self.view_kind = match self.view_kind {
             ViewKind::FlameGraph => ViewKind::Table,
+            ViewKind::Heatmap => ViewKind::Table,
             ViewKind::Table => ViewKind::ProcessList,
             ViewKind::ProcessList => ViewKind::FlameGraph,
             ViewKind::Output => ViewKind::FlameGraph,
@@ -172,6 +174,27 @@ impl FlameGraphState {
     pub fn toggle_view_kind_with_output(&mut self) {
         self.view_kind = match self.view_kind {
             ViewKind::FlameGraph => ViewKind::Table,
+            ViewKind::Heatmap => ViewKind::Table,
+            ViewKind::Table => ViewKind::ProcessList,
+            ViewKind::ProcessList => ViewKind::Output,
+            ViewKind::Output => ViewKind::FlameGraph,
+        };
+    }
+
+    pub fn toggle_live_view_kind(&mut self) {
+        self.view_kind = match self.view_kind {
+            ViewKind::FlameGraph => ViewKind::Heatmap,
+            ViewKind::Heatmap => ViewKind::Table,
+            ViewKind::Table => ViewKind::ProcessList,
+            ViewKind::ProcessList => ViewKind::FlameGraph,
+            ViewKind::Output => ViewKind::FlameGraph,
+        };
+    }
+
+    pub fn toggle_live_view_kind_with_output(&mut self) {
+        self.view_kind = match self.view_kind {
+            ViewKind::FlameGraph => ViewKind::Heatmap,
+            ViewKind::Heatmap => ViewKind::Table,
             ViewKind::Table => ViewKind::ProcessList,
             ViewKind::ProcessList => ViewKind::Output,
             ViewKind::Output => ViewKind::FlameGraph,
@@ -223,5 +246,40 @@ impl FlameGraphState {
             new.get_stack_by_full_name(old.get_stack_full_name_from_info(stack))
                 .map(|stack| stack.id)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FlameGraphState, ViewKind};
+
+    #[test]
+    fn cycles_live_views_with_heatmap() {
+        let mut state = FlameGraphState::default();
+
+        state.toggle_live_view_kind();
+        assert_eq!(state.view_kind, ViewKind::Heatmap);
+        state.toggle_live_view_kind();
+        assert_eq!(state.view_kind, ViewKind::Table);
+        state.toggle_live_view_kind();
+        assert_eq!(state.view_kind, ViewKind::ProcessList);
+        state.toggle_live_view_kind();
+        assert_eq!(state.view_kind, ViewKind::FlameGraph);
+    }
+
+    #[test]
+    fn cycles_live_views_with_output_and_heatmap() {
+        let mut state = FlameGraphState::default();
+
+        state.toggle_live_view_kind_with_output();
+        assert_eq!(state.view_kind, ViewKind::Heatmap);
+        state.toggle_live_view_kind_with_output();
+        assert_eq!(state.view_kind, ViewKind::Table);
+        state.toggle_live_view_kind_with_output();
+        assert_eq!(state.view_kind, ViewKind::ProcessList);
+        state.toggle_live_view_kind_with_output();
+        assert_eq!(state.view_kind, ViewKind::Output);
+        state.toggle_live_view_kind_with_output();
+        assert_eq!(state.view_kind, ViewKind::FlameGraph);
     }
 }

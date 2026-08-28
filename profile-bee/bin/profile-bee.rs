@@ -1539,6 +1539,7 @@ fn spawn_profiling_thread(
         let mut known_tgids = std::collections::HashSet::<u32>::new();
 
         loop {
+            let mut window_trace_count = HashMap::<StackInfo, usize>::new();
             // Drain the eBPF counts map (to prevent it from filling up) but
             // keep trace_count accumulating across cycles so the flamegraph
             // shows the full profile history, not just the latest window.
@@ -1573,6 +1574,7 @@ fn spawn_profiling_thread(
                         if local_counting {
                             let trace = trace_count.entry(stack).or_insert(0);
                             *trace += 1;
+                            *window_trace_count.entry(stack).or_insert(0) += 1;
 
                             if *trace == 1 {
                                 let _combined = profiler.get_exp_stacked_frames(
@@ -1670,6 +1672,7 @@ fn spawn_profiling_thread(
                 // across refresh cycles instead of showing only the latest window.
                 for (key, value) in counts.iter().flatten() {
                     let stack: StackInfo = key.0;
+                    let value = value as usize;
                     // Prime the symbol cache for new stacks
                     if !trace_count.contains_key(&stack) {
                         let _combined = profiler.get_exp_stacked_frames(
@@ -1680,7 +1683,8 @@ fn spawn_profiling_thread(
                             &stacked_pointers,
                         );
                     }
-                    *trace_count.entry(stack).or_insert(0) += value as usize;
+                    *trace_count.entry(stack).or_insert(0) += value;
+                    *window_trace_count.entry(stack).or_insert(0) += value;
                 }
             }
 
@@ -1698,7 +1702,7 @@ fn spawn_profiling_thread(
                 });
             }
 
-            let mut out = stacks
+            let mut aggregate_out = stacks
                 .into_iter()
                 .map(|frames| {
                     let key = frames
@@ -1711,15 +1715,51 @@ fn spawn_profiling_thread(
                     format!("{} {}", key, count)
                 })
                 .collect::<Vec<_>>();
-            out.sort();
+            aggregate_out.sort();
+
+            let mut window_stacks = Vec::new();
+            for (stack, value) in window_trace_count.iter() {
+                let combined = profiler.get_exp_stacked_frames(
+                    stack,
+                    &stack_traces,
+                    group_by_cpu,
+                    gbp,
+                    &stacked_pointers,
+                );
+                window_stacks.push(FrameCount {
+                    frames: combined,
+                    count: *value as u64,
+                });
+            }
+
+            let mut window_out = window_stacks
+                .into_iter()
+                .map(|frames| {
+                    let key = frames
+                        .frames
+                        .iter()
+                        .map(|s| s.fmt_symbol())
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    let count = frames.count;
+                    format!("{} {}", key, count)
+                })
+                .collect::<Vec<_>>();
+            window_out.sort();
 
             // Update TUI app with new flamegraph data
-            let data = out.join("\n");
+            let data = aggregate_out.join("\n");
+            let bucket_data = window_out.join("\n");
             let tic = std::time::Instant::now();
             let flamegraph = profile_bee_tui::flame::FlameGraph::from_string(data, true);
+            let bucket_flamegraph =
+                profile_bee_tui::flame::FlameGraph::from_string(bucket_data.clone(), true);
             let parsed = profile_bee_tui::app::ParsedFlameGraph {
                 flamegraph,
+                bucket_flamegraph,
+                collapsed_data: bucket_data,
                 elapsed: tic.elapsed(),
+                collected_at: std::time::Instant::now(),
             };
             *update_handle.lock().unwrap_or_else(|e| {
                 eprintln!("Mutex poisoned: {}", e);
@@ -1728,14 +1768,15 @@ fn spawn_profiling_thread(
 
             // Optionally feed the web server
             if let Some(ref tx) = web_tx {
-                let json = collapse_to_json(&out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
+                let json =
+                    collapse_to_json(&aggregate_out.iter().map(|v| v.as_str()).collect::<Vec<_>>());
                 let _ = tx.send(json);
             }
 
             // Optionally send to OTLP endpoint
             #[cfg(feature = "otlp")]
             if let Some(ref mut sink) = otlp_sink {
-                if let Err(e) = sink.write_batch(&out) {
+                if let Err(e) = sink.write_batch(&aggregate_out) {
                     tracing::warn!("OTLP export error in TUI/serve thread: {}", e);
                 }
             }
