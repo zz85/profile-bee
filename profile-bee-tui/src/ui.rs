@@ -29,10 +29,15 @@ const COLOR_TABLE_SELECTED_ROW: Color = Color::Rgb(65, 65, 65);
 #[derive(Debug, Clone, Default)]
 pub struct FlamelensWidgetState {
     frame_height: u16,
+    /// When set, `frame_height` was already assigned by a view-specific
+    /// renderer (e.g. the heatmap split) and must not be overwritten with the
+    /// full main-area height.
+    frame_height_locked: bool,
     frame_width: u16,
     render_time: Duration,
     cursor_position: Option<(u16, u16)>,
     pub stack_positions: Vec<crate::app::StackPosition>,
+    pub heatmap_positions: Vec<crate::app::HeatmapPosition>,
     /// Rendered height of the output view (full tab or split panel).
     /// Used by the key handler for accurate page-up/page-down.
     pub output_view_height: u16,
@@ -63,6 +68,7 @@ impl StatefulWidget for FlamelensWidget<'_> {
 
 impl<'a> FlamelensWidget<'a> {
     fn render_all(self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) {
+        state.heatmap_positions.clear();
         let view_kind_indicator = self.get_view_kind_indicator();
         let version_indicator = self.get_version_indicator();
 
@@ -157,7 +163,9 @@ impl<'a> FlamelensWidget<'a> {
                 .constraints(vec![Constraint::Percentage(70), Constraint::Percentage(30)])
                 .split(main_area);
 
-            if self.is_flamegraph_view() {
+            if self.is_heatmap_view() {
+                self.render_heatmap_view(split[0], buf, state);
+            } else if self.is_flamegraph_view() {
                 self.render_flamegraph(split[0], buf, state);
             } else if self.is_table_view() || self.is_process_list_view() {
                 if self.app.flamegraph_state().tree_mode {
@@ -171,13 +179,19 @@ impl<'a> FlamelensWidget<'a> {
 
             self.render_output_panel(split[1], buf);
 
-            // Use the top pane height for paging calculations
-            state.frame_height = split[0].height;
+            // Use the top pane height for paging calculations, unless a
+            // view-specific renderer already reported a more precise height
+            // (e.g. the heatmap split, whose flamegraph is only a sub-area).
+            if !state.frame_height_locked {
+                state.frame_height = split[0].height;
+            }
             // Record output panel height (minus border) for scroll calculations
             state.output_view_height = split[1].height.saturating_sub(1);
         } else if self.is_output_view() {
             self.render_output(main_area, buf);
             state.output_view_height = main_area.height;
+        } else if self.is_heatmap_view() {
+            self.render_heatmap_view(main_area, buf, state);
         } else if self.is_flamegraph_view() {
             self.render_flamegraph(main_area, buf, state);
         } else if self.is_table_view() || self.is_process_list_view() {
@@ -200,8 +214,9 @@ impl<'a> FlamelensWidget<'a> {
         help_bar.render(layout[help_bar_index], buf);
 
         // Update widget state — frame_height was already set in the split
-        // panel branch; only overwrite when not splitting.
-        if !show_split_panel {
+        // panel branch; only overwrite when not splitting and not locked by a
+        // view-specific renderer (e.g. the heatmap split).
+        if !show_split_panel && !state.frame_height_locked {
             state.frame_height = main_area.height;
         }
         state.frame_width = main_area.width;
@@ -230,6 +245,23 @@ impl<'a> FlamelensWidget<'a> {
                 } else {
                     help_tags.add("z", "freeze");
                 }
+                help_tags.add("m", "update mode");
+                help_tags.add("[/]", "history");
+            }
+            if self.app.has_output() {
+                help_tags.add("o", "output panel");
+            }
+        } else if self.is_heatmap_view() {
+            help_tags.add("↑↓", "grid/flame");
+            help_tags.add("←→", "prev/next");
+            help_tags.add("shift+←→", "expand range");
+            help_tags.add("home", "follow live");
+            help_tags.add("v", "grid/bars");
+            help_tags.add("enter/esc", "zoom");
+            help_tags.add("/", "search");
+            help_tags.add("#", "search like cursor");
+            if let FlameGraphInput::Live = self.app.flamegraph_input {
+                help_tags.add("z", "freeze");
                 help_tags.add("m", "update mode");
             }
             if self.app.has_output() {
@@ -309,6 +341,251 @@ impl<'a> FlamelensWidget<'a> {
             state,
         );
         has_more_rows_to_render
+    }
+
+    fn render_heatmap_view(&self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) {
+        // Always leave a few rows for the flamegraph below. Bars are read by
+        // height so they get a taller pane than the (multi-row) grid.
+        let max_h = area.height.saturating_sub(3).max(1);
+        let heatmap_height = match self.app.heatmap_style() {
+            crate::app::HeatmapStyle::Grid => area.height.saturating_div(3).clamp(4, 10),
+            crate::app::HeatmapStyle::Bars => area.height.saturating_mul(3) / 5,
+        }
+        .clamp(4, 18)
+        .min(max_h);
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(vec![
+                Constraint::Length(heatmap_height),
+                Constraint::Fill(1),
+            ])
+            .split(area);
+        self.render_heatmap(layout[0], buf, state);
+        self.render_flamegraph(layout[1], buf, state);
+        // The flamegraph occupies only the lower sub-area; report ITS height for
+        // cursor navigation / paging, not the full heatmap pane. Lock it so the
+        // caller's generic `frame_height` assignment doesn't clobber it.
+        state.frame_height = layout[1].height;
+        state.frame_height_locked = true;
+    }
+
+    fn render_heatmap(&self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) {
+        let title = self
+            .app
+            .heatmap_status()
+            .unwrap_or_else(|| "Heatmap".to_string());
+        // Highlight the grid border when it holds keyboard focus so it's clear
+        // where the arrow keys are pointing.
+        let focused = self.app.heatmap_focus() == crate::app::HeatmapFocus::Grid;
+        let border_style = if focused {
+            Style::default().fg(Color::Rgb(250, 200, 60))
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(format!(" Heatmap ({title}) "))
+            .title_style(Style::default().bold().yellow());
+        let inner = block.inner(area);
+        block.render(area, buf);
+        state.heatmap_positions.clear();
+
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        // Reserve the bottom row for the intensity legend.
+        let (grid_area, legend_area) = if inner.height >= 3 {
+            (
+                Rect {
+                    height: inner.height - 1,
+                    ..inner
+                },
+                Some(Rect {
+                    y: inner.bottom() - 1,
+                    height: 1,
+                    ..inner
+                }),
+            )
+        } else {
+            (inner, None)
+        };
+
+        match self.app.heatmap_style() {
+            crate::app::HeatmapStyle::Grid => self.render_heatmap_grid(grid_area, buf, state),
+            crate::app::HeatmapStyle::Bars => self.render_heatmap_bars(grid_area, buf, state),
+        }
+
+        if let Some(legend_area) = legend_area {
+            self.render_heatmap_legend(legend_area, buf);
+        }
+    }
+
+    /// Brighten a heat color for the selected bucket(s): blend it toward white
+    /// so the cell visibly "lights up" without changing its hue or adding any
+    /// overlay glyph/line. `t` is the blend amount in `[0, 1]`.
+    fn brighten(color: Color, t: f64) -> Color {
+        if let Color::Rgb(r, g, b) = color {
+            let mix = |c: u8| (c as f64 + (255.0 - c as f64) * t).round() as u8;
+            Color::Rgb(mix(r), mix(g), mix(b))
+        } else {
+            color
+        }
+    }
+
+    fn render_no_samples(&self, area: Rect, buf: &mut Buffer) {
+        let msg = Line::from("Waiting for samples...").style(Style::default().fg(Color::DarkGray));
+        let x = area
+            .x
+            .saturating_add(area.width.saturating_sub(msg.width() as u16) / 2);
+        let y = area.y + area.height / 2;
+        buf.set_line(x, y, &msg, area.width);
+    }
+
+    /// GitHub-contribution-style grid: each bucket is a small square cell,
+    /// colored by CPU utilization. Selected cells are brightened (blended toward
+    /// white) so they light up in place rather than being framed by a line.
+    fn render_heatmap_grid(&self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) {
+        // A cell is 2 columns wide + 1 column gutter so it reads as a square in
+        // a terminal (cells are ~half as wide as tall). Rows fill top-to-bottom.
+        const CELL_W: u16 = 2;
+        const GAP_W: u16 = 1;
+        const STRIDE_X: u16 = CELL_W + GAP_W;
+        const STRIDE_Y: u16 = 2; // one blank row between cell rows
+
+        let cols = ((area.width + GAP_W) / STRIDE_X).max(1) as usize;
+        let rows = ((area.height + 1) / STRIDE_Y).max(1) as usize;
+        let capacity = cols * rows;
+
+        let buckets = self.app.heatmap_cells(capacity);
+        if buckets.is_empty() {
+            self.render_no_samples(area, buf);
+            return;
+        }
+
+        let selected_range = self.app.current_heatmap_range();
+
+        for (idx, bucket) in buckets.iter().enumerate() {
+            let col = (idx % cols) as u16;
+            let row = (idx / cols) as u16;
+            let x = area.x + col * STRIDE_X;
+            let y = area.y + row * STRIDE_Y;
+            if y >= area.bottom() {
+                break;
+            }
+
+            // Heat is absolute CPU utilization (busy / total samples), NOT the
+            // count relative to the busiest cell — so an idle box reads as cool
+            // even during its busiest interval.
+            let mut color = Self::get_heatmap_color(bucket.intensity);
+            let selected = selected_range
+                .map(|(start, end)| bucket.start_index <= end && bucket.end_index >= start)
+                .unwrap_or(false);
+            // Selected cells light up in place (blended toward white).
+            if selected {
+                color = Self::brighten(color, 0.45);
+            }
+
+            // Fill the cell with its (possibly brightened) heat color.
+            for dx in 0..CELL_W {
+                if x + dx < area.right() {
+                    buf.set_string(x + dx, y, " ", Style::default().bg(color));
+                }
+            }
+
+            state.heatmap_positions.push(crate::app::HeatmapPosition {
+                start_index: bucket.start_index,
+                end_index: bucket.end_index,
+                x,
+                y,
+                width: CELL_W,
+                height: 1,
+            });
+        }
+    }
+
+    /// Original "slice bar" style: one vertical bar per bucket, height scaled by
+    /// CPU utilization and colored by the same heat ramp. Selected columns are
+    /// brightened (bar and a faint column background) so they light up.
+    fn render_heatmap_bars(&self, area: Rect, buf: &mut Buffer, state: &mut FlamelensWidgetState) {
+        let buckets = self.app.heatmap_cells(area.width as usize);
+        if buckets.is_empty() {
+            self.render_no_samples(area, buf);
+            return;
+        }
+
+        let selected_range = self.app.current_heatmap_range();
+
+        for (idx, bucket) in buckets.iter().enumerate() {
+            let x = area.x + idx as u16;
+            if x >= area.right() {
+                break;
+            }
+            let ratio = bucket.intensity;
+            let selected = selected_range
+                .map(|(start, end)| bucket.start_index <= end && bucket.end_index >= start)
+                .unwrap_or(false);
+            let mut color = Self::get_heatmap_color(ratio);
+            if selected {
+                color = Self::brighten(color, 0.4);
+            }
+            // Faint brightened backdrop so a selected column reads as a lit
+            // vertical slice even where the bar is short.
+            let bg = if selected {
+                Some(Self::brighten(Self::get_heatmap_color(0.0), 0.18))
+            } else {
+                None
+            };
+            // At least one row tall whenever there's any CPU activity.
+            let fill_height = if ratio <= 0.0 {
+                0
+            } else {
+                ((ratio * area.height as f64).ceil() as u16).clamp(1, area.height)
+            };
+
+            for row in 0..area.height {
+                let y = area.bottom().saturating_sub(row + 1);
+                if row < fill_height {
+                    let mut style = Style::default().fg(color);
+                    if let Some(bg) = bg {
+                        style = style.bg(bg);
+                    }
+                    buf.set_string(x, y, "█", style);
+                } else if let Some(bg) = bg {
+                    buf.set_string(x, y, " ", Style::default().bg(bg));
+                }
+            }
+
+            state.heatmap_positions.push(crate::app::HeatmapPosition {
+                start_index: bucket.start_index,
+                end_index: bucket.end_index,
+                x,
+                y: area.y,
+                width: 1,
+                height: area.height,
+            });
+        }
+    }
+
+    /// Render a "less → more" intensity legend using the same color ramp as the
+    /// grid cells (GitHub-style).
+    fn render_heatmap_legend(&self, area: Rect, buf: &mut Buffer) {
+        const STEPS: usize = 5;
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut spans = vec![Span::styled("idle ", dim)];
+        for i in 0..STEPS {
+            let ratio = i as f64 / (STEPS - 1) as f64;
+            let color = Self::get_heatmap_color(ratio);
+            spans.push(Span::styled("  ", Style::default().bg(color)));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled("busy", dim));
+        let line = Line::from(spans);
+        let x = area
+            .x
+            .saturating_add(area.width.saturating_sub(line.width() as u16) / 2);
+        buf.set_line(x, area.y, &line, area.width);
     }
 
     fn render_table(&self, area: Rect, buf: &mut Buffer) {
@@ -819,6 +1096,35 @@ impl<'a> FlamelensWidget<'a> {
         }
     }
 
+    /// Heat ramp for the heatmap grid: low intensity (idle) is a light/cool
+    /// tint, high intensity (busy CPU) ramps to bright orange then vivid red —
+    /// like a Flamescope / thermal heatmap. `ratio` is in `[0, 1]`.
+    fn get_heatmap_color(ratio: f64) -> Color {
+        let ratio = ratio.clamp(0.0, 1.0);
+        // Control points: (ratio, r, g, b), interpolated linearly.
+        // very light warm gray -> pale yellow -> orange -> red -> dark red
+        const STOPS: [(f64, f64, f64, f64); 5] = [
+            (0.00, 40.0, 48.0, 60.0),    // near-idle: dim cool gray
+            (0.25, 250.0, 240.0, 150.0), // light yellow
+            (0.50, 250.0, 180.0, 60.0),  // orange
+            (0.75, 235.0, 90.0, 30.0),   // red-orange
+            (1.00, 200.0, 20.0, 20.0),   // vivid red (hottest)
+        ];
+        let mut lo = &STOPS[0];
+        let mut hi = &STOPS[STOPS.len() - 1];
+        for pair in STOPS.windows(2) {
+            if ratio >= pair[0].0 && ratio <= pair[1].0 {
+                lo = &pair[0];
+                hi = &pair[1];
+                break;
+            }
+        }
+        let span = (hi.0 - lo.0).max(f64::EPSILON);
+        let t = ((ratio - lo.0) / span).clamp(0.0, 1.0);
+        let lerp = |a: f64, b: f64| (a + (b - a) * t).round() as u8;
+        Color::Rgb(lerp(lo.1, hi.1), lerp(lo.2, hi.2), lerp(lo.3, hi.3))
+    }
+
     fn get_view_kind_indicator(&self) -> Line<'_> {
         let mut header_bottom_title_spans = vec![Span::from(" ")];
 
@@ -840,6 +1146,14 @@ impl<'a> FlamelensWidget<'a> {
             ViewKind::FlameGraph,
             self.app.flamegraph_state().view_kind,
         ));
+        if self.app.is_live() {
+            header_bottom_title_spans.push(Span::from(" | "));
+            header_bottom_title_spans.push(_get_view_kind_span(
+                "Heatmap",
+                ViewKind::Heatmap,
+                self.app.flamegraph_state().view_kind,
+            ));
+        }
         header_bottom_title_spans.push(Span::from(" | "));
         header_bottom_title_spans.push(_get_view_kind_span(
             "Top",
@@ -881,6 +1195,9 @@ impl<'a> FlamelensWidget<'a> {
                 out += &format!(" [{}]", self.app.flamegraph_state().update_mode.as_str());
                 if self.app.flamegraph_state().freeze {
                     out += " [Frozen; press 'z' again to unfreeze]";
+                }
+                if let Some(snapshot_status) = self.app.snapshot_status() {
+                    out += &format!(" [{snapshot_status}]");
                 }
                 out
             }
@@ -983,6 +1300,16 @@ impl<'a> FlamelensWidget<'a> {
                 if let Some(transient_message) = &self.app.transient_message {
                     lines.push(("Info", Line::from(transient_message.as_str())));
                 }
+                if let FlameGraphInput::Live = self.app.flamegraph_input {
+                    if let Some(snapshot_status) = self.app.snapshot_status() {
+                        lines.push(("Time", Line::from(snapshot_status)));
+                    }
+                }
+                if self.is_heatmap_view() {
+                    if let Some(heatmap_status) = self.app.heatmap_status() {
+                        lines.push(("Window", Line::from(heatmap_status)));
+                    }
+                }
                 lines
             }
             None => vec![("Info", Line::from("No stack selected"))],
@@ -1021,6 +1348,10 @@ impl<'a> FlamelensWidget<'a> {
 
     fn is_flamegraph_view(&self) -> bool {
         self.view_kind() == ViewKind::FlameGraph
+    }
+
+    fn is_heatmap_view(&self) -> bool {
+        self.view_kind() == ViewKind::Heatmap
     }
 
     fn is_output_view(&self) -> bool {
@@ -1084,4 +1415,5 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
     // Copy stack positions for mouse click handling
     app.stack_positions = flamelens_state.stack_positions;
+    app.heatmap_positions = flamelens_state.heatmap_positions;
 }
