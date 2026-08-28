@@ -95,6 +95,9 @@ See [docs/otlp_export.md](docs/otlp_export.md) for the full guide including arch
 
 Run `probee` with no arguments or `probee --help` for the full list of options and examples.
 
+See [Java profiling](docs/java_profiling.md) for the HotSpot perf-map workflow
+and the scope of future JVMTI stack integration.
+
 ## Features
 
 - **Interactive TUI** — real-time flamegraph viewer with vim-style navigation, search, zoom, and mouse support (click, scroll, double-click to zoom)
