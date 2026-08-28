@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 /// This intentionally recognizes only launchers, not arbitrary binaries whose
 /// name happens to contain "java".
 pub fn is_hotspot_binary(path: &Path) -> bool {
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     matches!(name, "java" | "javaw" | "java.exe" | "javaw.exe")
         || (name.starts_with("java-")
             && name[5..]
