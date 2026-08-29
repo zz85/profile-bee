@@ -100,18 +100,58 @@ pub fn categorize(name: &str) -> FrameCategory {
     FrameCategory::User
 }
 
-/// Heuristic for a HotSpot JIT method name (post-demangling). True when the
-/// name has a `Package.Class.method(...)` shape: a `(` with a `.`-containing
-/// head and no `::` (which would mark it as C++/Rust). JS `(file.js:line)` and
-/// `cmd (pid)` roots are handled by earlier rules, so they never reach here.
+/// Compiler-clone segments GCC/Clang append to native symbols (`memcpy.cold`,
+/// `foo.constprop.0`). Used to keep such names out of the Java band.
+const NATIVE_CLONE_SEGMENTS: &[&str] = &[
+    "cold",
+    "part",
+    "constprop",
+    "isra",
+    "llvm",
+    "lto_priv",
+    "clone",
+    "hot",
+];
+
+/// Heuristic for a HotSpot JIT method name (post-demangling), matching the two
+/// shapes [`crate`]'s Java symbol formatter produces:
+/// - signature form `Package.Class.method(args)` — `Compiler.perfmap` (JDK 17+),
+///   e.g. `long Burn.fib(int)`;
+/// - signatureless form `Package.Class.method` — demangled `perf-map-agent`
+///   names (JDK 8/11), e.g. `java.lang.String.equals`.
+///
+/// C++/Rust use `::` (rejected outright). JS `(file.js:line)` and `cmd (pid)`
+/// roots are handled by earlier rules, so they never reach here.
 fn looks_like_java_method(name: &str) -> bool {
     if name.contains("::") {
         return false;
     }
-    match name.find('(') {
-        Some(paren) => name[..paren].contains('.'),
-        None => false,
+    // Signature form: a `(` with a `.`-containing head.
+    if let Some(paren) = name.find('(') {
+        return name[..paren].contains('.');
     }
+    // Signatureless fully-qualified form. Require a dotted path
+    // (`pkg.Class.method`, ≥3 segments) with a Class-like (uppercase-initial)
+    // segment, no whitespace, and no all-digit or compiler-clone segment — so
+    // native clones like `memcpy.cold` / `foo.constprop.0` stay out.
+    if name.contains(char::is_whitespace) {
+        return false;
+    }
+    let mut segments = 0usize;
+    let mut has_class_like = false;
+    for seg in name.split('.') {
+        segments += 1;
+        if seg.is_empty()
+            || seg.bytes().all(|b| b.is_ascii_digit())
+            || NATIVE_CLONE_SEGMENTS.contains(&seg)
+        {
+            return false;
+        }
+        if seg.as_bytes()[0].is_ascii_uppercase() {
+            has_class_like = true;
+        }
+    }
+    segments >= 3 && has_class_like
 }
 
 // FNV-1a hash constants (64-bit).
@@ -222,6 +262,12 @@ mod tests {
             categorize("void java.lang.Object.<init>()"),
             FrameCategory::Java
         );
+        // Signatureless fully-qualified names (demangled perf-map-agent output).
+        assert_eq!(categorize("java.lang.String.equals"), FrameCategory::Java);
+        assert_eq!(
+            categorize("org.example.app.Server.handle"),
+            FrameCategory::Java
+        );
         // Native C++/Rust use `::` and must NOT be classified as Java.
         assert_eq!(
             categorize("std::vector::push_back(int)"),
@@ -232,6 +278,12 @@ mod tests {
             categorize("operator new(unsigned long)"),
             FrameCategory::User
         );
+        // Native compiler clones are dotted but must NOT be Java.
+        assert_eq!(categorize("memcpy.cold"), FrameCategory::User);
+        assert_eq!(categorize("do_work.constprop.0"), FrameCategory::User);
+        assert_eq!(categorize("tcp_sendmsg.part.0"), FrameCategory::User);
+        // All-lowercase dotted names (no Class-like segment) are not Java.
+        assert_eq!(categorize("a.b.c"), FrameCategory::User);
         // JS sources still win over the Java method heuristic.
         assert_eq!(categorize("processData (server.js:42)"), FrameCategory::Js);
         // Java gets a visibly different color band from JS.

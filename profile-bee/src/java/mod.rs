@@ -23,7 +23,29 @@ pub use attach::{
     namespace_pids, refresh_perf_map, PerfMapEnsureResult,
 };
 
-use std::path::Path;
+use procfs::process::{MMapPath, Process};
+use std::path::{Path, PathBuf};
+
+/// Return the mapped `libjvm.so` pathname (as recorded in `/proc/<pid>/maps`),
+/// if the process maps one.
+///
+/// Uses `procfs` — the codebase's standard maps parser — so pathnames
+/// containing spaces are preserved (raw whitespace-splitting truncated them)
+/// and the trailing ` (deleted)` marker on unlinked mappings is stripped.
+fn mapped_libjvm_path(pid: u32) -> Option<String> {
+    let process = Process::new(pid as i32).ok()?;
+    let maps = process.maps().ok()?;
+    for map in maps.iter() {
+        if let MMapPath::Path(p) = &map.pathname {
+            let raw = p.to_string_lossy();
+            let path = raw.strip_suffix(" (deleted)").unwrap_or(&raw);
+            if path.ends_with("libjvm.so") {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
 
 /// Return true if `exe` looks like a HotSpot/OpenJDK `java` launcher.
 ///
@@ -47,13 +69,9 @@ pub fn is_java_binary(exe: &Path) -> bool {
                 .all(|c| c.is_ascii_digit() || c == '.'))
 }
 
-/// Return true if `/proc/<pid>/maps` references `libjvm.so`.
+/// Return true if the process maps `libjvm.so`.
 pub fn process_has_libjvm(pid: u32) -> bool {
-    let maps_path = format!("/proc/{}/maps", pid);
-    let Ok(contents) = std::fs::read_to_string(&maps_path) else {
-        return false;
-    };
-    contents.lines().any(|line| line.contains("libjvm.so"))
+    mapped_libjvm_path(pid).is_some()
 }
 
 /// Detect whether `pid` is a JVM worth enabling Java/JIT support for.
@@ -71,25 +89,16 @@ pub fn is_jvm_process(pid: u32) -> bool {
 }
 
 /// Path to `libjvm.so` for a process, if mapped.
-pub fn find_libjvm_path(pid: u32) -> Option<std::path::PathBuf> {
-    let maps_path = format!("/proc/{}/maps", pid);
-    let contents = std::fs::read_to_string(maps_path).ok()?;
-    for line in contents.lines() {
-        if let Some(path) = line.split_whitespace().last() {
-            if path.ends_with("libjvm.so") {
-                let container = std::path::PathBuf::from(format!("/proc/{}/root{}", pid, path));
-                if container.is_file() {
-                    return Some(container);
-                }
-                let host = std::path::PathBuf::from(path);
-                if host.is_file() {
-                    return Some(host);
-                }
-                return Some(host);
-            }
-        }
+///
+/// Prefers the container view (`/proc/<pid>/root/...`) when that file exists,
+/// otherwise falls back to the host path.
+pub fn find_libjvm_path(pid: u32) -> Option<PathBuf> {
+    let path = mapped_libjvm_path(pid)?;
+    let container = PathBuf::from(format!("/proc/{}/root{}", pid, path));
+    if container.is_file() {
+        return Some(container);
     }
-    None
+    Some(PathBuf::from(path))
 }
 
 /// Best-effort human label for a JVM process (for logs).

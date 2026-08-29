@@ -136,7 +136,7 @@ impl PerfMap {
 }
 
 /// Per-PID cache of perf maps with lazy load + periodic refresh.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PerfMapCache {
     maps: HashMap<u32, PerfMap>,
     /// How often to re-check mtime (wall clock). Checked on lookup.
@@ -144,6 +144,15 @@ pub struct PerfMapCache {
     lookups_since_refresh: HashMap<u32, u32>,
     /// Refresh file metadata every N lookups per PID.
     refresh_every: u32,
+}
+
+impl Default for PerfMapCache {
+    /// Delegate to [`PerfMapCache::new`] so a default-constructed cache uses the
+    /// same `refresh_every` as `new()` — the derived `Default` would set it to
+    /// `0`, causing a filesystem re-check on every single lookup.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PerfMapCache {
@@ -236,11 +245,18 @@ impl PerfMapCache {
     }
 
     /// Force mtime reload for every tracked PID (periodic JIT refresh).
-    pub fn reload_all(&mut self) {
+    ///
+    /// Returns the PIDs whose symbol table actually changed (reloaded on-disk
+    /// change, or newly discovered) so callers can invalidate any downstream
+    /// caches of already-symbolized frames for those PIDs.
+    pub fn reload_all(&mut self) -> Vec<u32> {
         let pids: Vec<u32> = self.maps.keys().copied().collect();
+        let mut changed = Vec::new();
         for pid in pids {
+            let mut did_change = false;
             if let Some(map) = self.maps.get_mut(&pid) {
                 if map.reload_if_changed() {
+                    did_change = true;
                     tracing::debug!(
                         "reloaded JIT perf-map for pid {} ({} symbols)",
                         pid,
@@ -249,8 +265,16 @@ impl PerfMapCache {
                 }
             }
             // Re-discover empty maps in case dump landed on an alternate path.
+            let had_symbols = self.has_symbols(pid);
             self.try_discover(pid);
+            if !had_symbols && self.has_symbols(pid) {
+                did_change = true;
+            }
+            if did_change {
+                changed.push(pid);
+            }
         }
+        changed
     }
 
     /// Resolve `addr` for `pid`, refreshing the file periodically.

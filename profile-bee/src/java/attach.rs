@@ -14,7 +14,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -447,17 +447,25 @@ fn trigger_attach_listener(pid: u32, inner: u32) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
+        // `/tmp` is world-writable, so create the attach flag exclusively and
+        // refuse to follow symlinks: `create_new` (O_CREAT|O_EXCL) fails if the
+        // path already exists (including as a symlink), and `O_NOFOLLOW` refuses
+        // a symlinked final component. This prevents an attacker who pre-plants
+        // `/tmp/.attach_pid<pid>` from having us truncate or chmod their target.
+        // We also no longer chmod the path (a leftover `set_permissions` would
+        // follow such a symlink). HotSpot validates the flag file's owner, so a
+        // root-created file is honored without extra permissions.
         match OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
         {
-            Ok(_) => {
-                created = true;
-                // Best-effort permissions; JVM may need to see it.
-                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o666));
-            }
+            Ok(_) => created = true,
+            // Already present (a prior trigger, or the JVM's own file): the
+            // listener only needs the flag to exist, and we deliberately do not
+            // touch a file we did not just create.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => created = true,
             Err(e) => tracing::debug!("cannot create {}: {e}", path.display()),
         }
     }

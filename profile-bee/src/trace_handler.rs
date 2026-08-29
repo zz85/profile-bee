@@ -689,13 +689,23 @@ impl TraceHandler {
     }
 
     /// Force-reload all tracked JIT perf-maps (periodic refresh).
+    ///
+    /// Any PID whose map changed has its cached, already-symbolized stack
+    /// frames invalidated so stacks are recomputed against the fresh JIT
+    /// symbols instead of served stale (e.g. frames that were `[unknown]`
+    /// before the map landed, or renamed after JIT re-tiering).
     pub fn refresh_perf_maps(&mut self) {
-        self.perf_maps.reload_all();
+        for pid in self.perf_maps.reload_all() {
+            self.cache.invalidate_pid(pid);
+        }
     }
 
     /// Load a specific perf-map path for a PID (after external dump).
     pub fn load_perf_map_path(&mut self, tgid: u32, path: &std::path::Path) {
         self.perf_maps.load_path(tgid, path);
+        // The freshly loaded map may resolve addresses that were previously
+        // cached as `[unknown]`; drop stale symbolized frames for this PID.
+        self.cache.invalidate_pid(tgid);
     }
 
     pub fn print_stats(&self) {
