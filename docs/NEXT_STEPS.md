@@ -38,7 +38,22 @@ Self-profiling shows the DWARF subsystem accounts for ~70% of probee's active CP
 
 ## 9. Interpreted / JIT Stack Support
 
-Support perf map files (`/tmp/perf-<pid>.map`) that runtimes like Java, Node.js, and Python emit. Well-established convention that would broaden the user base significantly.
+### 9a. Perf-map JIT symbols + Java detection ✅ Done (Phase 1)
+
+- Parses `/tmp/perf-<pid>.map` (and container `/proc/<pid>/root/tmp/...`)
+- Auto-detects HotSpot/`libjvm.so` processes; demangles `Lclass;method` names
+- Wired into `TraceHandler` as fallback for `[unknown]` user frames
+- **System-wide auto-dump**: startup `/proc` scan + `jcmd` / HotSpot attach / `nsenter`
+- Periodic JIT map refresh (`--java-refresh-secs`); toggle with `--auto-java`
+- See [docs/java_profiling.md](java_profiling.md)
+
+### 9b. HotSpot VM-struct symbolization (Phase 2) — Planned
+
+Userspace parse of `gHotSpotVMStructs` from `libjvm.so` + remote Method/nmethod reads (V8 heap-reader pattern).
+
+### 9c. eBPF HotSpot unwinder (Phase 3) — Planned
+
+OTel eBPF Profiler–style code-cache unwind in-kernel; `HotspotProcInfo` maps; interpreter/nmethod/stub actions; cookie-validated userspace symbolize. Highest effort; unlocks stacks without relying solely on perf-maps.
 
 ## 10. Output Format Expansion
 

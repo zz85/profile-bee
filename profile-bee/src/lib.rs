@@ -36,5 +36,8 @@ pub mod probe_spec;
 
 pub mod v8;
 
+pub mod java;
+pub mod perf_map;
+
 mod trace_handler;
 pub use trace_handler::*;

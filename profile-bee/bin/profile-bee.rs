@@ -285,6 +285,16 @@ struct Opt {
     #[arg(long, default_value_t = 2)]
     stream_mode: u8,
 
+    /// Automatically discover running HotSpot JVMs and dump JIT perf-maps
+    /// (`Compiler.perfmap`) so system-wide profiles resolve Java methods
+    /// without manual `jcmd`. Enabled by default.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    auto_java: bool,
+
+    /// Seconds between Java JIT map refresh/re-dump while profiling (0 = off).
+    #[arg(long, default_value_t = 30)]
+    java_refresh_secs: u64,
+
     /// Spawn command and profile (deprecated: use `-- <command>` instead)
     #[arg(long)]
     cmd: Option<String>,
@@ -739,6 +749,15 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         monitor_exit_pid,
         tgid_request_tx,
         enable_process_metadata: false,
+        auto_java_symbols: opt.auto_java,
+        java_refresh_interval: if opt.java_refresh_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(opt.java_refresh_secs))
+        },
+        // Scope Java auto-discovery to the target PID (spawned child or
+        // `--pid`); `None` here means system-wide profiling.
+        java_target_pid: pid,
     };
     let mut event_loop = ProfilingEventLoop::new(
         ebpf_profiler.counts,
@@ -1526,6 +1545,8 @@ fn spawn_profiling_thread(
     group_by_process: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tui_refresh_ms: u64,
     monitor_exit_pid: Option<u32>,
+    auto_java: bool,
+    java_target_pid: Option<u32>,
     #[cfg(feature = "otlp")] mut otlp_sink: Option<profile_bee::output::OtlpSink>,
 ) {
     std::thread::spawn(move || {
@@ -1537,6 +1558,10 @@ fn spawn_profiling_thread(
         let mut bpf = ebpf_profiler.bpf;
         let mut trace_count = HashMap::<StackInfo, usize>::new();
         let mut known_tgids = std::collections::HashSet::<u32>::new();
+        // PIDs already checked for JVM/Java JIT setup (so `is_jvm_process` runs
+        // at most once per PID). Mirrors ProfilingEventLoop's Java handling for
+        // the TUI / combined / serve collection path.
+        let mut java_known_pids = std::collections::HashSet::<u32>::new();
 
         loop {
             let mut window_trace_count = HashMap::<StackInfo, usize>::new();
@@ -1568,6 +1593,18 @@ fn spawn_profiling_thread(
                         if let Some(tx) = &tgid_request_tx {
                             if stack.tgid != 0 && known_tgids.insert(stack.tgid) {
                                 let _ = tx.send(DwarfThreadMsg::LoadProcess(stack.tgid));
+                            }
+                        }
+
+                        // On first sight of a (scoped) JVM, register it so its
+                        // /tmp/perf-<pid>.map is dumped/loaded for JIT symbols.
+                        if auto_java && stack.tgid != 0 && java_known_pids.insert(stack.tgid) {
+                            let scoped = match java_target_pid {
+                                Some(target) => target == stack.tgid,
+                                None => true,
+                            };
+                            if scoped && profile_bee::java::is_jvm_process(stack.tgid) {
+                                profiler.register_jvm(stack.tgid);
                             }
                         }
 
@@ -1640,6 +1677,13 @@ fn spawn_profiling_thread(
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
+            }
+
+            // Reload JIT perf-maps once per refresh cycle so newly compiled
+            // Java methods appear, dropping stale symbolized frames for any PID
+            // whose map changed.
+            if auto_java {
+                profiler.refresh_perf_maps();
             }
 
             // Generate flamegraph data
@@ -2073,6 +2117,8 @@ async fn run_combined_mode(
         pid_mode_handle.clone(),
         opt.tui_refresh_ms,
         external_pid,
+        opt.auto_java,
+        pid,
         #[cfg(feature = "otlp")]
         combined_otlp_sink,
     );
@@ -2207,6 +2253,8 @@ async fn run_tui_mode(opt: Opt) -> std::result::Result<(), anyhow::Error> {
         pid_mode_handle.clone(),
         opt.tui_refresh_ms,
         external_pid,
+        opt.auto_java,
+        pid,
         #[cfg(feature = "otlp")]
         tui_otlp_sink,
     );

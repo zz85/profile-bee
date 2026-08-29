@@ -52,6 +52,11 @@ pub struct SessionConfig {
     /// from proactive exec/exit detection). Agents should enable this for
     /// `ProcessMetadataCache` eviction and process-aware profiling.
     pub track_process_lifecycle: bool,
+    /// Auto-discover HotSpot JVMs and dump `/tmp/perf-<pid>.map` via jcmd/attach.
+    /// Default true so system-wide profiling resolves Java frames without manual jcmd.
+    pub auto_java_symbols: bool,
+    /// How often to re-dump/reload Java JIT maps while profiling.
+    pub java_refresh_interval: Option<std::time::Duration>,
 }
 
 impl Default for SessionConfig {
@@ -65,6 +70,8 @@ impl Default for SessionConfig {
             group_by_process: false,
             monitor_exit: true,
             track_process_lifecycle: false,
+            auto_java_symbols: true,
+            java_refresh_interval: Some(std::time::Duration::from_secs(30)),
         }
     }
 }
@@ -261,6 +268,11 @@ impl ProfilingSession {
             monitor_exit_pid,
             tgid_request_tx,
             enable_process_metadata: lifecycle_tracking,
+            auto_java_symbols: config.auto_java_symbols,
+            java_refresh_interval: config.java_refresh_interval,
+            // Scope Java auto-discovery to the target when one is set (spawned
+            // child PID or `--pid`); `None` = system-wide scan.
+            java_target_pid: pid,
         };
         let event_loop = ProfilingEventLoop::new(
             ebpf_profiler.counts,

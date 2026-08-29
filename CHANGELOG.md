@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.19
+
+### New Features
+
+- **Java / HotSpot profiling** — auto-detects HotSpot JVM processes (mapped `libjvm.so` or an exact `java`/`javaw` launcher) and resolves JIT code addresses via Linux `/tmp/perf-<pid>.map` (including container path `/proc/<pid>/root/tmp/...`). Demangles HotSpot names (`Ljava/lang/String;equals` → `java.lang.String.equals`) and tags JVM runtime frames as `[jvm] …`. See [docs/java_profiling.md](docs/java_profiling.md).
+- **Automatic JIT symbol maps** — dumps `Compiler.perfmap` (JDK 17+) via host `jcmd`, the process's own `JAVA_HOME` `jcmd`, direct HotSpot attach socket, or `nsenter` (containers), then reloads periodically (`--java-refresh-secs`, default 30) so JIT tiers stay fresh. Disable attach traffic with `--auto-java false`. On JDK 8/11 (no `Compiler.perfmap`), use `perf-map-agent`/async-profiler and the map is loaded automatically.
+- **Scoped auto-discovery** — when profiling a specific target (`--pid` / `--cmd` / `-- <cmd>`), Java auto-discovery is limited to that process: profile-bee never scans `/proc` for, or sends `jcmd`/SIGQUIT attach traffic to, unrelated (possibly production) JVMs on the host, and startup is not delayed by attaching to every JVM. The full system-wide scan runs only when no target is given.
+- **Auto frame-pointer injection for `java`** — launching a JVM through profile-bee (`probee -- java …` or `--cmd`) injects `JAVA_TOOL_OPTIONS=-XX:+PreserveFramePointer` (JDK 8u60+, usually <1% overhead) so the frame-pointer unwinder can walk JIT-compiled Java frames — no manual flag needed. Mirrors the existing Node.js `NODE_OPTIONS` injection.
+- **Java flamegraph coloring** — JVM/JIT frames get their own color category (green, Brendan Gregg's `--color=java` convention) across the TUI, SVG, and HTML/serve renderers, distinct from the JS/Node band, via the shared `profile-bee-common` classifier. Matches both signatured (`long Burn.fib(int)`) and signatureless (`java.lang.String.equals`) HotSpot names while keeping native `::` symbols and compiler clones (`memcpy.cold`) out.
+- **Java support in all collection modes** — JVM detection, auto-dump, and JIT symbol resolution now run in `--tui` and `--serve` collection, not just CLI (`--svg`/`--collapse`) output.
+- **Generic perf-map support** — any runtime that emits perf-maps (Node/V8, PyPy, etc.) benefits from the same fallback path when blazesym cannot resolve anonymous JIT mappings. Maps reload live when the file mtime/size changes; a reloaded map invalidates stale symbolized frames for that PID.
+
+### Hardening
+
+- **Safe HotSpot attach-flag creation** — the `/tmp/.attach_pid<pid>` flag used by the direct attach fallback is now created with `O_CREAT|O_EXCL|O_NOFOLLOW` and never `chmod`ed, so a symlink pre-planted in world-writable `/tmp` cannot be truncated or have its target's permissions changed.
+- **procfs-based maps parsing** — JVM `libjvm.so` detection now reads `/proc/<pid>/maps` via `procfs` (matching the rest of the codebase) instead of raw text, preserving pathnames with spaces and handling the ` (deleted)` marker.
+
 ## v0.3.18
 
 ### New Features
