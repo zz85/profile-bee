@@ -68,7 +68,11 @@ sudo probee -e uprobe:malloc -t 1000 -o malloc.svg
 # Off-CPU profiling — find where threads block
 sudo probee --off-cpu --tui -- ./my-server
 
-# Java: system-wide profiling auto-dumps JIT maps (see docs/java_profiling.md)
+# Java: launch a JVM hands-off — frame pointers and JIT symbol maps are set up
+# automatically, no -XX flags or manual jcmd needed (see docs/java_profiling.md)
+sudo probee --tui -- java -jar app.jar
+
+# Or attach to a running JVM; system-wide profiling also auto-dumps JIT maps
 sudo probee --tui
 ```
 
@@ -113,7 +117,8 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 - **Real-time web server** (`--serve`) — live flamegraph updates over HTTP with interactive controls
 - **Automatic termination** — stops when `-p` target or child process exits
 - **Rust & C++ demangling** — via gimli/blazesym
-- **Java / JIT symbols** — system-wide HotSpot discovery, automatic `Compiler.perfmap` dump/attach, and JIT frame resolution from `/tmp/perf-<pid>.map` (see [docs/java_profiling.md](docs/java_profiling.md))
+- **Java / HotSpot profiling** — auto-detects JVMs and resolves JIT-compiled methods from `/tmp/perf-<pid>.map`, auto-dumping it via `Compiler.perfmap` (JDK 17+) / HotSpot attach with no manual `jcmd`. Injects `-XX:+PreserveFramePointer` when launching `java`, scopes attach/dump to the profiled target (never touches other JVMs), and works in CLI, TUI, and `--serve` (see [docs/java_profiling.md](docs/java_profiling.md))
+- **Category-based coloring** — frames are colored by category (kernel, kernel I/O, JavaScript/V8, Java/JVM, native, synthetic) consistently across the TUI, SVG, and HTML/serve renderers
 - **BPF-based aggregation** — stack counting in kernel to reduce userspace data transfer
 - **Group by CPU / process** — per-core or per-PID flamegraph breakdown (`--group-by-cpu`, `--group-by-process`)
 - **Process lifecycle tracking** — eBPF-driven exec and exit detection via `sched_process_exec` / `sched_process_exit` tracepoints. Auto-enabled with DWARF unwinding; available to library consumers via `SessionConfig::track_process_lifecycle`
@@ -450,7 +455,7 @@ let session = ProfilingSession::new(config).await?;
 
 - Linux only (requires eBPF support)
 - DWARF unwinding: x86_64 only, see limits above
-- Interpreted / JIT stack traces not yet supported
+- JIT-compiled code (HotSpot Java, V8/Node) is symbolized via `/tmp/perf-<pid>.map`; interpreter and inlined frames are not yet reconstructed. `Compiler.perfmap` auto-dump requires JDK 17+ (on JDK 8/11 use perf-map-agent/async-profiler)
 - [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) `.eh_frame` parsed for DWARF unwinding; VDSO symbolization not yet supported
 
 ## Development

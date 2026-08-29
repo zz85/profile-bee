@@ -1,6 +1,6 @@
 [package]
 name = "profile-bee-tui"
-version = "0.3.18"
+version = "0.3.19"
 edition = "2021"
 license = "MIT"
 description = "Terminal-based flamegraph viewer for profile-bee (forked from flamelens)"
@@ -13,7 +13,7 @@ repository = "https://github.com/zz85/profile-bee"
 [dependencies]
 anyhow = "1.0"
 crossterm = { version = "0.28.1", features = ["use-dev-tty"] }
-profile-bee-common = { version = "0.3.18", path = "../profile-bee-common", features = ["color"] }
+profile-bee-common = { version = "0.3.19", path = "../profile-bee-common", features = ["color"] }
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
