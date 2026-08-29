@@ -285,6 +285,16 @@ struct Opt {
     #[arg(long, default_value_t = 2)]
     stream_mode: u8,
 
+    /// Automatically discover running HotSpot JVMs and dump JIT perf-maps
+    /// (`Compiler.perfmap`) so system-wide profiles resolve Java methods
+    /// without manual `jcmd`. Enabled by default.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    auto_java: bool,
+
+    /// Seconds between Java JIT map refresh/re-dump while profiling (0 = off).
+    #[arg(long, default_value_t = 30)]
+    java_refresh_secs: u64,
+
     /// Spawn command and profile (deprecated: use `-- <command>` instead)
     #[arg(long)]
     cmd: Option<String>,
@@ -739,6 +749,15 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         monitor_exit_pid,
         tgid_request_tx,
         enable_process_metadata: false,
+        auto_java_symbols: opt.auto_java,
+        java_refresh_interval: if opt.java_refresh_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(opt.java_refresh_secs))
+        },
+        // Scope Java auto-discovery to the target PID (spawned child or
+        // `--pid`); `None` here means system-wide profiling.
+        java_target_pid: pid,
     };
     let mut event_loop = ProfilingEventLoop::new(
         ebpf_profiler.counts,

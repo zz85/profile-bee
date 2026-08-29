@@ -1,4 +1,5 @@
 use crate::ebpf::{FramePointersPod, StackInfoPod};
+use crate::perf_map::{format_jit_symbol, PerfMapCache};
 use crate::v8::{V8HeapReader, V8IntrospectionData};
 use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
 use aya::maps::MapData;
@@ -427,7 +428,7 @@ impl SymbolFormatter {
         None
     }
 
-    /// Symbol name with V8 perf-map formatting applied when detected.
+    /// Symbol name with V8 / HotSpot JIT formatting applied when detected.
     fn map_user_sym_to_stack(sym: Symbolized) -> StackFrameInfo {
         let sym = match sym {
             Symbolized::Sym(sym) => sym,
@@ -442,6 +443,8 @@ impl SymbolFormatter {
         let name = sym.name.to_string();
         let display_name = if is_v8_symbol(&name) {
             format_v8_symbol(&name).unwrap_or(name)
+        } else if looks_like_hotspot_symbol(&name) {
+            crate::java::format_java_symbol(&name)
         } else {
             name
         };
@@ -451,6 +454,15 @@ impl SymbolFormatter {
             ..Default::default()
         }
     }
+}
+
+/// HotSpot JNI-style method descriptors and common JVM stubs that may appear
+/// in ELF/perf-map symbol streams.
+fn looks_like_hotspot_symbol(name: &str) -> bool {
+    (name.starts_with('L') && name.contains(';'))
+        || name == "Interpreter"
+        || name.starts_with("StubRoutines")
+        || name.contains("Adapter for")
 }
 
 /// Trace Handler convert address into proper stacktraces, apply necessary caching
@@ -469,6 +481,10 @@ pub struct TraceHandler {
     /// `CONFIG_PREEMPT_RT`, where softirq state is not in `preempt_count` and the
     /// softirq symbol heuristics must run even for `EXEC_CTX_TASK` samples.
     softirq_bits_valid: bool,
+    /// JIT symbol maps (`/tmp/perf-<pid>.map`) for Java, V8, etc.
+    perf_maps: PerfMapCache,
+    /// PIDs we've already logged a missing-perf-map hint for (avoid spam).
+    perf_map_hinted: HashMap<u32, bool>,
 }
 
 impl Default for TraceHandler {
@@ -558,6 +574,8 @@ impl TraceHandler {
             cache: Default::default(),
             v8_readers: HashMap::new(),
             softirq_bits_valid,
+            perf_maps: PerfMapCache::new(),
+            perf_map_hinted: HashMap::new(),
         }
     }
 
@@ -591,6 +609,8 @@ impl TraceHandler {
     pub fn invalidate_caches_for_pid(&mut self, tgid: u32) {
         self.cache.invalidate_pid(tgid);
         self.v8_readers.remove(&tgid);
+        self.perf_maps.remove(tgid);
+        self.perf_map_hinted.remove(&tgid);
         tracing::debug!("invalidated symbol caches for pid {}", tgid);
     }
 
@@ -606,6 +626,76 @@ impl TraceHandler {
             data.version.2,
         );
         self.v8_readers.insert(tgid, V8HeapReader::new(tgid, data));
+        // Node also emits perf-maps — track them for any frames without SFI.
+        self.perf_maps.ensure_pid(tgid);
+    }
+
+    /// Begin tracking `/tmp/perf-<pid>.map` for a process (Java, V8, others).
+    pub fn register_perf_map(&mut self, tgid: u32) {
+        self.perf_maps.ensure_pid(tgid);
+        if !self.perf_maps.has_symbols(tgid) {
+            self.perf_maps.try_discover(tgid);
+        }
+    }
+
+    /// Mark a PID as a JVM and ensure JIT symbol loading is armed.
+    ///
+    /// If no perf-map is present yet, best-effort auto-dump via jcmd / HotSpot
+    /// attach (`Compiler.perfmap`) so system-wide profiling resolves Java
+    /// frames without manual operator steps.
+    pub fn register_jvm(&mut self, tgid: u32) {
+        self.register_perf_map(tgid);
+        if !self.perf_maps.has_symbols(tgid) {
+            let result = crate::java::ensure_perf_map(tgid);
+            if let Some(path) = result.path.as_ref() {
+                self.perf_maps.load_path(tgid, path);
+            } else {
+                // Re-probe standard locations in case dump wrote a path we
+                // did not already know about.
+                self.perf_maps.try_discover(tgid);
+            }
+            if result.dumped {
+                tracing::info!(
+                    "JVM process {} ({}) — auto-dumped JIT perf-map via {} → {}",
+                    tgid,
+                    crate::java::describe_jvm(tgid),
+                    result.method.unwrap_or("unknown"),
+                    result
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "missing".into())
+                );
+            }
+        }
+
+        if self.perf_maps.has_symbols(tgid) {
+            tracing::info!(
+                "JVM process {} with JIT perf-map symbols ({})",
+                tgid,
+                crate::java::describe_jvm(tgid)
+            );
+        } else if let std::collections::hash_map::Entry::Vacant(e) =
+            self.perf_map_hinted.entry(tgid)
+        {
+            e.insert(true);
+            tracing::info!(
+                "JVM process {} ({}) — {}",
+                tgid,
+                crate::java::describe_jvm(tgid),
+                crate::java::PERF_MAP_HINT
+            );
+        }
+    }
+
+    /// Force-reload all tracked JIT perf-maps (periodic refresh).
+    pub fn refresh_perf_maps(&mut self) {
+        self.perf_maps.reload_all();
+    }
+
+    /// Load a specific perf-map path for a PID (after external dump).
+    pub fn load_perf_map_path(&mut self, tgid: u32, path: &std::path::Path) {
+        self.perf_maps.load_path(tgid, path);
     }
 
     pub fn print_stats(&self) {
@@ -923,6 +1013,17 @@ impl TraceHandler {
             frame.address = addr;
         }
 
+        // If blazesym returned fewer frames than addresses (unlikely) or empty
+        // on failure, pad with unknowns so JIT fallback can still label them.
+        while user_syms.len() < addrs.len() {
+            let addr = addrs[user_syms.len()];
+            user_syms.push(StackFrameInfo {
+                address: addr,
+                symbol: Some("[unknown]".to_string()),
+                ..Default::default()
+            });
+        }
+
         // Override symbols for V8 frames using the heap reader.
         // The v8_sfi array is parallel to the user addresses — if v8_sfi[i] != 0,
         // frame i is a V8 JavaScript frame and we can resolve the SFI pointer
@@ -950,6 +1051,10 @@ impl TraceHandler {
                 }
             }
         }
+
+        // JIT fallback: resolve [unknown] / empty frames via /tmp/perf-<pid>.map
+        // (HotSpot, V8 without SFI, other runtimes).
+        self.apply_perf_map_symbols(pid, &addrs, &mut user_syms);
 
         let kernel_addrs = kernel_stack.unwrap_or_default();
         let mut kernel_syms = self
@@ -1003,11 +1108,59 @@ impl TraceHandler {
 
         combined
     }
+
+    /// Fill unresolved user frames from the per-PID JIT perf-map cache.
+    fn apply_perf_map_symbols(
+        &mut self,
+        pid: u32,
+        addrs: &[u64],
+        user_syms: &mut [StackFrameInfo],
+    ) {
+        // Cheap exit when we have never registered this PID.
+        // Still try discovery once in a while for late-created maps.
+        if !self.perf_maps.has_symbols(pid) {
+            self.perf_maps.try_discover(pid);
+            if !self.perf_maps.has_symbols(pid) {
+                return;
+            }
+        }
+
+        for (frame, &addr) in user_syms.iter_mut().zip(addrs.iter()) {
+            let needs_jit = match frame.symbol.as_deref() {
+                None => true,
+                Some("[unknown]") => true,
+                Some(s) if s.starts_with("0x") => true,
+                // blazesym sometimes returns the hex address as the name
+                Some(_) => false,
+            };
+            if !needs_jit {
+                continue;
+            }
+            if let Some(raw) = self.perf_maps.lookup(pid, addr) {
+                let display = if is_v8_symbol(&raw) {
+                    format_v8_symbol(&raw).unwrap_or_else(|| format_jit_symbol(&raw))
+                } else if looks_like_hotspot_symbol(&raw) {
+                    crate::java::format_java_symbol(&raw)
+                } else {
+                    format_jit_symbol(&raw)
+                };
+                frame.symbol = Some(display);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hotspot_symbol_detection() {
+        assert!(looks_like_hotspot_symbol("Ljava/lang/String;equals"));
+        assert!(looks_like_hotspot_symbol("Interpreter"));
+        assert!(!looks_like_hotspot_symbol("malloc"));
+        assert!(!looks_like_hotspot_symbol("LazyCompile:*foo"));
+    }
 
     #[test]
     fn test_v8_optimized_with_source() {

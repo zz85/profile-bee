@@ -15,6 +15,9 @@
 //! intermediate representation feeding all renderers:
 //! - Kernel frames carry a `_k` suffix (see `trace_handler.rs`).
 //! - V8/Node JavaScript frames carry a `[v8]` prefix or a `(file.js:line)` source.
+//! - Java/HotSpot frames carry a `[jvm]` prefix (runtime stubs/interpreter) or a
+//!   dotted method signature like `long Burn.fib(int)` (JIT perf-map names use
+//!   `.`-separated packages, unlike C++/Rust which use `::`).
 //! - Synthetic/meta frames are `cpu_NN`, `swapper/N`, `idle`, or `cmd (pid)` roots.
 //!
 //! Pure `core`: no `alloc`, no floats, no panics. Integer fixed-point keeps it
@@ -29,6 +32,8 @@ pub enum FrameCategory {
     KernelIo,
     /// V8 / Node.js JavaScript frames.
     Js,
+    /// Java / HotSpot JVM frames (JIT-compiled methods, interpreter, stubs).
+    Java,
     /// Native userspace code — the default.
     User,
     /// Synthetic frames: per-CPU roots, the idle task, process roots.
@@ -57,7 +62,13 @@ pub fn categorize(name: &str) -> FrameCategory {
         return FrameCategory::Kernel;
     }
 
-    // 2. V8 / Node.js JavaScript frames.
+    // 2. Java/HotSpot runtime frames carry an explicit `[jvm] ` tag (interpreter,
+    //    stubs, adapters). This is a definitive signal, so check it before JS.
+    if name.starts_with("[jvm] ") {
+        return FrameCategory::Java;
+    }
+
+    // 3. V8 / Node.js JavaScript frames.
     if name.starts_with("[v8] ")
         || (name.ends_with(')')
             && (name.contains(".js") || name.contains(".mjs") || name.contains(".cjs")))
@@ -65,7 +76,7 @@ pub fn categorize(name: &str) -> FrameCategory {
         return FrameCategory::Js;
     }
 
-    // 3. Synthetic / meta frames.
+    // 4. Synthetic / meta frames.
     if name == "idle" || name.starts_with("cpu_") || name.starts_with("swapper/") {
         return FrameCategory::Meta;
     }
@@ -77,8 +88,30 @@ pub fn categorize(name: &str) -> FrameCategory {
         }
     }
 
-    // 4. Everything else is native user code.
+    // 5. JIT-compiled Java methods from `/tmp/perf-<pid>.map` arrive as dotted
+    //    signatures (`long Burn.fib(int)`, `java.lang.String.hashCode()`). Java
+    //    uses `.`-separated packages; C++/Rust use `::`, so requiring a dotted
+    //    call shape with no `::` keeps native frames out of this band.
+    if looks_like_java_method(name) {
+        return FrameCategory::Java;
+    }
+
+    // 6. Everything else is native user code.
     FrameCategory::User
+}
+
+/// Heuristic for a HotSpot JIT method name (post-demangling). True when the
+/// name has a `Package.Class.method(...)` shape: a `(` with a `.`-containing
+/// head and no `::` (which would mark it as C++/Rust). JS `(file.js:line)` and
+/// `cmd (pid)` roots are handled by earlier rules, so they never reach here.
+fn looks_like_java_method(name: &str) -> bool {
+    if name.contains("::") {
+        return false;
+    }
+    match name.find('(') {
+        Some(paren) => name[..paren].contains('.'),
+        None => false,
+    }
 }
 
 // FNV-1a hash constants (64-bit).
@@ -104,8 +137,9 @@ fn band(cat: FrameCategory) -> Band {
     match cat {
         FrameCategory::Kernel => [(215, 40), (95, 55), (0, 35)], // orange
         FrameCategory::KernelIo => [(35, 55), (105, 70), (200, 55)], // blue
-        FrameCategory::Js => [(55, 55), (175, 65), (55, 50)],    // green
-        FrameCategory::User => [(205, 50), (0, 230), (0, 55)],   // warm (legacy look)
+        FrameCategory::Js => [(55, 55), (175, 65), (55, 50)],    // yellow-green
+        FrameCategory::Java => [(40, 45), (140, 60), (95, 55)], // jade green (Gregg's --color=java)
+        FrameCategory::User => [(205, 50), (0, 230), (0, 55)],  // warm (legacy look)
         FrameCategory::Meta => [(95, 30), (100, 30), (110, 30)], // dim gray
     }
 }
@@ -168,6 +202,44 @@ mod tests {
         assert_eq!(categorize("foo (index.mjs)"), FrameCategory::Js);
         // A destructor-like `~Name` with no JS source is NOT JS.
         assert_eq!(categorize("~Widget"), FrameCategory::User);
+    }
+
+    #[test]
+    fn categorize_java() {
+        // Explicit `[jvm]` runtime tags.
+        assert_eq!(categorize("[jvm] Interpreter"), FrameCategory::Java);
+        assert_eq!(
+            categorize("[jvm] StubRoutines (initial stubs)"),
+            FrameCategory::Java
+        );
+        // JIT method signatures from Compiler.perfmap (dotted, no `::`).
+        assert_eq!(categorize("long Burn.fib(int)"), FrameCategory::Java);
+        assert_eq!(
+            categorize("java.lang.String.hashCode()"),
+            FrameCategory::Java
+        );
+        assert_eq!(
+            categorize("void java.lang.Object.<init>()"),
+            FrameCategory::Java
+        );
+        // Native C++/Rust use `::` and must NOT be classified as Java.
+        assert_eq!(
+            categorize("std::vector::push_back(int)"),
+            FrameCategory::User
+        );
+        assert_eq!(categorize("core::fmt::write"), FrameCategory::User);
+        assert_eq!(
+            categorize("operator new(unsigned long)"),
+            FrameCategory::User
+        );
+        // JS sources still win over the Java method heuristic.
+        assert_eq!(categorize("processData (server.js:42)"), FrameCategory::Js);
+        // Java gets a visibly different color band from JS.
+        assert_ne!(
+            band(FrameCategory::Java),
+            band(FrameCategory::Js),
+            "Java and JS bands must differ"
+        );
     }
 
     #[test]

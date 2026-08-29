@@ -180,14 +180,37 @@ fn is_nodejs_program(program: &str) -> bool {
     matches!(basename, "node" | "nodejs" | "nsolid")
 }
 
+/// Add `-XX:+PreserveFramePointer` to a `JAVA_TOOL_OPTIONS` value unless it is
+/// already present. Preserving the frame pointer (JDK 8u60+, usually <1%
+/// overhead) is what lets the frame-pointer unwinder walk through JIT-compiled
+/// Java frames — see docs/java_profiling.md and Brendan Gregg's CPU flame
+/// graph notes.
+fn java_tool_options_with_frame_pointers(existing: Option<String>) -> String {
+    const FLAG: &str = "-XX:+PreserveFramePointer";
+    match existing {
+        Some(options) if !options.is_empty() => {
+            if options.split_whitespace().any(|opt| opt == FLAG) {
+                options
+            } else {
+                format!("{options} {FLAG}")
+            }
+        }
+        _ => FLAG.to_string(),
+    }
+}
+
 /// Build extra environment variables for runtime-specific profiling support.
 ///
-/// For Node.js processes, injects `NODE_OPTIONS` with `--perf-prof` (writes
-/// `/tmp/perf-<pid>.map` for JIT symbol resolution) and
+/// For Node.js processes, injects `NODE_OPTIONS` with `--perf-basic-prof`
+/// (writes `/tmp/perf-<pid>.map` for JIT symbol resolution) and
 /// `--interpreted-frames-native-stack` (enables frame pointers in interpreted
 /// frames for reliable stack unwinding).
 ///
-/// Merges with any existing `NODE_OPTIONS` from the parent environment.
+/// For HotSpot JVMs, injects `JAVA_TOOL_OPTIONS=-XX:+PreserveFramePointer` so
+/// the frame-pointer unwinder can traverse JIT-compiled Java frames.
+///
+/// Merges with any existing `NODE_OPTIONS` / `JAVA_TOOL_OPTIONS` from the
+/// parent environment.
 fn build_runtime_env(program: &str) -> Vec<(&'static str, String)> {
     let mut env = Vec::new();
 
@@ -221,6 +244,18 @@ fn build_runtime_env(program: &str) -> Vec<(&'static str, String)> {
         env.push(("NODE_OPTIONS", value));
     }
 
+    if crate::java::is_java_binary(Path::new(program)) {
+        // -XX:+PreserveFramePointer keeps RBP as a real frame pointer in
+        // JIT-compiled code so the FP unwinder can walk mixed native/Java
+        // stacks. Merge with any inherited JAVA_TOOL_OPTIONS.
+        let value = java_tool_options_with_frame_pointers(std::env::var("JAVA_TOOL_OPTIONS").ok());
+        tracing::info!(
+            "HotSpot JVM detected: injecting JAVA_TOOL_OPTIONS=\"{}\" for native stack unwinding",
+            value
+        );
+        env.push(("JAVA_TOOL_OPTIONS", value));
+    }
+
     env
 }
 
@@ -233,8 +268,9 @@ fn build_runtime_env(program: &str) -> Vec<(&'static str, String)> {
 /// the caller can read them (e.g. for TUI display).  Use
 /// [`SpawnProcess::take_stdout`] / [`take_stderr`] to obtain the handles.
 ///
-/// For Node.js commands, automatically injects `NODE_OPTIONS` environment
-/// variables to enable JIT symbol resolution via perf-map files.
+/// For Node.js commands, injects `NODE_OPTIONS` to enable JIT symbol
+/// resolution via perf-map files; for HotSpot `java` commands, injects
+/// `JAVA_TOOL_OPTIONS=-XX:+PreserveFramePointer` for native stack unwinding.
 pub fn setup_process_to_profile(
     cmd: &Option<String>,
     command: &[String],
@@ -282,5 +318,44 @@ pub fn setup_process_to_profile(
         Ok((Some(stopper), Some(child)))
     } else {
         Ok((None, None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_frame_pointer_flag_once() {
+        assert_eq!(
+            java_tool_options_with_frame_pointers(None),
+            "-XX:+PreserveFramePointer"
+        );
+        assert_eq!(
+            java_tool_options_with_frame_pointers(Some(String::new())),
+            "-XX:+PreserveFramePointer"
+        );
+        assert_eq!(
+            java_tool_options_with_frame_pointers(Some("-Xmx1g".to_string())),
+            "-Xmx1g -XX:+PreserveFramePointer"
+        );
+        // Already present — do not duplicate.
+        assert_eq!(
+            java_tool_options_with_frame_pointers(Some(
+                "-XX:+PreserveFramePointer -Xmx1g".to_string()
+            )),
+            "-XX:+PreserveFramePointer -Xmx1g"
+        );
+    }
+
+    #[test]
+    fn build_runtime_env_injects_java_tool_options() {
+        let env = build_runtime_env("/usr/lib/jvm/java-21/bin/java");
+        assert!(env
+            .iter()
+            .any(|(k, v)| *k == "JAVA_TOOL_OPTIONS" && v.contains("-XX:+PreserveFramePointer")));
+        // javac is not a JVM launcher — no injection.
+        let env = build_runtime_env("/usr/bin/javac");
+        assert!(!env.iter().any(|(k, _)| *k == "JAVA_TOOL_OPTIONS"));
     }
 }
