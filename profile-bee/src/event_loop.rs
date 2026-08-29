@@ -13,6 +13,7 @@ use aya::Ebpf;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS, PROCESS_EVENT_EXEC, PROCESS_EVENT_EXIT};
 
 use crate::ebpf::{apply_dwarf_refresh, FramePointersPod, StackInfoPod, V8ProcInfoPod};
+use crate::java::{is_hotspot_binary, HotSpotPerfMapTracker, PerfMapChange};
 use crate::pipeline::{DwarfThreadMsg, PerfWork};
 use crate::process_metadata::ProcessMetadataCache;
 use crate::trace_handler::TraceHandler;
@@ -102,6 +103,7 @@ pub struct ProfilingEventLoop {
     /// `build_raw_stacks()` completes, so agents can still look up
     /// metadata for processes that exited within the collection window.
     pending_exit_pids: Vec<u32>,
+    hotspot_perf_maps: HotSpotPerfMapTracker,
 }
 
 impl ProfilingEventLoop {
@@ -135,6 +137,7 @@ impl ProfilingEventLoop {
                 None
             },
             pending_exit_pids: Vec::new(),
+            hotspot_perf_maps: HotSpotPerfMapTracker::default(),
         }
     }
 
@@ -308,6 +311,28 @@ impl ProfilingEventLoop {
             {
                 let _ = v8_map.remove(&tgid);
             }
+
+            fn observe_hotspot_perf_map(&mut self, tgid: u32) {
+                let exe_path = match std::fs::read_link(format!("/proc/{tgid}/exe")) {
+                    Ok(path) if is_hotspot_binary(&path) => path,
+                    _ => return,
+                };
+
+                if let Some(change) = self.hotspot_perf_maps.observe(tgid) {
+                    self.trace_handler.invalidate_symbol_cache_for_pid(tgid);
+                    match change {
+                        PerfMapChange::Available => tracing::info!(
+                            "discovered HotSpot perf map for pid {} ({}); resolving JIT symbols",
+                            tgid,
+                            exe_path.display()
+                        ),
+                        PerfMapChange::Changed => tracing::debug!(
+                            "HotSpot perf map changed for pid {}; refreshed JIT symbols",
+                            tgid
+                        ),
+                    }
+                }
+            }
         }
     }
 
@@ -388,6 +413,7 @@ impl ProfilingEventLoop {
                         // Even without DWARF thread, detect V8 processes
                         self.try_setup_v8_for_pid(stack.tgid);
                     }
+                    self.observe_hotspot_perf_map(stack.tgid);
                     if local_counting {
                         let trace = self.trace_count.entry(stack).or_insert(0);
                         *trace += 1;
@@ -422,6 +448,7 @@ impl ProfilingEventLoop {
                                 let _ = tx.send(DwarfThreadMsg::ProcessExited(event.pid));
                             }
                             self.known_tgids.remove(&event.pid);
+                            self.hotspot_perf_maps.remove(event.pid);
                             // Clean up V8 state for the exiting process to prevent
                             // stale readers from being used if the PID is reused.
                             self.trace_handler.invalidate_caches_for_pid(event.pid);
@@ -455,6 +482,7 @@ impl ProfilingEventLoop {
                             // PID triggers try_setup_v8_for_pid and DWARF reloading.
                             // Do NOT re-insert — let the StackInfo handler do it.
                             self.known_tgids.remove(&event.pid);
+                            self.hotspot_perf_maps.remove(event.pid);
                             // Invalidate symbol caches for this PID
                             self.trace_handler.invalidate_caches_for_pid(event.pid);
                             // Remove eBPF v8_proc_info for the old binary

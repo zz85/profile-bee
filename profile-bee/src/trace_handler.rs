@@ -502,6 +502,12 @@ impl TraceHandler {
         tracing::debug!("invalidated symbol caches for pid {}", tgid);
     }
 
+    /// Invalidate address symbols after a runtime rewrites its JIT perf map.
+    pub fn invalidate_symbol_cache_for_pid(&mut self, tgid: u32) {
+        self.cache.invalidate_pid(tgid);
+        tracing::debug!("invalidated symbol cache for pid {}", tgid);
+    }
+
     /// Register a V8 heap reader for a Node.js process.
     /// The reader uses the V8 introspection data to resolve SFI pointers
     /// from the eBPF V8 frame extractor to JavaScript function names.

@@ -21,10 +21,11 @@ entries in that file as:
 <hex-address> <hex-size> <method-name>
 ```
 
-When the map is present, profile-bee resolves its JIT entries through the same
-process-symbolization path used for Node.js. A missing map results in an
-explicit warning for `--pid`; native and kernel frames remain usable, while
-compiled Java methods are `[unknown]`.
+During system-wide profiling, profile-bee discovers sampled HotSpot processes,
+detects newly available maps, and invalidates symbol caches when the map is
+rewritten. When the map is present, profile-bee resolves its JIT entries through
+the same process-symbolization path used for Node.js. Native and kernel frames
+remain usable without a map, while compiled Java methods are `[unknown]`.
 
 ## JVMTI boundary
 
