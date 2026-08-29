@@ -143,10 +143,15 @@ pub fn collapse_to_json(stacks: &[&str]) -> String {
         // `processData (server.js:42)`), so splitting on the first space would
         // truncate the stack. This mirrors the collapse parsing elsewhere
         // (`build_collapse_output`, the SVG palette builder, the TUI `flame`).
+        // Only strip the trailing token when it actually parses as a count;
+        // otherwise the whole line is frames (a frame name may end in a space-
+        // separated token that is not a number). This keeps every frame name
+        // intact so each gets a color.
         let (frames_str, count) = match stack.rsplit_once(' ') {
-            Some((frames, count_str)) => {
-                (frames, count_str.trim().parse::<usize>().ok().unwrap_or(1))
-            }
+            Some((frames, count_str)) => match count_str.trim().parse::<usize>() {
+                Ok(count) => (frames, count),
+                Err(_) => (*stack, 1),
+            },
             None => (*stack, 1),
         };
         let names = frames_str.split(';');

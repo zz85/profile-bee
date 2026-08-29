@@ -43,7 +43,7 @@ cargo build --release --features tui
 sudo ./target/release/profile-bee --tui -- your-command
 ```
 
-In live mode, the TUI now includes a **Heatmap** tab. Use `[` and `]` to move across time buckets, `{` and `}` to expand the selected range, and `c` to return the detail pane to live-follow mode.
+In live mode, the TUI now includes a **Heatmap** tab. Use `←`/`→` to move across time buckets, `Shift`+`←`/`Shift`+`→` to expand the selected range, `Home` to return to live-follow mode, and `v` to toggle between the grid and bar styles.
 
 ## Architecture
 

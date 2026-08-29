@@ -143,11 +143,13 @@ impl OutputSink for SvgSink {
 fn build_svg_palette_map(stacks: &[String]) -> PaletteMap {
     let mut pm = PaletteMap::default();
     for line in stacks {
-        // Drop the trailing ` <count>`, then split frames on `;`.
-        let frames = line
-            .rsplit_once(' ')
-            .map(|(f, _)| f)
-            .unwrap_or(line.as_str());
+        // Drop the trailing ` <count>` only when it parses as a count; otherwise
+        // treat the whole line as frames so every frame name (which may itself
+        // end in a space-separated token) still receives a palette entry.
+        let frames = match line.rsplit_once(' ') {
+            Some((f, count_str)) if count_str.trim().parse::<u64>().is_ok() => f,
+            _ => line.as_str(),
+        };
         for name in frames.split(';') {
             if name.is_empty() || pm.get(name).is_some() {
                 continue;
