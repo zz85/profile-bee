@@ -311,26 +311,28 @@ impl ProfilingEventLoop {
             {
                 let _ = v8_map.remove(&tgid);
             }
+        }
+    }
 
-            fn observe_hotspot_perf_map(&mut self, tgid: u32) {
-                let exe_path = match std::fs::read_link(format!("/proc/{tgid}/exe")) {
-                    Ok(path) if is_hotspot_binary(&path) => path,
-                    _ => return,
-                };
+    fn observe_hotspot_perf_map(&mut self, tgid: u32) {
+        let exe_path = match std::fs::read_link(format!("/proc/{tgid}/exe")) {
+            Ok(path) if is_hotspot_binary(&path) => path,
+            _ => return,
+        };
 
-                if let Some(change) = self.hotspot_perf_maps.observe(tgid) {
-                    self.trace_handler.invalidate_symbol_cache_for_pid(tgid);
-                    match change {
-                        PerfMapChange::Available => tracing::info!(
-                            "discovered HotSpot perf map for pid {} ({}); resolving JIT symbols",
-                            tgid,
-                            exe_path.display()
-                        ),
-                        PerfMapChange::Changed => tracing::debug!(
-                            "HotSpot perf map changed for pid {}; refreshed JIT symbols",
-                            tgid
-                        ),
-                    }
+        if let Some(change) = self.hotspot_perf_maps.observe(tgid) {
+            self.trace_handler.invalidate_symbol_cache_for_pid(tgid);
+            match change {
+                PerfMapChange::Available => tracing::info!(
+                    "discovered HotSpot perf map for pid {} ({}); resolving JIT symbols",
+                    tgid,
+                    exe_path.display()
+                ),
+                PerfMapChange::Changed => {
+                    tracing::debug!(
+                        "HotSpot perf map changed for pid {}; refreshed JIT symbols",
+                        tgid
+                    )
                 }
             }
         }
