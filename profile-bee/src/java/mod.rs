@@ -5,6 +5,7 @@
 //! ```text
 //! Phase 1 (this module + perf_map):
 //!   Detect JVM processes → load /tmp/perf-<pid>.map → resolve JIT PCs
+//!   Auto-dump maps via jcmd / HotSpot attach (system-wide, no manual jcmd)
 //!
 //! Phase 2 (future): HotSpot VM-struct introspection in userspace
 //!   Parse gHotSpotVMStructs from libjvm.so → remote Method*/nmethod* reads
@@ -13,15 +14,14 @@
 //!   Code-cache aware frame walk + cookies → userspace symbolize
 //! ```
 //!
-//! Phase 1 is non-intrusive and matches the Linux perf JIT interface that
-//! HotSpot can emit. Enable maps with:
-//! ```text
-//! jcmd <pid> Compiler.perfmap
-//! # or:
-//! java -XX:+PreserveFramePointer ...
-//! ```
-//!
 //! See `docs/java_profiling.md`.
+
+mod attach;
+
+pub use attach::{
+    bootstrap_system_java_maps, discover_jvm_pids, ensure_perf_map, has_usable_perf_map,
+    namespace_pids, refresh_perf_map, PerfMapEnsureResult,
+};
 
 use std::path::Path;
 
@@ -123,12 +123,12 @@ fn is_jvm_runtime_stub(name: &str) -> bool {
         || name.contains("Adapter for")
 }
 
-/// Hint text shown once when a JVM is detected without a perf-map.
+/// Hint text shown once when automatic dump failed.
 pub const PERF_MAP_HINT: &str = "\
-JVM detected but no /tmp/perf-<pid>.map found. To enable Java method names:
-  jcmd <pid> Compiler.perfmap
-  # or start with frame pointers:
-  java -XX:+PreserveFramePointer ...
+JVM detected but automatic Compiler.perfmap dump failed.
+profile-bee tried jcmd, process JAVA_HOME jcmd, HotSpot attach, and nsenter.
+You can retry manually: jcmd <pid> Compiler.perfmap
+Prefer -XX:+PreserveFramePointer on the JVM for better mixed stacks.
 See docs/java_profiling.md";
 
 #[cfg(test)]

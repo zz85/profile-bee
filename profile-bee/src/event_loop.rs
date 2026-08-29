@@ -75,6 +75,28 @@ pub struct EventLoopConfig {
     /// on exec/exit events. Library consumers can access it via
     /// `process_metadata()`.
     pub enable_process_metadata: bool,
+    /// Scan `/proc` at startup for HotSpot JVMs and auto-dump perf-maps.
+    /// Default: `true` so system-wide profiling resolves Java stacks without
+    /// manual `jcmd`. Set `false` to disable attach traffic.
+    pub auto_java_symbols: bool,
+    /// How often to re-dump/reload Java JIT maps while profiling.
+    /// `None` disables periodic refresh (maps still reload on mtime).
+    pub java_refresh_interval: Option<Duration>,
+}
+
+impl Default for EventLoopConfig {
+    fn default() -> Self {
+        Self {
+            stream_mode: 2,
+            group_by_cpu: false,
+            group_by_process: false,
+            monitor_exit_pid: None,
+            tgid_request_tx: None,
+            enable_process_metadata: false,
+            auto_java_symbols: true,
+            java_refresh_interval: Some(Duration::from_secs(30)),
+        }
+    }
 }
 
 /// Owns the state needed to drain eBPF events and produce collapsed stacks.
@@ -102,6 +124,14 @@ pub struct ProfilingEventLoop {
     /// `build_raw_stacks()` completes, so agents can still look up
     /// metadata for processes that exited within the collection window.
     pending_exit_pids: Vec<u32>,
+    /// When true, discover JVMs and dump Compiler.perfmap automatically.
+    auto_java_symbols: bool,
+    /// Periodic Java JIT map refresh interval.
+    java_refresh_interval: Option<Duration>,
+    /// Last time we ran a full Java map refresh.
+    last_java_refresh: Instant,
+    /// JVM PIDs we have already attempted setup for (including startup scan).
+    java_known_pids: HashSet<u32>,
 }
 
 impl ProfilingEventLoop {
@@ -113,8 +143,42 @@ impl ProfilingEventLoop {
         bpf: Ebpf,
         config: EventLoopConfig,
     ) -> Self {
-        let trace_handler = TraceHandler::new();
+        let mut trace_handler = TraceHandler::new();
         trace_handler.prewarm_kernel_symbols();
+
+        let mut java_known_pids = HashSet::new();
+        if config.auto_java_symbols {
+            // System-wide: discover already-running JVMs and dump perf-maps
+            // before samples arrive so the first stacks symbolize correctly.
+            for result in crate::java::bootstrap_system_java_maps() {
+                java_known_pids.insert(result.pid);
+                if let Some(path) = result.path.as_ref() {
+                    trace_handler.load_perf_map_path(result.pid, path);
+                    if result.dumped {
+                        tracing::info!(
+                            "startup Java map for pid {} via {}: {}",
+                            result.pid,
+                            result.method.unwrap_or("existing"),
+                            path.display()
+                        );
+                    } else {
+                        tracing::info!(
+                            "startup Java map for pid {} (existing): {}",
+                            result.pid,
+                            path.display()
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "startup Java setup for pid {} failed: {}",
+                        result.pid,
+                        result.message
+                    );
+                    // Still mark as JVM so sample path can retry/hint once.
+                    trace_handler.register_jvm(result.pid);
+                }
+            }
+        }
 
         Self {
             counts,
@@ -135,6 +199,10 @@ impl ProfilingEventLoop {
                 None
             },
             pending_exit_pids: Vec::new(),
+            auto_java_symbols: config.auto_java_symbols,
+            java_refresh_interval: config.java_refresh_interval,
+            last_java_refresh: Instant::now(),
+            java_known_pids,
         }
     }
 
@@ -233,10 +301,53 @@ impl ProfilingEventLoop {
 
     /// Detect HotSpot/OpenJDK processes and enable Java JIT symbolization.
     fn try_setup_java_for_pid(&mut self, tgid: u32) {
+        if !self.auto_java_symbols {
+            // Still load an existing map if the operator dumped one manually.
+            if crate::java::is_jvm_process(tgid) {
+                self.trace_handler.register_perf_map(tgid);
+            }
+            return;
+        }
+        if self.java_known_pids.contains(&tgid) {
+            // Already handled at startup or earlier sample — keep map hot.
+            self.trace_handler.register_perf_map(tgid);
+            return;
+        }
         if !crate::java::is_jvm_process(tgid) {
             return;
         }
+        self.java_known_pids.insert(tgid);
         self.trace_handler.register_jvm(tgid);
+    }
+
+    /// Periodic rescan: new JVMs + re-dump maps so JIT tiers stay fresh.
+    fn maybe_refresh_java_maps(&mut self) {
+        let Some(interval) = self.java_refresh_interval else {
+            return;
+        };
+        if !self.auto_java_symbols {
+            return;
+        }
+        if self.last_java_refresh.elapsed() < interval {
+            return;
+        }
+        self.last_java_refresh = Instant::now();
+
+        // Discover JVMs that started after profiling began; re-dump known ones
+        // so newly JIT-compiled methods appear in the map.
+        for pid in crate::java::discover_jvm_pids() {
+            if self.java_known_pids.insert(pid) {
+                tracing::info!("periodic scan found new JVM pid {pid}");
+                self.trace_handler.register_jvm(pid);
+            } else {
+                let result = crate::java::refresh_perf_map(pid);
+                if let Some(path) = result.path.as_ref() {
+                    self.trace_handler.load_perf_map_path(pid, path);
+                }
+            }
+        }
+
+        self.trace_handler.refresh_perf_maps();
     }
 
     /// Detect if a new PID is a Node.js/V8 process and set up V8 introspection.
@@ -350,6 +461,9 @@ impl ProfilingEventLoop {
         // where a sample may arrive after its process's exit event.
         self.evict_pending_exits();
 
+        // Opportunistic Java JIT map refresh / new-JVM discovery.
+        self.maybe_refresh_java_maps();
+
         let mut queue_processed = 0u64;
         let mut stopped = false;
         let local_counting = self.stream_mode == EVENT_TRACE_ALWAYS;
@@ -361,8 +475,17 @@ impl ProfilingEventLoop {
         }
 
         let deadline = timeout.map(|d| Instant::now() + d);
+        // In batch mode (no overall timeout), still wake periodically so Java
+        // JIT maps can refresh while waiting on a quiet system.
+        let java_wake = self
+            .java_refresh_interval
+            .filter(|_| self.auto_java_symbols)
+            .map(|d| d.min(Duration::from_secs(5)));
 
         loop {
+            // Keep maps fresh during long drains.
+            self.maybe_refresh_java_maps();
+
             let work = if let Some(dl) = deadline {
                 let remaining = dl.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -373,6 +496,18 @@ impl ProfilingEventLoop {
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         tracing::warn!("drain_events: channel disconnected");
+                        stopped = true;
+                        break;
+                    }
+                }
+            } else if let Some(wake) = java_wake {
+                match rx.recv_timeout(wake) {
+                    Ok(w) => w,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Wake only for Java refresh; keep waiting for real work.
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
                         stopped = true;
                         break;
                     }
@@ -437,6 +572,7 @@ impl ProfilingEventLoop {
                                 let _ = tx.send(DwarfThreadMsg::ProcessExited(event.pid));
                             }
                             self.known_tgids.remove(&event.pid);
+                            self.java_known_pids.remove(&event.pid);
                             // Clean up V8 state for the exiting process to prevent
                             // stale readers from being used if the PID is reused.
                             self.trace_handler.invalidate_caches_for_pid(event.pid);
@@ -470,6 +606,7 @@ impl ProfilingEventLoop {
                             // PID triggers try_setup_runtimes_for_pid and DWARF reloading.
                             // Do NOT re-insert — let the StackInfo handler do it.
                             self.known_tgids.remove(&event.pid);
+                            self.java_known_pids.remove(&event.pid);
                             // Invalidate symbol caches for this PID
                             self.trace_handler.invalidate_caches_for_pid(event.pid);
                             // Remove eBPF v8_proc_info for the old binary

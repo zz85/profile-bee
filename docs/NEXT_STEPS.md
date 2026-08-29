@@ -43,6 +43,8 @@ Self-profiling shows the DWARF subsystem accounts for ~70% of probee's active CP
 - Parses `/tmp/perf-<pid>.map` (and container `/proc/<pid>/root/tmp/...`)
 - Auto-detects HotSpot/`libjvm.so` processes; demangles `Lclass;method` names
 - Wired into `TraceHandler` as fallback for `[unknown]` user frames
+- **System-wide auto-dump**: startup `/proc` scan + `jcmd` / HotSpot attach / `nsenter`
+- Periodic JIT map refresh (`--java-refresh-secs`); toggle with `--auto-java`
 - See [docs/java_profiling.md](java_profiling.md)
 
 ### 9b. HotSpot VM-struct symbolization (Phase 2) — Planned

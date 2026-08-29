@@ -6,26 +6,37 @@ native stack unwinding (frame pointers or DWARF) with **JIT symbol maps**.
 This is Phase 1 of the Java roadmap. Full HotSpot VM-struct unwinding in eBPF
 (OTel eBPF Profiler style) is planned as a later phase — see below.
 
-## Quick start
+## Quick start (system-wide, automatic)
 
 ```bash
-# 1. Run your JVM with frame pointers when possible (helps native+JIT boundaries)
-java -XX:+PreserveFramePointer -jar myapp.jar
+# Profile the whole machine — probee finds running JVMs, dumps JIT maps,
+# and resolves Java method names without manual jcmd:
+sudo probee --tui
 
-# 2. Dump JIT symbols into the standard perf-map path (OpenJDK 17+)
-jcmd <pid> Compiler.perfmap
-# creates /tmp/perf-<pid>.map
-
-# 3. Profile with probee (auto-detects JVM + loads the map)
+# Or target one PID (still auto-dumps Compiler.perfmap if needed):
 sudo probee --pid <pid> --tui
-# or
+
+# Spawn a workload under the profiler:
 sudo probee --cmd "java -XX:+PreserveFramePointer -jar myapp.jar" --tui
 ```
 
 Collapsed / SVG output works the same as for native apps:
 
 ```bash
-sudo probee --pid <pid> -o java.svg -t 10000
+sudo probee -o java.svg -t 10000
+```
+
+### Flags
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--auto-java true\|false` | `true` | Scan `/proc`, dump/load JIT perf-maps for HotSpot |
+| `--java-refresh-secs N` | `30` | Re-dump/reload maps every N seconds (`0` = off) |
+
+Disable attach traffic if you only want passive map loading:
+
+```bash
+sudo probee --auto-java false --tui
 ```
 
 ## What you get today (Phase 1)
@@ -33,30 +44,42 @@ sudo probee --pid <pid> -o java.svg -t 10000
 | Capability | Status |
 |------------|--------|
 | Detect HotSpot/`libjvm.so` processes | ✅ automatic |
+| **System-wide JVM scan at startup** | ✅ automatic |
+| **Auto-dump `Compiler.perfmap`** (jcmd / attach / nsenter) | ✅ automatic |
 | Resolve JIT PCs via `/tmp/perf-<pid>.map` | ✅ automatic |
 | Demangle `Ljava/lang/String;equals` → `java.lang.String.equals` | ✅ |
 | Tag JVM stubs (`Interpreter`, …) as `[jvm] …` | ✅ |
-| Container path `/proc/<pid>/root/tmp/perf-<pid>.map` | ✅ |
-| Live reload when the map file grows (recompilation) | ✅ |
+| Container path + NSpid-aware map names | ✅ |
+| Live reload + periodic re-dump for JIT churn | ✅ |
 | Native `libjvm.so` frames via DWARF/FP | ✅ (existing) |
 | Interpreter / nmethod frame walk in eBPF | ❌ Phase 3 |
 | Inlined Java frames (`ScopeDesc`) | ❌ Phase 3 |
 | Allocation / lock profiling | ❌ use async-profiler |
 | JFR output | ⏳ separate roadmap item |
 
-Without a perf-map, JIT frames appear as `[unknown]` (anonymous executable
-mappings). profile-bee logs a one-time hint when it sees a JVM without a map.
+If automatic dump fails (permissions, exotic JVM), JIT frames may still appear
+as `[unknown]`. profile-bee logs a one-time hint with recovery steps.
 
-## Enabling perf-maps
+## How auto-dump works
 
-### `jcmd Compiler.perfmap` (recommended)
+On startup (and when a new JVM PID is first sampled), profile-bee:
+
+1. Scans `/proc` for processes mapping `libjvm.so` or named `java`
+2. Looks for an existing `/tmp/perf-<pid>.map` (host, NSpid, container root)
+3. If missing, tries in order:
+   - host `jcmd <pid> Compiler.perfmap`
+   - `jcmd` next to the process’s own `java` binary
+   - direct HotSpot attach socket (`.java_pid*`, SIGQUIT trigger)
+   - `nsenter -t <pid> -m -p` + in-namespace `jcmd` (containers)
+4. Loads the map into the JIT symbol cache and refreshes periodically
+
+### Manual `jcmd` (optional)
+
+You can still dump maps yourself; profile-bee will pick them up:
 
 ```bash
 jcmd <pid> Compiler.perfmap
 ```
-
-OpenJDK writes `/tmp/perf-<pid>.map` with current code-cache methods. Re-run
-after warm-up or major recompilation; profile-bee reloads on mtime/size change.
 
 ### async-profiler as a symbol helper
 
@@ -89,10 +112,11 @@ Relevant code:
 
 | Module | Role |
 |--------|------|
-| `profile-bee/src/java/` | JVM detection, symbol display helpers |
+| `profile-bee/src/java/mod.rs` | JVM detection, symbol display helpers |
+| `profile-bee/src/java/attach.rs` | Discover JVMs, jcmd/attach/nsenter dump |
 | `profile-bee/src/perf_map.rs` | Parse/cache `/tmp/perf-<pid>.map` |
-| `profile-bee/src/trace_handler.rs` | Symbolize + JIT fallback |
-| `profile-bee/src/event_loop.rs` | Auto-register JVM/perf-map on new PIDs |
+| `profile-bee/src/trace_handler.rs` | Symbolize + JIT fallback + auto-dump |
+| `profile-bee/src/event_loop.rs` | Startup scan + periodic refresh |
 
 ## Comparison with other tools
 

@@ -220,6 +220,39 @@ impl PerfMapCache {
         }
     }
 
+    /// Force-load a known map path (e.g. after auto-dump / container path).
+    pub fn load_path(&mut self, pid: u32, path: &Path) {
+        let map = PerfMap::load(path);
+        if !map.is_empty() {
+            tracing::info!(
+                "loaded JIT perf-map for pid {} from {} ({} symbols)",
+                pid,
+                path.display(),
+                map.len()
+            );
+        }
+        self.maps.insert(pid, map);
+        self.lookups_since_refresh.insert(pid, 0);
+    }
+
+    /// Force mtime reload for every tracked PID (periodic JIT refresh).
+    pub fn reload_all(&mut self) {
+        let pids: Vec<u32> = self.maps.keys().copied().collect();
+        for pid in pids {
+            if let Some(map) = self.maps.get_mut(&pid) {
+                if map.reload_if_changed() {
+                    tracing::debug!(
+                        "reloaded JIT perf-map for pid {} ({} symbols)",
+                        pid,
+                        map.len()
+                    );
+                }
+            }
+            // Re-discover empty maps in case dump landed on an alternate path.
+            self.try_discover(pid);
+        }
+    }
+
     /// Resolve `addr` for `pid`, refreshing the file periodically.
     pub fn lookup(&mut self, pid: u32, addr: u64) -> Option<String> {
         // Periodic reload for live JIT updates.
@@ -253,12 +286,27 @@ impl PerfMapCache {
 ///
 /// Checks, in order:
 /// 1. `/tmp/perf-<pid>.map` (kernel perf / JVM / V8 convention)
-/// 2. `/proc/<pid>/root/tmp/perf-<pid>.map` (container host view)
+/// 2. `/tmp/perf-<nspid>.map` (container PID namespace ID)
+/// 3. `/proc/<pid>/root/tmp/perf-*.map` (container host view of guest /tmp)
 pub fn find_perf_map_path(pid: u32) -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from(format!("/tmp/perf-{}.map", pid)),
-        PathBuf::from(format!("/proc/{}/root/tmp/perf-{}.map", pid, pid)),
+    let mut candidates = vec![
+        PathBuf::from(format!("/tmp/perf-{pid}.map")),
+        PathBuf::from(format!("/proc/{pid}/root/tmp/perf-{pid}.map")),
     ];
+    // Nested PID namespaces: JVM often names the file with the innermost PID.
+    if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("NSpid:") {
+                for nspid in rest.split_whitespace().filter_map(|s| s.parse::<u32>().ok()) {
+                    candidates.push(PathBuf::from(format!("/tmp/perf-{nspid}.map")));
+                    candidates.push(PathBuf::from(format!(
+                        "/proc/{pid}/root/tmp/perf-{nspid}.map"
+                    )));
+                }
+                break;
+            }
+        }
+    }
     candidates.into_iter().find(|path| path.is_file())
 }
 

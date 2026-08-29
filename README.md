@@ -68,9 +68,8 @@ sudo probee -e uprobe:malloc -t 1000 -o malloc.svg
 # Off-CPU profiling — find where threads block
 sudo probee --off-cpu --tui -- ./my-server
 
-# Java: dump JIT symbols then profile (see docs/java_profiling.md)
-jcmd <pid> Compiler.perfmap
-sudo probee --pid <pid> --tui
+# Java: system-wide profiling auto-dumps JIT maps (see docs/java_profiling.md)
+sudo probee --tui
 ```
 
 ### OTLP Export (Pyroscope / devfiler)
@@ -114,7 +113,7 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 - **Real-time web server** (`--serve`) — live flamegraph updates over HTTP with interactive controls
 - **Automatic termination** — stops when `-p` target or child process exits
 - **Rust & C++ demangling** — via gimli/blazesym
-- **Java / JIT symbols** — auto-detects HotSpot JVMs and resolves JIT frames from `/tmp/perf-<pid>.map` (see [docs/java_profiling.md](docs/java_profiling.md))
+- **Java / JIT symbols** — system-wide HotSpot discovery, automatic `Compiler.perfmap` dump/attach, and JIT frame resolution from `/tmp/perf-<pid>.map` (see [docs/java_profiling.md](docs/java_profiling.md))
 - **BPF-based aggregation** — stack counting in kernel to reduce userspace data transfer
 - **Group by CPU / process** — per-core or per-PID flamegraph breakdown (`--group-by-cpu`, `--group-by-process`)
 - **Process lifecycle tracking** — eBPF-driven exec and exit detection via `sched_process_exec` / `sched_process_exit` tracepoints. Auto-enabled with DWARF unwinding; available to library consumers via `SessionConfig::track_process_lifecycle`

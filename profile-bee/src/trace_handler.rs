@@ -547,24 +547,63 @@ impl TraceHandler {
     }
 
     /// Mark a PID as a JVM and ensure JIT symbol loading is armed.
-    /// Logs a one-time hint if no perf-map is available yet.
+    ///
+    /// If no perf-map is present yet, best-effort auto-dump via jcmd / HotSpot
+    /// attach (`Compiler.perfmap`) so system-wide profiling resolves Java
+    /// frames without manual operator steps.
     pub fn register_jvm(&mut self, tgid: u32) {
         self.register_perf_map(tgid);
-        if !self.perf_maps.has_symbols(tgid) && !self.perf_map_hinted.contains_key(&tgid) {
-            self.perf_map_hinted.insert(tgid, true);
+        if !self.perf_maps.has_symbols(tgid) {
+            let result = crate::java::ensure_perf_map(tgid);
+            if let Some(path) = result.path.as_ref() {
+                self.perf_maps.load_path(tgid, path);
+            } else {
+                // Re-probe standard locations in case dump wrote a path we
+                // did not already know about.
+                self.perf_maps.try_discover(tgid);
+            }
+            if result.dumped {
+                tracing::info!(
+                    "JVM process {} ({}) — auto-dumped JIT perf-map via {} → {}",
+                    tgid,
+                    crate::java::describe_jvm(tgid),
+                    result.method.unwrap_or("unknown"),
+                    result
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "missing".into())
+                );
+            }
+        }
+
+        if self.perf_maps.has_symbols(tgid) {
+            tracing::info!(
+                "JVM process {} with JIT perf-map symbols ({})",
+                tgid,
+                crate::java::describe_jvm(tgid)
+            );
+        } else if let std::collections::hash_map::Entry::Vacant(e) =
+            self.perf_map_hinted.entry(tgid)
+        {
+            e.insert(true);
             tracing::info!(
                 "JVM process {} ({}) — {}",
                 tgid,
                 crate::java::describe_jvm(tgid),
                 crate::java::PERF_MAP_HINT
             );
-        } else if self.perf_maps.has_symbols(tgid) {
-            tracing::info!(
-                "JVM process {} with JIT perf-map symbols ({})",
-                tgid,
-                crate::java::describe_jvm(tgid)
-            );
         }
+    }
+
+    /// Force-reload all tracked JIT perf-maps (periodic refresh).
+    pub fn refresh_perf_maps(&mut self) {
+        self.perf_maps.reload_all();
+    }
+
+    /// Load a specific perf-map path for a PID (after external dump).
+    pub fn load_perf_map_path(&mut self, tgid: u32, path: &std::path::Path) {
+        self.perf_maps.load_path(tgid, path);
     }
 
     pub fn print_stats(&self) {

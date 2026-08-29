@@ -5,6 +5,7 @@
 ### New Features
 
 - **Java / JIT profiling (Phase 1)** — auto-detects HotSpot JVM processes (`libjvm.so` / `java` binaries) and resolves JIT code addresses via Linux `/tmp/perf-<pid>.map` files (including container path `/proc/<pid>/root/tmp/...`). Demangles HotSpot names (`Ljava/lang/String;equals` → `java.lang.String.equals`) and tags JVM stubs as `[jvm] …`. See [docs/java_profiling.md](docs/java_profiling.md).
+- **System-wide automatic Java maps** — on startup, scans `/proc` for HotSpot JVMs and dumps `Compiler.perfmap` via host `jcmd`, process JAVA_HOME `jcmd`, direct HotSpot attach socket, or `nsenter` (containers). Periodic re-dump/reload (`--java-refresh-secs`, default 30) keeps JIT symbols fresh; disable with `--auto-java false`.
 - **Generic perf-map support** — any runtime that emits perf-maps (Node/V8, PyPy, etc.) benefits from the same fallback path when blazesym cannot resolve anonymous JIT mappings. Maps reload live when the file mtime/size changes.
 
 ## v0.3.15
