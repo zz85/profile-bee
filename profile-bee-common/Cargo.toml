@@ -1,6 +1,6 @@
 [package]
 name = "profile-bee-common"
-version = "0.3.17"
+version = "0.3.18"
 edition = "2021"
 license = "MIT"
 description = "Shared types between profile-bee userspace and eBPF programs"
@@ -9,6 +9,8 @@ repository = "https://github.com/zz85/profile-bee"
 [features]
 default = []
 user = [ "aya" ]
+# Pure-core (no deps) frame-category coloring shared by userspace renderers.
+color = []
 
 [dependencies]
 aya = { version = ">=0.11", optional=true }

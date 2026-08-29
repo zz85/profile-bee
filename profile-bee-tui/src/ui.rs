@@ -16,10 +16,6 @@ use ratatui::{
     Frame,
 };
 use std::time::Duration;
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
 
 const SEARCH_PREFIX: &str = "";
 const COLOR_SELECTED_STACK: Color = Color::Rgb(250, 250, 250);
@@ -234,6 +230,7 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("#", "search like cursor");
             help_tags.add("p", "pid mode");
             help_tags.add("t", "tree view");
+            help_tags.add("i", "hide idle");
             if let Some(p) = &self.app.flamegraph_state().search_pattern {
                 if p.is_manual {
                     help_tags.add("n/N", "next/prev search");
@@ -260,6 +257,7 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("enter/esc", "zoom");
             help_tags.add("/", "search");
             help_tags.add("#", "search like cursor");
+            help_tags.add("i", "hide idle");
             if let FlameGraphInput::Live = self.app.flamegraph_input {
                 help_tags.add("z", "freeze");
                 help_tags.add("m", "update mode");
@@ -348,10 +346,10 @@ impl<'a> FlamelensWidget<'a> {
         // height so they get a taller pane than the (multi-row) grid.
         let max_h = area.height.saturating_sub(3).max(1);
         let heatmap_height = match self.app.heatmap_style() {
-            crate::app::HeatmapStyle::Grid => area.height.saturating_div(3).clamp(4, 10),
-            crate::app::HeatmapStyle::Bars => area.height.saturating_mul(3) / 5,
+            crate::app::HeatmapStyle::Grid => area.height.saturating_div(4).clamp(4, 8),
+            crate::app::HeatmapStyle::Bars => area.height.saturating_div(2),
         }
-        .clamp(4, 18)
+        .clamp(4, 14)
         .min(max_h);
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -1041,37 +1039,17 @@ impl<'a> FlamelensWidget<'a> {
         if self.app.flamegraph_state().selected == stack.id {
             return COLOR_SELECTED_STACK;
         }
-        // Roughly based on flamegraph.pl
-        fn hash_name(name: &str) -> f64 {
-            let mut hasher = DefaultHasher::new();
-            name.hash(&mut hasher);
-            hasher.finish() as f64 / u64::MAX as f64
-        }
-        fn hash_name_seeded(name: &str) -> f64 {
-            let mut hasher = DefaultHasher::new();
-            name.hash(&mut hasher);
-            // Feed an extra constant to produce a second independent hash,
-            // avoiding the `format!("{}#2", name)` allocation per stack.
-            0x517c_c1b7_2722_0a95_u64.hash(&mut hasher);
-            hasher.finish() as f64 / u64::MAX as f64
-        }
-        let full_name = self.app.flamegraph().get_stack_full_name_from_info(stack);
-        let v1 = hash_name(full_name);
-        let v2 = hash_name_seeded(full_name);
-        let mut r;
-        let mut g;
-        let mut b;
-        if !stack.hit {
-            r = 205 + (50.0 * v2) as u8;
-            g = (230.0 * v1) as u8;
-            b = (55.0 * v2) as u8;
+        // Base color: category (kernel/io/js/user/meta) selects a color band, and a
+        // name hash varies the hue within it. Search matches override to blue. The
+        // leaf/short name is colored so it matches the SVG/HTML per-frame coloring.
+        let (mut r, mut g, mut b) = if !stack.hit {
+            let name = self.app.flamegraph().get_stack_short_name_from_info(stack);
+            profile_bee_common::color::color_for(name)
         } else if let Color::Rgb(r_, g_, b_) = COLOR_MATCHED_BACKGROUND {
-            r = r_;
-            g = g_;
-            b = b_;
+            (r_, g_, b_)
         } else {
             unreachable!();
-        }
+        };
         if let Some(zoom_state) = zoom_state {
             if zoom_state.ancestors.contains(&stack.id) {
                 r = (r as f64 / 2.5) as u8;
@@ -1282,7 +1260,10 @@ impl<'a> FlamelensWidget<'a> {
                     ),
                 );
                 let status_text = format!("{:width$}", selected_text, width = width as usize,);
-                if self.is_flamegraph_view() {
+                // Show the selected-stack readout in both the flamegraph view and
+                // the heatmap view (whose lower pane is a flamegraph), so a stack
+                // selected in the heatmap still reports its sample share.
+                if self.is_flamegraph_view() || self.is_heatmap_view() {
                     lines.push(("Selected", Line::from(status_text)));
                 }
                 if self.app.debug {

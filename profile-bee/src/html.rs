@@ -14,11 +14,16 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use warp::sse::Event;
 
 /// hierarchical data structure
-/// in the form of { name, value, children }
+/// in the form of { name, value, c, children }
+///
+/// `c` is the category+hash color (`#rrggbb`) computed server-side so the HTML
+/// viewer colors frames identically to the SVG and TUI renderers.
 #[derive(Serialize, Deserialize, Default)]
 struct Stack<'a> {
     name: &'a str,
     value: usize,
+    #[serde(rename = "c")]
+    color: String,
     children: Vec<Rc<RefCell<Stack<'a>>>>,
 }
 
@@ -26,9 +31,16 @@ impl<'a> Stack<'a> {
     fn new(name: &'a str) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             name,
+            color: frame_color_hex(name),
             ..Default::default()
         }))
     }
+}
+
+/// Category+hash color for a frame name as a `#rrggbb` hex string.
+fn frame_color_hex(name: &str) -> String {
+    let (r, g, b) = profile_bee_common::color::color_for(name);
+    format!("#{:02x}{:02x}{:02x}", r, g, b)
 }
 
 /// starts a local server that serves the flamegraph html file
@@ -126,12 +138,23 @@ pub fn collapse_to_json(stacks: &[&str]) -> String {
     let mut crumbs = vec![root.clone()];
 
     for stack in stacks {
-        let mut parts = stack.split(' ');
-        let names = parts.next().map(|v| v.split(';')).expect("stack");
-        let count = parts
-            .next()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1);
+        // Split the trailing ` <count>` from the right: frame names can contain
+        // spaces (process roots like `node (1234)`, V8 frames like
+        // `processData (server.js:42)`), so splitting on the first space would
+        // truncate the stack. This mirrors the collapse parsing elsewhere
+        // (`build_collapse_output`, the SVG palette builder, the TUI `flame`).
+        // Only strip the trailing token when it actually parses as a count;
+        // otherwise the whole line is frames (a frame name may end in a space-
+        // separated token that is not a number). This keeps every frame name
+        // intact so each gets a color.
+        let (frames_str, count) = match stack.rsplit_once(' ') {
+            Some((frames, count_str)) => match count_str.trim().parse::<usize>() {
+                Ok(count) => (frames, count),
+                Err(_) => (*stack, 1),
+            },
+            None => (*stack, 1),
+        };
+        let names = frames_str.split(';');
 
         let mut depth = 0;
 
@@ -205,11 +228,33 @@ fn test_serialization() {
         "f;g 1",
     ];
 
-    assert_eq!(
-        collapse_to_json(&x),
-        r##"{"name":"","value":9,"children":[{"name":"a","value":8,"children":[{"name":"b","value":7,"children":[{"name":"c","value":2,"children":[{"name":"d","value":1,"children":[]}]},{"name":"e","value":3,"children":[]}]}]},{"name":"f","value":1,"children":[{"name":"g","value":1,"children":[]}]}]}"##
-    );
+    let parsed: serde_json::Value = serde_json::from_str(&collapse_to_json(&x)).unwrap();
 
+    // Structure + aggregated values are unchanged by the color field.
+    assert_eq!(parsed["name"], "");
+    assert_eq!(parsed["value"], 9);
+    let a = &parsed["children"][0];
+    assert_eq!(a["name"], "a");
+    assert_eq!(a["value"], 8);
+    let b = &a["children"][0];
+    assert_eq!(b["name"], "b");
+    assert_eq!(b["value"], 7);
+
+    // Every named node carries its category+hash color under key "c".
+    fn check_colors(node: &serde_json::Value) {
+        let name = node["name"].as_str().unwrap();
+        if !name.is_empty() {
+            assert_eq!(node["c"].as_str().unwrap(), frame_color_hex(name));
+        }
+        if let Some(children) = node["children"].as_array() {
+            for child in children {
+                check_colors(child);
+            }
+        }
+    }
+    check_colors(&parsed);
+
+    // A manually built Stack serializes the color field ("" by default here).
     let mut test = Stack {
         name: "hi",
         value: 10,
@@ -232,7 +277,7 @@ fn test_serialization() {
 
     assert_eq!(
         test_json,
-        r##"{"name":"hi","value":10,"children":[{"name":"test 1","value":3,"children":[]},{"name":"test 2","value":4,"children":[]}]}"##
+        r##"{"name":"hi","value":10,"c":"","children":[{"name":"test 1","value":3,"c":"","children":[]},{"name":"test 2","value":4,"c":"","children":[]}]}"##
     );
 }
 
@@ -274,4 +319,32 @@ fn test_varying_depth_stacks() {
 
     let b_children = b["children"].as_array().unwrap();
     assert_eq!(b_children.len(), 2); // Should have "c" and "d"
+}
+
+#[test]
+fn test_frame_names_with_spaces() {
+    // Frame names can contain spaces (process roots, V8/JS frames). The count
+    // must be split from the RIGHT so these names survive intact — otherwise
+    // the whole stack collapses to its first space-delimited token.
+    let stacks = [
+        "node (1234);main;processData (server.js:42) 5",
+        "node (1234);main;compute 3",
+    ];
+    let json = collapse_to_json(&stacks);
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("Valid JSON");
+
+    let root_child = &parsed["children"][0];
+    assert_eq!(root_child["name"], "node (1234)");
+    assert_eq!(root_child["value"], 8); // 5 + 3
+
+    let main = &root_child["children"][0];
+    assert_eq!(main["name"], "main");
+    let leaves: Vec<&str> = main["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(leaves.contains(&"processData (server.js:42)"));
+    assert!(leaves.contains(&"compute"));
 }

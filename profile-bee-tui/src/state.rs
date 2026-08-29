@@ -77,6 +77,9 @@ pub struct FlameGraphState {
     /// When true, the Top/Processes views show an expandable tree instead
     /// of a flat list. Toggled with 't'.
     pub tree_mode: bool,
+    /// When true, kernel idle stacks (swapper/`cpu_NN`) are filtered out of the
+    /// displayed flamegraph. Toggled with 'i'.
+    pub hide_idle: bool,
     pub view_kind: ViewKind,
     pub table_state: TableState,
     pub process_list_state: TableState,
@@ -121,6 +124,7 @@ impl Default for FlameGraphState {
             freeze: false,
             pid_mode: false,
             tree_mode: false,
+            hide_idle: false,
             view_kind: ViewKind::FlameGraph,
             table_state: TableState::default(),
             process_list_state: TableState::default(),

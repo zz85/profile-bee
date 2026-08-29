@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.3.18
+
+### New Features
+
+- **Category-based flamegraph coloring** — frames are now colored by category instead of a single warm name-hash palette, across the TUI, SVG, and HTML/serve outputs. A category selects a base color band and a name hash varies the hue within it, so frames stay individually distinguishable while their category is recognizable at a glance: kernel = orange, kernel I/O (block/net/vfs/…) = blue, JS/Node (V8) = green, native user code = warm, and synthetic/meta frames (`cpu_NN`, `swapper`, `idle`, process roots) = dim gray. Classification is shared across all renderers via a single `profile-bee-common` module keyed off signals already in the frame names (the `_k` kernel suffix, `[v8]`/`.js` markers, meta patterns); the SVG path feeds inferno a pre-populated palette map so it renders the identical colors.
+- **Hide/toggle idle stacks in the TUI** — press `i` to filter kernel idle stacks (the swapper task, rendered as `idle;cpu_NN` / `cpu_NN;idle`) out of the displayed flamegraph, live. Works across the live, snapshot-history, and heatmap views, and complements the start-time `--skip-idle` flag.
+
+### Improvements
+
+- **Heatmap view refinements (TUI)** — the heatmap pane is slightly shorter, giving the flamegraph below it more room, and the selected stack's sample share now stays visible in the heatmap view (alongside the selected time range's CPU %).
+
+### Bug Fixes
+
+- **HTML/JSON frames with spaces** — `collapse_to_json` split each stack's sample count from the first space, truncating any frame name containing a space (process roots like `node (1234)`, V8 frames like `processData (server.js:42)`) down to its first token. The count is now split from the right, so these frames render intact in the HTML/serve flamegraph.
+
 ## v0.3.17
 
 ### New Features

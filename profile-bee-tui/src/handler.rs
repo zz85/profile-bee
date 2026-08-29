@@ -24,6 +24,11 @@ pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
 
 /// Handle key events as commands
 pub fn handle_command(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
+    // Snapshot the transient message before dispatch. A handled key should
+    // dismiss a *pre-existing* message, but must not wipe one that the dispatched
+    // binding just set (e.g. the `i`, `t`, `p`, `v` toggles), otherwise those
+    // confirmations would never render.
+    let message_before = app.transient_message.clone();
     let mut key_handled = handle_command_generic(key_event, app)?;
     if !key_handled {
         let view = app.flamegraph_state().view_kind;
@@ -49,7 +54,9 @@ pub fn handle_command(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
             }
         }
     }
-    if key_handled && app.transient_message.is_some() {
+    // Only clear a message that predates this key press and is unchanged; leave
+    // a freshly set/updated one in place so bindings can surface a confirmation.
+    if key_handled && message_before.is_some() && app.transient_message == message_before {
         app.clear_transient_message();
     }
     Ok(())
@@ -132,6 +139,15 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
                 "off"
             };
             app.set_transient_message(&format!("Tree mode: {}", mode_str));
+        }
+        KeyCode::Char('i') => {
+            let new_val = !app.flamegraph_view.state.hide_idle;
+            app.flamegraph_view.state.hide_idle = new_val;
+            // Rebuild the active view immediately so the toggle takes effect
+            // without waiting for the next data refresh.
+            app.sync_active_flamegraph();
+            let mode_str = if new_val { "on" } else { "off" };
+            app.set_transient_message(&format!("Hide idle: {}", mode_str));
         }
         _ => {
             key_handled = false;
@@ -503,13 +519,18 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
                     changed
                 }
                 MouseButton::Right => {
-                    if view_kind == ViewKind::Heatmap {
+                    let x = mouse_event.column;
+                    let y = mouse_event.row;
+                    // In the heatmap view, a right-click on the grid pane returns
+                    // to live-follow; a right-click on the lower flamegraph pane
+                    // falls through to the normal zoom behavior below.
+                    if view_kind == ViewKind::Heatmap
+                        && app.find_heatmap_at_position(x, y).is_some()
+                    {
                         app.follow_heatmap_live();
                         return Ok(true);
                     }
                     // Right click: zoom into the stack at this position
-                    let x = mouse_event.column;
-                    let y = mouse_event.row;
                     let mut changed = false;
                     if let Some(stack_id) = app.find_stack_at_position(x, y) {
                         let prev_selected = app.flamegraph_view.state.selected;
@@ -541,4 +562,44 @@ pub fn handle_mouse_events(mouse_event: MouseEvent, app: &mut App) -> AppResult<
     };
 
     Ok(handled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn toggle_binding_message_survives_the_same_keypress() {
+        // The `t` (tree mode) toggle sets a transient message. That confirmation
+        // must remain visible after handle_command returns, not be cleared in the
+        // same call.
+        let mut app = App::with_live();
+        handle_command(key(KeyCode::Char('t')), &mut app).unwrap();
+        assert_eq!(app.transient_message.as_deref(), Some("Tree mode: on"));
+    }
+
+    #[test]
+    fn preexisting_message_is_dismissed_by_next_handled_key() {
+        // A message left over from a previous keypress should be dismissed by the
+        // next handled key that does not itself set one.
+        let mut app = App::with_live();
+        app.set_transient_message("stale");
+        // `z` (freeze) is handled but sets no message.
+        handle_command(key(KeyCode::Char('z')), &mut app).unwrap();
+        assert_eq!(app.transient_message, None);
+    }
+
+    #[test]
+    fn preexisting_message_is_replaced_when_binding_sets_a_new_one() {
+        // If a stale message exists and the pressed key sets a new one, the new
+        // message wins (it is not wiped by the stale-clear logic).
+        let mut app = App::with_live();
+        app.set_transient_message("stale");
+        handle_command(key(KeyCode::Char('t')), &mut app).unwrap();
+        assert_eq!(app.transient_message.as_deref(), Some("Tree mode: on"));
+    }
 }

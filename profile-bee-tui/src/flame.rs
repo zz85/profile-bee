@@ -6,6 +6,42 @@ pub type StackIdentifier = usize;
 pub static ROOT: &str = "all";
 pub static ROOT_ID: usize = 0;
 
+/// Kernel idle-leaf function names, mirroring `profile_bee::codeguru`.
+const IDLE_LEAF_NAMES: &[&str] = &[
+    "idle",
+    "swapper",
+    "cpu_idle",
+    "default_idle",
+    "native_safe_halt",
+    "acpi_idle_do_entry",
+    "intel_idle",
+    "mwait_idle",
+];
+
+/// Returns `true` when a collapsed stack (`;`-separated) is a kernel idle stack.
+///
+/// profile-bee renders true-idle samples (the swapper task, tgid 0) as a
+/// two-frame stack pairing a known idle function with the CPU thread. The frame
+/// ORDER depends on `--group-by-cpu`:
+///
+/// - default: `idle;cpu_00` (idle fn first)
+/// - `--group-by-cpu`: `cpu_00;idle` (cpu first)
+///
+/// The idle function may be a specific name (`native_safe_halt`, `intel_idle`,
+/// …) rather than the generic `idle`.
+///
+/// So we require BOTH endpoints to look like idle: one endpoint is a `cpu_<N>`
+/// frame and the other is a known idle function. Checking both endpoints (not a
+/// fixed root/leaf) makes this order-independent, and requiring the `cpu_`
+/// partner avoids false-positives from userspace frames merely named "idle".
+pub(crate) fn is_idle_stack(stack: &str) -> bool {
+    let first = stack.split(';').next().unwrap_or("");
+    let last = stack.rsplit(';').next().unwrap_or("");
+    let is_cpu = |f: &str| f.starts_with("cpu_");
+    let is_idle_fn = |f: &str| IDLE_LEAF_NAMES.contains(&f);
+    (is_cpu(first) && is_idle_fn(last)) || (is_idle_fn(first) && is_cpu(last))
+}
+
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct StackInfo {
     pub id: StackIdentifier,
@@ -232,6 +268,25 @@ impl FlameGraph {
         };
         out.populate_levels(&ROOT_ID, 0, None);
         out
+    }
+
+    /// Rebuild this flamegraph with kernel idle stacks (swapper/`cpu_NN`)
+    /// filtered out. Used by the TUI hide-idle toggle. Re-parses the retained
+    /// collapse text ([`Self::data`]) so it works uniformly on live, history,
+    /// and heatmap graphs, each of which keeps its own source text.
+    pub fn without_idle(&self) -> Self {
+        let filtered: String = self
+            .data
+            .lines()
+            .filter(|line| {
+                // A collapse line is `frame;frame;... <count>`; strip the count
+                // before testing so the endpoint check sees only frame names.
+                let stack = line.rsplit_once(' ').map(|(s, _)| s).unwrap_or(line);
+                !is_idle_stack(stack)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self::from_string(filtered, self.sorted)
     }
 
     fn get_ordered_stacks(counts: &HashMap<String, Count>) -> Ordered {
@@ -630,5 +685,34 @@ mod tests {
     #[test]
     fn test_recursive() {
         check_result("tests/data/recursive.txt");
+    }
+
+    #[test]
+    fn test_is_idle_stack_order_independent() {
+        assert!(is_idle_stack("idle;cpu_00"));
+        assert!(is_idle_stack("cpu_00;idle"));
+        assert!(is_idle_stack("intel_idle;cpu_03"));
+        assert!(is_idle_stack("cpu_12;default_idle"));
+        // Not idle: userspace frame merely named idle, no cpu_ partner.
+        assert!(!is_idle_stack("myapp;main;idle"));
+        assert!(!is_idle_stack("myapp;main;compute"));
+    }
+
+    #[test]
+    fn test_without_idle_filters_idle_stacks() {
+        let data = "idle;cpu_00 100\n\
+                    cpu_01;native_safe_halt 50\n\
+                    node;main;compute 30\n\
+                    node;main;read 20"
+            .to_string();
+        let fg = FlameGraph::from_string(data, true);
+        assert_eq!(fg.total_count(), 200);
+
+        let filtered = fg.without_idle();
+        // Only the two non-idle stacks (30 + 20) remain.
+        assert_eq!(filtered.total_count(), 50);
+        // Idle roots are gone; the work root ("node") remains.
+        assert!(filtered.get_stack_by_full_name("idle").is_none());
+        assert!(filtered.get_stack_by_full_name("node").is_some());
     }
 }
