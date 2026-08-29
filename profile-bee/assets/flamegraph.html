@@ -101,6 +101,16 @@ function hashColor(name) {
 function dimColor(name) {
   return 'hsl(' + (20 + Math.abs(nameHash(name) % 36)) + ',20%,80%)';
 }
+// Search-dim version of a server-provided #rrggbb color: blend ~70% toward a
+// light gray so unmatched frames recede while keeping a hint of their category.
+function dimFromHex(hex) {
+  if (!hex || hex.charAt(0) !== '#' || hex.length < 7) return 'hsl(0,0%,85%)';
+  var r = parseInt(hex.substr(1, 2), 16),
+      g = parseInt(hex.substr(3, 2), 16),
+      b = parseInt(hex.substr(5, 2), 16);
+  var m = function(c) { return Math.round(c * 0.3 + 230 * 0.7); };
+  return 'rgb(' + m(r) + ',' + m(g) + ',' + m(b) + ')';
+}
 
 // ── Build frames ─────────────────────────────────────────────────
 function buildFrames(data) {
@@ -112,10 +122,14 @@ function buildFrames(data) {
     var selfVal = node.value;
     if (node.children) for (var i = 0; i < node.children.length; i++) selfVal -= node.children[i].value;
     var n = node.name || 'root';
+    // Prefer the server-provided category+hash color (node.c); fall back to the
+    // legacy name-hash color for data without it.
+    var col = node.c || hashColor(n);
+    var dim = node.c ? dimFromHex(node.c) : dimColor(n);
     frames.push({
       name: n, depth: depth, x: x, w: node.value,
       selfValue: Math.max(0, selfVal), value: node.value,
-      parent: parentIdx, color: hashColor(n), dimColor: dimColor(n),
+      parent: parentIdx, color: col, dimColor: dim,
     });
     if (depth + 1 > totalLevels) totalLevels = depth + 1;
     if (node.children) {

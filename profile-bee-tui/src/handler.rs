@@ -133,6 +133,15 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
             };
             app.set_transient_message(&format!("Tree mode: {}", mode_str));
         }
+        KeyCode::Char('i') => {
+            let new_val = !app.flamegraph_view.state.hide_idle;
+            app.flamegraph_view.state.hide_idle = new_val;
+            // Rebuild the active view immediately so the toggle takes effect
+            // without waiting for the next data refresh.
+            app.sync_active_flamegraph();
+            let mode_str = if new_val { "on" } else { "off" };
+            app.set_transient_message(&format!("Hide idle: {}", mode_str));
+        }
         _ => {
             key_handled = false;
         }

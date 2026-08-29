@@ -1,4 +1,4 @@
-use crate::flame::{FlameGraph, SearchPattern, StackIdentifier};
+use crate::flame::{is_idle_stack, FlameGraph, SearchPattern, StackIdentifier};
 use crate::output::{ProcessOutputState, SharedOutputBuffer};
 use crate::state::{FlameGraphState, UpdateMode};
 use crate::view::FlameGraphView;
@@ -50,43 +50,6 @@ struct HistoricalBucket {
     /// Non-idle samples in this bucket — i.e. samples doing real work.
     /// `busy_count / sample_count` is the CPU utilization for the interval.
     busy_count: u64,
-}
-
-/// Kernel idle-leaf function names, mirroring `profile_bee::codeguru`.
-const IDLE_LEAF_NAMES: &[&str] = &[
-    "idle",
-    "swapper",
-    "cpu_idle",
-    "default_idle",
-    "native_safe_halt",
-    "acpi_idle_do_entry",
-    "intel_idle",
-    "mwait_idle",
-];
-
-/// Returns `true` when a collapsed stack (`;`-separated) is a kernel idle
-/// stack.
-///
-/// profile-bee renders true-idle samples (the swapper task, tgid 0) as a
-/// two-frame stack pairing a known idle function with the CPU thread. The frame
-/// ORDER depends on `--group-by-cpu`:
-///
-/// - default: `idle;cpu_00` (idle fn first)
-/// - `--group-by-cpu`: `cpu_00;idle` (cpu first)
-///
-/// The idle function may be a specific name (`native_safe_halt`, `intel_idle`,
-/// …) rather than the generic `idle`.
-///
-/// So we require BOTH endpoints to look like idle: one endpoint is a `cpu_<N>`
-/// frame and the other is a known idle function. Checking both endpoints (not a
-/// fixed root/leaf) makes this order-independent, and requiring the `cpu_`
-/// partner avoids false-positives from userspace frames merely named "idle".
-fn is_idle_stack(stack: &str) -> bool {
-    let first = stack.split(';').next().unwrap_or("");
-    let last = stack.rsplit(';').next().unwrap_or("");
-    let is_cpu = |f: &str| f.starts_with("cpu_");
-    let is_idle_fn = |f: &str| IDLE_LEAF_NAMES.contains(&f);
-    (is_cpu(first) && is_idle_fn(last)) || (is_idle_fn(first) && is_cpu(last))
 }
 
 /// Sum the sample counts of non-idle ("busy") stacks in collapsed flamegraph
@@ -376,7 +339,7 @@ impl App {
                 }
             } else if !self.flamegraph_view.state.freeze && self.history_cursor.is_none() {
                 let tic = Instant::now();
-                self.flamegraph_view.replace_flamegraph(flamegraph);
+                self.install_flamegraph(flamegraph);
                 self.elapsed
                     .insert("replacement".to_string(), tic.elapsed());
             }
@@ -809,6 +772,18 @@ impl App {
         }
     }
 
+    /// Swap a freshly built flamegraph into the view, applying the hide-idle
+    /// filter first when enabled. All display paths (live, history, heatmap)
+    /// route through here so the toggle applies uniformly.
+    fn install_flamegraph(&mut self, flamegraph: FlameGraph) {
+        let flamegraph = if self.flamegraph_view.state.hide_idle {
+            flamegraph.without_idle()
+        } else {
+            flamegraph
+        };
+        self.flamegraph_view.replace_flamegraph(flamegraph);
+    }
+
     fn push_history(&mut self, flamegraph: FlameGraph, collected_at: Instant) {
         self.history.push_back(HistoricalFlameGraph {
             flamegraph,
@@ -868,8 +843,7 @@ impl App {
 
         if let Some(entry) = selected {
             let tic = Instant::now();
-            self.flamegraph_view
-                .replace_flamegraph(entry.flamegraph.clone());
+            self.install_flamegraph(entry.flamegraph.clone());
             self.elapsed
                 .insert("replacement".to_string(), tic.elapsed());
             self.dirty = true;
@@ -881,7 +855,7 @@ impl App {
             return;
         };
         let tic = Instant::now();
-        self.flamegraph_view.replace_flamegraph(flamegraph);
+        self.install_flamegraph(flamegraph);
         self.elapsed
             .insert("replacement".to_string(), tic.elapsed());
         self.dirty = true;

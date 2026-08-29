@@ -2,6 +2,10 @@
 
 use core::mem::size_of;
 
+/// Category-based flamegraph frame coloring, shared across renderers.
+#[cfg(feature = "color")]
+pub mod color;
+
 /// Stack trace information shared between eBPF and userspace
 ///
 /// Contains the process ID, stack trace IDs for both kernel and user stacks,

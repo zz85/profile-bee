@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use inferno::flamegraph::color::{Color, PaletteMap};
 use inferno::flamegraph::{self, Options};
 
 use crate::codeguru::{collapse_to_codeguru, CodeGuruOptions, CounterType};
@@ -107,11 +108,21 @@ impl SvgSink {
 
 impl OutputSink for SvgSink {
     fn finish(&mut self, final_stacks: &[String]) -> Result<()> {
+        // Pre-populate a palette map with our category+hash color for every unique
+        // frame name. inferno's `find_color_for` returns a pre-inserted color on a
+        // cache hit, so the SVG uses exactly the same colors as the TUI and HTML
+        // renderers instead of inferno's own palette.
+        let palette_map = build_svg_palette_map(final_stacks);
+
         let mut opts = Options::default();
         opts.title = self.title.clone();
         if self.off_cpu {
             opts.count_name = "us".to_string();
         }
+        // Held in a local so the `&mut` borrow lives for the `from_lines` call.
+        let mut palette_map = palette_map;
+        opts.palette_map = Some(&mut palette_map);
+
         let mut writer =
             std::io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(&self.path)?);
         flamegraph::from_lines(
@@ -125,6 +136,27 @@ impl OutputSink for SvgSink {
         })?;
         Ok(())
     }
+}
+
+/// Build an inferno `PaletteMap` mapping each unique frame name in the collapse
+/// output to its category+hash color (see `profile_bee_common::color`).
+fn build_svg_palette_map(stacks: &[String]) -> PaletteMap {
+    let mut pm = PaletteMap::default();
+    for line in stacks {
+        // Drop the trailing ` <count>`, then split frames on `;`.
+        let frames = line
+            .rsplit_once(' ')
+            .map(|(f, _)| f)
+            .unwrap_or(line.as_str());
+        for name in frames.split(';') {
+            if name.is_empty() || pm.get(name).is_some() {
+                continue;
+            }
+            let (r, g, b) = profile_bee_common::color::color_for(name);
+            pm.insert(name, Color { r, g, b });
+        }
+    }
+    pm
 }
 
 /// Writes an HTML flamegraph on finish.
