@@ -17,6 +17,9 @@
 //! See `docs/java_profiling.md`.
 
 mod attach;
+mod vmstructs;
+
+pub use vmstructs::{VmOffsets, VmStructsReader};
 
 pub use attach::{
     bootstrap_system_java_maps, discover_jvm_pids, ensure_perf_map, has_usable_perf_map,
