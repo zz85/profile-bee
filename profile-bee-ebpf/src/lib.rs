@@ -18,6 +18,7 @@ use aya_ebpf::{
 };
 
 // use aya_log_ebpf::info;
+use profile_bee_common::HotspotProcInfo;
 use profile_bee_common::{
     normalize_exec_context, DwarfUnwindState, ExecMapping, ExecMappingKey, FramePointers,
     StackInfo, UnwindEntry, V8ProcInfo, CFA_REG_DEREF_RSP, CFA_REG_PLT, CFA_REG_RBP, CFA_REG_RSP,
@@ -329,6 +330,11 @@ pub static DWARF_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(4, 0);
 pub static V8_PROC_INFO: HashMap<u32, profile_bee_common::V8ProcInfo> =
     HashMap::with_max_entries(256, 0);
 
+/// Per-process HotSpot interpreter info, populated by userspace when a JVM is
+/// registered. The FP walker uses it to extract interpreter-frame `Method*`.
+#[map(name = "hotspot_proc_info")]
+pub static HOTSPOT_PROC_INFO: HashMap<u32, HotspotProcInfo> = HashMap::with_max_entries(256, 0);
+
 // --- Off-CPU profiling maps ---
 
 /// Tracks when each thread (by kernel PID = thread ID) went off-CPU.
@@ -411,7 +417,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
         // If it fails (program not registered, non-perf_event context), we fall
         // through to the inline FP walker below (without V8 extraction).
         fp_v8_try_tail_call(&ctx, &*regs, tgid, user_stack_id, kernel_stack_id, cpu);
-        copy_stack_regs(&*regs, pointer)
+        copy_stack_regs(&*regs, pointer, tgid)
     };
     pointer.len = len;
 
@@ -551,7 +557,7 @@ unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &pt_r
         let (ip, bp, len) = dwarf_copy_stack_regs(regs, &mut pointer.pointers, tgid);
         (ip, bp, len, regs.rsp)
     } else {
-        copy_stack_regs(regs, pointer)
+        copy_stack_regs(regs, pointer, tgid)
     };
     pointer.len = len;
 
@@ -748,7 +754,7 @@ pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
         let (ip, bp, len) = dwarf_copy_stack_regs(&regs, &mut pointer.pointers, tgid);
         (ip, bp, len, regs.rsp)
     } else {
-        copy_stack_regs(&regs, pointer)
+        copy_stack_regs(&regs, pointer, tgid)
     };
     pointer.len = len;
 
@@ -1184,10 +1190,11 @@ unsafe fn dwarf_finalize_stack(state: &DwarfUnwindState) {
     }
     pointer.len = len;
 
-    // Clear v8_sfi to prevent stale SFI data from a previous FP+V8
-    // sample leaking into this DWARF sample (STORAGE persists per-CPU).
+    // Clear v8_sfi / hotspot_method to prevent stale data from a previous
+    // FP sample leaking into this DWARF sample (STORAGE persists per-CPU).
     for i in 0..MAX_V8_FRAMES {
         pointer.v8_sfi[i] = 0;
+        pointer.hotspot_method[i] = 0;
     }
 
     // Tail calls preserve interrupt context, so preempt_count read here reflects
@@ -1349,13 +1356,31 @@ unsafe fn binary_search_unwind_entry(
 /// registered, non-perf_event context), this inline fallback runs without
 /// V8 extraction.
 #[inline(always)]
-unsafe fn copy_stack_regs(regs: &pt_regs, pointer: &mut FramePointers) -> (u64, u64, usize, u64) {
-    // Clear v8_sfi to prevent stale SFI values from a previous tail-call
-    // sample leaking through (STORAGE is a PerCpuArray that persists).
+unsafe fn copy_stack_regs(
+    regs: &pt_regs,
+    pointer: &mut FramePointers,
+    tgid: u32,
+) -> (u64, u64, usize, u64) {
+    // Clear v8_sfi / hotspot_method to prevent stale values from a previous
+    // tail-call sample leaking through (STORAGE is a PerCpuArray that persists).
     for i in 0..MAX_V8_FRAMES {
         pointer.v8_sfi[i] = 0;
+        pointer.hotspot_method[i] = 0;
     }
-    copy_stack_regs_fp_only(regs, &mut pointer.pointers)
+    let ret = copy_stack_regs_fp_only(regs, &mut pointer.pointers);
+
+    // HotSpot interpreter Method* for the LEAF frame only, on the inline FP path
+    // (kprobe/uprobe, and kernels where the tail-call FP program won't load).
+    // A per-frame re-walk here blows the BPF verifier complexity budget on this
+    // already-large program, so we name only the on-CPU leaf (the most valuable
+    // frame); deeper interpreter frames are named via the tail-call path. One
+    // map lookup + one read — same cost class as the V8 leaf extraction.
+    if let Some(hi) = HOTSPOT_PROC_INFO.get(&tgid) {
+        if let Some(m) = try_read_hotspot_method(hi, regs.rip, regs.rbp) {
+            pointer.hotspot_method[0] = m;
+        }
+    }
+    ret
 }
 
 /// Initialize FP+V8 unwind state and attempt to tail-call into the FP+V8 step
@@ -1395,6 +1420,14 @@ unsafe fn fp_v8_try_tail_call<C: EbpfContext>(
     if let Some(vi) = V8_PROC_INFO.get(&tgid) {
         if let Some(sfi) = try_read_v8_sfi(vi, regs.rbp) {
             (*state).v8_sfi[0] = sfi;
+        }
+    }
+
+    // HotSpot interpreter Method* for the leaf frame (IP=rip, base=rbp).
+    (*state).hotspot_method[0] = 0;
+    if let Some(hi) = HOTSPOT_PROC_INFO.get(&tgid) {
+        if let Some(m) = try_read_hotspot_method(hi, regs.rip, regs.rbp) {
+            (*state).hotspot_method[0] = m;
         }
     }
 
@@ -1438,6 +1471,14 @@ unsafe fn fp_v8_finalize_stack(state: &DwarfUnwindState) {
             break;
         }
         pointer.v8_sfi[i] = state.v8_sfi[i];
+    }
+
+    // Copy HotSpot interpreter Method* data
+    for i in 0..MAX_V8_FRAMES {
+        if i >= len {
+            break;
+        }
+        pointer.hotspot_method[i] = state.hotspot_method[i];
     }
 
     // Tail calls preserve interrupt context (see dwarf_finalize_stack).
@@ -1517,6 +1558,14 @@ pub unsafe fn fp_v8_unwind_step_impl<C: EbpfContext>(ctx: C) {
                     state.v8_sfi[idx] = sfi;
                 }
             }
+            // HotSpot interpreter Method* for this frame (same convention as
+            // V8: the frame just discovered at pointers[idx] has base new_bp).
+            state.hotspot_method[idx] = 0;
+            if let Some(hi) = HOTSPOT_PROC_INFO.get(&state.tgid) {
+                if let Some(m) = try_read_hotspot_method(hi, ra, new_bp) {
+                    state.hotspot_method[idx] = m;
+                }
+            }
         }
 
         state.frame_count = idx + 1;
@@ -1569,6 +1618,24 @@ unsafe fn copy_stack_regs_fp_only(regs: &pt_regs, pointers: &mut [u64]) -> (u64,
 /// Reads: [fp - V8_FP_CONTEXT_SIZE + fp_function] → JSFunction tagged ptr
 ///        JSFunction.map → Map.instance_type (verify it's a JSFunction)
 ///        JSFunction.shared → SharedFunctionInfo tagged ptr
+/// Extract a HotSpot interpreter frame's `Method*`.
+///
+/// `ra` is the frame's return address (its executing PC) and `frame_bp` its
+/// base pointer. If `ra` is inside the template-interpreter code range, the
+/// current `Method*` is at `frame_bp + method_offset`.
+#[inline(always)]
+unsafe fn try_read_hotspot_method(hi: &HotspotProcInfo, ra: u64, frame_bp: u64) -> Option<u64> {
+    if ra < hi.interp_low || ra >= hi.interp_high {
+        return None;
+    }
+    let addr = (frame_bp as i64).wrapping_add(hi.method_offset) as u64;
+    let method = bpf_probe_read_user::<u64>(addr as *const u64).ok()?;
+    if method == 0 || method >= __START_KERNEL_MAP {
+        return None;
+    }
+    Some(method)
+}
+
 #[inline(always)]
 unsafe fn try_read_v8_sfi(vi: &V8ProcInfo, bp: u64) -> Option<u64> {
     // The fp_function offset is a byte offset within the 64-byte FP context
@@ -1780,7 +1847,7 @@ unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
         let (ip, bp, len) = dwarf_copy_stack_regs(&*regs, &mut pointer.pointers, current_tgid);
         (ip, bp, len, (*regs).rsp)
     } else {
-        copy_stack_regs(&*regs, pointer)
+        copy_stack_regs(&*regs, pointer, current_tgid)
     };
     pointer.len = len;
 

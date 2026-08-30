@@ -86,6 +86,15 @@ impl PerfMap {
         }
     }
 
+    /// Return the `[start, end)` range of the first entry named exactly `name`.
+    /// Used to find the HotSpot template-interpreter blob (`Interpreter`).
+    pub fn symbol_range(&self, name: &str) -> Option<(u64, u64)> {
+        self.entries
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| (e.start, e.end))
+    }
+
     /// Re-read the backing file if mtime/size changed. Returns `true` if the
     /// in-memory table was replaced.
     pub fn reload_if_changed(&mut self) -> bool {
@@ -303,6 +312,12 @@ impl PerfMapCache {
     /// Whether we currently have any symbols for this PID.
     pub fn has_symbols(&self, pid: u32) -> bool {
         self.maps.get(&pid).is_some_and(|m| !m.is_empty())
+    }
+
+    /// `[start, end)` of the named symbol in `pid`'s perf-map (e.g. the HotSpot
+    /// `Interpreter` blob), if loaded.
+    pub fn symbol_range(&self, pid: u32, name: &str) -> Option<(u64, u64)> {
+        self.maps.get(&pid).and_then(|m| m.symbol_range(name))
     }
 }
 

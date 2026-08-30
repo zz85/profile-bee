@@ -125,6 +125,13 @@ pub struct FramePointers {
     /// `[unknown]` in the flamegraph.  V8 stacks rarely exceed 64 JS
     /// frames in practice.
     pub v8_sfi: [u64; MAX_V8_FRAMES],
+    /// HotSpot interpreter `Method*` pointers, parallel to `pointers`.
+    /// For frame i: if `hotspot_method[i] != 0`, the frame is a HotSpot
+    /// interpreter frame and the value is the `Method*` read from the
+    /// interpreter frame slot (`[rbp + interpreter_frame_method_offset]`).
+    /// Userspace resolves it to `pkg.Class.method` via `VmStructsReader`.
+    /// Only the first `MAX_V8_FRAMES` entries are populated (shared limit).
+    pub hotspot_method: [u64; MAX_V8_FRAMES],
 }
 
 /// Maximum V8 frames with metadata per stack sample.
@@ -418,6 +425,32 @@ pub struct DwarfUnwindState {
     /// Only used by the FP+V8 step program (PROG_ARRAY index 1); the DWARF
     /// step program (index 0) ignores this field.
     pub v8_sfi: [u64; MAX_V8_FRAMES],
+    /// HotSpot interpreter `Method*` pointers extracted during FP tail-call
+    /// walking, parallel to `pointers[0..MAX_V8_FRAMES]`. Zero means "not a
+    /// HotSpot interpreter frame". Only used by the FP+V8 step program.
+    pub hotspot_method: [u64; MAX_V8_FRAMES],
+}
+
+/// Per-process HotSpot data for eBPF interpreter-frame `Method*` extraction.
+///
+/// Populated by userspace when a JVM is registered and read in the FP tail-call
+/// walker: if a frame's return address falls in `[interp_low, interp_high)` it
+/// is a template-interpreter frame, and the current `Method*` sits at
+/// `frame_base + method_offset` (x86-64: `interpreter_frame_method_offset` is
+/// -3 words = -24 bytes).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct HotspotProcInfo {
+    /// Inclusive start of the template-interpreter code range.
+    pub interp_low: u64,
+    /// Exclusive end of the template-interpreter code range.
+    pub interp_high: u64,
+    /// Signed byte offset of `Method*` from the interpreter frame's base pointer.
+    pub method_offset: i64,
+}
+
+impl HotspotProcInfo {
+    pub const STRUCT_SIZE: usize = size_of::<HotspotProcInfo>();
 }
 
 #[cfg(test)]

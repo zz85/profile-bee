@@ -477,6 +477,9 @@ pub struct TraceHandler {
     /// V8 heap readers per PID, for resolving JavaScript function names
     /// from SFI pointers extracted by the eBPF V8 frame extractor.
     v8_readers: HashMap<u32, V8HeapReader>,
+    /// Per-JVM HotSpot VM-structs readers + resolved offsets, for turning the
+    /// interpreter-frame `Method*` captured by eBPF into `pkg.Class.method`.
+    hotspot_readers: HashMap<u32, (crate::java::VmStructsReader, crate::java::VmOffsets)>,
     /// Whether `preempt_count` softirq bits are valid on this kernel. False under
     /// `CONFIG_PREEMPT_RT`, where softirq state is not in `preempt_count` and the
     /// softirq symbol heuristics must run even for `EXEC_CTX_TASK` samples.
@@ -573,6 +576,7 @@ impl TraceHandler {
             symbolizer: Symbolizer::new(),
             cache: Default::default(),
             v8_readers: HashMap::new(),
+            hotspot_readers: HashMap::new(),
             softirq_bits_valid,
             perf_maps: PerfMapCache::new(),
             perf_map_hinted: HashMap::new(),
@@ -609,6 +613,7 @@ impl TraceHandler {
     pub fn invalidate_caches_for_pid(&mut self, tgid: u32) {
         self.cache.invalidate_pid(tgid);
         self.v8_readers.remove(&tgid);
+        self.hotspot_readers.remove(&tgid);
         self.perf_maps.remove(tgid);
         self.perf_map_hinted.remove(&tgid);
         tracing::debug!("invalidated symbol caches for pid {}", tgid);
@@ -636,6 +641,35 @@ impl TraceHandler {
         if !self.perf_maps.has_symbols(tgid) {
             self.perf_maps.try_discover(tgid);
         }
+    }
+
+    /// Set up HotSpot VM-structs introspection for a JVM so interpreter-frame
+    /// `Method*` pointers captured by eBPF can be resolved to method names.
+    /// Returns `true` if a complete offset set was resolved.
+    pub fn register_hotspot_reader(&mut self, tgid: u32) -> bool {
+        if self.hotspot_readers.contains_key(&tgid) {
+            return true;
+        }
+        let Some(reader) = crate::java::VmStructsReader::new(tgid) else {
+            return false;
+        };
+        let Ok(offsets) = reader.resolve_offsets() else {
+            return false;
+        };
+        if !offsets.is_complete() {
+            return false;
+        }
+        tracing::info!("HotSpot VM-structs introspection ready for pid {tgid}");
+        self.hotspot_readers.insert(tgid, (reader, offsets));
+        true
+    }
+
+    /// The template-interpreter code range for `tgid`, taken from the
+    /// `Interpreter` entry of its loaded `/tmp/perf-<pid>.map`. Used to build
+    /// the eBPF `HotspotProcInfo` so the FP walker knows which frames are
+    /// interpreter frames.
+    pub fn hotspot_interp_range(&self, tgid: u32) -> Option<(u64, u64)> {
+        self.perf_maps.symbol_range(tgid, "Interpreter")
     }
 
     /// Mark a PID as a JVM and ensure JIT symbol loading is armed.
@@ -803,34 +837,37 @@ impl TraceHandler {
         let key = StackInfoPod(*stack_info);
 
         // Try to use custom-unwound frame pointers from eBPF (FP or DWARF path)
-        let (user_stack, v8_sfi) = if let Ok(pointers) = stacked_pointers.get(&key, 0) {
-            let pointers = pointers.0;
-            let len = pointers.len.min(pointers.pointers.len());
-            let fp_len = fp_user_stack.as_ref().map_or(0, |v| v.len());
-            if len > fp_len {
-                let addrs: Vec<u64> = pointers.pointers[..len].to_vec();
-                // Extract V8 SFI pointers (parallel to user addresses)
-                let sfi_len = len.min(MAX_V8_FRAMES);
-                let v8_sfi: Vec<u64> = pointers.v8_sfi[..sfi_len].to_vec();
-                tracing::debug!(
-                    "Using custom-unwound stack ({} frames, vs {} from stackid) for pid {}",
-                    addrs.len(),
-                    fp_len,
-                    stack_info.tgid,
-                );
-                (Some(addrs), v8_sfi)
+        let (user_stack, v8_sfi, hotspot_method) =
+            if let Ok(pointers) = stacked_pointers.get(&key, 0) {
+                let pointers = pointers.0;
+                let len = pointers.len.min(pointers.pointers.len());
+                let fp_len = fp_user_stack.as_ref().map_or(0, |v| v.len());
+                if len > fp_len {
+                    let addrs: Vec<u64> = pointers.pointers[..len].to_vec();
+                    // Extract V8 SFI + HotSpot Method* pointers (parallel to addrs)
+                    let side_len = len.min(MAX_V8_FRAMES);
+                    let v8_sfi: Vec<u64> = pointers.v8_sfi[..side_len].to_vec();
+                    let hotspot_method: Vec<u64> = pointers.hotspot_method[..side_len].to_vec();
+                    tracing::debug!(
+                        "Using custom-unwound stack ({} frames, vs {} from stackid) for pid {}",
+                        addrs.len(),
+                        fp_len,
+                        stack_info.tgid,
+                    );
+                    (Some(addrs), v8_sfi, hotspot_method)
+                } else {
+                    (fp_user_stack, Vec::new(), Vec::new())
+                }
             } else {
-                (fp_user_stack, Vec::new())
-            }
-        } else {
-            (fp_user_stack, Vec::new())
-        };
+                (fp_user_stack, Vec::new(), Vec::new())
+            };
 
         let result = self.format_stack_trace(
             stack_info,
             kernel_stack,
             user_stack,
             &v8_sfi,
+            &hotspot_method,
             group_by_cpu,
             group_by_process,
         );
@@ -904,6 +941,7 @@ impl TraceHandler {
             kernel_stack,
             user_stack,
             &[], // no V8 metadata in this path
+            &[], // no HotSpot metadata in this path
             group_by_cpu,
             group_by_process,
         )
@@ -945,12 +983,14 @@ impl TraceHandler {
     /// converts pointers from bpf to usable, symbol resolved stack information
     /// Return is an array sorted from the bottom (root) to the top (inner most function)
     /// Looks up symbolization
+    #[allow(clippy::too_many_arguments)]
     fn format_stack_trace(
         &mut self,
         stack_info: &StackInfo,
         kernel_stack: Option<Vec<u64>>,
         user_stack: Option<Vec<u64>>,
         v8_sfi: &[u64],
+        hotspot_method: &[u64],
         group_by_cpu: bool,
         group_by_process: bool,
     ) -> Vec<StackFrameInfo> {
@@ -1057,6 +1097,24 @@ impl TraceHandler {
                             v8sym.function_name.clone()
                         };
                         user_syms[i].symbol = Some(display);
+                    }
+                }
+            }
+        }
+
+        // Override HotSpot interpreter frames with real method names. The eBPF
+        // walker captured each interpreter frame's Method*; resolve it against
+        // the live JVM via VM-structs introspection. This runs before the
+        // generic perf-map fallback so real `pkg.Class.method` names win over
+        // the coarse `Interpreter` perf-map label.
+        if !hotspot_method.is_empty() {
+            if let Some((reader, offsets)) = self.hotspot_readers.get(&pid) {
+                for (i, &method) in hotspot_method.iter().enumerate() {
+                    if method == 0 || i >= user_syms.len() {
+                        continue;
+                    }
+                    if let Some(name) = reader.resolve_method_name(offsets, method) {
+                        user_syms[i].symbol = Some(name);
                     }
                 }
             }
