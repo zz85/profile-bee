@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.20
+
+### New Features
+
+- **Java interpreter-frame names (HotSpot Phase 2)** — interpreter frames that previously showed as `[jvm] Interpreter` now resolve to the real method (e.g. `Burn.fib`, `java.util.concurrent.locks.LockSupport.parkNanos`). profile-bee reads the live JVM's exported `gHotSpotVMStructs`/`gHotSpotVMTypes` tables (via `process_vm_readv`) to walk `Method* → ConstMethod → ConstantPool → Symbol`, and the eBPF frame-pointer unwinder captures each interpreter frame's `Method*` (`[rbp + interpreter_frame_method_offset]`) into a side-channel parallel to the V8 SFI path. x86-64. See [docs/java_profiling.md](docs/java_profiling.md).
+  - Full-depth interpreter naming on kernels where the tail-call FP unwinder loads; the inline FP path (kprobe/uprobe, and kernels without tail-call support) names the on-CPU leaf frame.
+  - Auto-discovery is scoped to profiled JVMs and torn down on process exit/exec; the frame cache is flushed when a JVM is armed so pre-arming stacks are recomputed.
+
 ## v0.3.19
 
 ### New Features

@@ -1,6 +1,6 @@
 [package]
 name = "symbol-server"
-version = "0.3.19"
+version = "0.3.20"
 edition = "2021"
 description = "Devfiler-compatible symbol server for profile-bee"
 
@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Shared symbol extraction
-profile-bee-symbols = { version = "0.3.19", path = "../profile-bee-symbols" }
+profile-bee-symbols = { version = "0.3.20", path = "../profile-bee-symbols" }
 
 # HTTP server
 axum = "0.7"
