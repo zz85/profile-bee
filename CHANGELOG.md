@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- **`--group-by-process` rolls threads up to the process, with a GC subcategory** — previously the flamegraph root was the per-thread comm, so a JVM produced a separate root per thread (`GC Thread#0`, `GC Thread#1`, …), and `--group-by-process` re-used that same thread name rather than grouping. Now every thread of a process rolls up under a single `process_name (pid)` root (the main-thread name from `/proc/<pid>/comm`), and recognized thread pools collapse into a subcategory: all garbage-collector threads (HotSpot Serial/Parallel `GC Thread#N`, G1, ZGC, Shenandoah, legacy CMS) aggregate into one `[GC]` block instead of N roots. Non-GC threads keep their own name as sub-nodes.
+
 ## v0.3.22
 
 ### New Features

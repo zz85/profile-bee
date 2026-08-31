@@ -469,6 +469,29 @@ fn looks_like_hotspot_symbol(name: &str) -> bool {
 ///
 /// Main entry point for the trace handler that manages symbol resolution and caching
 /// for efficient stack trace processing and visualization.
+/// Classify a thread name (`/proc/<tid>/comm`) into a coarse process-wide
+/// subcategory for `--group-by-process`. Returns a bracketed label to collapse
+/// the thread under (e.g. `[GC]`), or `None` to keep the thread's own name.
+///
+/// Currently recognizes HotSpot garbage-collector threads across collectors
+/// (Serial/Parallel `GC Thread#N`, G1 `G1 Conc/Refine/Main Marker/Young RemSet`,
+/// ZGC `ZWorker*`/`ZDriver*`, Shenandoah, legacy CMS `Gang worker#N`). Names in
+/// `/proc/.../comm` are truncated to 15 chars, so matching is prefix-based.
+fn thread_subcategory(comm: &str) -> Option<&'static str> {
+    let c = comm.trim();
+    let is_gc = c.starts_with("GC Thread")
+        || c.starts_with("GC thread")
+        || c.starts_with("G1 ")
+        || c.starts_with("ZWorker")
+        || c.starts_with("ZDriver")
+        || c.starts_with("ZGC")
+        || c.starts_with("Shenandoah")
+        || c.starts_with("Gang worker")
+        || c.starts_with("Parallel GC")
+        || c.starts_with("Concurrent GC");
+    is_gc.then_some("[GC]")
+}
+
 pub struct TraceHandler {
     /// blazesym Symbolizer that internally handles caching
     symbolizer: Symbolizer,
@@ -488,6 +511,10 @@ pub struct TraceHandler {
     perf_maps: PerfMapCache,
     /// PIDs we've already logged a missing-perf-map hint for (avoid spam).
     perf_map_hinted: HashMap<u32, bool>,
+    /// Process (main-thread) name per tgid, read from `/proc/<tgid>/comm`.
+    /// Used as the shared root under `--group-by-process` so every thread of a
+    /// process rolls up to one node (the per-sample `cmd` is the *thread* name).
+    process_names: HashMap<u32, String>,
 }
 
 impl Default for TraceHandler {
@@ -580,7 +607,25 @@ impl TraceHandler {
             softirq_bits_valid,
             perf_maps: PerfMapCache::new(),
             perf_map_hinted: HashMap::new(),
+            process_names: HashMap::new(),
         }
+    }
+
+    /// Resolve the process (main-thread) name for `tgid` from `/proc/<tgid>/comm`,
+    /// caching the result. Falls back to `pid-<tgid>` if the process is gone.
+    /// This is the process name shared by all threads, unlike the per-thread
+    /// `cmd` carried in each sample.
+    fn process_name(&mut self, tgid: u32) -> String {
+        if let Some(name) = self.process_names.get(&tgid) {
+            return name.clone();
+        }
+        let name = std::fs::read_to_string(format!("/proc/{tgid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("pid-{tgid}"));
+        self.process_names.insert(tgid, name.clone());
+        name
     }
 
     /// Override whether `preempt_count` softirq bits are valid (false under
@@ -616,6 +661,7 @@ impl TraceHandler {
         self.hotspot_readers.remove(&tgid);
         self.perf_maps.remove(tgid);
         self.perf_map_hinted.remove(&tgid);
+        self.process_names.remove(&tgid);
         tracing::debug!("invalidated symbol caches for pid {}", tgid);
     }
 
@@ -1157,8 +1203,20 @@ impl TraceHandler {
             });
         }
 
-        let pid_info = StackFrameInfo::process_only(stack_info);
-        combined.push(pid_info);
+        // Thread node. Under process-wide grouping, collapse recognized thread
+        // pools into a subcategory (e.g. all `GC Thread#N` -> `[GC]`) so they
+        // aggregate into one block; other threads keep their own name. Without
+        // grouping, the per-thread comm is the root (existing behavior).
+        if group_by_process {
+            let cmd = stack_info.get_cmd();
+            let node = thread_subcategory(&cmd).map(str::to_string).unwrap_or(cmd);
+            combined.push(StackFrameInfo {
+                symbol: Some(node),
+                ..Default::default()
+            });
+        } else {
+            combined.push(StackFrameInfo::process_only(stack_info));
+        }
 
         if group_by_cpu {
             if let Some(cpu_id) = stack_info.get_cpu_id() {
@@ -1172,9 +1230,12 @@ impl TraceHandler {
         }
 
         if group_by_process {
-            let cmd = stack_info.get_cmd();
+            // Process-wide root shared by every thread of the process (the
+            // main-thread name from /proc/<tgid>/comm), so all threads roll up
+            // to one node instead of one root per thread name.
+            let proc_name = self.process_name(stack_info.tgid);
             let frame = StackFrameInfo {
-                symbol: Some(format!("{} ({})", cmd, stack_info.tgid)),
+                symbol: Some(format!("{} ({})", proc_name, stack_info.tgid)),
                 ..Default::default()
             };
             combined.push(frame);
@@ -1229,6 +1290,35 @@ impl TraceHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_thread_subcategory_gc() {
+        // HotSpot GC threads across collectors collapse into "[GC]".
+        for comm in [
+            "GC Thread#0",
+            "GC Thread#7",
+            "G1 Conc#0",
+            "G1 Refine#0",
+            "G1 Main Marker",
+            "G1 Young RemSet",
+            "ZWorkerYoung#3",
+            "ZDriverMinor",
+            "Shenandoah GC",
+            "Gang worker#1",
+        ] {
+            assert_eq!(thread_subcategory(comm), Some("[GC]"), "comm: {comm}");
+        }
+        // Non-GC threads keep their own name (None).
+        for comm in [
+            "main",
+            "java",
+            "C2 CompilerThre",
+            "VM Thread",
+            "VM Periodic Tas",
+        ] {
+            assert_eq!(thread_subcategory(comm), None, "comm: {comm}");
+        }
+    }
 
     #[test]
     fn test_hotspot_symbol_detection() {

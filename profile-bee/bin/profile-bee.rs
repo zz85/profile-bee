@@ -256,8 +256,10 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     group_by_cpu: bool,
 
-    /// Group flamegraph by process name and PID. Each process gets its own
-    /// sub-tree rooted at "process_name (pid)". Useful for system-wide profiling.
+    /// Group flamegraph by process, not per thread. Every thread of a process
+    /// rolls up under one root, "process_name (pid)", and recognized thread
+    /// pools collapse into a subcategory (all GC threads -> "[GC]") so they
+    /// aggregate into a single block. Useful for system-wide profiling.
     #[arg(long, default_value_t = false)]
     group_by_process: bool,
 
