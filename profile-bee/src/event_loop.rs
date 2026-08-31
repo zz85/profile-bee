@@ -394,6 +394,10 @@ impl ProfilingEventLoop {
                         return;
                     }
                     self.hotspot_armed.insert(tgid);
+                    // Stacks cached (as `[jvm] Interpreter`) before arming would
+                    // otherwise be served stale from the frame cache; flush them
+                    // so later samples reach HotSpot method resolution.
+                    self.trace_handler.flush_frame_cache_for_pid(tgid);
                     tracing::info!(
                         "HotSpot interpreter unwinding armed for pid {tgid}: Interpreter [{low:#x},{high:#x})"
                     );

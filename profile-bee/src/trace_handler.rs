@@ -742,6 +742,14 @@ impl TraceHandler {
         self.cache.invalidate_pid(tgid);
     }
 
+    /// Drop cached symbolized stacks for a PID without touching the runtime
+    /// readers. Called when HotSpot interpreter introspection is armed so
+    /// stacks cached (as `[jvm] Interpreter`) before arming are recomputed
+    /// through HotSpot method resolution instead of served stale.
+    pub fn flush_frame_cache_for_pid(&mut self, tgid: u32) {
+        self.cache.invalidate_pid(tgid);
+    }
+
     pub fn print_stats(&self) {
         tracing::info!("{}", self.cache.stats());
     }

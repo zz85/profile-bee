@@ -86,8 +86,13 @@ fn ptrace_getregs(pid: i32) -> Option<libc::user_regs_struct> {
         let mut status = 0;
         libc::waitpid(pid, &mut status, 0);
         let mut regs: libc::user_regs_struct = std::mem::zeroed();
-        let ok = libc::ptrace(libc::PTRACE_GETREGS, pid, 0, &mut regs as *mut _) == 0;
-        ok.then_some(regs)
+        if libc::ptrace(libc::PTRACE_GETREGS, pid, 0, &mut regs as *mut _) == 0 {
+            Some(regs)
+        } else {
+            // Detach so a failed register read doesn't leave the target stopped.
+            libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0);
+            None
+        }
     }
 }
 

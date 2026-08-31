@@ -88,6 +88,7 @@ impl VmOffsets {
             && self.pool_holder >= 0
             && self.klass_name >= 0
             && self.symbol_body >= 0
+            && self.constantpool_size >= 0
             && (self.symbol_length >= 0 || self.symbol_length_and_refcount >= 0)
     }
 }
@@ -322,27 +323,6 @@ fn decode_symbol_body(body: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(body).into_owned())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_symbol_body() {
-        assert_eq!(decode_symbol_body(b"fib").as_deref(), Some("fib"));
-        assert_eq!(
-            decode_symbol_body(b"java/lang/String").as_deref(),
-            Some("java/lang/String")
-        );
-        assert_eq!(decode_symbol_body(b""), None);
-    }
-
-    #[test]
-    fn offsets_incomplete_by_default() {
-        // A freshly constructed offset set must not claim completeness.
-        assert!(!VmOffsets::default().is_complete());
-    }
-}
-
 /// Compute the runtime load bias of `libjvm.so` in `pid` so that a link-time
 /// symbol vaddr maps to a live address: `runtime = link_vaddr + bias`.
 ///
@@ -369,4 +349,25 @@ fn libjvm_load_bias(pid: u32) -> Option<u64> {
         }
     }
     base
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_symbol_body() {
+        assert_eq!(decode_symbol_body(b"fib").as_deref(), Some("fib"));
+        assert_eq!(
+            decode_symbol_body(b"java/lang/String").as_deref(),
+            Some("java/lang/String")
+        );
+        assert_eq!(decode_symbol_body(b""), None);
+    }
+
+    #[test]
+    fn offsets_incomplete_by_default() {
+        // A freshly constructed offset set must not claim completeness.
+        assert!(!VmOffsets::default().is_complete());
+    }
 }
