@@ -55,6 +55,11 @@ unsafe impl Pod for ProcessExitEventPod {}
 pub struct V8ProcInfoPod(pub V8ProcInfo);
 unsafe impl Pod for V8ProcInfoPod {}
 
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct HotspotProcInfoPod(pub profile_bee_common::HotspotProcInfo);
+unsafe impl Pod for HotspotProcInfoPod {}
+
 /// Wrapper for eBPF stuff
 #[derive(Debug)]
 pub struct EbpfProfiler {
@@ -729,6 +734,45 @@ impl EbpfProfiler {
             Some(map) => {
                 let mut v8_map: HashMap<&mut MapData, u32, V8ProcInfoPod> = HashMap::try_from(map)?;
                 let _ = v8_map.remove(&tgid); // ignore error if not present
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Load HotSpot interpreter info for a JVM into the eBPF map so the FP
+    /// walker extracts interpreter-frame `Method*` pointers.
+    pub fn load_hotspot_proc_info(
+        &mut self,
+        tgid: u32,
+        info: &profile_bee_common::HotspotProcInfo,
+    ) -> Result<(), anyhow::Error> {
+        match self.bpf.map_mut("hotspot_proc_info") {
+            Some(map) => {
+                let mut m: HashMap<&mut MapData, u32, HotspotProcInfoPod> = HashMap::try_from(map)?;
+                m.insert(tgid, HotspotProcInfoPod(*info), 0)?;
+                tracing::debug!(
+                    "loaded HotspotProcInfo for pid {} (interp [{:#x},{:#x}), method_off {})",
+                    tgid,
+                    info.interp_low,
+                    info.interp_high,
+                    info.method_offset,
+                );
+                Ok(())
+            }
+            None => {
+                tracing::debug!("hotspot_proc_info map not found (older eBPF binary)");
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove HotSpot interpreter info for a process that exited.
+    pub fn remove_hotspot_proc_info(&mut self, tgid: u32) -> Result<(), anyhow::Error> {
+        match self.bpf.map_mut("hotspot_proc_info") {
+            Some(map) => {
+                let mut m: HashMap<&mut MapData, u32, HotspotProcInfoPod> = HashMap::try_from(map)?;
+                let _ = m.remove(&tgid);
                 Ok(())
             }
             None => Ok(()),

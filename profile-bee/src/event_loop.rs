@@ -12,7 +12,9 @@ use aya::maps::{MapData, StackTraceMap};
 use aya::Ebpf;
 use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS, PROCESS_EVENT_EXEC, PROCESS_EVENT_EXIT};
 
-use crate::ebpf::{apply_dwarf_refresh, FramePointersPod, StackInfoPod, V8ProcInfoPod};
+use crate::ebpf::{
+    apply_dwarf_refresh, FramePointersPod, HotspotProcInfoPod, StackInfoPod, V8ProcInfoPod,
+};
 use crate::pipeline::{DwarfThreadMsg, PerfWork};
 use crate::process_metadata::ProcessMetadataCache;
 use crate::trace_handler::TraceHandler;
@@ -140,6 +142,9 @@ pub struct ProfilingEventLoop {
     last_java_refresh: Instant,
     /// JVM PIDs we have already attempted setup for (including startup scan).
     java_known_pids: HashSet<u32>,
+    /// JVMs for which HotSpot interpreter introspection (VM-structs reader +
+    /// eBPF `hotspot_proc_info` entry) has been armed.
+    hotspot_armed: HashSet<u32>,
     /// Effective target PID; when set, Java discovery is scoped to it only.
     java_target_pid: Option<u32>,
 }
@@ -238,6 +243,7 @@ impl ProfilingEventLoop {
             java_refresh_interval: config.java_refresh_interval,
             last_java_refresh: Instant::now(),
             java_known_pids,
+            hotspot_armed: HashSet::new(),
             java_target_pid: config.java_target_pid,
         }
     }
@@ -345,8 +351,10 @@ impl ProfilingEventLoop {
             return;
         }
         if self.java_known_pids.contains(&tgid) {
-            // Already handled at startup or earlier sample — keep map hot.
+            // Already handled at startup or earlier sample — keep map hot and
+            // (re)try interpreter introspection in case the map only just landed.
             self.trace_handler.register_perf_map(tgid);
+            self.setup_hotspot_introspection(tgid);
             return;
         }
         if !crate::java::is_jvm_process(tgid) {
@@ -354,6 +362,49 @@ impl ProfilingEventLoop {
         }
         self.java_known_pids.insert(tgid);
         self.trace_handler.register_jvm(tgid);
+        self.setup_hotspot_introspection(tgid);
+    }
+
+    /// Arm HotSpot interpreter-frame introspection for a JVM: resolve VM-structs
+    /// offsets (userspace) and publish its interpreter code range into the eBPF
+    /// `hotspot_proc_info` map so the FP walker captures each interpreter
+    /// frame's `Method*`. Idempotent; a no-op once armed.
+    fn setup_hotspot_introspection(&mut self, tgid: u32) {
+        if self.hotspot_armed.contains(&tgid) {
+            return;
+        }
+        if !self.trace_handler.register_hotspot_reader(tgid) {
+            return; // offsets not resolvable (yet)
+        }
+        // The interpreter code range comes from the dumped perf-map.
+        let Some((low, high)) = self.trace_handler.hotspot_interp_range(tgid) else {
+            return; // perf-map / Interpreter entry not present yet; retry later
+        };
+        let info = profile_bee_common::HotspotProcInfo {
+            interp_low: low,
+            interp_high: high,
+            // x86-64 interpreter_frame_method_offset = -3 words.
+            method_offset: -24,
+        };
+        if let Some(map) = self.bpf.map_mut("hotspot_proc_info") {
+            match aya::maps::HashMap::<&mut MapData, u32, HotspotProcInfoPod>::try_from(map) {
+                Ok(mut m) => {
+                    if let Err(e) = m.insert(tgid, HotspotProcInfoPod(info), 0) {
+                        tracing::warn!("failed to insert HotspotProcInfo for pid {tgid}: {e}");
+                        return;
+                    }
+                    self.hotspot_armed.insert(tgid);
+                    // Stacks cached (as `[jvm] Interpreter`) before arming would
+                    // otherwise be served stale from the frame cache; flush them
+                    // so later samples reach HotSpot method resolution.
+                    self.trace_handler.flush_frame_cache_for_pid(tgid);
+                    tracing::info!(
+                        "HotSpot interpreter unwinding armed for pid {tgid}: Interpreter [{low:#x},{high:#x})"
+                    );
+                }
+                Err(e) => tracing::warn!("hotspot_proc_info map error: {e}"),
+            }
+        }
     }
 
     /// Periodic rescan: new JVMs + re-dump maps so JIT tiers stay fresh.
@@ -483,6 +534,19 @@ impl ProfilingEventLoop {
                 aya::maps::HashMap::<&mut MapData, u32, V8ProcInfoPod>::try_from(map)
             {
                 let _ = v8_map.remove(&tgid);
+            }
+        }
+    }
+
+    /// Remove the HotspotProcInfo entry (and armed marker) for an exiting or
+    /// exec'd PID so a reused PID re-resolves against its new image.
+    fn remove_hotspot_for_pid(&mut self, tgid: u32) {
+        self.hotspot_armed.remove(&tgid);
+        if let Some(map) = self.bpf.map_mut("hotspot_proc_info") {
+            if let Ok(mut m) =
+                aya::maps::HashMap::<&mut MapData, u32, HotspotProcInfoPod>::try_from(map)
+            {
+                let _ = m.remove(&tgid);
             }
         }
     }
@@ -627,6 +691,7 @@ impl ProfilingEventLoop {
                             // Also remove the eBPF v8_proc_info entry so the FP walker
                             // won't try to extract V8 SFI for a reused PID.
                             self.remove_v8_proc_info_for_pid(event.pid);
+                            self.remove_hotspot_for_pid(event.pid);
                             // Defer metadata cache eviction until after build_raw_stacks()
                             // so agents can still look up metadata for processes that
                             // exited within the collection window.
@@ -659,6 +724,7 @@ impl ProfilingEventLoop {
                             self.trace_handler.invalidate_caches_for_pid(event.pid);
                             // Remove eBPF v8_proc_info for the old binary
                             self.remove_v8_proc_info_for_pid(event.pid);
+                            self.remove_hotspot_for_pid(event.pid);
                             if let Some(ref mut cache) = self.process_metadata {
                                 cache.invalidate(event.pid);
                             }
