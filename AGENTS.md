@@ -308,7 +308,7 @@ sudo tests/run_e2e.sh --filter dwarf
 | Entries per shard | 65,536 (`MAX_SHARD_ENTRIES`) | Very large binaries truncated |
 | CFA registers | RSP, RBP only | Other registers skipped |
 | DWARF expressions | Unsupported | Except PLT-stub and signal-frame patterns |
-| Architecture | x86_64 only | Hardcoded register rules |
+| Architecture | x86_64 and aarch64 | Per-arch register rules (`SP_REG`/`FP_REG`/`RA_REG`); aarch64 adds an RA column (`UnwindEntry::ra_offset`) since the return address is in LR, not always at CFA-8 |
 
 ## Key Dependencies
 

@@ -27,6 +27,9 @@ use profile_bee_common::{
     MAX_EXEC_MAPPING_ENTRIES, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, MAX_V8_FRAMES, REG_RULE_OFFSET,
     REG_RULE_SAME_VALUE, SHARD_NONE, V8_FP_CONTEXT_SIZE,
 };
+// RA-recovery sentinels are only referenced by the aarch64 DWARF unwinder.
+#[cfg(bpf_target_arch = "aarch64")]
+use profile_bee_common::{RA_OFFSET_IN_LR, RA_OFFSET_UNDEFINED};
 
 // ---------------------------------------------------------------------------
 // Arch-neutral register access
@@ -73,6 +76,13 @@ fn reg_fp(r: &RawRegs) -> u64 {
 fn reg_syscall_nr(r: &RawRegs) -> u64 {
     r.orig_rax
 }
+/// Link register (return address of a leaf frame). x86_64 has no LR — the
+/// return address is always on the stack — so this is unused there.
+#[cfg(bpf_target_arch = "x86_64")]
+#[inline(always)]
+fn reg_lr(_r: &RawRegs) -> u64 {
+    0
+}
 
 // aarch64: PC = pc, SP = sp, FP = x29 (`regs[29]`), syscall NR = x8 (`regs[8]`).
 #[cfg(bpf_target_arch = "aarch64")]
@@ -95,6 +105,12 @@ fn reg_fp(r: &RawRegs) -> u64 {
 fn reg_syscall_nr(r: &RawRegs) -> u64 {
     r.regs[8]
 }
+/// Link register = x30 (`regs[30]`) — holds a leaf frame's return address.
+#[cfg(bpf_target_arch = "aarch64")]
+#[inline(always)]
+fn reg_lr(r: &RawRegs) -> u64 {
+    r.regs[30]
+}
 
 // Force LLVM to retain the full type definition of UnwindEntry during LTO.
 // Without this, bpf-linker emits only a BTF FWD (forward declaration) for
@@ -105,9 +121,9 @@ static _UNWIND_ENTRY_BTF_ANCHOR: UnwindEntry = UnwindEntry {
     pc: 0,
     cfa_offset: 0,
     rbp_offset: 0,
+    ra_offset: 0,
     cfa_type: 0,
     rbp_type: 0,
-    _pad: [0; 2],
 };
 
 pub const STACK_ENTRIES: u32 = 16392;
@@ -862,7 +878,88 @@ pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
     }
 }
 
+/// First non-userspace address — used to reject kernel pointers when validating
+/// unwound frame IPs and interpreter `Method*` reads. Architecture-specific:
+///
+/// - x86_64: the kernel text base `0xffffffff80000000`. (Canonical kernel-half
+///   addresses start at `0xffff800000000000`, but the historical value here is
+///   sufficient for the FP/DWARF walkers and is preserved unchanged.)
+/// - aarch64: `2^48`, one past the top of the 48-bit user virtual address range
+///   (`0x0000_ffff_ffff_ffff`). Kernel (TTBR1) addresses live at
+///   `0xffff_0000_0000_0000`+ — crucially *below* the x86_64 constant, so that
+///   value would wrongly accept aarch64 kernel pointers (observed as bogus
+///   "user" frames when walking kernel register state, e.g. off-CPU).
+#[cfg(bpf_target_arch = "x86_64")]
 const __START_KERNEL_MAP: u64 = 0xffffffff80000000;
+#[cfg(bpf_target_arch = "aarch64")]
+const __START_KERNEL_MAP: u64 = 0x0001_0000_0000_0000;
+
+/// Resolve a frame's return address from its unwind entry and computed CFA.
+///
+/// Returns `None` to stop unwinding. `is_leaf_step` is true when unwinding out
+/// of the sampled (leaf) frame — the only frame whose return address may still
+/// be in a register. `lr` is the sampled link register (aarch64).
+///
+/// x86_64: the return address is always at CFA-8 (or a fixed ucontext offset
+/// for signal frames); `ra_offset` is ignored, preserving the original behavior
+/// byte-for-byte.
+#[cfg(bpf_target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn dwarf_return_addr(
+    entry: &UnwindEntry,
+    cfa: u64,
+    sp: u64,
+    _lr: u64,
+    _is_leaf_step: bool,
+) -> Option<u64> {
+    // Signal frame: RA at *(RSP + 168); normal frame: RA at CFA-8.
+    let ra_addr = if entry.cfa_type == CFA_REG_DEREF_RSP {
+        sp + 168
+    } else {
+        cfa.wrapping_sub(8)
+    };
+    let ra = bpf_probe_read_user(ra_addr as *const u64).ok()?;
+    if ra == 0 {
+        None
+    } else {
+        Some(ra)
+    }
+}
+
+/// aarch64: the return address lives in LR (x30). `ra_offset` is load-bearing —
+/// it is either a CFA-relative offset where the RA was spilled, or the sentinel
+/// [`RA_OFFSET_IN_LR`] (RA still in x30, recoverable only for the leaf step) or
+/// [`RA_OFFSET_UNDEFINED`] (top of stack).
+#[cfg(bpf_target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dwarf_return_addr(
+    entry: &UnwindEntry,
+    cfa: u64,
+    _sp: u64,
+    lr: u64,
+    is_leaf_step: bool,
+) -> Option<u64> {
+    match entry.ra_offset {
+        RA_OFFSET_UNDEFINED => None,
+        RA_OFFSET_IN_LR => {
+            // RA is still in x30: only the sampled leaf frame's LR is known.
+            if is_leaf_step && lr != 0 {
+                Some(lr)
+            } else {
+                None
+            }
+        }
+        off => {
+            let ra_addr = (cfa as i64).wrapping_add(off as i64) as u64;
+            let ra = bpf_probe_read_user(ra_addr as *const u64).ok()?;
+            if ra == 0 {
+                None
+            } else {
+                Some(ra)
+            }
+        }
+    }
+}
 
 /// Perform one frame of DWARF unwinding, updating state in place.
 /// Returns true if unwinding should continue, false if done.
@@ -967,20 +1064,12 @@ unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState) -> bool {
         return false;
     }
 
-    // Return address: CFA-8 for normal frames, *(RSP+168) for signal frames
-    let ra_addr = if is_signal {
-        sp + 168
-    } else {
-        cfa.wrapping_sub(8)
-    };
-    let return_addr = match bpf_probe_read_user(ra_addr as *const u64) {
-        Ok(val) => val,
-        Err(_) => return false,
-    };
-
-    if return_addr == 0 {
+    // Return address: x86_64 uses CFA-8 (or the signal-frame ucontext slot);
+    // aarch64 uses the entry's ra_offset / LR. frame_idx == 1 is the step out
+    // of the sampled leaf frame (the only frame whose RA may be in a register).
+    let Some(return_addr) = dwarf_return_addr(&entry, cfa, sp, state.lr, frame_idx == 1) else {
         return false;
-    }
+    };
 
     // Restore RBP: for signal frames read from *(RSP+120),
     // otherwise use normal CFA-relative offset rule
@@ -1148,20 +1237,12 @@ unsafe fn dwarf_copy_stack_regs(
             break;
         }
 
-        // Return address: CFA-8 for normal frames, *(RSP+168) for signal frames
-        let ra_addr = if is_signal {
-            sp + 168
-        } else {
-            cfa.wrapping_sub(8)
-        };
-        let return_addr = match bpf_probe_read_user(ra_addr as *const u64) {
-            Ok(val) => val,
-            Err(_) => break,
-        };
-
-        if return_addr == 0 {
+        // Return address: x86_64 uses CFA-8 (or signal-frame ucontext slot);
+        // aarch64 uses the entry's ra_offset / LR. i == 1 is the step out of the
+        // sampled leaf frame (the only frame whose RA may still be in a register).
+        let Some(return_addr) = dwarf_return_addr(&entry, cfa, sp, reg_lr(regs), i == 1) else {
             break;
-        }
+        };
 
         // Restore RBP: for signal frames read from *(RSP+120),
         // otherwise use normal CFA-relative offset rule
@@ -1226,6 +1307,9 @@ unsafe fn dwarf_try_tail_call<C: EbpfContext>(
     (*state).current_ip = ip;
     (*state).sp = sp;
     (*state).bp = bp;
+    // Sampled link register: lets the aarch64 step program recover the leaf
+    // frame's return address when it is still in x30 (no-op on x86_64).
+    (*state).lr = reg_lr(regs);
     (*state).tgid = tgid;
     (*state).mapping_count = 0; // Unused with LPM trie, kept for struct layout compat
 
