@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.21
+
+### Bug Fixes
+
+- **Fix `Error: invalid value size 9224, expected 8712` on startup** — the bundled prebuilt eBPF object (`profile-bee/ebpf-bin/profile-bee.bpf.o`) was not regenerated after v0.3.20 grew `FramePointers` by the `hotspot_method[]` side-channel. Stable `cargo build` / `cargo install` builds embed that prebuilt object, so its `stacked_pointers` map (value size 8712) no longer matched the userspace struct (9224) and map creation failed at startup. Regenerated the prebuilt to match. Builds using a fresh `cargo xtask build-ebpf` were unaffected. Architecture-independent (affected x86-64 and aarch64).
+
 ## v0.3.20
 
 ### New Features
