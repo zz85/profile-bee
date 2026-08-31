@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- **aarch64 support for frame-pointer unwinding and Java/HotSpot interpreter naming** — the eBPF register access was hardcoded to x86_64 (`pt_regs.rip/rbp/rsp/orig_rax`), so the kernel programs could not even compile for an aarch64 BPF target. Register access is now arch-neutral: a `RawRegs` alias plus `reg_ip/reg_sp/reg_fp/reg_syscall_nr` accessors gated on `bpf_target_arch` (emitted by a new `profile-bee-ebpf/build.rs` mirroring aya-ebpf's logic). On aarch64 the register file is read as `user_pt_regs` (FP = x29, IP = pc, SP = sp). Frame-pointer stack walking, kernel-stack symbolization, and HotSpot interpreter-frame `Method*` naming (`interpreter_frame_method_offset = -3` words = -24 bytes, identical on x86_64 and aarch64) all work. Validated end to end on Corretto 17 aarch64 (`-Xint`): leaf interpreter frame resolves to `Burn.fib`, and the FP fixtures resolve full `_start → main → … ` chains.
+  - A per-arch prebuilt eBPF object (`ebpf-bin/profile-bee.<arch>.bpf.o`, e.g. `profile-bee.aarch64.bpf.o`) is now selected by `build.rs` from `CARGO_CFG_TARGET_ARCH`, falling back to `profile-bee.bpf.o` (x86_64), so stable `cargo install` works on aarch64 without a nightly eBPF rebuild.
+  - DWARF `.eh_frame` unwinding remains x86_64 only (unwind-table register rules and the RA-at-CFA-8 convention are still x86_64-specific); `--dwarf` on aarch64 warns and falls back to frame pointers. aarch64 DWARF is a follow-up.
+  - Removed the dead, misleading `profile-bee-ebpf/src/pt_regs.rs` (an unused x86_64 bindgen dump — the real `pt_regs` comes from `aya_ebpf::bindings`).
+
 ## v0.3.21
 
 ### Bug Fixes

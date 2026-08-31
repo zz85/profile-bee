@@ -2,6 +2,11 @@
 //!
 //! These tests validate that the `dwarf_unwind` module can parse binaries
 //! and produce sensible unwind tables for eBPF map loading.
+//!
+//! DWARF unwind-table generation is x86_64-only for now (register rules and the
+//! RA-at-CFA-8 convention are hardcoded for x86_64), so this suite is gated to
+//! x86_64. aarch64 DWARF support is tracked as a follow-up.
+#![cfg(target_arch = "x86_64")]
 
 use profile_bee::dwarf_unwind::{generate_unwind_table, DwarfUnwindManager};
 use profile_bee_common::*;

@@ -84,7 +84,9 @@ src/lib.rs                  All implementation + map definitions:
                               dwarf_unwind_step_impl()     — tail-call target (5 frames per call)
                               dwarf_finalize_stack()       — write completed stack to maps
                               handle_process_exit()        — PID exit detection
-src/pt_regs.rs              pt_regs struct definition for x86_64
+                              (register access is arch-neutral via RawRegs +
+                              reg_ip/reg_sp/reg_fp, gated on bpf_target_arch;
+                              build.rs emits that cfg — x86_64 + aarch64)
 ```
 
 ## Data Flow — One Sample

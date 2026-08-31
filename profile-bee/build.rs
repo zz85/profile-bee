@@ -22,8 +22,18 @@ fn main() {
     let fresh_release = workspace_root.join("target/bpfel-unknown-none/release/profile-bee");
     let fresh_debug = workspace_root.join("target/bpfel-unknown-none/debug/profile-bee");
 
-    // Prebuilt binary checked into the repository.
-    let prebuilt = manifest_dir.join("ebpf-bin/profile-bee.bpf.o");
+    // Prebuilt binary checked into the repository. The eBPF bytecode embeds
+    // architecture-specific register offsets (pt_regs layout), so prefer an
+    // arch-specific prebuilt (`profile-bee.<arch>.bpf.o`) when present, falling
+    // back to the default `profile-bee.bpf.o` (x86_64).
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let prebuilt_arch = manifest_dir.join(format!("ebpf-bin/profile-bee.{target_arch}.bpf.o"));
+    let prebuilt_default = manifest_dir.join("ebpf-bin/profile-bee.bpf.o");
+    let prebuilt = if prebuilt_arch.exists() {
+        prebuilt_arch
+    } else {
+        prebuilt_default
+    };
 
     // Prefer the freshly-built binary matching the current profile,
     // then the other profile, then the prebuilt fallback.
@@ -42,6 +52,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", fresh_release.display());
     println!("cargo:rerun-if-changed={}", fresh_debug.display());
     println!("cargo:rerun-if-changed={}", prebuilt.display());
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
     fs::copy(source, &dest).unwrap_or_else(|e| {
         panic!(

@@ -4,7 +4,7 @@
 /// different ebpf applications.
 ///
 use aya_ebpf::{
-    bindings::{bpf_raw_tracepoint_args, pt_regs, BPF_F_USER_STACK},
+    bindings::{bpf_raw_tracepoint_args, BPF_F_USER_STACK},
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_current_task_btf, bpf_get_smp_processor_id,
         bpf_ktime_get_ns, bpf_probe_read, bpf_probe_read_kernel, bpf_probe_read_user,
@@ -27,6 +27,74 @@ use profile_bee_common::{
     MAX_EXEC_MAPPING_ENTRIES, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, MAX_V8_FRAMES, REG_RULE_OFFSET,
     REG_RULE_SAME_VALUE, SHARD_NONE, V8_FP_CONTEXT_SIZE,
 };
+
+// ---------------------------------------------------------------------------
+// Arch-neutral register access
+// ---------------------------------------------------------------------------
+//
+// aya's `bindings::pt_regs` is field-accessible on x86_64 but an opaque ZST on
+// aarch64. On aarch64 the kernel `struct pt_regs` begins with `user_pt_regs`
+// ({ regs[31], sp, pc, pstate }) — the same leading bytes exposed to BPF as
+// `bpf_user_pt_regs_t` — so we reinterpret the register file as `user_pt_regs`
+// there. All unwinding code holds `&RawRegs` and reads registers through the
+// `reg_*` accessors, keeping the sampling paths arch-neutral.
+//
+// The `bpf_target_arch` cfg is emitted by this crate's build.rs (mirroring
+// aya-ebpf's own logic) so it matches the arch aya selected for `pt_regs`.
+#[cfg(bpf_target_arch = "x86_64")]
+type RawRegs = aya_ebpf::bindings::pt_regs;
+#[cfg(bpf_target_arch = "aarch64")]
+type RawRegs = aya_ebpf::bindings::user_pt_regs;
+
+#[cfg(not(any(bpf_target_arch = "x86_64", bpf_target_arch = "aarch64")))]
+compile_error!("profile-bee-ebpf supports only x86_64 and aarch64 BPF targets");
+
+/// Instruction pointer (program counter) of the sampled frame.
+#[cfg(bpf_target_arch = "x86_64")]
+#[inline(always)]
+fn reg_ip(r: &RawRegs) -> u64 {
+    r.rip
+}
+/// Stack pointer of the sampled frame.
+#[cfg(bpf_target_arch = "x86_64")]
+#[inline(always)]
+fn reg_sp(r: &RawRegs) -> u64 {
+    r.rsp
+}
+/// Frame pointer (base pointer) of the sampled frame.
+#[cfg(bpf_target_arch = "x86_64")]
+#[inline(always)]
+fn reg_fp(r: &RawRegs) -> u64 {
+    r.rbp
+}
+/// Syscall number preserved in the register file (x86_64: `orig_rax`).
+#[cfg(bpf_target_arch = "x86_64")]
+#[inline(always)]
+fn reg_syscall_nr(r: &RawRegs) -> u64 {
+    r.orig_rax
+}
+
+// aarch64: PC = pc, SP = sp, FP = x29 (`regs[29]`), syscall NR = x8 (`regs[8]`).
+#[cfg(bpf_target_arch = "aarch64")]
+#[inline(always)]
+fn reg_ip(r: &RawRegs) -> u64 {
+    r.pc
+}
+#[cfg(bpf_target_arch = "aarch64")]
+#[inline(always)]
+fn reg_sp(r: &RawRegs) -> u64 {
+    r.sp
+}
+#[cfg(bpf_target_arch = "aarch64")]
+#[inline(always)]
+fn reg_fp(r: &RawRegs) -> u64 {
+    r.regs[29]
+}
+#[cfg(bpf_target_arch = "aarch64")]
+#[inline(always)]
+fn reg_syscall_nr(r: &RawRegs) -> u64 {
+    r.regs[8]
+}
 
 // Force LLVM to retain the full type definition of UnwindEntry during LTO.
 // Without this, bpf-linker emits only a BTF FWD (forward declaration) for
@@ -391,7 +459,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
     let pointer = &mut *pointer;
 
-    let regs = ctx.as_ptr() as *const pt_regs;
+    let regs = ctx.as_ptr() as *const RawRegs;
 
     // Try tail-call-based DWARF unwinding for deep stacks (up to 165 frames).
     // If the tail call succeeds, execution transfers to dwarf_unwind_step and
@@ -408,7 +476,7 @@ pub unsafe fn collect_trace<C: EbpfContext>(ctx: C) {
 
     let (ip, bp, len, sp) = if dwarf_enabled() {
         let (ip, bp, len) = dwarf_copy_stack_regs(&*regs, &mut pointer.pointers, tgid);
-        (ip, bp, len, (*regs).rsp)
+        (ip, bp, len, reg_sp(&*regs))
     } else {
         // Try tail-call-based FP+V8 walking for deep stacks with V8 SFI extraction.
         // If the tail call succeeds, execution transfers to fp_v8_unwind_step and
@@ -477,7 +545,7 @@ pub unsafe fn collect_trace_raw_syscall(ctx: RawTracePointContext) {
     let args_ptr = (*args).args.as_ptr();
 
     // args[0] = struct pt_regs *
-    let regs_ptr = args_ptr.read() as *const pt_regs;
+    let regs_ptr = args_ptr.read() as *const RawRegs;
     // args[1] = long syscall_id (for sys_enter this IS the syscall number)
     let syscall_nr = args_ptr.add(1).read() as i64;
 
@@ -505,14 +573,15 @@ pub unsafe fn collect_trace_raw_syscall_exit(ctx: RawTracePointContext) {
     let args_ptr = (*args).args.as_ptr();
 
     // args[0] = struct pt_regs *
-    let regs_ptr = args_ptr.read() as *const pt_regs;
+    let regs_ptr = args_ptr.read() as *const RawRegs;
 
     let Ok(regs) = bpf_probe_read_kernel(regs_ptr) else {
         return;
     };
 
-    // For sys_exit, get the syscall number from pt_regs.orig_rax
-    let syscall_nr = regs.orig_rax as i64;
+    // For sys_exit, recover the syscall number from the register file
+    // (x86_64: orig_rax; aarch64: x8, best-effort).
+    let syscall_nr = reg_syscall_nr(&regs) as i64;
 
     let target = target_syscall_nr();
     if target >= 0 && syscall_nr != target {
@@ -525,7 +594,7 @@ pub unsafe fn collect_trace_raw_syscall_exit(ctx: RawTracePointContext) {
 /// Shared body for raw syscall tracepoint collection.
 /// Called after syscall NR filtering with the already-read pt_regs.
 #[inline(always)]
-unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &pt_regs) {
+unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &RawRegs) {
     let pid = ctx.pid();
 
     if pid == 0 && skip_idle() {
@@ -555,7 +624,7 @@ unsafe fn collect_trace_with_regs_and_ctx(ctx: RawTracePointContext, regs: &pt_r
 
     let (ip, bp, len, sp) = if dwarf_enabled() {
         let (ip, bp, len) = dwarf_copy_stack_regs(regs, &mut pointer.pointers, tgid);
-        (ip, bp, len, regs.rsp)
+        (ip, bp, len, reg_sp(regs))
     } else {
         copy_stack_regs(regs, pointer, tgid)
     };
@@ -697,7 +766,7 @@ pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
 
     // Get pt_regs from current task (kernel >= 5.15)
     let task = bpf_get_current_task_btf();
-    let regs_ptr = bpf_task_pt_regs(task) as *const pt_regs;
+    let regs_ptr = bpf_task_pt_regs(task) as *const RawRegs;
     if regs_ptr.is_null() {
         return;
     }
@@ -752,7 +821,7 @@ pub unsafe fn collect_trace_raw_tp_with_task_regs(ctx: RawTracePointContext) {
 
     let (ip, bp, len, sp) = if dwarf_enabled() {
         let (ip, bp, len) = dwarf_copy_stack_regs(&regs, &mut pointer.pointers, tgid);
-        (ip, bp, len, regs.rsp)
+        (ip, bp, len, reg_sp(&regs))
     } else {
         copy_stack_regs(&regs, pointer, tgid)
     };
@@ -946,13 +1015,13 @@ unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState) -> bool {
 /// DWARF-based stack unwinding using pre-loaded unwind tables (from pt_regs directly)
 #[inline(always)]
 unsafe fn dwarf_copy_stack_regs(
-    regs: &pt_regs,
+    regs: &RawRegs,
     pointers: &mut [u64],
     tgid: u32,
 ) -> (u64, u64, usize) {
-    let ip = regs.rip;
-    let mut sp = regs.rsp;
-    let mut bp = regs.rbp;
+    let ip = reg_ip(regs);
+    let mut sp = reg_sp(regs);
+    let mut bp = reg_fp(regs);
 
     pointers[0] = ip;
 
@@ -1137,7 +1206,7 @@ unsafe fn dwarf_copy_stack_regs(
 #[inline(always)]
 unsafe fn dwarf_try_tail_call<C: EbpfContext>(
     ctx: &C,
-    regs: &pt_regs,
+    regs: &RawRegs,
     tgid: u32,
     user_stack_id: i32,
     kernel_stack_id: i32,
@@ -1147,12 +1216,16 @@ unsafe fn dwarf_try_tail_call<C: EbpfContext>(
         return;
     };
 
+    let ip = reg_ip(regs);
+    let sp = reg_sp(regs);
+    let bp = reg_fp(regs);
+
     // Initialize unwind state with first frame
-    (*state).pointers[0] = regs.rip;
+    (*state).pointers[0] = ip;
     (*state).frame_count = 1;
-    (*state).current_ip = regs.rip;
-    (*state).sp = regs.rsp;
-    (*state).bp = regs.rbp;
+    (*state).current_ip = ip;
+    (*state).sp = sp;
+    (*state).bp = bp;
     (*state).tgid = tgid;
     (*state).mapping_count = 0; // Unused with LPM trie, kept for struct layout compat
 
@@ -1161,9 +1234,9 @@ unsafe fn dwarf_try_tail_call<C: EbpfContext>(
     (*state).kernel_stack_id = kernel_stack_id;
     (*state).cmd = ctx.command().unwrap_or_default();
     (*state).cpu = cpu;
-    (*state).initial_ip = regs.rip;
-    (*state).initial_bp = regs.rbp;
-    (*state).initial_sp = regs.rsp;
+    (*state).initial_ip = ip;
+    (*state).initial_bp = bp;
+    (*state).initial_sp = sp;
 
     // Attempt tail call. If successful, we never return.
     // If it fails (wrong program type, index not populated), we return.
@@ -1278,7 +1351,7 @@ pub unsafe fn dwarf_unwind_step_impl<C: EbpfContext>(ctx: C) {
 /// Used as fallback when tail-call dispatch is not available.
 /// Uses per-CPU state and a flat loop limited to LEGACY_MAX_DWARF_STACK_DEPTH (21) frames.
 #[inline(always)]
-unsafe fn dwarf_copy_stack(regs: &pt_regs, pointers: &mut [u64], tgid: u32) -> (u64, u64, usize) {
+unsafe fn dwarf_copy_stack(regs: &RawRegs, pointers: &mut [u64], tgid: u32) -> (u64, u64, usize) {
     dwarf_copy_stack_regs(regs, pointers, tgid)
 }
 
@@ -1357,7 +1430,7 @@ unsafe fn binary_search_unwind_entry(
 /// V8 extraction.
 #[inline(always)]
 unsafe fn copy_stack_regs(
-    regs: &pt_regs,
+    regs: &RawRegs,
     pointer: &mut FramePointers,
     tgid: u32,
 ) -> (u64, u64, usize, u64) {
@@ -1376,7 +1449,7 @@ unsafe fn copy_stack_regs(
     // frame); deeper interpreter frames are named via the tail-call path. One
     // map lookup + one read — same cost class as the V8 leaf extraction.
     if let Some(hi) = HOTSPOT_PROC_INFO.get(&tgid) {
-        if let Some(m) = try_read_hotspot_method(hi, regs.rip, regs.rbp) {
+        if let Some(m) = try_read_hotspot_method(hi, reg_ip(regs), reg_fp(regs)) {
             pointer.hotspot_method[0] = m;
         }
     }
@@ -1397,7 +1470,7 @@ unsafe fn copy_stack_regs(
 #[inline(always)]
 unsafe fn fp_v8_try_tail_call<C: EbpfContext>(
     ctx: &C,
-    regs: &pt_regs,
+    regs: &RawRegs,
     tgid: u32,
     user_stack_id: i32,
     kernel_stack_id: i32,
@@ -1407,26 +1480,30 @@ unsafe fn fp_v8_try_tail_call<C: EbpfContext>(
         return;
     };
 
+    let ip = reg_ip(regs);
+    let sp = reg_sp(regs);
+    let bp = reg_fp(regs);
+
     // Initialize with first frame (current IP)
-    (*state).pointers[0] = regs.rip;
+    (*state).pointers[0] = ip;
     (*state).frame_count = 1;
-    (*state).current_ip = regs.rip;
-    (*state).sp = regs.rsp;
-    (*state).bp = regs.rbp;
+    (*state).current_ip = ip;
+    (*state).sp = sp;
+    (*state).bp = bp;
     (*state).tgid = tgid;
 
     // Zero V8 SFI slot for frame 0 and attempt extraction
     (*state).v8_sfi[0] = 0;
     if let Some(vi) = V8_PROC_INFO.get(&tgid) {
-        if let Some(sfi) = try_read_v8_sfi(vi, regs.rbp) {
+        if let Some(sfi) = try_read_v8_sfi(vi, bp) {
             (*state).v8_sfi[0] = sfi;
         }
     }
 
-    // HotSpot interpreter Method* for the leaf frame (IP=rip, base=rbp).
+    // HotSpot interpreter Method* for the leaf frame (IP=pc, base=fp).
     (*state).hotspot_method[0] = 0;
     if let Some(hi) = HOTSPOT_PROC_INFO.get(&tgid) {
-        if let Some(m) = try_read_hotspot_method(hi, regs.rip, regs.rbp) {
+        if let Some(m) = try_read_hotspot_method(hi, ip, bp) {
             (*state).hotspot_method[0] = m;
         }
     }
@@ -1436,9 +1513,9 @@ unsafe fn fp_v8_try_tail_call<C: EbpfContext>(
     (*state).kernel_stack_id = kernel_stack_id;
     (*state).cmd = ctx.command().unwrap_or_default();
     (*state).cpu = cpu;
-    (*state).initial_ip = regs.rip;
-    (*state).initial_bp = regs.rbp;
-    (*state).initial_sp = regs.rsp;
+    (*state).initial_ip = ip;
+    (*state).initial_bp = bp;
+    (*state).initial_sp = sp;
 
     // Attempt tail call to FP+V8 step program at index 1.
     // If successful, we never return.
@@ -1588,13 +1665,13 @@ pub unsafe fn fp_v8_unwind_step_impl<C: EbpfContext>(ctx: C) {
 
 /// Pure FP-based stack walking without V8 extraction.
 /// Used internally by `copy_stack_regs` and as a fallback from `dwarf_copy_stack_regs`.
-unsafe fn copy_stack_regs_fp_only(regs: &pt_regs, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
+unsafe fn copy_stack_regs_fp_only(regs: &RawRegs, pointers: &mut [u64]) -> (u64, u64, usize, u64) {
     // instruction pointer
-    let ip = regs.rip;
-    let sp = regs.rsp;
+    let ip = reg_ip(regs);
+    let sp = reg_sp(regs);
 
     // base pointer (frame pointer)
-    let mut bp = regs.rbp;
+    let mut bp = reg_fp(regs);
 
     pointers[0] = ip;
 
@@ -1840,12 +1917,12 @@ unsafe fn collect_off_cpu_trace_percpu<C: EbpfContext>(ctx: &C, now: u64) {
     // sleep, and bpf_get_stackid captures it from the saved registers.
     // Custom FP/DWARF unwinding also works here since the kernel preserves
     // the task's register state.
-    let regs = ctx.as_ptr() as *const pt_regs;
+    let regs = ctx.as_ptr() as *const RawRegs;
 
     // Attempt FP/DWARF unwinding if enabled, otherwise just use stackid
     let (ip, bp, len, sp) = if dwarf_enabled() {
         let (ip, bp, len) = dwarf_copy_stack_regs(&*regs, &mut pointer.pointers, current_tgid);
-        (ip, bp, len, (*regs).rsp)
+        (ip, bp, len, reg_sp(&*regs))
     } else {
         copy_stack_regs(&*regs, pointer, current_tgid)
     };

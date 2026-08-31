@@ -335,7 +335,7 @@ sudo probee -o output.svg -t 5000 -- ./my-fp-binary
 - Rust: Add `-g` flag when compiling
 - C/C++: Compile with debug symbols (`-g` flag)
 
-**Limitations:** Max 8 executable mappings per process, 131K unwind table entries per binary (up to 64 binaries), up to 165 frame depth (via tail-call chaining; legacy fallback: 21 frames). x86_64 only. Libraries loaded via dlopen are detected within ~1 second.
+**Limitations:** Max 8 executable mappings per process, 131K unwind table entries per binary (up to 64 binaries), up to 165 frame depth (via tail-call chaining; legacy fallback: 21 frames). DWARF unwinding is x86_64 only; frame-pointer unwinding (the default) and Java/HotSpot interpreter naming also work on aarch64. Libraries loaded via dlopen are detected within ~1 second.
 
 See [docs/dwarf_unwinding_design.md](docs/dwarf_unwinding_design.md) for architecture details, and [Polar Signals' article on profiling without frame pointers](https://www.polarsignals.com/blog/posts/2022/11/29/profiling-without-frame-pointers) for background.
 
@@ -454,7 +454,8 @@ let session = ProfilingSession::new(config).await?;
 ## Limitations
 
 - Linux only (requires eBPF support)
-- DWARF unwinding: x86_64 only, see limits above
+- Architecture: x86_64 and aarch64 supported for frame-pointer unwinding and Java/HotSpot interpreter naming
+- DWARF unwinding: x86_64 only, see limits above (aarch64 DWARF is a follow-up)
 - JIT-compiled code (HotSpot Java, V8/Node) is symbolized via `/tmp/perf-<pid>.map`; interpreter and inlined frames are not yet reconstructed. `Compiler.perfmap` auto-dump requires JDK 17+ (on JDK 8/11 use perf-map-agent/async-profiler)
 - [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) `.eh_frame` parsed for DWARF unwinding; VDSO symbolization not yet supported
 

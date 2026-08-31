@@ -510,6 +510,18 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         // Initialize the subscriber
         .init();
 
+    // DWARF `.eh_frame` unwinding is x86_64-only: the eBPF unwind tables encode
+    // x86_64 CFA/RBP register rules and the compact UnwindEntry omits an RA
+    // column (return address is always at CFA-8 on x86_64). Frame-pointer
+    // unwinding — the default — works on all supported arches. Disable DWARF on
+    // non-x86_64 rather than feed the FP walker x86_64 rules that yield garbage.
+    if cfg!(not(target_arch = "x86_64")) && opt.dwarf.unwrap_or(false) {
+        tracing::warn!(
+            "--dwarf is only supported on x86_64; falling back to frame-pointer unwinding"
+        );
+        opt.dwarf = Some(false);
+    }
+
     use tokio::sync::broadcast;
     let (tx, rx) = broadcast::channel(16);
 

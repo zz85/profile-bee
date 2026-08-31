@@ -884,7 +884,10 @@ impl DwarfUnwindManager {
     }
 }
 
-#[cfg(test)]
+// DWARF `.eh_frame` unwind-table generation is x86_64-only (the register rules
+// and RA-at-CFA-8 convention are hardcoded for x86_64), so these tests only run
+// on x86_64. aarch64 DWARF support is tracked as a follow-up.
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
 
