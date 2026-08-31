@@ -454,7 +454,7 @@ let session = ProfilingSession::new(config).await?;
 ## Limitations
 
 - Linux only (requires eBPF support)
-- Architecture: x86_64 and aarch64 supported (frame-pointer + DWARF unwinding, Java/HotSpot interpreter naming)
+- Architecture: x86_64 and aarch64 supported (frame-pointer + DWARF unwinding, Java/HotSpot `Method*` naming)
 - JIT-compiled code (HotSpot Java, V8/Node) is symbolized via `/tmp/perf-<pid>.map`; interpreter and inlined frames are not yet reconstructed. `Compiler.perfmap` auto-dump requires JDK 17+ (on JDK 8/11 use perf-map-agent/async-profiler)
 - [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) `.eh_frame` parsed for DWARF unwinding; VDSO symbolization not yet supported
 

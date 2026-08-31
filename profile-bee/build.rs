@@ -24,15 +24,22 @@ fn main() {
 
     // Prebuilt binary checked into the repository. The eBPF bytecode embeds
     // architecture-specific register offsets (pt_regs layout), so prefer an
-    // arch-specific prebuilt (`profile-bee.<arch>.bpf.o`) when present, falling
-    // back to the default `profile-bee.bpf.o` (x86_64).
+    // arch-specific prebuilt (`profile-bee.<arch>.bpf.o`) when present. The
+    // default `profile-bee.bpf.o` is x86_64 bytecode, so it is only a valid
+    // fallback on x86_64 (or when the arch is unknown). On other arches, point
+    // at the (possibly missing) arch-specific prebuilt instead of the x86_64
+    // default — falling back to x86_64 bytecode there would produce a binary
+    // that reads the wrong registers; a fresh `cargo xtask build-ebpf` or the
+    // committed arch prebuilt is required.
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let prebuilt_arch = manifest_dir.join(format!("ebpf-bin/profile-bee.{target_arch}.bpf.o"));
     let prebuilt_default = manifest_dir.join("ebpf-bin/profile-bee.bpf.o");
     let prebuilt = if prebuilt_arch.exists() {
         prebuilt_arch
-    } else {
+    } else if target_arch == "x86_64" || target_arch.is_empty() {
         prebuilt_default
+    } else {
+        prebuilt_arch
     };
 
     // Prefer the freshly-built binary matching the current profile,

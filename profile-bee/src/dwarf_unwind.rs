@@ -17,10 +17,14 @@ use gimli::{BaseAddresses, CfaRule, EhFrame, NativeEndian, Register, RegisterRul
 use object::{Object, ObjectSection};
 use procfs::process::{MMapPath, Process};
 use profile_bee_common::{
-    ExecMapping, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_PLT, CFA_REG_RBP,
-    CFA_REG_RSP, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
-    REG_RULE_UNDEFINED,
+    ExecMapping, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_RBP, CFA_REG_RSP,
+    MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED,
 };
+// CFA_REG_PLT is produced only by the x86_64 CFA-expression classifier and
+// referenced by tests; gating avoids an unused-import warning on non-x86_64,
+// non-test builds.
+#[cfg(any(target_arch = "x86_64", test))]
+use profile_bee_common::CFA_REG_PLT;
 // RA-recovery sentinels are only used by the aarch64 unwind-table generator.
 #[cfg(target_arch = "aarch64")]
 use profile_bee_common::{RA_OFFSET_IN_LR, RA_OFFSET_UNDEFINED};
@@ -181,7 +185,9 @@ pub fn summarize_address_range(low: u64, high: u64) -> Vec<AddressBlockRange> {
 }
 
 // x86_64 register numbers in DWARF (used by the x86_64 CFA-expression classifier)
+#[cfg(target_arch = "x86_64")]
 const X86_64_RSP: Register = Register(7);
+#[cfg(target_arch = "x86_64")]
 const X86_64_RA: Register = Register(16);
 
 // Arch-neutral DWARF register aliases used by the unwind-table generator.
@@ -223,6 +229,30 @@ pub fn generate_unwind_table(
 /// 2. Signal frame: `breg7(rsp)+N; deref`
 ///    → CFA = *(RSP + N)
 fn classify_cfa_expression(
+    unwind_expr: &gimli::UnwindExpression<usize>,
+    eh_frame_data: &[u8],
+) -> (u8, i16) {
+    // The PLT-stub and signal-frame CFA-expression shapes recognized below — and
+    // the fixed offsets the eBPF unwinder applies for `CFA_REG_PLT` /
+    // `CFA_REG_DEREF_RSP` — are x86_64-specific. On other architectures the DWARF
+    // register numbers differ (e.g. reg 7 is x7, not SP), so matching these
+    // patterns could misclassify an entry and drive the wrong recovery. Always
+    // return the generic classification there so the entry is skipped and the FP
+    // walker takes over.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (unwind_expr, eh_frame_data);
+        (CFA_REG_EXPRESSION, 0)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        classify_cfa_expression_x86_64(unwind_expr, eh_frame_data)
+    }
+}
+
+/// x86_64-specific CFA-expression classifier (PLT stub / signal frame).
+#[cfg(target_arch = "x86_64")]
+fn classify_cfa_expression_x86_64(
     unwind_expr: &gimli::UnwindExpression<usize>,
     eh_frame_data: &[u8],
 ) -> (u8, i16) {
@@ -925,10 +955,12 @@ impl DwarfUnwindManager {
     }
 }
 
-// DWARF `.eh_frame` unwind-table generation is x86_64-only (the register rules
-// and RA-at-CFA-8 convention are hardcoded for x86_64), so these tests only run
-// on x86_64. aarch64 DWARF support is tracked as a follow-up.
-#[cfg(all(test, target_arch = "x86_64"))]
+// Most of these tests are architecture-neutral (address-range summarization,
+// struct sizes, manager bookkeeping, and unwind-table generation for the current
+// binary, which now works on both x86_64 and aarch64). The few that encode
+// x86_64-specific expectations — hardcoded x86_64 libc paths, and the x86_64
+// RA-at-CFA-8 convention — carry their own `#[cfg(target_arch = "x86_64")]`.
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -997,6 +1029,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<UnwindEntry>(), 12);
     }
 
+    // x86_64-specific: asserts the x86_64 RA-at-CFA-8 convention.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_unwind_table_return_address_convention() {
         // On x86_64, return address is always at CFA-8.
@@ -1032,6 +1066,8 @@ mod tests {
         );
     }
 
+    // x86_64-specific: hardcoded x86_64 libc paths.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_libc_unwind_table() {
         // Parse libc's .eh_frame to verify we can handle shared libraries
