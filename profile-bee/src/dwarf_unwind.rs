@@ -17,10 +17,17 @@ use gimli::{BaseAddresses, CfaRule, EhFrame, NativeEndian, Register, RegisterRul
 use object::{Object, ObjectSection};
 use procfs::process::{MMapPath, Process};
 use profile_bee_common::{
-    ExecMapping, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_PLT, CFA_REG_RBP,
-    CFA_REG_RSP, MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE,
-    REG_RULE_UNDEFINED,
+    ExecMapping, UnwindEntry, CFA_REG_DEREF_RSP, CFA_REG_EXPRESSION, CFA_REG_RBP, CFA_REG_RSP,
+    MAX_SHARD_ENTRIES, MAX_UNWIND_SHARDS, REG_RULE_OFFSET, REG_RULE_SAME_VALUE, REG_RULE_UNDEFINED,
 };
+// CFA_REG_PLT is produced only by the x86_64 CFA-expression classifier and
+// referenced by tests; gating avoids an unused-import warning on non-x86_64,
+// non-test builds.
+#[cfg(any(target_arch = "x86_64", test))]
+use profile_bee_common::CFA_REG_PLT;
+// RA-recovery sentinels are only used by the aarch64 unwind-table generator.
+#[cfg(target_arch = "aarch64")]
+use profile_bee_common::{RA_OFFSET_IN_LR, RA_OFFSET_UNDEFINED};
 
 /// Errors from the DWARF unwind subsystem.
 #[derive(Error, Debug)]
@@ -177,10 +184,30 @@ pub fn summarize_address_range(low: u64, high: u64) -> Vec<AddressBlockRange> {
     res
 }
 
-// x86_64 register numbers in DWARF
+// x86_64 register numbers in DWARF (used by the x86_64 CFA-expression classifier)
+#[cfg(target_arch = "x86_64")]
 const X86_64_RSP: Register = Register(7);
-const X86_64_RBP: Register = Register(6);
+#[cfg(target_arch = "x86_64")]
 const X86_64_RA: Register = Register(16);
+
+// Arch-neutral DWARF register aliases used by the unwind-table generator.
+// `SP_REG`/`FP_REG` back the CFA base (CFA_REG_RSP/CFA_REG_RBP) and the
+// frame-pointer restore rule (`rbp_offset`/`rbp_type`); `RA_REG` is the return
+// address column.
+//   x86_64: RSP=7, RBP=6, RA=16
+//   aarch64: SP=31, FP(x29)=29, LR(x30)=30
+#[cfg(target_arch = "x86_64")]
+const SP_REG: Register = Register(7);
+#[cfg(target_arch = "x86_64")]
+const FP_REG: Register = Register(6);
+#[cfg(target_arch = "x86_64")]
+const RA_REG: Register = Register(16);
+#[cfg(target_arch = "aarch64")]
+const SP_REG: Register = Register(31);
+#[cfg(target_arch = "aarch64")]
+const FP_REG: Register = Register(29);
+#[cfg(target_arch = "aarch64")]
+const RA_REG: Register = Register(30);
 
 /// Generates a compact unwind table from an ELF binary's .eh_frame section
 pub fn generate_unwind_table(
@@ -202,6 +229,30 @@ pub fn generate_unwind_table(
 /// 2. Signal frame: `breg7(rsp)+N; deref`
 ///    → CFA = *(RSP + N)
 fn classify_cfa_expression(
+    unwind_expr: &gimli::UnwindExpression<usize>,
+    eh_frame_data: &[u8],
+) -> (u8, i16) {
+    // The PLT-stub and signal-frame CFA-expression shapes recognized below — and
+    // the fixed offsets the eBPF unwinder applies for `CFA_REG_PLT` /
+    // `CFA_REG_DEREF_RSP` — are x86_64-specific. On other architectures the DWARF
+    // register numbers differ (e.g. reg 7 is x7, not SP), so matching these
+    // patterns could misclassify an entry and drive the wrong recovery. Always
+    // return the generic classification there so the entry is skipped and the FP
+    // walker takes over.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (unwind_expr, eh_frame_data);
+        (CFA_REG_EXPRESSION, 0)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        classify_cfa_expression_x86_64(unwind_expr, eh_frame_data)
+    }
+}
+
+/// x86_64-specific CFA-expression classifier (PLT stub / signal frame).
+#[cfg(target_arch = "x86_64")]
+fn classify_cfa_expression_x86_64(
     unwind_expr: &gimli::UnwindExpression<usize>,
     eh_frame_data: &[u8],
 ) -> (u8, i16) {
@@ -394,9 +445,9 @@ pub fn generate_unwind_table_from_bytes(
 
                     let (cfa_type, cfa_offset) = match cfa {
                         CfaRule::RegisterAndOffset { register, offset } => {
-                            let reg_type = if *register == X86_64_RSP {
+                            let reg_type = if *register == SP_REG {
                                 CFA_REG_RSP
-                            } else if *register == X86_64_RBP {
+                            } else if *register == FP_REG {
                                 CFA_REG_RBP
                             } else {
                                 // Unsupported register for CFA
@@ -416,23 +467,42 @@ pub fn generate_unwind_table_from_bytes(
                         continue;
                     }
 
-                    // Get return address rule — on x86_64 it's always CFA-8 for
-                    // normal frames. Signal frames use expression-based rules
-                    // (DW_OP_breg7+offset) which we handle specially.
-                    let ra_rule = row.register(X86_64_RA);
+                    // Return-address rule (stored in UnwindEntry::ra_offset).
+                    let ra_rule = row.register(RA_REG);
                     let is_signal_frame = cfa_type == CFA_REG_DEREF_RSP;
-                    match ra_rule {
-                        RegisterRule::Offset(-8) => {}
-                        // Signal frames: RA is an expression (breg7+168).
-                        // We hardcode the ucontext_t offsets in eBPF.
-                        RegisterRule::Expression(_) if is_signal_frame => {}
-                        RegisterRule::Undefined => continue,
+
+                    // x86_64: RA is always at CFA-8 for normal frames; signal
+                    // frames use an expression handled via fixed ucontext offsets
+                    // in eBPF. Reject anything else to match the eBPF x86_64
+                    // assumptions exactly (ra_offset is ignored by the x86_64
+                    // unwinder but recorded for documentation).
+                    #[cfg(target_arch = "x86_64")]
+                    let ra_offset: i16 = match ra_rule {
+                        RegisterRule::Offset(-8) => -8,
+                        RegisterRule::Expression(_) if is_signal_frame => -8,
                         _ => continue,
                     };
 
-                    // Get RBP rule (important for restoring frame pointer)
-                    let rbp_rule = row.register(X86_64_RBP);
-                    let (rbp_type, rbp_offset) = match rbp_rule {
+                    // aarch64: RA lives in LR (x30). Offset(n) → spilled at CFA+n;
+                    // Undefined/SameValue/Register(x30) → still in LR (leaf frame).
+                    #[cfg(target_arch = "aarch64")]
+                    let ra_offset: i16 = {
+                        let _ = is_signal_frame; // aarch64 signal frames not modeled yet
+                        match ra_rule {
+                            RegisterRule::Offset(n) => match i16::try_from(n) {
+                                // Guard against a real offset colliding with a sentinel.
+                                Ok(o) if o != RA_OFFSET_IN_LR && o != RA_OFFSET_UNDEFINED => o,
+                                _ => continue,
+                            },
+                            RegisterRule::Undefined | RegisterRule::SameValue => RA_OFFSET_IN_LR,
+                            RegisterRule::Register(r) if r == RA_REG => RA_OFFSET_IN_LR,
+                            _ => continue,
+                        }
+                    };
+
+                    // Frame-pointer restore rule (RBP on x86_64, x29 on aarch64).
+                    let fp_rule = row.register(FP_REG);
+                    let (rbp_type, rbp_offset) = match fp_rule {
                         RegisterRule::Offset(offset) => {
                             let Ok(offset_i16) = i16::try_from(offset) else {
                                 continue;
@@ -457,7 +527,7 @@ pub fn generate_unwind_table_from_bytes(
                         rbp_offset,
                         cfa_type,
                         rbp_type,
-                        _pad: [0; 2],
+                        ra_offset,
                     });
                 }
             }
@@ -476,6 +546,7 @@ pub fn generate_unwind_table_from_bytes(
             && a.cfa_offset == b.cfa_offset
             && a.rbp_type == b.rbp_type
             && a.rbp_offset == b.rbp_offset
+            && a.ra_offset == b.ra_offset
     });
     let after = entries.len();
     if before != after {
@@ -884,6 +955,11 @@ impl DwarfUnwindManager {
     }
 }
 
+// Most of these tests are architecture-neutral (address-range summarization,
+// struct sizes, manager bookkeeping, and unwind-table generation for the current
+// binary, which now works on both x86_64 and aarch64). The few that encode
+// x86_64-specific expectations — hardcoded x86_64 libc paths, and the x86_64
+// RA-at-CFA-8 convention — carry their own `#[cfg(target_arch = "x86_64")]`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,6 +1029,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<UnwindEntry>(), 12);
     }
 
+    // x86_64-specific: asserts the x86_64 RA-at-CFA-8 convention.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_unwind_table_return_address_convention() {
         // On x86_64, return address is always at CFA-8.
@@ -988,6 +1066,8 @@ mod tests {
         );
     }
 
+    // x86_64-specific: hardcoded x86_64 libc paths.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_libc_unwind_table() {
         // Parse libc's .eh_frame to verify we can handle shared libraries

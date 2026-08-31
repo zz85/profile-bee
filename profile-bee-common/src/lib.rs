@@ -225,11 +225,21 @@ pub const REG_RULE_UNDEFINED: u8 = 2;
 pub const REG_RULE_REGISTER: u8 = 3;
 pub const REG_RULE_EXPRESSION: u8 = 4;
 
-/// Compact unwind table entry for eBPF-side stack unwinding.
+/// Compact unwind table entry for eBPF-side stack unwinding (12 bytes).
 ///
-/// On x86_64, the return address is always at CFA-8, so we don't store RA
-/// rule/offset. Using u32 for PC (file-relative addresses fit in 4GB) and
-/// i16 offsets gives us 12 bytes per entry.
+/// `rbp_offset`/`rbp_type` describe the frame-pointer register (RBP on x86_64,
+/// x29 on aarch64). `ra_offset` describes where the return address lives:
+///
+/// - On x86_64 the return address is always at CFA-8, so the eBPF x86_64 path
+///   ignores `ra_offset` and hardcodes CFA-8. Generation still records -8 for
+///   documentation.
+/// - On aarch64 the return address is in LR (x30) — not always on the stack —
+///   so `ra_offset` is load-bearing: a byte offset from CFA where RA is saved,
+///   or the sentinel [`RA_OFFSET_IN_LR`] meaning "RA is still in the LR
+///   register" (leaf frames; recoverable only for the sampled frame).
+///
+/// `u32` PC (file-relative addresses fit in 4GB) and `i16` offsets keep this at
+/// 12 bytes per entry.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct UnwindEntry {
@@ -238,12 +248,25 @@ pub struct UnwindEntry {
     pub rbp_offset: i16,
     pub cfa_type: u8,
     pub rbp_type: u8,
-    pub _pad: [u8; 2],
+    /// Return-address recovery (see struct docs). Occupies the two bytes that
+    /// were previously padding, so both the size (12 bytes) and the offsets of
+    /// every other field are unchanged — an existing x86_64 prebuilt (which
+    /// ignores this field) stays byte-compatible.
+    pub ra_offset: i16,
 }
 
 impl UnwindEntry {
     pub const STRUCT_SIZE: usize = size_of::<UnwindEntry>();
 }
+
+/// `ra_offset` sentinel: the return address is still in the LR register (x30),
+/// not saved to the stack (leaf frames / function prologue on aarch64). Only
+/// recoverable for the sampled (leaf) frame, where the LR register value is
+/// known; deeper frames with this rule terminate unwinding.
+pub const RA_OFFSET_IN_LR: i16 = i16::MAX;
+/// `ra_offset` sentinel: the return address is undefined (top of stack /
+/// outermost frame) — terminate unwinding.
+pub const RA_OFFSET_UNDEFINED: i16 = i16::MIN;
 
 /// Maximum frames to unwind per tail-call iteration
 pub const FRAMES_PER_TAIL_CALL: usize = 5;
@@ -411,14 +434,14 @@ pub struct DwarfUnwindState {
     /// Saved CPU ID (for finalization)
     pub cpu: u32,
     pub _pad2: u32,
-    /// Reserved. Originally intended to thread the normalized execution context
-    /// through the tail-call chain, but the finalizers read `preempt_count`
-    /// directly instead (threading it from `collect_trace` forked verifier state
-    /// through the FP-walk loop and blew the instruction limit). Kept for layout
-    /// stability; tail calls preserve interrupt context so the direct read is
-    /// equivalent.
-    pub context: u32,
-    pub _pad3: u32,
+    /// Link register (x30) captured from the sampled register file. Used by the
+    /// aarch64 DWARF unwinder to recover the leaf frame's return address when it
+    /// is still in LR (not yet spilled to the stack). Zero / unused on x86_64.
+    ///
+    /// Occupies the 8 bytes formerly split between a reserved `context` field
+    /// (the finalizers read `preempt_count` directly, so it was unused) and
+    /// `_pad3`, so the struct size is unchanged.
+    pub lr: u64,
     /// V8 SharedFunctionInfo tagged pointers extracted during FP+V8 tail-call
     /// walking. Parallel to `pointers[0..MAX_V8_FRAMES]`. Zero means "not a
     /// V8 frame" or "beyond V8 extraction limit".

@@ -510,6 +510,17 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         // Initialize the subscriber
         .init();
 
+    // DWARF `.eh_frame` unwinding is supported on x86_64 and aarch64. On other
+    // architectures the eBPF unwind tables would be generated with the wrong
+    // register rules, so disable DWARF there and fall back to frame pointers.
+    if cfg!(not(any(target_arch = "x86_64", target_arch = "aarch64"))) && opt.dwarf.unwrap_or(false)
+    {
+        tracing::warn!(
+            "--dwarf is only supported on x86_64 and aarch64; falling back to frame-pointer unwinding"
+        );
+        opt.dwarf = Some(false);
+    }
+
     use tokio::sync::broadcast;
     let (tx, rx) = broadcast::channel(16);
 

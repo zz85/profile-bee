@@ -383,7 +383,9 @@ impl ProfilingEventLoop {
         let info = profile_bee_common::HotspotProcInfo {
             interp_low: low,
             interp_high: high,
-            // x86-64 interpreter_frame_method_offset = -3 words.
+            // HotSpot `interpreter_frame_method_offset` = -3 words, relative to
+            // the frame pointer (rbp/x29). Identical on x86_64 and aarch64
+            // (frame_x86.hpp / frame_aarch64.hpp), so -24 bytes covers both.
             method_offset: -24,
         };
         if let Some(map) = self.bpf.map_mut("hotspot_proc_info") {

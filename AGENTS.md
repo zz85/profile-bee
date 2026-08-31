@@ -84,7 +84,9 @@ src/lib.rs                  All implementation + map definitions:
                               dwarf_unwind_step_impl()     — tail-call target (5 frames per call)
                               dwarf_finalize_stack()       — write completed stack to maps
                               handle_process_exit()        — PID exit detection
-src/pt_regs.rs              pt_regs struct definition for x86_64
+                              (register access is arch-neutral via RawRegs +
+                              reg_ip/reg_sp/reg_fp, gated on bpf_target_arch;
+                              build.rs emits that cfg — x86_64 + aarch64)
 ```
 
 ## Data Flow — One Sample
@@ -306,7 +308,7 @@ sudo tests/run_e2e.sh --filter dwarf
 | Entries per shard | 65,536 (`MAX_SHARD_ENTRIES`) | Very large binaries truncated |
 | CFA registers | RSP, RBP only | Other registers skipped |
 | DWARF expressions | Unsupported | Except PLT-stub and signal-frame patterns |
-| Architecture | x86_64 only | Hardcoded register rules |
+| Architecture | x86_64 and aarch64 | Per-arch register rules (`SP_REG`/`FP_REG`/`RA_REG`); aarch64 adds an RA column (`UnwindEntry::ra_offset`) since the return address is in LR, not always at CFA-8 |
 
 ## Key Dependencies
 

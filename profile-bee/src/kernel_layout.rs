@@ -298,14 +298,20 @@ fn uname_version() -> Option<String> {
 /// `/proc/kallsyms` has 100k+ lines but only two symbols are ever needed
 /// (`__per_cpu_offset`, `__preempt_count`), so `load` streams the file and
 /// retains only those rather than buffering the whole file and every symbol.
+// `Kallsyms` backs the x86_64 per-CPU `preempt_count` layout resolver; on other
+// arches (e.g. aarch64, which reads a task_struct field instead) only the
+// arch-neutral parser is exercised by tests, so allow the rest to be unused.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct Kallsyms {
     map: std::collections::HashMap<String, u64>,
 }
 
 /// The only symbols the layout resolver looks up. Streaming `load` keeps just
 /// these; other consumers should extend this list rather than retaining all.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const WANTED_SYMBOLS: [&str; 2] = ["__per_cpu_offset", "__preempt_count"];
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 impl Kallsyms {
     fn load() -> std::io::Result<Self> {
         use std::io::BufRead;
