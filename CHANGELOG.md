@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New Features (experimental)
+
+- **`--java-engine async-profiler` (prototype)** — instead of reconstructing Java stacks from eBPF (which needs `-XX:+PreserveFramePointer` for JIT frames), profile-bee can delegate to [async-profiler](https://github.com/async-profiler/async-profiler): when profiling a single JVM by `--pid`, it attaches `asprof` for the profiling window and uses its `AsyncGetCallTrace`-accurate folded output. Because async-profiler's `-o collapsed` format is the same folded format profile-bee emits — and `--pid` already scopes eBPF sampling to that one process — the JVM's eBPF stacks are cleanly replaced by async-profiler's for the run. No `-XX:+PreserveFramePointer` required; JIT/interpreter/inlined frames resolve to real method names. Locate `asprof` via `$ASPROF` or `$PATH`. Scope: batch (`--collapse`/`--svg`/`--json`) output only; requires `--pid` + `--time`; falls back to eBPF stacks (with a reason) when prerequisites are unmet. Streaming/serve/TUI and multi-process merging are follow-ups.
+
 ## v0.3.22
 
 ### New Features

@@ -1,0 +1,169 @@
+//! Prototype: delegate Java stacks to async-profiler.
+//!
+//! When profiling a single JVM by `--pid`, profile-bee can attach
+//! async-profiler (`asprof`) for the profiling window and use its folded
+//! ("collapsed") output — which is `AsyncGetCallTrace`-accurate and needs no
+//! `-XX:+PreserveFramePointer` — instead of the eBPF-reconstructed Java stacks.
+//!
+//! async-profiler's `-o collapsed` output is the same `frame;frame;… count`
+//! folded format profile-bee emits, so merging is a splice. Because `--pid`
+//! already filters eBPF sampling to the one target, replacing the whole eBPF
+//! collapse with async-profiler's output for that run is clean.
+//!
+//! Scope of this prototype: single-PID replacement, batch (collapse/svg/json)
+//! output only. Streaming/serve/TUI and multi-process merging are follow-ups.
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+
+/// Locate the async-profiler launcher: `$ASPROF`, then `asprof`/`profiler.sh`
+/// on `$PATH`, then a couple of common install roots.
+pub fn find_asprof() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ASPROF") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            for name in ["asprof", "profiler.sh"] {
+                let cand = Path::new(dir).join(name);
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    for base in ["/opt/async-profiler", "/usr/local/async-profiler"] {
+        for rel in ["bin/asprof", "asprof", "profiler.sh"] {
+            let cand = Path::new(base).join(rel);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// A running async-profiler attach. Profiles for a fixed duration, then exits;
+/// [`Session::finish`] waits for it and returns the re-rooted folded stacks.
+pub struct Session {
+    child: Child,
+    output: PathBuf,
+    root: String,
+    pid: u32,
+}
+
+impl Session {
+    /// Attach async-profiler to `pid` for `duration_ms`, sampling `event`
+    /// (e.g. `"cpu"`, `"wall"`, `"alloc"`), writing collapsed output to a temp
+    /// file. `root` is prepended to every folded stack so the JVM's frames land
+    /// under one flamegraph root consistent with profile-bee's output.
+    pub fn start(
+        asprof: &Path,
+        pid: u32,
+        duration_ms: u64,
+        event: &str,
+        root: String,
+    ) -> std::io::Result<Session> {
+        let secs = duration_ms.div_ceil(1000).max(1);
+        let output = std::env::temp_dir().join(format!("probee-asprof-{pid}.folded"));
+        let _ = std::fs::remove_file(&output);
+        let child = Command::new(asprof)
+            .arg("-d")
+            .arg(secs.to_string())
+            .arg("-e")
+            .arg(event)
+            .arg("-o")
+            .arg("collapsed")
+            .arg("-f")
+            .arg(&output)
+            .arg(pid.to_string())
+            .spawn()?;
+        Ok(Session {
+            child,
+            output,
+            root,
+            pid,
+        })
+    }
+
+    /// The profiled PID.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Wait for the profiling window to complete, then read and re-root the
+    /// folded output. Returns one `stack;… count` line per collapsed entry.
+    pub fn finish(mut self) -> std::io::Result<Vec<String>> {
+        let status = self.child.wait()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "asprof exited with status {status}"
+            )));
+        }
+        let text = std::fs::read_to_string(&self.output)?;
+        let _ = std::fs::remove_file(&self.output);
+        Ok(reroot_folded(&text, &self.root))
+    }
+}
+
+/// Prefix each folded line's stack with `root`, preserving the trailing count.
+fn reroot_folded(text: &str, root: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| reroot_line(line, root))
+        .collect()
+}
+
+/// `"a;b 5"` + root `"java (12)"` -> `Some("java (12);a;b 5")`.
+/// Returns `None` for blank lines or lines without a trailing integer count.
+fn reroot_line(line: &str, root: &str) -> Option<String> {
+    let line = line.trim_end();
+    if line.is_empty() {
+        return None;
+    }
+    let (stack, count) = line.rsplit_once(' ')?;
+    if stack.is_empty() || count.parse::<u64>().is_err() {
+        return None;
+    }
+    Some(format!("{root};{stack} {count}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reroot_basic() {
+        assert_eq!(
+            reroot_line("start;Main.run;fib 42", "java (7)"),
+            Some("java (7);start;Main.run;fib 42".to_string())
+        );
+    }
+
+    #[test]
+    fn reroot_single_frame() {
+        assert_eq!(
+            reroot_line("Interpreter 3", "java (7)"),
+            Some("java (7);Interpreter 3".to_string())
+        );
+    }
+
+    #[test]
+    fn reroot_rejects_malformed() {
+        assert_eq!(reroot_line("", "r"), None);
+        assert_eq!(reroot_line("no_count", "r"), None);
+        assert_eq!(reroot_line("a;b notanumber", "r"), None);
+    }
+
+    #[test]
+    fn reroot_folded_multi() {
+        let text = "a;b 5\n\nc 2\nbad line here\n";
+        let out = reroot_folded(text, "P (1)");
+        assert_eq!(
+            out,
+            vec!["P (1);a;b 5".to_string(), "P (1);c 2".to_string()]
+        );
+    }
+}

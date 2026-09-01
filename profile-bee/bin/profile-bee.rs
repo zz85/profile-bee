@@ -35,6 +35,18 @@ use profile_bee::types::FrameCount;
 // Output format inference from file extension
 // ---------------------------------------------------------------------------
 
+/// Which engine produces Java stacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum JavaEngine {
+    /// Reconstruct Java stacks from eBPF (frame pointers / DWARF + perf-map).
+    Ebpf,
+    /// Attach async-profiler (`asprof`) to a single `--pid` JVM and use its
+    /// AsyncGetCallTrace-accurate folded output instead. Prototype: batch
+    /// collapse/svg/json output only.
+    #[value(name = "async-profiler", alias = "ap")]
+    AsyncProfiler,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
     Svg,
@@ -261,6 +273,14 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     group_by_process: bool,
 
+    /// Java stack engine (prototype). `ebpf` (default) reconstructs Java stacks
+    /// from eBPF. `async-profiler` attaches async-profiler (`asprof`) to a single
+    /// `--pid` JVM and uses its AsyncGetCallTrace-accurate folded output instead
+    /// — no `-XX:+PreserveFramePointer` needed. Requires `--pid`, `--time`, and
+    /// `asprof` on `$PATH` or `$ASPROF`. Batch collapse/svg/json output only.
+    #[arg(long, value_enum, default_value_t = JavaEngine::Ebpf)]
+    java_engine: JavaEngine,
+
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     dwarf: Option<bool>,
@@ -403,6 +423,57 @@ impl Opt {
             || { #[cfg(feature = "otlp")] { self.otlp_endpoint.is_some() } #[cfg(not(feature = "otlp"))] { false } }
             // Continuous profiling mode
             || self.flush_interval.is_some()
+    }
+}
+
+/// If the async-profiler Java engine is selected and prerequisites are met,
+/// attach async-profiler to the target JVM for the profiling window and return
+/// the running session. Otherwise log why and return `None` so the caller falls
+/// back to eBPF stacks. The session runs concurrently with eBPF collection and
+/// is drained with [`Session::finish`] after the window closes.
+fn maybe_start_async_profiler(
+    opt: &Opt,
+    pid: Option<u32>,
+) -> Option<profile_bee::java::async_profiler::Session> {
+    use profile_bee::java::{async_profiler, is_jvm_process};
+
+    if opt.java_engine != JavaEngine::AsyncProfiler {
+        return None;
+    }
+    let Some(pid) = pid else {
+        eprintln!("--java-engine async-profiler requires --pid <jvm-pid>; using eBPF stacks");
+        return None;
+    };
+    let Some(duration) = opt.time else {
+        eprintln!("--java-engine async-profiler requires --time <ms>; using eBPF stacks");
+        return None;
+    };
+    if !is_jvm_process(pid) {
+        eprintln!("pid {pid} is not a JVM (no libjvm.so mapping); using eBPF stacks");
+        return None;
+    }
+    let Some(asprof) = async_profiler::find_asprof() else {
+        eprintln!(
+            "async-profiler not found — set $ASPROF or put `asprof` on $PATH; using eBPF stacks"
+        );
+        return None;
+    };
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "java".to_string());
+    let root = format!("{comm} ({pid})");
+    match async_profiler::Session::start(&asprof, pid, duration as u64, "cpu", root) {
+        Ok(session) => {
+            eprintln!(
+                "async-profiler engine: attached {} to pid {pid} for {duration}ms (cpu)",
+                asprof.display()
+            );
+            Some(session)
+        }
+        Err(e) => {
+            eprintln!("failed to start async-profiler ({e}); using eBPF stacks");
+            None
+        }
     }
 }
 
@@ -1165,12 +1236,38 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             sink.set_actual_duration_ms(actual_duration_ms);
             sink.finish(&collapse_stacks)?;
         } else {
-            // Pre-symbolized: use collect() for collapse strings
+            // Pre-symbolized: use collect() for collapse strings.
             tracing::debug!("batch mode: collecting samples");
+            // Optional async-profiler Java engine (prototype): started here so it
+            // profiles the same window as eBPF collection, which blocks below.
+            let ap_session = maybe_start_async_profiler(&opt, pid);
             let result = event_loop.collect(&perf_rx, None);
-            sink.write_batch(&result.stacks)?;
+            // When async-profiler ran for the target JVM, use its folded output
+            // instead of the eBPF-reconstructed stacks (--pid scopes eBPF to that
+            // one process, so this is a clean replacement for the run).
+            let stacks = match ap_session {
+                Some(session) => match session.finish() {
+                    Ok(lines) if !lines.is_empty() => {
+                        eprintln!(
+                            "async-profiler engine: using {} folded Java stacks (replacing eBPF stacks for the target)",
+                            lines.len()
+                        );
+                        lines
+                    }
+                    Ok(_) => {
+                        eprintln!("async-profiler produced no samples; using eBPF stacks");
+                        result.stacks
+                    }
+                    Err(e) => {
+                        eprintln!("async-profiler error: {e}; using eBPF stacks");
+                        result.stacks
+                    }
+                },
+                None => result.stacks,
+            };
+            sink.write_batch(&stacks)?;
             sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
-            sink.finish(&result.stacks)?;
+            sink.finish(&stacks)?;
         }
 
         // TODO: unified collect path that produces both raw + symbolized simultaneously
