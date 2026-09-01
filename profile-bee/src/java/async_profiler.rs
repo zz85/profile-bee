@@ -127,7 +127,16 @@ pub async fn ensure_asprof() -> std::io::Result<PathBuf> {
     );
 
     eprintln!("async-profiler: downloading pinned {asset} (verified) ...");
-    let bytes = reqwest::get(&url)
+    // Bounded timeouts so a host with no GitHub egress fails fast into the eBPF
+    // fallback instead of hanging the whole run on a stuck connection.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(Error::other)?;
+    let bytes = client
+        .get(&url)
+        .send()
         .await
         .and_then(|r| r.error_for_status())
         .map_err(Error::other)?
