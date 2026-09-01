@@ -1,10 +1,12 @@
 # Changelog
 
-## v0.3.23
+## v0.3.24
 
 ### New Features
 
 - **Bun / JavaScriptCore JIT symbol resolution via JITDump** — JIT-compiled JavaScript in Bun (which uses JavaScriptCore, not V8) previously showed as `[unknown]` because JSC emits a binary perf JITDump (`jit-<pid>.dump`) rather than a text perf-map. New `jitdump.rs` parses that format (JIT_CODE_LOAD / MOVE / DEBUG_INFO / CLOSE records, `BTreeMap` range lookups, incremental reload for streaming modes, JSC and standard `jit-<pid>.dump` file-naming). Integrated as an additional JIT symbol source *after* V8 SFI, HotSpot `Method*`, and the text perf-map fallback, so it only names frames nothing else could. `spawn` auto-injects `BUN_JSC_useJITDump=1` for `probee -- bun <script>`; `event_loop` auto-loads per PID and reloads each collection window; `event_loop` warns once when a `--pid`/system-wide Bun process lacks a JITDump file; offline re-symbolization (`.raw`) applies the same override. JSC symbol names are cleaned (e.g. `hot#DdCypB` → `hot`). Validated on aarch64 Bun 1.3.14: the on-CPU FTL-JIT frame resolves to `JSC-FTL: hot`. Ported from the `bun` branch and rebased onto the current V8/HotSpot/DWARF/aarch64 infrastructure. E2E: `bun_callstack.js` fixture + a JITDump resolution test.
+
+## v0.3.23
 
 ### New Features (experimental)
 

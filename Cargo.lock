@@ -2533,7 +2533,7 @@ dependencies = [
 
 [[package]]
 name = "profile-bee"
-version = "0.3.23"
+version = "0.3.24"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -2632,14 +2632,14 @@ dependencies = [
 
 [[package]]
 name = "profile-bee-common"
-version = "0.3.23"
+version = "0.3.24"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "profile-bee-symbols"
-version = "0.3.23"
+version = "0.3.24"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2652,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "profile-bee-tui"
-version = "0.3.23"
+version = "0.3.24"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3481,7 +3481,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "symbol-server"
-version = "0.3.23"
+version = "0.3.24"
 dependencies = [
  "anyhow",
  "axum",

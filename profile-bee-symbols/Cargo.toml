@@ -1,6 +1,6 @@
 [package]
 name = "profile-bee-symbols"
-version = "0.3.23"
+version = "0.3.24"
 edition = "2021"
 license = "MIT"
 description = "Shared symbol extraction and FileId computation for profile-bee ecosystem"
