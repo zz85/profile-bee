@@ -462,17 +462,25 @@ fn start_async_profiler(opt: &Opt, pid: Option<u32>, asprof: &Path) -> Option<As
     if opt.java_engine != JavaEngine::AsyncProfiler {
         return None;
     }
-    let Some(duration) = opt.time else {
-        eprintln!("--java-engine async-profiler requires --time <ms>; using eBPF stacks");
+    // async-profiler attaches for a fixed window, so a bounded positive duration
+    // is required; `--time 0` (run until Ctrl-C) has no fixed window, so treat it
+    // like no `--time` and fall back to eBPF.
+    let Some(duration) = opt.time.filter(|&t| t > 0) else {
+        eprintln!(
+            "--java-engine async-profiler requires a positive --time <ms>; using eBPF stacks"
+        );
         return None;
     };
     let duration = duration as u64;
+    // Match async-profiler's sampling interval to the eBPF --frequency.
+    let interval_ns = 1_000_000_000u64.checked_div(opt.frequency).unwrap_or(0);
 
     let start_one = |pid: u32| match async_profiler::Session::start(
         asprof,
         pid,
         duration,
         "cpu",
+        interval_ns,
         jvm_root(pid),
     ) {
         Ok(s) => {
@@ -673,10 +681,29 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         opt.dwarf = Some(false);
     }
 
+    // The async-profiler engine only wires into batch (collapse/svg/json) output;
+    // it does not touch the streaming/TUI/serve or raw-only paths. Only enable
+    // its setup (group-by-process, disabling profile-bee's own Java discovery,
+    // and the asprof download) when a supported batch mode is in effect — so an
+    // unsupported combination doesn't silently disable Java naming or download a
+    // binary for nothing.
+    let ap_only_raw = !resolved_outputs.is_empty()
+        && resolved_outputs
+            .iter()
+            .all(|(f, _)| *f == OutputFormat::Raw);
+    let ap_batch_supported = !opt.tui && !opt.serve && opt.flush_interval.is_none() && !ap_only_raw;
+    let async_profiler_active = opt.java_engine == JavaEngine::AsyncProfiler && ap_batch_supported;
+    if opt.java_engine == JavaEngine::AsyncProfiler && !ap_batch_supported {
+        eprintln!(
+            "--java-engine async-profiler only applies to batch output (-o/--collapse/--svg/--json); \
+             ignored for --tui/--serve/--flush-interval/raw-only — using eBPF stacks"
+        );
+    }
+
     // System-wide async-profiler engine needs eBPF folded roots to carry the pid
     // (`comm (pid)`) so per-JVM output can replace the right process's stacks, so
     // force --group-by-process in that mode.
-    if opt.java_engine == JavaEngine::AsyncProfiler && opt.pid.is_none() && !opt.group_by_process {
+    if async_profiler_active && opt.pid.is_none() && !opt.group_by_process {
         eprintln!(
             "async-profiler engine (system-wide): enabling --group-by-process for per-JVM merge"
         );
@@ -684,14 +711,14 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     }
     // async-profiler owns Java symbolization in this mode; disable profile-bee's
     // own JVM auto-discovery so both don't attach (jcmd/perf-map) to the same JVMs.
-    if opt.java_engine == JavaEngine::AsyncProfiler {
+    if async_profiler_active {
         opt.auto_java = false;
     }
 
     // Resolve the async-profiler binary up front (async: may download the pinned,
     // checksum-verified release into the cache on first use). Done here so the
     // network fetch happens before eBPF setup, not mid-profiling.
-    let asprof_bin: Option<PathBuf> = if opt.java_engine == JavaEngine::AsyncProfiler {
+    let asprof_bin: Option<PathBuf> = if async_profiler_active {
         match profile_bee::java::async_profiler::ensure_asprof().await {
             Ok(p) => {
                 eprintln!("async-profiler engine: using {}", p.display());

@@ -72,6 +72,43 @@ fn cached_asprof() -> Option<PathBuf> {
     )))
 }
 
+/// Security gate for auto-download cache paths. profile-bee usually runs as root
+/// and the default cache lives under world-writable `/var/tmp`, so a local user
+/// could plant a trojan `asprof`/`libasyncProfiler.so`. Require every component
+/// from the cache root down to `path` to be a non-symlink, owned by root or the
+/// current euid, and not group/other-writable — otherwise root might read or
+/// execute an attacker-controlled file. Only applied to the download cache;
+/// `$ASPROF`/`$PATH`/install-root binaries are operator-chosen and trusted.
+fn is_trusted_cache_path(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let euid = unsafe { libc::geteuid() };
+    let secure = |p: &Path| -> bool {
+        match std::fs::symlink_metadata(p) {
+            Ok(md) => {
+                !md.file_type().is_symlink()
+                    && (md.uid() == 0 || md.uid() == euid)
+                    && md.mode() & 0o022 == 0
+            }
+            Err(_) => false,
+        }
+    };
+    let root = cache_dir();
+    let Ok(rel) = path.strip_prefix(&root) else {
+        return false;
+    };
+    if !secure(&root) {
+        return false;
+    }
+    let mut cur = root;
+    for comp in rel.components() {
+        cur = cur.join(comp);
+        if !secure(&cur) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Locate an already-present async-profiler launcher without touching the
 /// network: `$ASPROF`, then `asprof`/`profiler.sh` on `$PATH`, then common
 /// install roots, then the auto-download cache.
@@ -100,7 +137,9 @@ pub fn asprof_path() -> Option<PathBuf> {
             }
         }
     }
-    cached_asprof().filter(|p| p.is_file())
+    // Cache binaries are only trusted if the whole chain is root/self-owned and
+    // not world/group-writable (the cache lives under world-writable /var/tmp).
+    cached_asprof().filter(|p| p.is_file() && is_trusted_cache_path(p))
 }
 
 /// Ensure an `asprof` binary is available, downloading the pinned official
@@ -154,34 +193,47 @@ pub async fn ensure_asprof() -> std::io::Result<PathBuf> {
 
     let root = cache_dir();
     std::fs::create_dir_all(&root)?;
+    // Normalize our cache root to 0755 (world-readable, not world-writable), then
+    // refuse to extract into / use a root we don't control — the default cache
+    // lives under world-writable /var/tmp, so a planted dir is possible.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755));
+    }
+    if !is_trusted_cache_path(&root) {
+        return Err(Error::other(format!(
+            "refusing untrusted async-profiler cache dir {} (unexpected owner/permissions/symlink); set $PROFILE_BEE_CACHE or $ASPROF",
+            root.display()
+        )));
+    }
+
+    // Extract fresh (drop any stale/tampered prior extraction under our root).
+    let asset_dir = root.join(&asset);
+    let _ = std::fs::remove_dir_all(&asset_dir);
     // The tarball has a single top-level dir `async-profiler-<ver>-linux-<arch>/`.
     let mut archive = tar::Archive::new(GzDecoder::new(&bytes[..]));
     archive.unpack(&root)?;
 
-    // Ensure the cache is world-readable/traversable so a target JVM of any uid
-    // can dlopen libasyncProfiler.so (see `cache_dir`).
-    set_world_accessible(&root);
-    set_tree_world_readable(&root.join(&asset));
+    // Make the extraction world-readable/traversable (never world-writable) so a
+    // target JVM of any uid can dlopen libasyncProfiler.so (see `cache_dir`).
+    set_tree_world_readable(&asset_dir);
 
-    let asprof = root.join(&asset).join("bin/asprof");
+    let asprof = asset_dir.join("bin/asprof");
     if !asprof.is_file() {
         return Err(Error::other(format!(
             "async-profiler extracted but {} is missing",
             asprof.display()
         )));
     }
+    // Final gate: the resolved binary chain must be trusted before we return it
+    // for execution.
+    if !is_trusted_cache_path(&asprof) {
+        return Err(Error::other(
+            "async-profiler cache failed the trust check after extraction",
+        ));
+    }
     eprintln!("async-profiler: cached at {}", asprof.display());
     Ok(asprof)
-}
-
-/// Best-effort: make a single dir world-traversable (`o+rx`).
-fn set_world_accessible(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(md) = std::fs::metadata(path) {
-        let mut perm = md.permissions();
-        perm.set_mode(perm.mode() | 0o755);
-        let _ = std::fs::set_permissions(path, perm);
-    }
 }
 
 /// Best-effort recursive `a+rX`: dirs and executables become world-rx, regular
@@ -225,27 +277,35 @@ impl Session {
     /// (e.g. `"cpu"`, `"wall"`, `"alloc"`), writing collapsed output to a temp
     /// file. `root` is prepended to every folded stack so the JVM's frames land
     /// under one flamegraph root consistent with profile-bee's output.
+    ///
+    /// `interval_ns`, when non-zero, sets async-profiler's sampling interval
+    /// (`-i`) so its rate matches the eBPF `--frequency` (interval = 1e9 / Hz);
+    /// otherwise async-profiler's own default interval is used.
     pub fn start(
         asprof: &Path,
         pid: u32,
         duration_ms: u64,
         event: &str,
+        interval_ns: u64,
         root: String,
     ) -> std::io::Result<Session> {
         let secs = duration_ms.div_ceil(1000).max(1);
         let output = std::env::temp_dir().join(format!("probee-asprof-{pid}.folded"));
         let _ = std::fs::remove_file(&output);
-        let child = Command::new(asprof)
-            .arg("-d")
+        let mut cmd = Command::new(asprof);
+        cmd.arg("-d")
             .arg(secs.to_string())
             .arg("-e")
             .arg(event)
             .arg("-o")
             .arg("collapsed")
             .arg("-f")
-            .arg(&output)
-            .arg(pid.to_string())
-            .spawn()?;
+            .arg(&output);
+        if interval_ns > 0 {
+            // async-profiler `-i` is in nanoseconds for time-based events.
+            cmd.arg("-i").arg(interval_ns.to_string());
+        }
+        let child = cmd.arg(pid.to_string()).spawn()?;
         Ok(Session {
             child,
             output,
