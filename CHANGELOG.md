@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.23
+
+### New Features (experimental)
+
+- **`--java-engine async-profiler` (experimental, opt-in)** — instead of reconstructing Java stacks from eBPF (which needs `-XX:+PreserveFramePointer` for JIT frames), profile-bee can delegate to [async-profiler](https://github.com/async-profiler/async-profiler), whose in-process `AsyncGetCallTrace` walks Java stacks without frame pointers and names JIT/interpreter/inlined frames. profile-bee attaches `asprof` for the profiling window; its `-o collapsed` output is the same folded format profile-bee emits, so merging is a splice.
+  - **Single `--pid`**: eBPF is already scoped to that process, so its collapse is replaced wholesale by async-profiler's output.
+  - **System-wide** (no `--pid`): every discovered JVM is attached; each attached JVM's eBPF stacks are dropped (matched by the `(pid)` in the auto-enabled `--group-by-process` root) and replaced with async-profiler's, while native processes — and any JVM that refused attach or produced no samples — keep their eBPF stacks. profile-bee's own JVM auto-discovery is disabled in this mode so both don't attach the same JVMs.
+  - **No manual install:** `asprof` is used from `$ASPROF`/`$PATH`/common install roots if present, otherwise the pinned official release for the host arch (x86_64/aarch64) is **downloaded, SHA-256-verified, and cached** on first use. The cache is a world-readable dir (`/var/tmp/profile-bee`, override `$PROFILE_BEE_CACHE`) so a target JVM of any uid can `dlopen` `libasyncProfiler.so` when profile-bee runs as root. Nothing unverified is executed; offline hosts can still pre-place the binary or set `$ASPROF`.
+  - Requires `--time`; batch (`--collapse`/`--svg`/`--json`) output only (streaming/serve/TUI is a follow-up). Falls back to eBPF stacks (with a logged reason) when prerequisites are unmet, per-JVM.
+
+### Validated
+
+- aarch64 fleet host (Corretto 17, G1GC, no `-XX:+PreserveFramePointer`): the stress JVM resolved 28,887 frames with ~0.01% unknown (vs ~22% eBPF-only), naming the real Netty/Membrain client call graph, while non-JVM processes kept eBPF stacks.
+
 ## v0.3.22
 
 ### New Features

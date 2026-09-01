@@ -35,6 +35,17 @@ use profile_bee::types::FrameCount;
 // Output format inference from file extension
 // ---------------------------------------------------------------------------
 
+/// Which engine produces Java stacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum JavaEngine {
+    /// Reconstruct Java stacks from eBPF (frame pointers / DWARF + perf-map).
+    Ebpf,
+    /// Attach async-profiler and use its AsyncGetCallTrace-accurate folded
+    /// output (single `--pid` JVM, or all JVMs system-wide). Batch output only.
+    #[value(name = "async-profiler", alias = "ap")]
+    AsyncProfiler,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
     Svg,
@@ -261,6 +272,17 @@ struct Opt {
     #[arg(long, default_value_t = false)]
     group_by_process: bool,
 
+    /// Java stack engine. `ebpf` (default) reconstructs Java stacks from eBPF.
+    /// `async-profiler` attaches async-profiler to JVMs and uses its
+    /// AsyncGetCallTrace-accurate folded output instead — no
+    /// `-XX:+PreserveFramePointer` needed. With `--pid` it targets that one JVM;
+    /// without `--pid` it attaches every discovered JVM system-wide (eBPF for the
+    /// rest). `asprof` is taken from `$ASPROF`/`$PATH` if present, else the pinned
+    /// official release is downloaded (checksum-verified) and cached on first use.
+    /// Requires `--time`; batch collapse/svg/json output only.
+    #[arg(long, value_enum, default_value_t = JavaEngine::Ebpf)]
+    java_engine: JavaEngine,
+
     /// Enable DWARF-based stack unwinding (for binaries without frame pointers)
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     dwarf: Option<bool>,
@@ -406,6 +428,153 @@ impl Opt {
     }
 }
 
+/// A started async-profiler engine run: one or more attached JVM sessions plus
+/// how their output should be merged with the eBPF collapse.
+struct AsyncProfilerPlan {
+    sessions: Vec<profile_bee::java::async_profiler::Session>,
+    /// `true` = system-wide (no `--pid`): filter the eBPF collapse by pid and
+    /// splice async-profiler output per JVM. `false` = single `--pid`: eBPF was
+    /// scoped to that one process, so replace the whole collapse.
+    system_wide: bool,
+}
+
+/// The `process (pid)` root used to re-root a JVM's async-profiler output so it
+/// aligns with profile-bee's `--group-by-process` folded roots.
+fn jvm_root(pid: u32) -> String {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "java".to_string());
+    format!("{comm} ({pid})")
+}
+
+/// If the async-profiler Java engine is selected and prerequisites are met,
+/// attach async-profiler to the target JVM(s) for the profiling window and
+/// return the running sessions. Otherwise log why and return `None` so the
+/// caller falls back to eBPF stacks. Sessions run concurrently with eBPF
+/// collection and are drained after the window closes.
+///
+/// With `--pid`, attaches that one JVM. Without `--pid` (system-wide), discovers
+/// every JVM and attaches each one it can; JVMs that refuse attach simply keep
+/// their eBPF stacks.
+fn start_async_profiler(opt: &Opt, pid: Option<u32>, asprof: &Path) -> Option<AsyncProfilerPlan> {
+    use profile_bee::java::{async_profiler, discover_jvm_pids, is_jvm_process};
+
+    if opt.java_engine != JavaEngine::AsyncProfiler {
+        return None;
+    }
+    // async-profiler attaches for a fixed window, so a bounded positive duration
+    // is required; `--time 0` (run until Ctrl-C) has no fixed window, so treat it
+    // like no `--time` and fall back to eBPF.
+    let Some(duration) = opt.time.filter(|&t| t > 0) else {
+        eprintln!(
+            "--java-engine async-profiler requires a positive --time <ms>; using eBPF stacks"
+        );
+        return None;
+    };
+    let duration = duration as u64;
+    // async-profiler's `-d` is whole seconds, so a sub-second remainder would make
+    // its window longer than the eBPF window. Require whole seconds for an exact
+    // match rather than silently rounding up.
+    if !duration.is_multiple_of(1000) {
+        eprintln!(
+            "--java-engine async-profiler requires a whole-second --time (got {duration}ms); using eBPF stacks"
+        );
+        return None;
+    }
+    // Match async-profiler's sampling interval to the eBPF --frequency.
+    let interval_ns = 1_000_000_000u64.checked_div(opt.frequency).unwrap_or(0);
+
+    let start_one = |pid: u32| match async_profiler::Session::start(
+        asprof,
+        pid,
+        duration,
+        "cpu",
+        interval_ns,
+        jvm_root(pid),
+    ) {
+        Ok(s) => {
+            eprintln!("async-profiler engine: attached to JVM pid {pid} for {duration}ms (cpu)");
+            Some(s)
+        }
+        Err(e) => {
+            eprintln!("async-profiler: could not attach to pid {pid} ({e}); keeping eBPF stacks");
+            None
+        }
+    };
+
+    if let Some(pid) = pid {
+        // Single-PID mode: eBPF is already scoped to this process.
+        if !is_jvm_process(pid) {
+            eprintln!("pid {pid} is not a JVM (no libjvm.so mapping); using eBPF stacks");
+            return None;
+        }
+        let sessions: Vec<_> = start_one(pid).into_iter().collect();
+        (!sessions.is_empty()).then_some(AsyncProfilerPlan {
+            sessions,
+            system_wide: false,
+        })
+    } else {
+        // System-wide mode: attach every discoverable JVM.
+        let jvms = discover_jvm_pids();
+        if jvms.is_empty() {
+            eprintln!("async-profiler engine: no JVM processes found; using eBPF stacks");
+            return None;
+        }
+        eprintln!(
+            "async-profiler engine (system-wide): {} JVM(s) discovered",
+            jvms.len()
+        );
+        let sessions: Vec<_> = jvms.into_iter().filter_map(start_one).collect();
+        (!sessions.is_empty()).then_some(AsyncProfilerPlan {
+            sessions,
+            system_wide: true,
+        })
+    }
+}
+
+/// Drain the async-profiler sessions and merge their folded output into the
+/// eBPF collapse. Any session that failed or produced no samples keeps its
+/// process's eBPF stacks.
+fn merge_async_profiler(plan: AsyncProfilerPlan, ebpf_stacks: Vec<String>) -> Vec<String> {
+    use profile_bee::java::async_profiler;
+    use std::collections::HashMap;
+
+    let attached: HashMap<u32, Vec<String>> = plan
+        .sessions
+        .into_iter()
+        .filter_map(|s| {
+            let pid = s.pid();
+            match s.finish() {
+                Ok(lines) if !lines.is_empty() => Some((pid, lines)),
+                Ok(_) => {
+                    eprintln!("async-profiler: pid {pid} produced no samples; keeping eBPF stacks");
+                    None
+                }
+                Err(e) => {
+                    eprintln!("async-profiler: pid {pid} error ({e}); keeping eBPF stacks");
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if attached.is_empty() {
+        return ebpf_stacks;
+    }
+
+    if plan.system_wide {
+        let njvm = attached.len();
+        let out = async_profiler::merge_system_wide(ebpf_stacks, &attached);
+        eprintln!(
+            "async-profiler engine: spliced Java stacks for {njvm} JVM(s), eBPF for the rest"
+        );
+        out
+    } else {
+        eprintln!("async-profiler engine: replacing eBPF stacks for the target JVM");
+        attached.into_values().flatten().collect()
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::result::Result<(), anyhow::Error> {
     // Intercept `probee symbolize <file.raw> [-o output]` before clap parses
@@ -520,6 +689,80 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
         );
         opt.dwarf = Some(false);
     }
+
+    // The async-profiler engine only wires into batch (collapse/svg/json) output;
+    // it does not touch the streaming/TUI/serve or raw-only paths. Only enable
+    // its setup (group-by-process, disabling profile-bee's own Java discovery,
+    // and the asprof download) when a supported batch mode is in effect — so an
+    // unsupported combination doesn't silently disable Java naming or download a
+    // binary for nothing.
+    // `Opt::tui` only exists under the `tui` feature; alias it so this compiles
+    // with --no-default-features.
+    #[cfg(feature = "tui")]
+    let is_tui = opt.tui;
+    #[cfg(not(feature = "tui"))]
+    let is_tui = false;
+
+    let ap_only_raw = !resolved_outputs.is_empty()
+        && resolved_outputs
+            .iter()
+            .all(|(f, _)| *f == OutputFormat::Raw);
+    // Native OTLP export (otlp feature + endpoint + symbol server, non-serve/tui)
+    // takes the collect_raw path that the async-profiler merge does not wire into,
+    // so exclude it here — keeping profile-bee's own Java naming for that export.
+    #[cfg(feature = "otlp")]
+    let native_otlp = {
+        #[cfg(feature = "symbol-server")]
+        let has_symbol_server = opt.symbol_server.is_some() || opt.symbol_server_listen.is_some();
+        #[cfg(not(feature = "symbol-server"))]
+        let has_symbol_server = opt.symbol_server.is_some();
+        opt.otlp_endpoint.is_some() && has_symbol_server && !opt.serve && !is_tui
+    };
+    #[cfg(not(feature = "otlp"))]
+    let native_otlp = false;
+
+    let ap_batch_supported =
+        !is_tui && !opt.serve && opt.flush_interval.is_none() && !ap_only_raw && !native_otlp;
+    let async_profiler_active = opt.java_engine == JavaEngine::AsyncProfiler && ap_batch_supported;
+    if opt.java_engine == JavaEngine::AsyncProfiler && !ap_batch_supported {
+        eprintln!(
+            "--java-engine async-profiler only applies to batch output (-o/--collapse/--svg/--json); \
+             ignored for --tui/--serve/--flush-interval/raw-only/native-OTLP — using eBPF stacks"
+        );
+    }
+
+    // System-wide async-profiler engine needs eBPF folded roots to carry the pid
+    // (`comm (pid)`) so per-JVM output can replace the right process's stacks, so
+    // force --group-by-process in that mode.
+    if async_profiler_active && opt.pid.is_none() && !opt.group_by_process {
+        eprintln!(
+            "async-profiler engine (system-wide): enabling --group-by-process for per-JVM merge"
+        );
+        opt.group_by_process = true;
+    }
+    // async-profiler owns Java symbolization in this mode; disable profile-bee's
+    // own JVM auto-discovery so both don't attach (jcmd/perf-map) to the same JVMs.
+    if async_profiler_active {
+        opt.auto_java = false;
+    }
+
+    // Resolve the async-profiler binary up front (async: may download the pinned,
+    // checksum-verified release into the cache on first use). Done here so the
+    // network fetch happens before eBPF setup, not mid-profiling.
+    let asprof_bin: Option<PathBuf> = if async_profiler_active {
+        match profile_bee::java::async_profiler::ensure_asprof().await {
+            Ok(p) => {
+                eprintln!("async-profiler engine: using {}", p.display());
+                Some(p)
+            }
+            Err(e) => {
+                eprintln!("async-profiler unavailable ({e}); using eBPF stacks");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     use tokio::sync::broadcast;
     let (tx, rx) = broadcast::channel(16);
@@ -1165,12 +1408,23 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
             sink.set_actual_duration_ms(actual_duration_ms);
             sink.finish(&collapse_stacks)?;
         } else {
-            // Pre-symbolized: use collect() for collapse strings
+            // Pre-symbolized: use collect() for collapse strings.
             tracing::debug!("batch mode: collecting samples");
+            // Optional async-profiler Java engine: started here so it profiles
+            // the same window as eBPF collection, which blocks below. With --pid
+            // it replaces the (pid-scoped) eBPF stacks; system-wide it splices
+            // per-JVM output over the eBPF collapse.
+            let ap_plan = asprof_bin
+                .as_deref()
+                .and_then(|asprof| start_async_profiler(&opt, pid, asprof));
             let result = event_loop.collect(&perf_rx, None);
-            sink.write_batch(&result.stacks)?;
+            let stacks = match ap_plan {
+                Some(plan) => merge_async_profiler(plan, result.stacks),
+                None => result.stacks,
+            };
+            sink.write_batch(&stacks)?;
             sink.set_actual_duration_ms(started.elapsed().as_millis() as u64);
-            sink.finish(&result.stacks)?;
+            sink.finish(&stacks)?;
         }
 
         // TODO: unified collect path that produces both raw + symbolized simultaneously

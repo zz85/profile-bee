@@ -16,6 +16,7 @@
 //!
 //! See `docs/java_profiling.md`.
 
+pub mod async_profiler;
 mod attach;
 mod vmstructs;
 
