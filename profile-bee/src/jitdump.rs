@@ -649,7 +649,7 @@ mod tests {
         rec.push(0);
 
         // Native code bytes (content irrelevant — the parser skips them)
-        rec.extend(std::iter::repeat(0xCCu8).take(code_size as usize));
+        rec.extend(std::iter::repeat_n(0xCCu8, code_size as usize));
 
         rec
     }
