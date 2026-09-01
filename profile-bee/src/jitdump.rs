@@ -49,7 +49,8 @@ pub struct JitSymbol {
 pub struct JitSymbolTable {
     symbols: BTreeMap<u64, JitSymbol>,
     /// Debug info that arrives before its corresponding JIT_CODE_LOAD.
-    /// Keyed by `code_index` (matches JIT_CODE_LOAD's `code_index` field).
+    /// Keyed by `code_addr` — the same address `parse_debug_info` stores under
+    /// and `parse_code_load` looks up (see those methods).
     pending_debug: HashMap<u64, (String, u32)>,
     /// File offset for incremental reload — next read starts here.
     last_read_offset: u64,
@@ -115,7 +116,7 @@ impl JitSymbolTable {
         let file = std::fs::File::open(path)?;
         let file_len = file.metadata()?.len();
 
-        // Detect truncated/rotated file — reset and re-parse from scratch
+        // Detect truncated/rotated file — reset and re-parse from scratch.
         if file_len < self.last_read_offset {
             tracing::debug!(
                 "JITDump file shrunk ({} < {}), resetting",
@@ -125,13 +126,20 @@ impl JitSymbolTable {
             self.symbols.clear();
             self.pending_debug.clear();
             self.last_read_offset = 0;
+        }
 
+        // Not yet past the header (never loaded, or just reset above): parse and
+        // validate the header before reading records, so header bytes are never
+        // misinterpreted as a record. Keep an incompletely-written header
+        // retryable — leave the offset at 0 so a later reload picks it up.
+        if self.last_read_offset < JITDUMP_HEADER_SIZE {
             let mut reader = BufReader::new(file);
             match parse_header(&mut reader) {
                 Ok(_) => {
                     self.last_read_offset = JITDUMP_HEADER_SIZE;
                     return self.read_records(&mut reader);
                 }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
                 Err(e) => return Err(e),
             }
         }
@@ -226,8 +234,18 @@ impl JitSymbolTable {
                     break;
                 }
                 _ => {
-                    // Unknown record type — skip
-                    skip_bytes(reader, payload_size)?;
+                    // Unknown record type — skip its payload. A truncated skip
+                    // (partial file) is handled like any other incomplete record:
+                    // rewind to the record start and stop, leaving it retryable.
+                    // Unrelated I/O errors still propagate.
+                    match skip_bytes(reader, payload_size) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            self.last_read_offset = record_start;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
 
@@ -381,13 +399,21 @@ impl JitSymbolTable {
             let _discrim = read_u32(reader)?;
             consumed += 16;
 
-            // Read null-terminated filename from remaining payload
+            // Read a bounded prefix of the null-terminated filename, then skip
+            // the rest of the payload. Bounding the allocation guards against a
+            // malformed record advertising a huge total_size (these files come
+            // from /tmp and profile-bee reads them as root).
+            const MAX_FILENAME_BYTES: u64 = 64 * 1024;
             let remaining = payload_size - consumed;
-            let mut buf = vec![0u8; remaining as usize];
+            let read_len = remaining.min(MAX_FILENAME_BYTES) as usize;
+            let mut buf = vec![0u8; read_len];
             reader.read_exact(&mut buf)?;
 
             let name_end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
             let filename = String::from_utf8_lossy(&buf[..name_end]).to_string();
+
+            // Keep the reader aligned to the end of the record.
+            skip_bytes(reader, remaining - read_len as u64)?;
 
             if !filename.is_empty() {
                 self.pending_debug.insert(code_addr, (filename, line));
@@ -492,7 +518,19 @@ fn strip_jsc_hash(name: &str) -> &str {
 struct JitdumpHeader {
     _version: u32,
     _elf_mach: u32,
-    _pid: u32,
+    /// PID of the process that produced the dump. Used to confirm a dump file
+    /// belongs to the process being symbolized before its symbols are applied.
+    pid: u32,
+}
+
+/// Read only the JITDump header and return its embedded PID.
+///
+/// Callers use this to reject a dump whose header PID does not match the
+/// process being symbolized (defends against pid reuse / a mislabeled file)
+/// before loading and applying its symbols.
+pub fn read_header_pid(path: &Path) -> io::Result<u32> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    Ok(parse_header(&mut reader)?.pid)
 }
 
 fn parse_header<R: Read>(reader: &mut R) -> io::Result<JitdumpHeader> {
@@ -523,7 +561,7 @@ fn parse_header<R: Read>(reader: &mut R) -> io::Result<JitdumpHeader> {
     Ok(JitdumpHeader {
         _version: version,
         _elf_mach: elf_mach,
-        _pid: pid,
+        pid,
     })
 }
 
@@ -640,6 +678,26 @@ mod tests {
         rec.extend_from_slice(&JIT_CODE_CLOSE.to_le_bytes());
         rec.extend_from_slice(&16u32.to_le_bytes()); // total_size = header only
         rec.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        rec
+    }
+
+    /// Build a JIT_CODE_DEBUG_INFO record with a single entry.
+    fn debug_info_record(code_addr: u64, entry_addr: u64, line: u32, filename: &str) -> Vec<u8> {
+        let fname = filename.as_bytes();
+        // code_addr(8) + nr_entry(8) + entry[addr(8)+line(4)+discrim(4)] + name+null
+        let payload_size = 16 + 16 + fname.len() as u32 + 1;
+        let total_size = 16 + payload_size;
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&JIT_CODE_DEBUG_INFO.to_le_bytes());
+        rec.extend_from_slice(&total_size.to_le_bytes());
+        rec.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        rec.extend_from_slice(&code_addr.to_le_bytes());
+        rec.extend_from_slice(&1u64.to_le_bytes()); // nr_entry
+        rec.extend_from_slice(&entry_addr.to_le_bytes());
+        rec.extend_from_slice(&line.to_le_bytes());
+        rec.extend_from_slice(&0u32.to_le_bytes()); // discriminator
+        rec.extend_from_slice(fname);
+        rec.push(0);
         rec
     }
 
@@ -777,6 +835,92 @@ mod tests {
         table.read_records(&mut cursor).unwrap();
         assert_eq!(table.len(), 0);
         assert!(table.resolve(0x1000).is_none());
+    }
+
+    #[test]
+    fn test_debug_info_populates_source_and_format() {
+        // DEBUG_INFO precedes its CODE_LOAD (per spec); the loaded symbol should
+        // carry the (file, line) and format_jit_symbol should render it.
+        let data = build_jitdump(&[
+            debug_info_record(0x1000, 0x1000, 42, "app/server.js"),
+            code_load_record(0x1000, 0x100, 0, "handleRequest"),
+        ]);
+        let mut cursor = Cursor::new(data);
+        let _ = parse_header(&mut cursor).unwrap();
+        let mut table = JitSymbolTable {
+            symbols: BTreeMap::new(),
+            pending_debug: HashMap::new(),
+            last_read_offset: JITDUMP_HEADER_SIZE,
+        };
+        table.read_records(&mut cursor).unwrap();
+
+        let sym = table.resolve(0x1050).unwrap();
+        assert_eq!(sym.source, Some(("app/server.js".to_string(), 42)));
+        assert_eq!(format_jit_symbol(sym), "handleRequest (server.js:42)");
+    }
+
+    #[test]
+    fn test_debug_info_oversized_rejected() {
+        // A DEBUG_INFO advertising a huge payload but with a short body must be
+        // handled without a giant allocation: the bounded filename read hits EOF
+        // and parsing stops cleanly rather than allocating the advertised size.
+        let mut rec = Vec::new();
+        let huge_payload: u32 = 512 * 1024 * 1024; // advertise 512 MiB
+        let total_size = 16 + huge_payload;
+        rec.extend_from_slice(&JIT_CODE_DEBUG_INFO.to_le_bytes());
+        rec.extend_from_slice(&total_size.to_le_bytes());
+        rec.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        rec.extend_from_slice(&0x1000u64.to_le_bytes()); // code_addr
+        rec.extend_from_slice(&1u64.to_le_bytes()); // nr_entry
+        rec.extend_from_slice(&0x1000u64.to_le_bytes()); // entry addr
+        rec.extend_from_slice(&7u32.to_le_bytes()); // line
+        rec.extend_from_slice(&0u32.to_le_bytes()); // discriminator
+        rec.extend_from_slice(b"short.js\0"); // real body is tiny (truncated vs advertised)
+
+        let data = build_jitdump(&[rec]);
+        let mut cursor = Cursor::new(data);
+        let _ = parse_header(&mut cursor).unwrap();
+        let mut table = JitSymbolTable {
+            symbols: BTreeMap::new(),
+            pending_debug: HashMap::new(),
+            last_read_offset: JITDUMP_HEADER_SIZE,
+        };
+        // Returns cleanly; no code loaded (only a truncated debug-info record).
+        assert!(table.read_records(&mut cursor).is_ok());
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn test_reload_incremental_and_shrink() {
+        let dir = std::env::temp_dir().join("jitdump_test_reload");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("jit-reload-{}.dump", std::process::id()));
+
+        // Initial file: header + one symbol.
+        let initial = build_jitdump(&[code_load_record(0x1000, 0x100, 0, "first")]);
+        std::fs::write(&path, &initial).unwrap();
+        let mut table = JitSymbolTable::load_from_file(&path).unwrap();
+        assert_eq!(table.len(), 1);
+        assert!(table.resolve(0x1050).is_some());
+
+        // Append a second record; incremental reload reads only the new one.
+        let mut appended = initial.clone();
+        appended.extend_from_slice(&code_load_record(0x2000, 0x100, 1, "second"));
+        std::fs::write(&path, &appended).unwrap();
+        let mutations = table.reload_from_file(&path).unwrap();
+        assert_eq!(mutations, 1, "only the appended record should be read");
+        assert_eq!(table.len(), 2);
+        assert!(table.resolve(0x2050).is_some());
+
+        // Shrink/rotate the file: reload resets and re-parses from scratch.
+        let shrunk = build_jitdump(&[code_load_record(0x3000, 0x100, 0, "third")]);
+        std::fs::write(&path, &shrunk).unwrap();
+        table.reload_from_file(&path).unwrap();
+        assert_eq!(table.len(), 1);
+        assert!(table.resolve(0x3050).is_some());
+        assert!(table.resolve(0x1050).is_none());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

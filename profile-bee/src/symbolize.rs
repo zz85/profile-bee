@@ -68,6 +68,25 @@ pub fn symbolize_raw_file(path: &Path) -> anyhow::Result<Vec<String>> {
     let mut jit_tables: HashMap<u32, JitSymbolTable> = HashMap::new();
     for &pid in &pids {
         if let Some(dump) = jitdump::find_jitdump_for_pid(pid) {
+            // Confirm the dump's embedded PID matches before trusting its
+            // symbols — a mismatched header means the file belongs to a
+            // different process (pid reuse / mislabeled file).
+            match jitdump::read_header_pid(&dump) {
+                Ok(header_pid) if header_pid != pid => {
+                    tracing::debug!(
+                        "JITDump {} header pid {} != {}, skipping",
+                        dump.display(),
+                        header_pid,
+                        pid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!("JITDump header read failed for pid {}: {}", pid, e);
+                    continue;
+                }
+                Ok(_) => {}
+            }
             match JitSymbolTable::load_from_file(&dump) {
                 Ok(table) if !table.is_empty() => {
                     tracing::info!("loaded JITDump for pid {} ({} symbols)", pid, table.len());
