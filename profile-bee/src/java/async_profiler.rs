@@ -1,18 +1,24 @@
-//! Prototype: delegate Java stacks to async-profiler.
+//! Delegate Java stacks to async-profiler.
 //!
-//! When profiling a single JVM by `--pid`, profile-bee can attach
-//! async-profiler (`asprof`) for the profiling window and use its folded
-//! ("collapsed") output — which is `AsyncGetCallTrace`-accurate and needs no
-//! `-XX:+PreserveFramePointer` — instead of the eBPF-reconstructed Java stacks.
+//! Out-of-process eBPF unwinding can't walk HotSpot JIT frames without
+//! `-XX:+PreserveFramePointer`. Instead, profile-bee can attach async-profiler
+//! (`asprof`) to a JVM for the profiling window and use its folded ("collapsed")
+//! output — which is `AsyncGetCallTrace`-accurate and needs no frame pointers.
 //!
 //! async-profiler's `-o collapsed` output is the same `frame;frame;… count`
-//! folded format profile-bee emits, so merging is a splice. Because `--pid`
-//! already filters eBPF sampling to the one target, replacing the whole eBPF
-//! collapse with async-profiler's output for that run is clean.
+//! folded format profile-bee emits, so merging is a splice:
 //!
-//! Scope of this prototype: single-PID replacement, batch (collapse/svg/json)
-//! output only. Streaming/serve/TUI and multi-process merging are follow-ups.
+//! - **Single `--pid`**: eBPF sampling is already scoped to that process, so its
+//!   whole collapse is replaced by async-profiler's output.
+//! - **System-wide**: every discovered JVM is attached; [`merge_system_wide`]
+//!   drops each attached JVM's eBPF stacks (matched by the `(pid)` in the
+//!   `--group-by-process` root) and splices in async-profiler's, keeping eBPF
+//!   stacks for native processes and any JVM that refused attach.
+//!
+//! Scope: batch (collapse/svg/json) output only; streaming/serve/TUI is a
+//! follow-up.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
@@ -130,6 +136,33 @@ fn reroot_line(line: &str, root: &str) -> Option<String> {
     Some(format!("{root};{stack} {count}"))
 }
 
+/// Extract the process id from a folded line's root frame, which under
+/// `--group-by-process` is `"<comm> (<pid>)"` (the pid is the trailing
+/// parenthesized integer of the first `;`-separated segment). Used to attribute
+/// eBPF folded lines to a process so async-profiler output can replace them
+/// per-pid. Returns `None` if the root has no `(<int>)` suffix.
+pub fn folded_line_pid(line: &str) -> Option<u32> {
+    let root = line.split(';').next()?;
+    let open = root.rfind('(')?;
+    let close = root[open + 1..].find(')')? + open + 1;
+    root[open + 1..close].parse::<u32>().ok()
+}
+
+/// System-wide merge: replace the eBPF folded stacks of every process in
+/// `attached` with async-profiler's folded output for that pid, keeping eBPF
+/// stacks for all other processes (native code, and JVMs that couldn't be
+/// attached). `attached` maps pid -> already-re-rooted folded lines.
+pub fn merge_system_wide(ebpf: Vec<String>, attached: &HashMap<u32, Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = ebpf
+        .into_iter()
+        .filter(|line| folded_line_pid(line).is_none_or(|pid| !attached.contains_key(&pid)))
+        .collect();
+    for lines in attached.values() {
+        out.extend(lines.iter().cloned());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +198,40 @@ mod tests {
             out,
             vec!["P (1);a;b 5".to_string(), "P (1);c 2".to_string()]
         );
+    }
+
+    #[test]
+    fn folded_pid_parsing() {
+        assert_eq!(folded_line_pid("java (2856450);main;fib 5"), Some(2856450));
+        // Thread comm with a space/# still resolves via the trailing (pid).
+        assert_eq!(folded_line_pid("GC Thread#0 (42);a;b 1"), Some(42));
+        // Root-only line keeps its count after the ')'.
+        assert_eq!(folded_line_pid("java (7) 3"), Some(7));
+        // No pid in root -> None (line is kept during merge).
+        assert_eq!(folded_line_pid("bash;main 9"), None);
+        assert_eq!(folded_line_pid("swapper 1"), None);
+    }
+
+    #[test]
+    fn merge_replaces_attached_pids_only() {
+        let ebpf = vec![
+            "java (10);GcBurn.main 5".to_string(), // attached JVM -> dropped
+            "GC Thread#0 (10);gc 3".to_string(),   // same JVM, another thread -> dropped
+            "nginx (20);worker 7".to_string(),     // not attached -> kept
+            "bash;sh 1".to_string(),               // no pid root -> kept
+        ];
+        let mut attached = HashMap::new();
+        attached.insert(
+            10u32,
+            vec!["java (10);start;GcBurn.main;alloc 42".to_string()],
+        );
+        let out = merge_system_wide(ebpf, &attached);
+        assert!(out.contains(&"nginx (20);worker 7".to_string()));
+        assert!(out.contains(&"bash;sh 1".to_string()));
+        assert!(out.contains(&"java (10);start;GcBurn.main;alloc 42".to_string()));
+        // Both eBPF lines for pid 10 were replaced.
+        assert!(!out.iter().any(|l| l == "java (10);GcBurn.main 5"));
+        assert!(!out.iter().any(|l| l == "GC Thread#0 (10);gc 3"));
+        assert_eq!(out.len(), 3);
     }
 }
