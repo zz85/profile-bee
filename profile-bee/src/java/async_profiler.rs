@@ -17,8 +17,9 @@
 //!
 //! `asprof` is taken from `$ASPROF`/`$PATH`/common install roots if present,
 //! otherwise the pinned official release for the host arch is downloaded
-//! (SHA-256-verified) and cached under `$XDG_CACHE_HOME`/`$HOME/.cache` on first
-//! use — no manual install required. See [`asprof_path`] / [`ensure_asprof`].
+//! (SHA-256-verified) and cached in a world-readable dir (`/var/tmp/profile-bee`,
+//! override `$PROFILE_BEE_CACHE`) on first use — no manual install required. See
+//! [`asprof_path`] / [`ensure_asprof`].
 //!
 //! Scope: batch (collapse/svg/json) output only; streaming/serve/TUI is a
 //! follow-up.
@@ -46,20 +47,21 @@ fn ap_platform() -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// Cache directory for the auto-downloaded async-profiler
-/// (`$XDG_CACHE_HOME`/`$HOME/.cache`, else a temp dir), under `profile-bee/`.
+/// Cache directory for the auto-downloaded async-profiler.
+///
+/// Deliberately a **world-readable** location (default `/var/tmp/profile-bee`),
+/// not `$HOME/.cache`: profile-bee typically runs as root (sudo) and attaches
+/// JVMs owned by other users, and async-profiler injects `libasyncProfiler.so`
+/// which the *target* JVM must then `dlopen` as its own uid. A root-only cache
+/// (`/root/.cache` under sudo) makes that fail with "Permission denied".
+/// Override with `$PROFILE_BEE_CACHE`.
 fn cache_dir() -> PathBuf {
-    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
-        if !x.is_empty() {
-            return PathBuf::from(x).join("profile-bee");
+    if let Ok(d) = std::env::var("PROFILE_BEE_CACHE") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
         }
     }
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
-            return PathBuf::from(h).join(".cache/profile-bee");
-        }
-    }
-    std::env::temp_dir().join("profile-bee-cache")
+    PathBuf::from("/var/tmp/profile-bee")
 }
 
 /// `asprof` path inside the cache for the pinned version + host arch.
@@ -147,6 +149,11 @@ pub async fn ensure_asprof() -> std::io::Result<PathBuf> {
     let mut archive = tar::Archive::new(GzDecoder::new(&bytes[..]));
     archive.unpack(&root)?;
 
+    // Ensure the cache is world-readable/traversable so a target JVM of any uid
+    // can dlopen libasyncProfiler.so (see `cache_dir`).
+    set_world_accessible(&root);
+    set_tree_world_readable(&root.join(&asset));
+
     let asprof = root.join(&asset).join("bin/asprof");
     if !asprof.is_file() {
         return Err(Error::other(format!(
@@ -156,6 +163,43 @@ pub async fn ensure_asprof() -> std::io::Result<PathBuf> {
     }
     eprintln!("async-profiler: cached at {}", asprof.display());
     Ok(asprof)
+}
+
+/// Best-effort: make a single dir world-traversable (`o+rx`).
+fn set_world_accessible(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(md) = std::fs::metadata(path) {
+        let mut perm = md.permissions();
+        perm.set_mode(perm.mode() | 0o755);
+        let _ = std::fs::set_permissions(path, perm);
+    }
+}
+
+/// Best-effort recursive `a+rX`: dirs and executables become world-rx, regular
+/// files world-r, so any uid can read/execute the extracted async-profiler.
+fn set_tree_world_readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(md) = std::fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() {
+            return;
+        }
+        let mode = md.permissions().mode();
+        let add = if md.is_dir() || mode & 0o111 != 0 {
+            0o555
+        } else {
+            0o444
+        };
+        let mut perm = md.permissions();
+        perm.set_mode(mode | add);
+        let _ = std::fs::set_permissions(path, perm);
+        if md.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for e in entries.flatten() {
+                    set_tree_world_readable(&e.path());
+                }
+            }
+        }
+    }
 }
 
 /// A running async-profiler attach. Profiles for a fixed duration, then exits;
