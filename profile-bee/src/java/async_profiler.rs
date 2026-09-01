@@ -15,16 +15,65 @@
 //!   `--group-by-process` root) and splices in async-profiler's, keeping eBPF
 //!   stacks for native processes and any JVM that refused attach.
 //!
+//! `asprof` is taken from `$ASPROF`/`$PATH`/common install roots if present,
+//! otherwise the pinned official release for the host arch is downloaded
+//! (SHA-256-verified) and cached under `$XDG_CACHE_HOME`/`$HOME/.cache` on first
+//! use — no manual install required. See [`asprof_path`] / [`ensure_asprof`].
+//!
 //! Scope: batch (collapse/svg/json) output only; streaming/serve/TUI is a
 //! follow-up.
 
+use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
-/// Locate the async-profiler launcher: `$ASPROF`, then `asprof`/`profiler.sh`
-/// on `$PATH`, then a couple of common install roots.
-pub fn find_asprof() -> Option<PathBuf> {
+/// Pinned async-profiler release used for on-demand download.
+const AP_VERSION: &str = "4.5";
+/// SHA-256 of the official `async-profiler-<ver>-linux-<arch>.tar.gz` release
+/// assets, verified after download before anything is extracted or executed.
+const AP_SHA256_X64: &str = "89546fbb9ee0fc5496c7edd4099b0709489bc78b0d8057ccbb4b801f6b032b62";
+const AP_SHA256_ARM64: &str = "64c41d1465d60097439c50d7e924b4946f1f62b1cbd21ce5b034fad09c0d6979";
+
+/// Map the host arch to async-profiler's release-asset arch tag + expected
+/// tarball SHA-256. Returns `None` on arches async-profiler doesn't publish.
+fn ap_platform() -> Option<(&'static str, &'static str)> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some(("x64", AP_SHA256_X64)),
+        "aarch64" => Some(("arm64", AP_SHA256_ARM64)),
+        _ => None,
+    }
+}
+
+/// Cache directory for the auto-downloaded async-profiler
+/// (`$XDG_CACHE_HOME`/`$HOME/.cache`, else a temp dir), under `profile-bee/`.
+fn cache_dir() -> PathBuf {
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
+        if !x.is_empty() {
+            return PathBuf::from(x).join("profile-bee");
+        }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return PathBuf::from(h).join(".cache/profile-bee");
+        }
+    }
+    std::env::temp_dir().join("profile-bee-cache")
+}
+
+/// `asprof` path inside the cache for the pinned version + host arch.
+fn cached_asprof() -> Option<PathBuf> {
+    let (arch, _) = ap_platform()?;
+    Some(cache_dir().join(format!(
+        "async-profiler-{AP_VERSION}-linux-{arch}/bin/asprof"
+    )))
+}
+
+/// Locate an already-present async-profiler launcher without touching the
+/// network: `$ASPROF`, then `asprof`/`profiler.sh` on `$PATH`, then common
+/// install roots, then the auto-download cache.
+pub fn asprof_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ASPROF") {
         let p = PathBuf::from(p);
         if p.is_file() {
@@ -49,7 +98,64 @@ pub fn find_asprof() -> Option<PathBuf> {
             }
         }
     }
-    None
+    cached_asprof().filter(|p| p.is_file())
+}
+
+/// Ensure an `asprof` binary is available, downloading the pinned official
+/// release for the host arch into the cache if none is found locally.
+///
+/// The download is checksum-verified (SHA-256) against a pinned digest before
+/// extraction — nothing unverified is written to the cache or executed. Returns
+/// the existing/`$ASPROF`/`$PATH` binary immediately when present (no network).
+pub async fn ensure_asprof() -> std::io::Result<PathBuf> {
+    use std::io::Error;
+
+    if let Some(p) = asprof_path() {
+        return Ok(p);
+    }
+    let (arch, expected_sha) = ap_platform().ok_or_else(|| {
+        Error::other(format!(
+            "no async-profiler release for arch {}; set $ASPROF",
+            std::env::consts::ARCH
+        ))
+    })?;
+    let asset = format!("async-profiler-{AP_VERSION}-linux-{arch}");
+    let url = format!(
+        "https://github.com/async-profiler/async-profiler/releases/download/v{AP_VERSION}/{asset}.tar.gz"
+    );
+
+    eprintln!("async-profiler: downloading pinned {asset} (verified) ...");
+    let bytes = reqwest::get(&url)
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(Error::other)?
+        .bytes()
+        .await
+        .map_err(Error::other)?;
+
+    let digest = Sha256::digest(&bytes);
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    if hex != expected_sha {
+        return Err(Error::other(format!(
+            "async-profiler {asset} checksum mismatch: got {hex}, expected {expected_sha}"
+        )));
+    }
+
+    let root = cache_dir();
+    std::fs::create_dir_all(&root)?;
+    // The tarball has a single top-level dir `async-profiler-<ver>-linux-<arch>/`.
+    let mut archive = tar::Archive::new(GzDecoder::new(&bytes[..]));
+    archive.unpack(&root)?;
+
+    let asprof = root.join(&asset).join("bin/asprof");
+    if !asprof.is_file() {
+        return Err(Error::other(format!(
+            "async-profiler extracted but {} is missing",
+            asprof.display()
+        )));
+    }
+    eprintln!("async-profiler: cached at {}", asprof.display());
+    Ok(asprof)
 }
 
 /// A running async-profiler attach. Profiles for a fixed duration, then exits;

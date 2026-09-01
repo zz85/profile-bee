@@ -118,6 +118,7 @@ Run `probee` with no arguments or `probee --help` for the full list of options a
 - **Automatic termination** — stops when `-p` target or child process exits
 - **Rust & C++ demangling** — via gimli/blazesym
 - **Java / HotSpot profiling** — auto-detects JVMs and resolves JIT-compiled methods from `/tmp/perf-<pid>.map`, auto-dumping it via `Compiler.perfmap` (JDK 17+) / HotSpot attach with no manual `jcmd`. Injects `-XX:+PreserveFramePointer` when launching `java`, scopes attach/dump to the profiled target (never touches other JVMs), and works in CLI, TUI, and `--serve` (see [docs/java_profiling.md](docs/java_profiling.md))
+- **async-profiler engine (experimental)** — `--java-engine async-profiler` delegates Java stacks to [async-profiler](https://github.com/async-profiler/async-profiler) (AsyncGetCallTrace), so JIT/interpreter/inlined frames resolve **without `-XX:+PreserveFramePointer`**. Works per-`--pid` or system-wide (attaches every discovered JVM, eBPF for the rest). `asprof` is auto-downloaded (pinned, SHA-256-verified, cached) if not already on `$PATH`/`$ASPROF`. Batch output only; see below
 - **Category-based coloring** — frames are colored by category (kernel, kernel I/O, JavaScript/V8, Java/JVM, native, synthetic) consistently across the TUI, SVG, and HTML/serve renderers
 - **BPF-based aggregation** — stack counting in kernel to reduce userspace data transfer
 - **Group by CPU / process** — per-core or per-PID flamegraph breakdown (`--group-by-cpu`, `--group-by-process`)
@@ -455,7 +456,7 @@ let session = ProfilingSession::new(config).await?;
 
 - Linux only (requires eBPF support)
 - Architecture: x86_64 and aarch64 supported (frame-pointer + DWARF unwinding, Java/HotSpot `Method*` naming)
-- JIT-compiled code (HotSpot Java, V8/Node) is symbolized via `/tmp/perf-<pid>.map`; interpreter and inlined frames are not yet reconstructed. `Compiler.perfmap` auto-dump requires JDK 17+ (on JDK 8/11 use perf-map-agent/async-profiler)
+- JIT-compiled code (HotSpot Java, V8/Node) is symbolized via `/tmp/perf-<pid>.map`; interpreter and inlined frames are not yet reconstructed by the eBPF engine. `Compiler.perfmap` auto-dump requires JDK 17+ (on JDK 8/11 use perf-map-agent/async-profiler). For full Java fidelity without `-XX:+PreserveFramePointer`, use `--java-engine async-profiler` (batch output only)
 - [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) `.eh_frame` parsed for DWARF unwinding; VDSO symbolization not yet supported
 
 ## Development
