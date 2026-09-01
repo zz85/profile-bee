@@ -15,6 +15,7 @@ use profile_bee_common::{StackInfo, EVENT_TRACE_ALWAYS, PROCESS_EVENT_EXEC, PROC
 use crate::ebpf::{
     apply_dwarf_refresh, FramePointersPod, HotspotProcInfoPod, StackInfoPod, V8ProcInfoPod,
 };
+use crate::jitdump::{self, JitSymbolTable};
 use crate::pipeline::{DwarfThreadMsg, PerfWork};
 use crate::process_metadata::ProcessMetadataCache;
 use crate::trace_handler::TraceHandler;
@@ -147,6 +148,9 @@ pub struct ProfilingEventLoop {
     hotspot_armed: HashSet<u32>,
     /// Effective target PID; when set, Java discovery is scoped to it only.
     java_target_pid: Option<u32>,
+    /// PIDs for which we've already emitted the "Bun without JITDump" warning
+    /// (one-shot per PID to avoid log spam during system-wide / `--pid` runs).
+    warned_jitdump_pids: HashSet<u32>,
 }
 
 /// System-wide startup path: discover every running JVM and dump/load its
@@ -245,6 +249,7 @@ impl ProfilingEventLoop {
             java_known_pids,
             hotspot_armed: HashSet::new(),
             java_target_pid: config.java_target_pid,
+            warned_jitdump_pids: HashSet::new(),
         }
     }
 
@@ -339,6 +344,83 @@ impl ProfilingEventLoop {
         // Always arm perf-map discovery — cheap if the file is absent, and
         // helps any JIT runtime that writes /tmp/perf-<pid>.map.
         self.trace_handler.register_perf_map(tgid);
+        // Binary JITDump (`jit-<pid>.dump`) for Bun/JSC and other emitters.
+        self.try_load_jitdump_for_pid(tgid);
+    }
+
+    /// Load a binary JITDump table (`jit-<pid>.dump`) for a PID if one exists.
+    ///
+    /// If the PID is a Bun process and no JITDump file exists, emits a one-time
+    /// warning so the user knows to restart Bun with `BUN_JSC_useJITDump=1`.
+    fn try_load_jitdump_for_pid(&mut self, tgid: u32) {
+        if self.trace_handler.has_jit_table(tgid) {
+            return;
+        }
+        if let Some(path) = jitdump::find_jitdump_for_pid(tgid) {
+            match JitSymbolTable::load_from_file(&path) {
+                Ok(table) if !table.is_empty() => {
+                    self.trace_handler.register_jit_table(tgid, table);
+                }
+                Ok(_) => tracing::debug!("JITDump for pid {} is empty", tgid),
+                Err(e) => tracing::debug!("JITDump read failed for pid {}: {}", tgid, e),
+            }
+        } else {
+            self.warn_bun_missing_jitdump(tgid);
+        }
+    }
+
+    /// One-time warning if a PID is a Bun process running without a JITDump file.
+    ///
+    /// Bun (JavaScriptCore) only writes `jit-<pid>.dump` when started with
+    /// `BUN_JSC_useJITDump=1`; without it, JIT-compiled JS shows as `[unknown]`.
+    /// Fires during system-wide / `--pid` profiling where probee can't inject
+    /// the env var itself (for `probee -- bun ...`, `spawn` injects it).
+    fn warn_bun_missing_jitdump(&mut self, tgid: u32) {
+        if self.warned_jitdump_pids.contains(&tgid) {
+            return;
+        }
+        let exe_path = match std::fs::read_link(format!("/proc/{tgid}/exe")) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let basename = exe_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !crate::spawn::is_bun_program(basename) {
+            return;
+        }
+        self.warned_jitdump_pids.insert(tgid);
+        tracing::warn!(
+            "Bun process (PID {tgid}) detected without a JITDump file; JS function \
+             names will show as [unknown]. Restart with BUN_JSC_useJITDump=1, or \
+             profile via `probee -- bun <script>` for auto-injection."
+        );
+    }
+
+    /// Reload JITDump tables for known PIDs (streaming modes pick up newly
+    /// JIT-compiled functions). Incremental for loaded tables, fresh-load
+    /// otherwise; invalidates the symbol cache for PIDs that gained symbols so
+    /// previously-`[unknown]` frames re-resolve.
+    pub fn reload_jitdump_tables(&mut self) {
+        let tgids: Vec<u32> = self.known_tgids.iter().copied().collect();
+        for tgid in tgids {
+            if self.trace_handler.has_jit_table(tgid) {
+                if let Some(path) = jitdump::find_jitdump_for_pid(tgid) {
+                    if let Some(table) = self.trace_handler.jit_table_mut(tgid) {
+                        match table.reload_from_file(&path) {
+                            Ok(n) if n > 0 => {
+                                tracing::debug!("reloaded {n} new JITDump symbols for pid {tgid}");
+                                self.trace_handler.flush_frame_cache_for_pid(tgid);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::debug!("JITDump reload failed for pid {tgid}: {e}")
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.try_load_jitdump_for_pid(tgid);
+            }
+        }
     }
 
     /// Detect HotSpot/OpenJDK processes and enable Java JIT symbolization.
@@ -746,6 +828,13 @@ impl ProfilingEventLoop {
                     break;
                 }
             }
+        }
+
+        // Reload JITDump tables at the end of the window so symbols compiled
+        // during profiling are picked up (the first-sight load may have seen an
+        // empty/absent file). Skip on the raw-capture path to avoid I/O.
+        if symbolize {
+            self.reload_jitdump_tables();
         }
 
         tracing::debug!("drain_events: processed {} events", queue_processed);
