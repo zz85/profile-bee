@@ -276,37 +276,20 @@ fn set_tree_world_readable(path: &Path) {
     }
 }
 
-/// Create a fresh, uniquely-named async-profiler output file in the temp dir.
+/// Build an unpredictable async-profiler output path in the temp dir.
 ///
-/// The name carries 128 bits of `/dev/urandom` entropy and the file is created
-/// with `O_CREAT|O_EXCL|O_NOFOLLOW`, so an attacker can neither predict the path
-/// nor have a pre-planted file/symlink reused (creation fails and we retry). It
-/// is mode 0666 because the *target* JVM (any uid, e.g. a non-root JVM profiled
-/// by a root profile-bee) writes the collapsed output through async-profiler.
-fn create_output_file(pid: u32) -> std::io::Result<PathBuf> {
+/// async-profiler creates the `-f` file itself (as the *target* JVM's uid, which
+/// may differ from ours), so we cannot pre-create it exclusively. Instead the
+/// name carries 128 bits of `/dev/urandom` entropy: an attacker cannot guess it,
+/// so a pre-planted file/symlink at this path is not feasible. The file must not
+/// already exist (async-profiler refuses to overwrite), which the random name
+/// ensures; we do not touch the path so no symlink is followed on our side.
+fn output_path(pid: u32) -> std::io::Result<PathBuf> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = std::env::temp_dir();
-    for _ in 0..8 {
-        let mut rnd = [0u8; 16];
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut rnd)?;
-        let suffix: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
-        let path = dir.join(format!("probee-asprof-{pid}-{suffix}.folded"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true) // O_CREAT | O_EXCL
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(0o666)
-            .open(&path)
-        {
-            Ok(_) => return Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::other(
-        "could not create a unique async-profiler output file",
-    ))
+    let mut rnd = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut rnd)?;
+    let suffix: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(std::env::temp_dir().join(format!("probee-asprof-{pid}-{suffix}.folded")))
 }
 
 /// A running async-profiler attach. Profiles for a fixed duration, then exits;
@@ -338,7 +321,7 @@ impl Session {
         // async-profiler `-d` is whole seconds; callers pass whole-second windows
         // (see start_async_profiler) so this matches the eBPF window exactly.
         let secs = (duration_ms / 1000).max(1);
-        let output = create_output_file(pid)?;
+        let output = output_path(pid)?;
         let mut cmd = Command::new(asprof);
         cmd.arg("-d")
             .arg(secs.to_string())
@@ -369,15 +352,17 @@ impl Session {
     /// Wait for the profiling window to complete, then read and re-root the
     /// folded output. Returns one `stack;… count` line per collapsed entry.
     pub fn finish(mut self) -> std::io::Result<Vec<String>> {
-        let status = self.child.wait()?;
+        let status = self.child.wait();
+        // Always remove the temp output, whether or not the run succeeded.
+        let read = std::fs::read_to_string(&self.output);
+        let _ = std::fs::remove_file(&self.output);
+        let status = status?;
         if !status.success() {
             return Err(std::io::Error::other(format!(
                 "asprof exited with status {status}"
             )));
         }
-        let text = std::fs::read_to_string(&self.output)?;
-        let _ = std::fs::remove_file(&self.output);
-        Ok(reroot_folded(&text, &self.root))
+        Ok(reroot_folded(&read?, &self.root))
     }
 }
 
