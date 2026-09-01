@@ -104,7 +104,10 @@ impl JitSymbolTable {
     /// Resume reading from a partially-read file for streaming modes.
     ///
     /// Seeks to `last_read_offset` and reads any new records appended since
-    /// the last read. Returns the number of new symbols loaded.
+    /// the last read. Returns the number of records that mutated the table
+    /// (loads and applied moves) — nonzero means a cache flush is warranted,
+    /// including same-length replacements that a net symbol-count delta would
+    /// miss.
     ///
     /// If the file has been truncated or rotated (size < last_read_offset),
     /// resets state and re-parses from the beginning.
@@ -127,9 +130,7 @@ impl JitSymbolTable {
             match parse_header(&mut reader) {
                 Ok(_) => {
                     self.last_read_offset = JITDUMP_HEADER_SIZE;
-                    let before = self.symbols.len();
-                    self.read_records(&mut reader)?;
-                    return Ok(self.symbols.len() - before);
+                    return self.read_records(&mut reader);
                 }
                 Err(e) => return Err(e),
             }
@@ -138,9 +139,7 @@ impl JitSymbolTable {
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(self.last_read_offset))?;
 
-        let before = self.symbols.len();
-        self.read_records(&mut reader)?;
-        Ok(self.symbols.len() - before)
+        self.read_records(&mut reader)
     }
 
     /// Number of symbols in the table.
@@ -154,7 +153,14 @@ impl JitSymbolTable {
     }
 
     /// Read records from the current reader position until EOF or JIT_CODE_CLOSE.
-    fn read_records<R: Read + Seek>(&mut self, reader: &mut R) -> io::Result<()> {
+    ///
+    /// Returns the number of records that mutated the symbol table (loads and
+    /// applied moves). Callers use this to decide whether to flush caches —
+    /// counting *mutations* rather than the net symbol-count delta so that
+    /// same-length replacements (a move onto an existing address, or a reload
+    /// at the same address) still register as a change.
+    fn read_records<R: Read + Seek>(&mut self, reader: &mut R) -> io::Result<usize> {
+        let mut mutations: usize = 0;
         loop {
             let record_start = reader.stream_position()?;
 
@@ -187,14 +193,22 @@ impl JitSymbolTable {
 
             match record_id {
                 JIT_CODE_LOAD => match self.parse_code_load(reader, payload_size) {
-                    Ok(()) => {}
+                    Ok(changed) => {
+                        if changed {
+                            mutations += 1;
+                        }
+                    }
                     Err(_) => {
                         self.last_read_offset = record_start;
                         break;
                     }
                 },
                 JIT_CODE_MOVE => match self.parse_code_move(reader, payload_size) {
-                    Ok(()) => {}
+                    Ok(changed) => {
+                        if changed {
+                            mutations += 1;
+                        }
+                    }
                     Err(_) => {
                         self.last_read_offset = record_start;
                         break;
@@ -220,7 +234,7 @@ impl JitSymbolTable {
             self.last_read_offset = record_start + total_size as u64;
         }
 
-        Ok(())
+        Ok(mutations)
     }
 
     /// Parse a JIT_CODE_LOAD record.
@@ -228,9 +242,15 @@ impl JitSymbolTable {
     /// Fixed fields after record header:
     ///   pid(u32), tid(u32), vma(u64), code_addr(u64), code_size(u64), code_index(u64)
     /// Followed by: null-terminated function name, then raw code bytes.
-    fn parse_code_load<R: Read>(&mut self, reader: &mut R, payload_size: u64) -> io::Result<()> {
+    fn parse_code_load<R: Read>(&mut self, reader: &mut R, payload_size: u64) -> io::Result<bool> {
         // Fixed fields: 4 + 4 + 8 + 8 + 8 + 8 = 40 bytes
         const FIXED_SIZE: u64 = 40;
+        // Upper bound on the symbol-name portion we will allocate. Real JIT
+        // function names / source paths are short; this caps memory use if a
+        // malformed record advertises a huge total_size (profile-bee reads
+        // attacker-influenceable /tmp/jit-<pid>.dump files as root).
+        const MAX_NAME_BYTES: u64 = 64 * 1024;
+
         if payload_size < FIXED_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -245,17 +265,34 @@ impl JitSymbolTable {
         let code_size = read_u64(reader)?;
         let _code_index = read_u64(reader)?;
 
-        // Remaining bytes: null-terminated name + code bytes
+        // The remaining payload is the null-terminated name followed by
+        // `code_size` bytes of native code. Reject records whose code_size
+        // can't fit — this catches oversized/malformed sizes before we read.
         let remaining = payload_size - FIXED_SIZE;
-        let mut name_and_code = vec![0u8; remaining as usize];
-        reader.read_exact(&mut name_and_code)?;
+        if code_size > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "JIT_CODE_LOAD code_size exceeds record payload",
+            ));
+        }
 
-        // Extract null-terminated name
-        let name_end = name_and_code
+        // Name occupies the bytes before the native code. Read only a bounded
+        // prefix of it (never the code), so a huge advertised size can't drive
+        // a huge allocation.
+        let name_region = remaining - code_size;
+        let name_read = name_region.min(MAX_NAME_BYTES) as usize;
+        let mut name_buf = vec![0u8; name_read];
+        reader.read_exact(&mut name_buf)?;
+
+        let name_end = name_buf
             .iter()
             .position(|&b| b == 0)
-            .unwrap_or(name_and_code.len());
-        let name = String::from_utf8_lossy(&name_and_code[..name_end]).to_string();
+            .unwrap_or(name_buf.len());
+        let name = String::from_utf8_lossy(&name_buf[..name_end]).to_string();
+
+        // Skip the rest of the name region (if we capped it) and the native
+        // code bytes without allocating them.
+        skip_bytes(reader, (name_region - name_read as u64) + code_size)?;
 
         // Check for pending debug info (keyed by code_addr — the same
         // address that appeared in the preceding JIT_CODE_DEBUG_INFO record)
@@ -271,15 +308,18 @@ impl JitSymbolTable {
             },
         );
 
-        Ok(())
+        Ok(true)
     }
 
     /// Parse a JIT_CODE_MOVE record.
     ///
-    /// Fixed fields: old_code_addr(u64), new_code_addr(u64),
-    ///               new_code_size(u64), code_index(u64)
-    fn parse_code_move<R: Read>(&mut self, reader: &mut R, payload_size: u64) -> io::Result<()> {
-        const FIXED_SIZE: u64 = 32;
+    /// Fixed fields (perf JITDump `jr_code_move`, 48 bytes after the header):
+    ///   pid(u32), tid(u32), vma(u64), old_code_addr(u64),
+    ///   new_code_addr(u64), code_size(u64), code_index(u64)
+    ///
+    /// Returns whether an existing symbol was actually moved.
+    fn parse_code_move<R: Read>(&mut self, reader: &mut R, payload_size: u64) -> io::Result<bool> {
+        const FIXED_SIZE: u64 = 48;
         if payload_size < FIXED_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -287,6 +327,9 @@ impl JitSymbolTable {
             ));
         }
 
+        let _pid = read_u32(reader)?;
+        let _tid = read_u32(reader)?;
+        let _vma = read_u64(reader)?;
         let old_code_addr = read_u64(reader)?;
         let new_code_addr = read_u64(reader)?;
         let new_code_size = read_u64(reader)?;
@@ -302,9 +345,10 @@ impl JitSymbolTable {
             sym.code_addr = new_code_addr;
             sym.code_size = new_code_size;
             self.symbols.insert(new_code_addr, sym);
+            Ok(true)
+        } else {
+            Ok(false)
         }
-
-        Ok(())
     }
 
     /// Parse a JIT_CODE_DEBUG_INFO record.
@@ -541,11 +585,12 @@ mod tests {
         buf
     }
 
-    /// Build a JIT_CODE_LOAD record.
+    /// Build a JIT_CODE_LOAD record (spec-compliant: name + `code_size` bytes
+    /// of native code follow the fixed fields).
     fn code_load_record(code_addr: u64, code_size: u64, code_index: u64, name: &str) -> Vec<u8> {
         let name_bytes = name.as_bytes();
-        // name + null terminator, no code bytes for simplicity
-        let payload_size = 40 + name_bytes.len() as u32 + 1;
+        // fixed(40) + name + null + code_size code bytes
+        let payload_size = 40 + name_bytes.len() as u32 + 1 + code_size as u32;
         let total_size = 16 + payload_size;
 
         let mut rec = Vec::new();
@@ -565,16 +610,23 @@ mod tests {
         rec.extend_from_slice(name_bytes);
         rec.push(0);
 
+        // Native code bytes (content irrelevant — the parser skips them)
+        rec.extend(std::iter::repeat(0xCCu8).take(code_size as usize));
+
         rec
     }
 
-    /// Build a JIT_CODE_MOVE record.
+    /// Build a JIT_CODE_MOVE record (spec-compliant 48-byte payload with
+    /// pid/tid/vma preceding the address fields).
     fn code_move_record(old_addr: u64, new_addr: u64, new_size: u64, code_index: u64) -> Vec<u8> {
-        let total_size: u32 = 16 + 32;
+        let total_size: u32 = 16 + 48;
         let mut rec = Vec::new();
         rec.extend_from_slice(&JIT_CODE_MOVE.to_le_bytes());
         rec.extend_from_slice(&total_size.to_le_bytes());
         rec.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        rec.extend_from_slice(&1234u32.to_le_bytes()); // pid
+        rec.extend_from_slice(&1234u32.to_le_bytes()); // tid
+        rec.extend_from_slice(&new_addr.to_le_bytes()); // vma
         rec.extend_from_slice(&old_addr.to_le_bytes());
         rec.extend_from_slice(&new_addr.to_le_bytes());
         rec.extend_from_slice(&new_size.to_le_bytes());
@@ -670,6 +722,61 @@ mod tests {
         let sym = table.resolve(0x5050).unwrap();
         assert_eq!(sym.name, "movedFunc");
         assert_eq!(sym.code_size, 0x200);
+    }
+
+    #[test]
+    fn test_read_records_reports_mutations() {
+        // A load followed by a move is two mutations even though the net symbol
+        // count stays at one — this is what drives cache invalidation.
+        let data = build_jitdump(&[
+            code_load_record(0x1000, 0x100, 0, "f"),
+            code_move_record(0x1000, 0x5000, 0x100, 0),
+        ]);
+        let mut cursor = Cursor::new(data);
+        let _ = parse_header(&mut cursor).unwrap();
+        let mut table = JitSymbolTable {
+            symbols: BTreeMap::new(),
+            pending_debug: HashMap::new(),
+            last_read_offset: JITDUMP_HEADER_SIZE,
+        };
+        let mutations = table.read_records(&mut cursor).unwrap();
+        assert_eq!(mutations, 2, "load + move should count as two mutations");
+        assert_eq!(table.len(), 1);
+        assert!(table.resolve(0x5050).is_some());
+    }
+
+    #[test]
+    fn test_code_load_oversized_code_size_rejected() {
+        // A JIT_CODE_LOAD whose code_size far exceeds the record payload must be
+        // rejected without loading a symbol (and without a huge allocation),
+        // rather than trusting the advertised size.
+        let name = b"evil\0";
+        let payload_size = 40u32 + name.len() as u32; // fixed fields + name, no code
+        let total_size = 16 + payload_size;
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&JIT_CODE_LOAD.to_le_bytes());
+        rec.extend_from_slice(&total_size.to_le_bytes());
+        rec.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        rec.extend_from_slice(&1234u32.to_le_bytes()); // pid
+        rec.extend_from_slice(&1234u32.to_le_bytes()); // tid
+        rec.extend_from_slice(&0x1000u64.to_le_bytes()); // vma
+        rec.extend_from_slice(&0x1000u64.to_le_bytes()); // code_addr
+        rec.extend_from_slice(&0xFFFF_FFFFu64.to_le_bytes()); // code_size (bogus)
+        rec.extend_from_slice(&0u64.to_le_bytes()); // code_index
+        rec.extend_from_slice(name);
+
+        let data = build_jitdump(&[rec]);
+        let mut cursor = Cursor::new(data);
+        let _ = parse_header(&mut cursor).unwrap();
+        let mut table = JitSymbolTable {
+            symbols: BTreeMap::new(),
+            pending_debug: HashMap::new(),
+            last_read_offset: JITDUMP_HEADER_SIZE,
+        };
+        // Stops cleanly; no symbol loaded.
+        table.read_records(&mut cursor).unwrap();
+        assert_eq!(table.len(), 0);
+        assert!(table.resolve(0x1000).is_none());
     }
 
     #[test]

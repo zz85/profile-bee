@@ -143,8 +143,14 @@ pub fn symbolize_raw_file(path: &Path) -> anyhow::Result<Vec<String>> {
                     }
                     Err(e) => {
                         tracing::debug!("user symbolization failed for pid {}: {}", pid, e);
+                        // blazesym failed for the whole stack (e.g. process gone),
+                        // but JIT frames can still resolve from the JITDump table.
                         for addr in &sample.user_addrs {
-                            frames.push(format!("{:#x}", addr));
+                            if let Some(jit_sym) = jit_table.and_then(|t| t.resolve(*addr)) {
+                                frames.push(jitdump::format_jit_symbol(jit_sym));
+                            } else {
+                                frames.push(format!("{:#x}", addr));
+                            }
                         }
                     }
                 }
