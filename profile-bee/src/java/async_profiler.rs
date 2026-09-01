@@ -193,9 +193,22 @@ pub async fn ensure_asprof() -> std::io::Result<PathBuf> {
 
     let root = cache_dir();
     std::fs::create_dir_all(&root)?;
-    // Normalize our cache root to 0755 (world-readable, not world-writable), then
-    // refuse to extract into / use a root we don't control — the default cache
-    // lives under world-writable /var/tmp, so a planted dir is possible.
+    // Reject a symlinked or foreign-owned cache root BEFORE touching permissions.
+    // `set_permissions` follows symlinks, so chmod'ing an attacker-planted
+    // symlinked root would alter its target (the default cache lives under
+    // world-writable /var/tmp, so a planted root is possible).
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::symlink_metadata(&root)?;
+        let euid = unsafe { libc::geteuid() };
+        if md.file_type().is_symlink() || (md.uid() != 0 && md.uid() != euid) {
+            return Err(Error::other(format!(
+                "refusing untrusted async-profiler cache dir {} (symlink or unexpected owner); set $PROFILE_BEE_CACHE or $ASPROF",
+                root.display()
+            )));
+        }
+    }
+    // Now safe (a real directory we own): normalize to 0755 (not world-writable).
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755));
@@ -263,6 +276,39 @@ fn set_tree_world_readable(path: &Path) {
     }
 }
 
+/// Create a fresh, uniquely-named async-profiler output file in the temp dir.
+///
+/// The name carries 128 bits of `/dev/urandom` entropy and the file is created
+/// with `O_CREAT|O_EXCL|O_NOFOLLOW`, so an attacker can neither predict the path
+/// nor have a pre-planted file/symlink reused (creation fails and we retry). It
+/// is mode 0666 because the *target* JVM (any uid, e.g. a non-root JVM profiled
+/// by a root profile-bee) writes the collapsed output through async-profiler.
+fn create_output_file(pid: u32) -> std::io::Result<PathBuf> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = std::env::temp_dir();
+    for _ in 0..8 {
+        let mut rnd = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut rnd)?;
+        let suffix: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+        let path = dir.join(format!("probee-asprof-{pid}-{suffix}.folded"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // O_CREAT | O_EXCL
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o666)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(
+        "could not create a unique async-profiler output file",
+    ))
+}
+
 /// A running async-profiler attach. Profiles for a fixed duration, then exits;
 /// [`Session::finish`] waits for it and returns the re-rooted folded stacks.
 pub struct Session {
@@ -289,9 +335,10 @@ impl Session {
         interval_ns: u64,
         root: String,
     ) -> std::io::Result<Session> {
-        let secs = duration_ms.div_ceil(1000).max(1);
-        let output = std::env::temp_dir().join(format!("probee-asprof-{pid}.folded"));
-        let _ = std::fs::remove_file(&output);
+        // async-profiler `-d` is whole seconds; callers pass whole-second windows
+        // (see start_async_profiler) so this matches the eBPF window exactly.
+        let secs = (duration_ms / 1000).max(1);
+        let output = create_output_file(pid)?;
         let mut cmd = Command::new(asprof);
         cmd.arg("-d")
             .arg(secs.to_string())

@@ -472,6 +472,15 @@ fn start_async_profiler(opt: &Opt, pid: Option<u32>, asprof: &Path) -> Option<As
         return None;
     };
     let duration = duration as u64;
+    // async-profiler's `-d` is whole seconds, so a sub-second remainder would make
+    // its window longer than the eBPF window. Require whole seconds for an exact
+    // match rather than silently rounding up.
+    if !duration.is_multiple_of(1000) {
+        eprintln!(
+            "--java-engine async-profiler requires a whole-second --time (got {duration}ms); using eBPF stacks"
+        );
+        return None;
+    }
     // Match async-profiler's sampling interval to the eBPF --frequency.
     let interval_ns = 1_000_000_000u64.checked_div(opt.frequency).unwrap_or(0);
 
@@ -687,16 +696,38 @@ async fn main() -> std::result::Result<(), anyhow::Error> {
     // and the asprof download) when a supported batch mode is in effect — so an
     // unsupported combination doesn't silently disable Java naming or download a
     // binary for nothing.
+    // `Opt::tui` only exists under the `tui` feature; alias it so this compiles
+    // with --no-default-features.
+    #[cfg(feature = "tui")]
+    let is_tui = opt.tui;
+    #[cfg(not(feature = "tui"))]
+    let is_tui = false;
+
     let ap_only_raw = !resolved_outputs.is_empty()
         && resolved_outputs
             .iter()
             .all(|(f, _)| *f == OutputFormat::Raw);
-    let ap_batch_supported = !opt.tui && !opt.serve && opt.flush_interval.is_none() && !ap_only_raw;
+    // Native OTLP export (otlp feature + endpoint + symbol server, non-serve/tui)
+    // takes the collect_raw path that the async-profiler merge does not wire into,
+    // so exclude it here — keeping profile-bee's own Java naming for that export.
+    #[cfg(feature = "otlp")]
+    let native_otlp = {
+        #[cfg(feature = "symbol-server")]
+        let has_symbol_server = opt.symbol_server.is_some() || opt.symbol_server_listen.is_some();
+        #[cfg(not(feature = "symbol-server"))]
+        let has_symbol_server = opt.symbol_server.is_some();
+        opt.otlp_endpoint.is_some() && has_symbol_server && !opt.serve && !is_tui
+    };
+    #[cfg(not(feature = "otlp"))]
+    let native_otlp = false;
+
+    let ap_batch_supported =
+        !is_tui && !opt.serve && opt.flush_interval.is_none() && !ap_only_raw && !native_otlp;
     let async_profiler_active = opt.java_engine == JavaEngine::AsyncProfiler && ap_batch_supported;
     if opt.java_engine == JavaEngine::AsyncProfiler && !ap_batch_supported {
         eprintln!(
             "--java-engine async-profiler only applies to batch output (-o/--collapse/--svg/--json); \
-             ignored for --tui/--serve/--flush-interval/raw-only — using eBPF stacks"
+             ignored for --tui/--serve/--flush-interval/raw-only/native-OTLP — using eBPF stacks"
         );
     }
 
