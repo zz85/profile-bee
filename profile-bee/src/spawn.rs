@@ -180,6 +180,15 @@ fn is_nodejs_program(program: &str) -> bool {
     matches!(basename, "node" | "nodejs" | "nsolid")
 }
 
+/// Check if a program name looks like Bun (JavaScriptCore runtime).
+pub fn is_bun_program(program: &str) -> bool {
+    let basename = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    matches!(basename, "bun" | "bunx")
+}
+
 /// Add `-XX:+PreserveFramePointer` to a `JAVA_TOOL_OPTIONS` value unless it is
 /// already present. Preserving the frame pointer (JDK 8u60+, usually <1%
 /// overhead) is what lets the frame-pointer unwinder walk through JIT-compiled
@@ -254,6 +263,14 @@ fn build_runtime_env(program: &str) -> Vec<(&'static str, String)> {
             value
         );
         env.push(("JAVA_TOOL_OPTIONS", value));
+    }
+
+    if is_bun_program(program) {
+        // BUN_JSC_useJITDump=1 makes JavaScriptCore write a perf `jit-<pid>.dump`
+        // with JIT symbol addresses, so JIT-compiled JS resolves instead of
+        // appearing as [unknown].
+        tracing::info!("Bun detected: injecting BUN_JSC_useJITDump=1 for JIT symbol resolution");
+        env.push(("BUN_JSC_useJITDump", "1".to_string()));
     }
 
     env

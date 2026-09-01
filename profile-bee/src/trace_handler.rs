@@ -1,4 +1,5 @@
 use crate::ebpf::{FramePointersPod, StackInfoPod};
+use crate::jitdump::{self, JitSymbolTable};
 use crate::perf_map::{format_jit_symbol, PerfMapCache};
 use crate::v8::{V8HeapReader, V8IntrospectionData};
 use crate::{cache::PointerStackFramesCache, types::StackFrameInfo, types::StackInfoExt};
@@ -488,6 +489,10 @@ pub struct TraceHandler {
     perf_maps: PerfMapCache,
     /// PIDs we've already logged a missing-perf-map hint for (avoid spam).
     perf_map_hinted: HashMap<u32, bool>,
+    /// Binary JITDump tables (`jit-<pid>.dump`) per PID, for runtimes that emit
+    /// the perf JITDump format — notably Bun/JavaScriptCore (`BUN_JSC_useJITDump=1`),
+    /// which does not write a text perf-map. Consulted after V8/HotSpot/perf-map.
+    jit_tables: HashMap<u32, JitSymbolTable>,
 }
 
 impl Default for TraceHandler {
@@ -580,6 +585,7 @@ impl TraceHandler {
             softirq_bits_valid,
             perf_maps: PerfMapCache::new(),
             perf_map_hinted: HashMap::new(),
+            jit_tables: HashMap::new(),
         }
     }
 
@@ -616,6 +622,7 @@ impl TraceHandler {
         self.hotspot_readers.remove(&tgid);
         self.perf_maps.remove(tgid);
         self.perf_map_hinted.remove(&tgid);
+        self.jit_tables.remove(&tgid);
         tracing::debug!("invalidated symbol caches for pid {}", tgid);
     }
 
@@ -748,6 +755,23 @@ impl TraceHandler {
     /// through HotSpot method resolution instead of served stale.
     pub fn flush_frame_cache_for_pid(&mut self, tgid: u32) {
         self.cache.invalidate_pid(tgid);
+    }
+
+    /// Register a JITDump symbol table for a PID (perf `jit-<pid>.dump`).
+    /// Flushes cached frames so previously-`[unknown]` stacks re-resolve.
+    pub fn register_jit_table(&mut self, tgid: u32, table: JitSymbolTable) {
+        self.jit_tables.insert(tgid, table);
+        self.cache.invalidate_pid(tgid);
+    }
+
+    /// Whether a JITDump table is loaded for this PID.
+    pub fn has_jit_table(&self, tgid: u32) -> bool {
+        self.jit_tables.contains_key(&tgid)
+    }
+
+    /// Mutable access to a PID's JITDump table for incremental reloads.
+    pub fn jit_table_mut(&mut self, tgid: u32) -> Option<&mut JitSymbolTable> {
+        self.jit_tables.get_mut(&tgid)
     }
 
     pub fn print_stats(&self) {
@@ -1132,6 +1156,10 @@ impl TraceHandler {
         // (HotSpot, V8 without SFI, other runtimes).
         self.apply_perf_map_symbols(pid, &addrs, &mut user_syms);
 
+        // Binary JITDump fallback (`jit-<pid>.dump`) for runtimes that emit the
+        // perf JITDump format instead of a text perf-map — notably Bun/JSC.
+        self.apply_jitdump_symbols(pid, &addrs, &mut user_syms);
+
         let kernel_addrs = kernel_stack.unwrap_or_default();
         let mut kernel_syms = self
             .symbolize_kernel_stack(&kernel_addrs)
@@ -1221,6 +1249,29 @@ impl TraceHandler {
                     format_jit_symbol(&raw)
                 };
                 frame.symbol = Some(display);
+            }
+        }
+    }
+
+    /// Fill still-unresolved user frames from the per-PID binary JITDump table.
+    /// Runs after the perf-map fallback, so it only touches frames no other
+    /// source could name (e.g. Bun/JSC JIT code in anonymous mappings).
+    fn apply_jitdump_symbols(&mut self, pid: u32, addrs: &[u64], user_syms: &mut [StackFrameInfo]) {
+        let Some(jit_table) = self.jit_tables.get(&pid) else {
+            return;
+        };
+        for (frame, &addr) in user_syms.iter_mut().zip(addrs.iter()) {
+            let needs_jit = match frame.symbol.as_deref() {
+                None => true,
+                Some("[unknown]") => true,
+                Some(s) if s.starts_with("0x") => true,
+                Some(_) => false,
+            };
+            if !needs_jit {
+                continue;
+            }
+            if let Some(jit_sym) = jit_table.resolve(addr) {
+                frame.symbol = Some(jitdump::format_jit_symbol(jit_sym));
             }
         }
     }

@@ -456,7 +456,7 @@ let session = ProfilingSession::new(config).await?;
 
 - Linux only (requires eBPF support)
 - Architecture: x86_64 and aarch64 supported (frame-pointer + DWARF unwinding, Java/HotSpot `Method*` naming)
-- JIT-compiled code (HotSpot Java, V8/Node) is symbolized via `/tmp/perf-<pid>.map`; interpreter and inlined frames are not yet reconstructed by the eBPF engine. `Compiler.perfmap` auto-dump requires JDK 17+ (on JDK 8/11 use perf-map-agent/async-profiler). For full Java fidelity without `-XX:+PreserveFramePointer`, use `--java-engine async-profiler` (batch output only)
+- JIT-compiled code (HotSpot Java, V8/Node) is symbolized via `/tmp/perf-<pid>.map`; interpreter and inlined frames are not yet reconstructed by the eBPF engine. `Compiler.perfmap` auto-dump requires JDK 17+ (on JDK 8/11 use perf-map-agent/async-profiler). For full Java fidelity without `-XX:+PreserveFramePointer`, use `--java-engine async-profiler` (batch output only). Bun/JavaScriptCore JIT frames are resolved from the binary JITDump (`jit-<pid>.dump`); `probee -- bun <script>` auto-enables it via `BUN_JSC_useJITDump=1` (for `--pid`/system-wide, start Bun with that env var set)
 - [VDSO](https://man7.org/linux/man-pages/man7/vdso.7.html) `.eh_frame` parsed for DWARF unwinding; VDSO symbolization not yet supported
 
 ## Development

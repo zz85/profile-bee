@@ -22,6 +22,8 @@ use blazesym::symbolize::source::{Kernel, Process, Source};
 use blazesym::symbolize::{Input, Symbolized, Symbolizer};
 use blazesym::Pid;
 
+use crate::jitdump::{self, JitSymbolTable};
+
 /// A parsed raw stack sample (one line of the raw collapse file).
 #[derive(Debug)]
 struct RawLine {
@@ -60,6 +62,41 @@ pub fn symbolize_raw_file(path: &Path) -> anyhow::Result<Vec<String>> {
 
     // Determine PIDs from mappings header
     let pids: Vec<u32> = mappings.keys().copied().collect();
+
+    // Load binary JITDump tables (`jit-<pid>.dump`) for any PIDs that have them,
+    // so JIT-compiled frames (e.g. Bun/JSC) resolve in offline re-symbolization.
+    let mut jit_tables: HashMap<u32, JitSymbolTable> = HashMap::new();
+    for &pid in &pids {
+        if let Some(dump) = jitdump::find_jitdump_for_pid(pid) {
+            // Confirm the dump's embedded PID matches before trusting its
+            // symbols — a mismatched header means the file belongs to a
+            // different process (pid reuse / mislabeled file).
+            match jitdump::read_header_pid(&dump) {
+                Ok(header_pid) if header_pid != pid => {
+                    tracing::debug!(
+                        "JITDump {} header pid {} != {}, skipping",
+                        dump.display(),
+                        header_pid,
+                        pid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!("JITDump header read failed for pid {}: {}", pid, e);
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            match JitSymbolTable::load_from_file(&dump) {
+                Ok(table) if !table.is_empty() => {
+                    tracing::info!("loaded JITDump for pid {} ({} symbols)", pid, table.len());
+                    jit_tables.insert(pid, table);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("JITDump read failed for pid {}: {}", pid, e),
+            }
+        }
+    }
 
     let symbolizer = Symbolizer::new();
     let mut output = Vec::new();
@@ -104,16 +141,35 @@ pub fn symbolize_raw_file(path: &Path) -> anyhow::Result<Vec<String>> {
         if !sample.user_addrs.is_empty() {
             if let Some(pid) = target_pid {
                 let src = Source::Process(Process::new(Pid::from(pid)));
+                let jit_table = jit_tables.get(&pid);
                 match symbolizer.symbolize(&src, Input::AbsAddr(&sample.user_addrs)) {
                     Ok(syms) => {
-                        for sym in syms {
-                            frames.push(format_symbolized(sym, false));
+                        for (i, sym) in syms.into_iter().enumerate() {
+                            let formatted = format_symbolized(sym, false);
+                            // Override [unknown] with a JITDump symbol if available.
+                            if formatted == "[unknown]" {
+                                if let (Some(table), Some(addr)) =
+                                    (jit_table, sample.user_addrs.get(i))
+                                {
+                                    if let Some(jit_sym) = table.resolve(*addr) {
+                                        frames.push(jitdump::format_jit_symbol(jit_sym));
+                                        continue;
+                                    }
+                                }
+                            }
+                            frames.push(formatted);
                         }
                     }
                     Err(e) => {
                         tracing::debug!("user symbolization failed for pid {}: {}", pid, e);
+                        // blazesym failed for the whole stack (e.g. process gone),
+                        // but JIT frames can still resolve from the JITDump table.
                         for addr in &sample.user_addrs {
-                            frames.push(format!("{:#x}", addr));
+                            if let Some(jit_sym) = jit_table.and_then(|t| t.resolve(*addr)) {
+                                frames.push(jitdump::format_jit_symbol(jit_sym));
+                            } else {
+                                frames.push(format!("{:#x}", addr));
+                            }
                         }
                     }
                 }
