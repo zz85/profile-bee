@@ -4,7 +4,10 @@
 
 ### New Features (experimental)
 
-- **`--java-engine async-profiler` (prototype)** — instead of reconstructing Java stacks from eBPF (which needs `-XX:+PreserveFramePointer` for JIT frames), profile-bee can delegate to [async-profiler](https://github.com/async-profiler/async-profiler): when profiling a single JVM by `--pid`, it attaches `asprof` for the profiling window and uses its `AsyncGetCallTrace`-accurate folded output. Because async-profiler's `-o collapsed` format is the same folded format profile-bee emits — and `--pid` already scopes eBPF sampling to that one process — the JVM's eBPF stacks are cleanly replaced by async-profiler's for the run. No `-XX:+PreserveFramePointer` required; JIT/interpreter/inlined frames resolve to real method names. Locate `asprof` via `$ASPROF` or `$PATH`. Scope: batch (`--collapse`/`--svg`/`--json`) output only; requires `--pid` + `--time`; falls back to eBPF stacks (with a reason) when prerequisites are unmet. Streaming/serve/TUI and multi-process merging are follow-ups.
+- **`--java-engine async-profiler` (experimental, opt-in)** — instead of reconstructing Java stacks from eBPF (which needs `-XX:+PreserveFramePointer` for JIT frames), profile-bee can delegate to [async-profiler](https://github.com/async-profiler/async-profiler), whose in-process `AsyncGetCallTrace` walks Java stacks without frame pointers and names JIT/interpreter/inlined frames. profile-bee attaches `asprof` for the profiling window; its `-o collapsed` output is the same folded format profile-bee emits, so merging is a splice.
+  - **Single `--pid`**: eBPF is already scoped to that process, so its collapse is replaced wholesale by async-profiler's output.
+  - **System-wide** (no `--pid`): every discovered JVM is attached; each attached JVM's eBPF stacks are dropped (matched by the `(pid)` in the auto-enabled `--group-by-process` root) and replaced with async-profiler's, while native processes — and any JVM that refused attach or produced no samples — keep their eBPF stacks. profile-bee's own JVM auto-discovery is disabled in this mode so both don't attach the same JVMs.
+  - Locate `asprof` via `$ASPROF` or `$PATH`; requires `--time`; batch (`--collapse`/`--svg`/`--json`) output only (streaming/serve/TUI is a follow-up). Falls back to eBPF stacks (with a logged reason) when prerequisites are unmet, per-JVM.
 
 ## v0.3.22
 
