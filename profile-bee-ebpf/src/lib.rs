@@ -898,35 +898,10 @@ const __START_KERNEL_MAP: u64 = 0x0001_0000_0000_0000;
 ///
 /// Returns `None` to stop unwinding. `is_leaf_step` is true when unwinding out
 /// of the sampled (leaf) frame — the only frame whose return address may still
-/// be in a register. `lr` is the sampled link register (aarch64).
+/// be in a register. `lr` is the sampled link register.
 ///
-/// x86_64: the return address is always at CFA-8 (or a fixed ucontext offset
-/// for signal frames); `ra_offset` is ignored, preserving the original behavior
-/// byte-for-byte.
-#[cfg(bpf_target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn dwarf_return_addr(
-    entry: &UnwindEntry,
-    cfa: u64,
-    sp: u64,
-    _lr: u64,
-    _is_leaf_step: bool,
-) -> Option<u64> {
-    // Signal frame: RA at *(RSP + 168); normal frame: RA at CFA-8.
-    let ra_addr = if entry.cfa_type == CFA_REG_DEREF_RSP {
-        sp + 168
-    } else {
-        cfa.wrapping_sub(8)
-    };
-    let ra = bpf_probe_read_user(ra_addr as *const u64).ok()?;
-    if ra == 0 {
-        None
-    } else {
-        Some(ra)
-    }
-}
-
-/// aarch64: the return address lives in LR (x30). `ra_offset` is load-bearing —
+/// Only aarch64 needs this: the return address lives in LR (x30). `ra_offset` is
+/// load-bearing —
 /// it is either a CFA-relative offset where the RA was spilled, or the sentinel
 /// [`RA_OFFSET_IN_LR`] (RA still in x30, recoverable only for the leaf step) or
 /// [`RA_OFFSET_UNDEFINED`] (top of stack).
@@ -1064,11 +1039,27 @@ unsafe fn dwarf_unwind_one_frame(state: &mut DwarfUnwindState) -> bool {
         return false;
     }
 
-    // Return address: x86_64 uses CFA-8 (or the signal-frame ucontext slot);
-    // aarch64 uses the entry's ra_offset / LR. frame_idx == 1 is the step out
-    // of the sampled leaf frame (the only frame whose RA may be in a register).
-    let Some(return_addr) = dwarf_return_addr(&entry, cfa, sp, state.lr, frame_idx == 1) else {
-        return false;
+    // Return address. x86_64: kept as the original inline form (RA at CFA-8, or
+    // the signal-frame ucontext slot) — folding it into a helper that borrows
+    // `entry` across the probe-read kept the UnwindEntry spilled and made the
+    // verifier reject an uninitialized stack slot on some kernels (6.1.x).
+    // aarch64: the RA lives in LR, so it needs the entry's ra_offset / LR rule.
+    #[cfg(bpf_target_arch = "x86_64")]
+    let return_addr = {
+        let ra_addr = if is_signal { sp + 168 } else { cfa.wrapping_sub(8) };
+        let ra = match bpf_probe_read_user(ra_addr as *const u64) {
+            Ok(val) => val,
+            Err(_) => return false,
+        };
+        if ra == 0 {
+            return false;
+        }
+        ra
+    };
+    #[cfg(bpf_target_arch = "aarch64")]
+    let return_addr = match dwarf_return_addr(&entry, cfa, sp, state.lr, frame_idx == 1) {
+        Some(v) => v,
+        None => return false,
     };
 
     // Restore RBP: for signal frames read from *(RSP+120),
@@ -1237,11 +1228,23 @@ unsafe fn dwarf_copy_stack_regs(
             break;
         }
 
-        // Return address: x86_64 uses CFA-8 (or signal-frame ucontext slot);
-        // aarch64 uses the entry's ra_offset / LR. i == 1 is the step out of the
-        // sampled leaf frame (the only frame whose RA may still be in a register).
-        let Some(return_addr) = dwarf_return_addr(&entry, cfa, sp, reg_lr(regs), i == 1) else {
-            break;
+        // Return address (see dwarf_unwind_one_frame for why x86_64 stays inline).
+        #[cfg(bpf_target_arch = "x86_64")]
+        let return_addr = {
+            let ra_addr = if is_signal { sp + 168 } else { cfa.wrapping_sub(8) };
+            let ra = match bpf_probe_read_user(ra_addr as *const u64) {
+                Ok(val) => val,
+                Err(_) => break,
+            };
+            if ra == 0 {
+                break;
+            }
+            ra
+        };
+        #[cfg(bpf_target_arch = "aarch64")]
+        let return_addr = match dwarf_return_addr(&entry, cfa, sp, reg_lr(regs), i == 1) {
+            Some(v) => v,
+            None => break,
         };
 
         // Restore RBP: for signal frames read from *(RSP+120),
