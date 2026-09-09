@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.25
+
+### Bug Fixes
+
+- **`--dwarf` no longer crashes on load (x86_64, newer kernels)** — released x86_64 binaries were shipping a stale committed eBPF object (v0.3.21-era) that the stricter verifier on newer kernels rejects (`invalid read from stack` in the DWARF unwinder; observed on kernel 6.1.180). Root cause: the release workflow built the eBPF via `--manifest-path` from the repo root, so the object landed in `profile-bee-ebpf/target/` instead of the `target/bpfel-unknown-none/…` path `build.rs` checks, and `build.rs` silently fell back to the committed prebuilt. Fixed by building the eBPF from inside `profile-bee-ebpf` in `release.yml` (matching the CI e2e job) and by teaching `build.rs` to also look under `profile-bee-ebpf/target/`, so releases embed a fresh build. Also restored the x86_64 DWARF return-address read to its original inline form (the `dwarf_return_addr` helper is now aarch64-only) so the fresh build is verifier-clean. Validated on kernel 6.1.180 x86_64: `probee --dwarf` verifies and runs. aarch64 DWARF unchanged.
+
 ## v0.3.24
 
 ### New Features
