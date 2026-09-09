@@ -18,9 +18,21 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir.parent().unwrap();
 
-    // Freshly-built eBPF binaries from `cargo xtask build-ebpf`.
-    let fresh_release = workspace_root.join("target/bpfel-unknown-none/release/profile-bee");
-    let fresh_debug = workspace_root.join("target/bpfel-unknown-none/debug/profile-bee");
+    // Freshly-built eBPF binaries. `cargo xtask build-ebpf` (and building from
+    // inside profile-bee-ebpf, where its .cargo/config sets target-dir=../target)
+    // lands them under the workspace-root target dir. Building the eBPF crate via
+    // `--manifest-path profile-bee-ebpf/Cargo.toml` from elsewhere instead lands
+    // them under profile-bee-ebpf/target; check both so a fresh build is never
+    // silently ignored in favor of the committed prebuilt.
+    let ebpf_dir = workspace_root.join("profile-bee-ebpf");
+    let fresh_candidates = [
+        workspace_root.join("target/bpfel-unknown-none/release/profile-bee"),
+        ebpf_dir.join("target/bpfel-unknown-none/release/profile-bee"),
+    ];
+    let fresh_debug_candidates = [
+        workspace_root.join("target/bpfel-unknown-none/debug/profile-bee"),
+        ebpf_dir.join("target/bpfel-unknown-none/debug/profile-bee"),
+    ];
 
     // Prebuilt binary checked into the repository. The eBPF bytecode embeds
     // architecture-specific register offsets (pt_regs layout), so prefer an
@@ -45,23 +57,25 @@ fn main() {
     // Prefer the freshly-built binary matching the current profile,
     // then the other profile, then the prebuilt fallback.
     let profile = env::var("PROFILE").unwrap_or_default();
+    let first_existing = |cands: &[PathBuf]| cands.iter().find(|p| p.exists()).cloned();
     let source = if profile == "debug" {
-        pick_fresh(&fresh_debug)
-            .or_else(|| pick_fresh(&fresh_release))
-            .unwrap_or(&prebuilt)
+        first_existing(&fresh_debug_candidates)
+            .or_else(|| first_existing(&fresh_candidates))
+            .unwrap_or_else(|| prebuilt.clone())
     } else {
-        pick_fresh(&fresh_release)
-            .or_else(|| pick_fresh(&fresh_debug))
-            .unwrap_or(&prebuilt)
+        first_existing(&fresh_candidates)
+            .or_else(|| first_existing(&fresh_debug_candidates))
+            .unwrap_or_else(|| prebuilt.clone())
     };
 
     // Tell cargo to re-run this script if any of the candidate files change.
-    println!("cargo:rerun-if-changed={}", fresh_release.display());
-    println!("cargo:rerun-if-changed={}", fresh_debug.display());
+    for cand in fresh_candidates.iter().chain(fresh_debug_candidates.iter()) {
+        println!("cargo:rerun-if-changed={}", cand.display());
+    }
     println!("cargo:rerun-if-changed={}", prebuilt.display());
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
-    fs::copy(source, &dest).unwrap_or_else(|e| {
+    fs::copy(&source, &dest).unwrap_or_else(|e| {
         panic!(
             "Failed to copy eBPF binary from {} to {}: {}",
             source.display(),
@@ -123,13 +137,4 @@ fn compile_otlp_protos(manifest_dir: &Path) {
         .build_server(false) // we only need the gRPC client
         .compile_fds(file_descriptors)
         .expect("failed to generate Rust code from OTLP protos");
-}
-
-/// Returns `Some(path)` if the file exists, `None` otherwise.
-fn pick_fresh(path: &Path) -> Option<&Path> {
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
 }

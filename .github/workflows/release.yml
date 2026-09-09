@@ -70,7 +70,13 @@ jobs:
             profile-bee-ebpf
 
       - name: Build eBPF
-        run: cargo +nightly build --release -Z build-std=core --target bpfel-unknown-none --manifest-path profile-bee-ebpf/Cargo.toml
+        # Build from inside profile-bee-ebpf so its .cargo/config (target-dir =
+        # ../target) applies and the object lands at
+        # target/bpfel-unknown-none/release/profile-bee, where profile-bee's
+        # build.rs looks for it. Using --manifest-path from the repo root puts
+        # it in profile-bee-ebpf/target/ instead, so build.rs silently falls
+        # back to the (stale) committed prebuilt. Matches the CI e2e job.
+        run: cd profile-bee-ebpf && cargo +nightly build --release -Z build-std=core --target bpfel-unknown-none
 
       - name: Build profile-bee (x86_64 musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
